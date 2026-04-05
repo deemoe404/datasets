@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wind-datasets"
+version = "0.1.0"
+description = "Dataset processing, caching, and task indexing for wind power forecasting datasets."
+requires-python = ">=3.13"
+dependencies = [
+  "duckdb>=1.5.1",
+  "matplotlib>=3.10.0",
+  "numpy>=2.0.0",
+  "polars>=1.39.0",
+  "pyarrow>=23.0.0",
+  "pytest>=9.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["test"]
