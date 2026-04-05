@@ -18,7 +18,11 @@ def test_greenbyte_parser_merges_duplicate_rows_and_records_conflicts(tmp_path) 
     assert continuous_files
     merged = pl.read_parquet(continuous_files[0]).sort("Date and time")
     conflicts = pl.read_parquet(silver_path / "conflicts.parquet")
-    events = pl.read_parquet(next((silver_path / "events").glob("*.parquet")))
+    event_frames = [
+        pl.read_parquet(path)
+        for path in sorted((silver_path / "events").glob("Status_*.parquet"))
+    ]
+    events = pl.concat(event_frames, how="diagonal_relaxed")
 
     assert merged.height == 8
     assert merged.filter(pl.col("Date and time") == "2024-01-01 00:00:00")["source_row_count"][0] == 2
@@ -28,7 +32,7 @@ def test_greenbyte_parser_merges_duplicate_rows_and_records_conflicts(tmp_path) 
     ][0] == "0.9"
     assert conflicts.height == 1
     assert conflicts["column_name"][0] == "Wind speed (m/s)"
-    assert events.height == 2
+    assert events.height == 4
 
     rebuilt_path = builder.build_silver()
     rebuilt_conflicts = pl.read_parquet(rebuilt_path / "conflicts.parquet")

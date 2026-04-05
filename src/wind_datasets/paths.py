@@ -12,6 +12,9 @@ class DatasetCachePaths:
     silver_dir: Path
     silver_continuous_dir: Path
     silver_events_dir: Path
+    silver_shared_ts_dir: Path
+    silver_event_features_dir: Path
+    silver_interventions_dir: Path
     silver_meta_dir: Path
     gold_base_dir: Path
     tasks_dir: Path
@@ -23,6 +26,15 @@ class DatasetCachePaths:
     @property
     def hill_duplicate_audit_path(self) -> Path:
         return self.silver_meta_dir / "default_table_duplicate_audit.parquet"
+
+    def silver_shared_ts_path(self, group_name: str) -> Path:
+        return self.silver_shared_ts_dir / f"{group_name}.parquet"
+
+    def silver_event_features_path(self, group_name: str) -> Path:
+        return self.silver_event_features_dir / f"{group_name}.parquet"
+
+    def silver_interventions_path(self, group_name: str) -> Path:
+        return self.silver_interventions_dir / f"{group_name}.parquet"
 
     def gold_base_profile_dir(self, quality_profile: str) -> Path:
         return self.gold_base_dir / quality_profile
@@ -59,6 +71,9 @@ def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:
         silver_dir=silver_dir,
         silver_continuous_dir=silver_dir / "continuous",
         silver_events_dir=silver_dir / "events",
+        silver_shared_ts_dir=silver_dir / "shared_ts",
+        silver_event_features_dir=silver_dir / "event_features",
+        silver_interventions_dir=silver_dir / "interventions",
         silver_meta_dir=silver_dir / "meta",
         gold_base_dir=gold_base_dir,
         tasks_dir=tasks_dir,

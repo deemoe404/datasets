@@ -27,8 +27,18 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     report = builder.profile_dataset()
 
     assert "quality_flags" in series.columns
+    assert "farm_pmu__gms_power_kw" in series.columns
+    assert "farm_grid_meter__grid_meter_energy_export_kwh" in series.columns
+    assert "evt_stop_active" in series.columns
+    assert "evt_status_code__710" in series.columns
+    assert "farm_evt_status__communication" in series.columns
     assert turbine_static.height == len(spec.turbine_ids)
     assert turbine_static["turbine_id"].to_list() == [spec.turbine_ids[0]]
+    observed_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+    assert observed_row["farm_pmu__gms_power_kw"][0] == 920.0
+    assert observed_row["farm_grid_meter__grid_meter_energy_export_kwh"][0] == 102.0
+    assert observed_row["evt_status__informational"][0] is True
+    assert observed_row["farm_evt_status__communication"][0] is True
     assert series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")[
         "is_observed"
     ][0] is False
@@ -55,8 +65,40 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
 
     _assert_unique_series_keys(series)
     assert turbine_static.height == len(spec.turbine_ids)
+    assert "farm_grid__activepower" in series.columns
+    assert "farm_grid_sci__activepowermean" in series.columns
+    assert "tur_count__wtc_turrdhrt_endvalue" in series.columns
+    assert "tur_digi_in__wtc_smokenac_counts" in series.columns
+    assert "tur_digi_out__wtc_turbinok_counts" in series.columns
+    assert "tur_intern__wtc_valsuppv_mean" in series.columns
+    assert "tur_press__wtc_brakpres_mean" in series.columns
+    assert "tur_temp__wtc_ambietmp_mean" in series.columns
+    assert "shutdown_duration_s" in series.columns
+    assert "alarm_any_active" in series.columns
+    assert "alarm_code__42" in series.columns
+    assert "aeroup_post_install" in series.columns
+    assert "aeroup_in_install_window" in series.columns
     assert duplicate_audit.filter(pl.col("is_conflicting")).height == 1
     assert duplicate_audit.filter(pl.col("is_conflicting"))["conflicting_columns"][0] == "wtc_PrWindSp_mean"
+    t01_0020 = series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+    )
+    t01_0010 = series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+    )
+    t02_0010 = series.filter(
+        (pl.col("turbine_id") == "T02")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+    )
+    assert t01_0020["farm_grid__activepower"][0] == 2020.0
+    assert t01_0020["farm_grid_sci__activepowermean"][0] == 2020.0
+    assert t01_0020["shutdown_duration_s"][0] == 600.0
+    assert t01_0020["alarm_any_active"][0] is True
+    assert t01_0020["alarm_code__42"][0] is True
+    assert t01_0010["aeroup_post_install"][0] is True
+    assert t02_0010["aeroup_in_install_window"][0] is True
     assert "duplicate_conflict_resolved" in series.filter(
         (pl.col("turbine_id") == "T01")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 01:00:00")

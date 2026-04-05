@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 
 from wind_datasets import api as api_module
-from wind_datasets.api import build_silver, load_turbine_static
+from wind_datasets.api import (
+    build_silver,
+    load_event_features,
+    load_interventions,
+    load_shared_timeseries,
+    load_turbine_static,
+)
 from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
 from wind_datasets.manifest import build_manifest as build_manifest_for_spec
 from wind_datasets.models import DatasetSpec, OfficialRelease
@@ -92,3 +98,33 @@ def test_manifest_reports_layout_problem_for_zip_only_sources(tmp_path) -> None:
     assert manifest["source_release_check"]["status"] == "layout_problem"
     assert manifest["source_layout"]["archive_files"] == ["Kelmarsh wind farm data.zip"]
     assert manifest["warnings"]
+
+
+def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -> None:
+    greenbyte_spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
+    hill_spec = build_hill_fixture(tmp_path / "raw" / "hill")
+
+    spec_map = {
+        "kelmarsh": greenbyte_spec,
+        "hill_of_towie": hill_spec,
+    }
+
+    def _fake_get_dataset_spec(requested_dataset_id: str):
+        return spec_map[requested_dataset_id]
+
+    monkeypatch.setattr(api_module, "get_dataset_spec", _fake_get_dataset_spec)
+
+    build_silver("kelmarsh", cache_root=tmp_path / "cache")
+    build_silver("hill_of_towie", cache_root=tmp_path / "cache")
+
+    farm_pmu = load_shared_timeseries("kelmarsh", "farm_pmu", cache_root=tmp_path / "cache")
+    turbine_status = load_event_features("kelmarsh", "turbine_status", cache_root=tmp_path / "cache")
+    hill_grid = load_shared_timeseries("hill_of_towie", "farm_grid", cache_root=tmp_path / "cache")
+    hill_alarm = load_event_features("hill_of_towie", "alarmlog", cache_root=tmp_path / "cache")
+    hill_aeroup = load_interventions("hill_of_towie", "aeroup", cache_root=tmp_path / "cache")
+
+    assert "farm_pmu__gms_power_kw" in farm_pmu.columns
+    assert "evt_status_code__710" in turbine_status.columns
+    assert "farm_grid__activepower" in hill_grid.columns
+    assert "alarm_code__42" in hill_alarm.columns
+    assert hill_aeroup.columns == ["dataset", "turbine_id", "aeroup_start", "aeroup_end"]

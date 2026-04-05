@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
 from ..utils import ensure_directory
 from .base import BaseDatasetBuilder
-from .common import build_quality_report, ensure_turbine_static_schema, reindex_regular_series, write_quality_report
+from .common import (
+    ParquetChunkWriter,
+    QualityReportAccumulator,
+    ensure_turbine_static_schema,
+    featureize_interval_events,
+    finalize_quality_report,
+    iter_reindexed_regular_series,
+    sanitize_feature_name,
+    update_quality_report_accumulator,
+    write_quality_report,
+)
 
 _DEFAULT_TABLES = ("tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag")
 _DUPLICATE_AUDIT_SCHEMA = {
@@ -17,6 +28,37 @@ _DUPLICATE_AUDIT_SCHEMA = {
     "is_conflicting": pl.Boolean,
     "conflicting_columns": pl.String,
 }
+
+_HILL_SHARED_TABLE_SPECS = (
+    ("tblGrid", "farm_grid", "farm_grid", ("TimeStamp",)),
+    ("tblGridScientific", "farm_grid_sci", "farm_grid_sci", ("TimeStamp",)),
+    ("tblSCTurCount", "turbine_count", "tur_count", ("TimeStamp", "StationId")),
+    ("tblSCTurDigiIn", "turbine_digi_in", "tur_digi_in", ("TimeStamp", "StationId")),
+    ("tblSCTurDigiOut", "turbine_digi_out", "tur_digi_out", ("TimeStamp", "StationId")),
+    ("tblSCTurIntern", "turbine_intern", "tur_intern", ("TimeStamp", "StationId")),
+    ("tblSCTurPress", "turbine_press", "tur_press", ("TimeStamp", "StationId")),
+    ("tblSCTurTemp", "turbine_temp", "tur_temp", ("TimeStamp", "StationId")),
+)
+
+_HILL_BROADCAST_SHARED_GROUPS = (
+    "farm_grid",
+    "farm_grid_sci",
+)
+
+_HILL_TURBINE_SHARED_GROUPS = (
+    "turbine_shutdown_duration",
+    "turbine_count",
+    "turbine_digi_in",
+    "turbine_digi_out",
+    "turbine_intern",
+    "turbine_press",
+    "turbine_temp",
+)
+
+_HILL_EVENT_FEATURE_GROUPS = (
+    "alarmlog",
+    "aeroup",
+)
 
 
 def _read_csv_with_fallback(path):
@@ -116,10 +158,449 @@ def _audit_hill_duplicate_keys(
     return deduped, audit_frame, conflict_keys
 
 
+def _concat_hill_tables(paths: list[Path]) -> pl.DataFrame:
+    if not paths:
+        return pl.DataFrame()
+    return pl.concat([pl.read_parquet(path) for path in paths], how="diagonal_relaxed")
+
+
+def _hill_timestamp_frame(frame: pl.DataFrame, timestamp_column: str) -> pl.DataFrame:
+    return frame.with_columns(
+        pl.col(timestamp_column)
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("timestamp")
+    )
+
+
+def _dedupe_hill_by_keys(frame: pl.DataFrame, key_columns: list[str]) -> pl.DataFrame:
+    return frame.unique(subset=key_columns, keep="first", maintain_order=True)
+
+
+def _max_hill_timestamp(paths: list[Path], timestamp_column: str = "TimeStamp") -> Any:
+    maximum = None
+    for path in paths:
+        frame = pl.read_parquet(path, columns=[timestamp_column]).with_columns(
+            pl.col(timestamp_column)
+            .cast(pl.Utf8)
+            .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+            .alias("timestamp")
+        )
+        value = frame["timestamp"].max()
+        if value is not None and (maximum is None or value > maximum):
+            maximum = value
+    return maximum
+
+
+def _standardize_hill_shared_table(
+    *,
+    frame: pl.DataFrame,
+    dataset_id: str,
+    metadata: pl.DataFrame,
+    table_name: str,
+    prefix: str,
+    key_columns: tuple[str, ...],
+) -> pl.DataFrame:
+    if frame.is_empty():
+        if key_columns == ("TimeStamp",):
+            return pl.DataFrame(schema={"dataset": pl.String, "timestamp": pl.Datetime})
+        return pl.DataFrame(schema={"dataset": pl.String, "turbine_id": pl.String, "timestamp": pl.Datetime})
+
+    frame = _hill_timestamp_frame(frame, "TimeStamp")
+    join_keys: list[str]
+    if key_columns == ("TimeStamp",):
+        join_keys = ["timestamp"]
+        frame = _dedupe_hill_by_keys(frame, join_keys)
+    else:
+        frame = frame.with_columns(pl.col("StationId").cast(pl.String).alias("StationId"))
+        frame = _dedupe_hill_by_keys(frame, ["timestamp", "StationId"])
+        frame = frame.join(metadata, on="StationId", how="left")
+        join_keys = ["turbine_id", "timestamp"]
+
+    excluded = {
+        "TimeStamp",
+        "timestamp",
+        "Station",
+        "StationId",
+        "TimestampStation",
+        "WPSStatus",
+        "DataOk",
+        "dataset",
+        "turbine_id",
+    }
+    payload_columns = [column for column in frame.columns if column not in excluded]
+    select_expressions: list[pl.Expr] = [
+        pl.lit(dataset_id).alias("dataset"),
+        pl.col("timestamp"),
+    ]
+    if "turbine_id" in join_keys:
+        select_expressions.insert(1, pl.col("turbine_id").cast(pl.String))
+    for column in payload_columns:
+        select_expressions.append(
+            pl.col(column)
+            .cast(pl.Float64, strict=False)
+            .alias(f"{prefix}__{sanitize_feature_name(column)}")
+        )
+    standardized = frame.select(select_expressions)
+    feature_columns = [
+        column
+        for column in standardized.columns
+        if column not in {"dataset", "turbine_id", "timestamp"}
+    ]
+    group_by_keys = ["dataset", *join_keys]
+    return (
+        standardized.group_by(group_by_keys, maintain_order=True)
+        .agg([pl.col(column).drop_nulls().first().alias(column) for column in feature_columns])
+        .sort(group_by_keys)
+    )
+
+
+def _standardize_shutdown_duration(
+    *,
+    path: Path,
+    dataset_id: str,
+    metadata: pl.DataFrame,
+) -> pl.DataFrame:
+    if not path.exists():
+        return pl.DataFrame(schema={"dataset": pl.String, "turbine_id": pl.String, "timestamp": pl.Datetime})
+    frame = pl.read_parquet(path).with_columns(
+        pl.col("TimeStamp_StartFormat")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("timestamp"),
+        pl.col("TurbineName").cast(pl.String).alias("turbine_id"),
+        pl.col("ShutdownDuration").cast(pl.Float64, strict=False).alias("shutdown_duration_s"),
+    )
+    return (
+        frame.select(
+            pl.lit(dataset_id).alias("dataset"),
+            "turbine_id",
+            "timestamp",
+            "shutdown_duration_s",
+        )
+        .unique(subset=["dataset", "turbine_id", "timestamp"], keep="first", maintain_order=True)
+        .sort(["dataset", "turbine_id", "timestamp"])
+    )
+
+
+def _standardize_alarmlog(
+    *,
+    frame: pl.DataFrame,
+    dataset_id: str,
+    metadata: pl.DataFrame,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return pl.DataFrame(
+            schema={
+                "dataset": pl.String,
+                "turbine_id": pl.String,
+                "event_start": pl.Datetime,
+                "event_end": pl.Datetime,
+                "alarm_code": pl.String,
+            }
+        )
+    return (
+        frame.with_columns(
+            pl.col("TimeOn")
+            .cast(pl.Utf8)
+            .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+            .alias("event_start"),
+            pl.col("TimeOff")
+            .cast(pl.Utf8)
+            .str.strip_chars()
+            .replace({"": None, "-": None})
+            .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+            .alias("event_end"),
+            pl.col("StationNr").cast(pl.String).alias("StationId"),
+            pl.col("Alarmcode").cast(pl.String).str.strip_chars().replace({"": None}).alias("alarm_code"),
+        )
+        .join(metadata, on="StationId", how="left")
+        .select(
+            pl.lit(dataset_id).alias("dataset"),
+            "turbine_id",
+            "event_start",
+            "event_end",
+            "alarm_code",
+        )
+        .filter(pl.col("event_start").is_not_null() & pl.col("turbine_id").is_not_null())
+        .sort(["dataset", "turbine_id", "event_start"])
+    )
+
+
+def _standardize_aeroup(path: Path, dataset_id: str) -> pl.DataFrame:
+    if not path.exists():
+        return pl.DataFrame(
+            schema={
+                "dataset": pl.String,
+                "turbine_id": pl.String,
+                "aeroup_start": pl.Datetime,
+                "aeroup_end": pl.Datetime,
+            }
+        )
+    frame = pl.read_parquet(path).with_columns(
+        pl.col("Turbine").cast(pl.String).alias("turbine_id"),
+        pl.col("First date of AeroUp works")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d", strict=False)
+        .alias("aeroup_start"),
+        pl.col("Last date of AeroUp works")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d", strict=False)
+        .alias("aeroup_end"),
+    )
+    return frame.select(
+        pl.lit(dataset_id).alias("dataset"),
+        "turbine_id",
+        "aeroup_start",
+        "aeroup_end",
+    ).filter(pl.col("turbine_id").is_not_null())
+
+
+def _featureize_aeroup_interventions(
+    frame: pl.DataFrame,
+    resolution_minutes: int,
+    dataset_end: Any | None = None,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return pl.DataFrame(
+            schema={
+                "dataset": pl.String,
+                "turbine_id": pl.String,
+                "timestamp": pl.Datetime,
+                "aeroup_in_install_window": pl.Boolean,
+                "aeroup_post_install": pl.Boolean,
+                "days_since_aeroup_start": pl.Float64,
+                "days_since_aeroup_end": pl.Float64,
+            }
+        )
+    output_schema = {
+        "dataset": pl.String,
+        "turbine_id": pl.String,
+        "timestamp": pl.Datetime,
+        "aeroup_in_install_window": pl.Boolean,
+        "aeroup_post_install": pl.Boolean,
+        "days_since_aeroup_start": pl.Float64,
+        "days_since_aeroup_end": pl.Float64,
+    }
+    output_frames: list[pl.DataFrame] = []
+    for group in frame.partition_by(["dataset", "turbine_id"], maintain_order=True):
+        dataset_id = group["dataset"][0]
+        turbine_id = group["turbine_id"][0]
+        start = group["aeroup_start"].min()
+        end = group["aeroup_end"].max()
+        if start is None:
+            continue
+        grid_end = max(
+            value for value in (dataset_end, end, start) if value is not None
+        )
+        timestamps = pl.datetime_range(
+            start=start,
+            end=grid_end,
+            interval=f"{resolution_minutes}m",
+            eager=True,
+        )
+        rows: list[dict[str, Any]] = []
+        for timestamp in timestamps.to_list():
+            in_window = bool(start <= timestamp and (end is None or timestamp <= end))
+            post_install = bool(end is not None and timestamp > end)
+            days_since_start = (timestamp - start).total_seconds() / 86_400 if timestamp >= start else None
+            days_since_end = (
+                (timestamp - end).total_seconds() / 86_400
+                if end is not None and timestamp > end
+                else None
+            )
+            rows.append(
+                {
+                    "dataset": dataset_id,
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "aeroup_in_install_window": in_window,
+                    "aeroup_post_install": post_install,
+                    "days_since_aeroup_start": days_since_start,
+                    "days_since_aeroup_end": days_since_end,
+                }
+            )
+        output_frames.append(pl.DataFrame(rows, schema=output_schema))
+    return pl.concat(output_frames, how="vertical").sort(["dataset", "turbine_id", "timestamp"])
+
+
+def _join_hill_extra_frames(base: pl.DataFrame, cache_paths) -> pl.DataFrame:
+    joined = base
+    for group_name in (
+        "farm_grid",
+        "farm_grid_sci",
+        "turbine_shutdown_duration",
+        "turbine_count",
+        "turbine_digi_in",
+        "turbine_digi_out",
+        "turbine_intern",
+        "turbine_press",
+        "turbine_temp",
+    ):
+        path = cache_paths.silver_shared_ts_path(group_name)
+        if not path.exists():
+            continue
+        frame = pl.read_parquet(path)
+        join_keys = ["dataset", "timestamp"]
+        if "turbine_id" in frame.columns:
+            join_keys.insert(1, "turbine_id")
+        joined = joined.join(frame, on=join_keys, how="left")
+
+    for group_name in ("alarmlog", "aeroup"):
+        path = cache_paths.silver_event_features_path(group_name)
+        if path.exists():
+            joined = joined.join(
+                pl.read_parquet(path),
+                on=["dataset", "turbine_id", "timestamp"],
+                how="left",
+            )
+
+    boolean_columns = [column for column, dtype in joined.schema.items() if dtype == pl.Boolean]
+    count_like_columns = [
+        column
+        for column, dtype in joined.schema.items()
+        if dtype.is_numeric()
+        and (
+            column.startswith("alarm_")
+            or column.startswith("evt_")
+            or column == "shutdown_duration_s"
+        )
+        and not column.startswith("days_since_")
+        and not column.endswith("days_since_aeroup_start")
+        and not column.endswith("days_since_aeroup_end")
+    ]
+    if boolean_columns or count_like_columns:
+        joined = joined.with_columns(
+            [pl.col(column).fill_null(False).alias(column) for column in boolean_columns]
+            + [pl.col(column).fill_null(0).alias(column) for column in count_like_columns]
+        )
+    return joined.sort(["dataset", "turbine_id", "timestamp"])
+
+
+def _load_turbine_time_slice(path: Path, turbine_id: str, start: Any, end: Any) -> pl.DataFrame:
+    if not path.exists():
+        return pl.DataFrame()
+    return (
+        pl.scan_parquet(path)
+        .filter(
+            (pl.col("turbine_id") == turbine_id)
+            & (pl.col("timestamp") >= start)
+            & (pl.col("timestamp") <= end)
+        )
+        .collect()
+    )
+
+
+def _augment_hill_batch(
+    base_batch: pl.DataFrame,
+    cache_paths,
+    shared_frames: dict[str, pl.DataFrame],
+    expected_extra_schema: dict[str, pl.DataType],
+) -> pl.DataFrame:
+    if base_batch.is_empty():
+        return base_batch
+    turbine_id = base_batch["turbine_id"][0]
+    batch_start = base_batch["timestamp"].min()
+    batch_end = base_batch["timestamp"].max()
+    joined = base_batch
+
+    for frame in shared_frames.values():
+        joined = joined.join(frame, on=["dataset", "timestamp"], how="left")
+
+    for group_name in _HILL_TURBINE_SHARED_GROUPS:
+        frame = _load_turbine_time_slice(
+            cache_paths.silver_shared_ts_path(group_name),
+            turbine_id,
+            batch_start,
+            batch_end,
+        )
+        if not frame.is_empty():
+            joined = joined.join(frame, on=["dataset", "turbine_id", "timestamp"], how="left")
+
+    for group_name in _HILL_EVENT_FEATURE_GROUPS:
+        frame = _load_turbine_time_slice(
+            cache_paths.silver_event_features_path(group_name),
+            turbine_id,
+            batch_start,
+            batch_end,
+        )
+        if not frame.is_empty():
+            joined = joined.join(frame, on=["dataset", "turbine_id", "timestamp"], how="left")
+
+    missing_columns = [
+        pl.lit(None).cast(dtype).alias(column)
+        for column, dtype in expected_extra_schema.items()
+        if column not in joined.columns
+    ]
+    if missing_columns:
+        joined = joined.with_columns(missing_columns)
+
+    boolean_columns = [column for column, dtype in joined.schema.items() if dtype == pl.Boolean]
+    count_like_columns = [
+        column
+        for column, dtype in joined.schema.items()
+        if dtype.is_numeric()
+        and (
+            column.startswith("alarm_")
+            or column.startswith("evt_")
+            or column == "shutdown_duration_s"
+        )
+        and not column.startswith("days_since_")
+        and not column.endswith("days_since_aeroup_start")
+        and not column.endswith("days_since_aeroup_end")
+    ]
+    if boolean_columns or count_like_columns:
+        joined = joined.with_columns(
+            [pl.col(column).fill_null(False).alias(column) for column in boolean_columns]
+            + [pl.col(column).fill_null(0).alias(column) for column in count_like_columns]
+        )
+    return joined.sort(["dataset", "turbine_id", "timestamp"])
+
+
+def _write_hill_gold_with_extras(
+    base_chunks,
+    cache_paths,
+    output_path: Path,
+    spec,
+    batch_rows: int = 2_000,
+) -> QualityReportAccumulator:
+    ensure_directory(output_path.parent)
+    shared_frames = {
+        group_name: pl.read_parquet(cache_paths.silver_shared_ts_path(group_name))
+        for group_name in _HILL_BROADCAST_SHARED_GROUPS
+        if cache_paths.silver_shared_ts_path(group_name).exists()
+    }
+    expected_extra_schema: dict[str, pl.DataType] = {}
+    for path in [cache_paths.silver_shared_ts_path(group_name) for group_name in _HILL_TURBINE_SHARED_GROUPS] + [
+        cache_paths.silver_event_features_path(group_name) for group_name in _HILL_EVENT_FEATURE_GROUPS
+    ]:
+        if not path.exists():
+            continue
+        schema = pl.scan_parquet(path).collect_schema()
+        for column, dtype in schema.items():
+            if column not in {"dataset", "turbine_id", "timestamp"}:
+                expected_extra_schema[column] = dtype
+    writer = ParquetChunkWriter(output_path, row_group_size=1_000)
+    accumulator = QualityReportAccumulator()
+    for base_chunk in base_chunks:
+        if base_chunk.is_empty():
+            continue
+        update_quality_report_accumulator(accumulator, base_chunk, spec)
+        for offset in range(0, base_chunk.height, batch_rows):
+            batch = base_chunk.slice(offset, batch_rows)
+            writer.write_frame(_augment_hill_batch(batch, cache_paths, shared_frames, expected_extra_schema))
+    writer.close()
+    return accumulator
+
+
 class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
     def build_silver(self) -> Path:
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_dir)
+        ensure_directory(self.cache_paths.silver_events_dir)
+        ensure_directory(self.cache_paths.silver_shared_ts_dir)
+        ensure_directory(self.cache_paths.silver_event_features_dir)
+        ensure_directory(self.cache_paths.silver_interventions_dir)
         ensure_directory(self.cache_paths.silver_meta_dir)
         for path in sorted(self.spec.source_root.rglob("*.csv")):
             relative = path.relative_to(self.spec.source_root)
@@ -156,11 +637,79 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         else:
             turbine_static = ensure_turbine_static_schema(pl.DataFrame())
         turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
+
+        metadata = pl.read_parquet(self.cache_paths.silver_dir / "Hill_of_Towie_turbine_metadata.parquet").select(
+            pl.col("Station ID").cast(pl.String).alias("StationId"),
+            pl.col("Turbine Name").cast(pl.String).alias("turbine_id"),
+        )
+        dataset_end = _max_hill_timestamp(
+            sorted(self.cache_paths.silver_dir.rglob("tblSCTurGrid_*.parquet"))
+        )
+        for table_name, group_name, prefix, key_columns in _HILL_SHARED_TABLE_SPECS:
+            standardized = _standardize_hill_shared_table(
+                frame=_concat_hill_tables(sorted(self.cache_paths.silver_dir.rglob(f"{table_name}_*.parquet"))),
+                dataset_id=self.spec.dataset_id,
+                metadata=metadata,
+                table_name=table_name,
+                prefix=prefix,
+                key_columns=key_columns,
+            )
+            standardized.write_parquet(self.cache_paths.silver_shared_ts_path(group_name))
+
+        shutdown_path = self.cache_paths.silver_dir / "ShutdownDuration.parquet"
+        _standardize_shutdown_duration(
+            path=shutdown_path,
+            dataset_id=self.spec.dataset_id,
+            metadata=metadata,
+        ).write_parquet(self.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"))
+
+        alarmlog = _standardize_alarmlog(
+            frame=_concat_hill_tables(sorted(self.cache_paths.silver_dir.rglob("tblAlarmLog_*.parquet"))),
+            dataset_id=self.spec.dataset_id,
+            metadata=metadata,
+        )
+        alarmlog.write_parquet(self.cache_paths.silver_events_dir / "alarmlog.parquet")
+        featureize_interval_events(
+            events=alarmlog,
+            resolution_minutes=self.spec.resolution_minutes,
+            key_columns=("dataset", "turbine_id"),
+            start_column="event_start",
+            end_column="event_end",
+            base_prefix="alarm",
+            categorical_prefixes=(("alarm_code", "alarm_code"),),
+        ).write_parquet(self.cache_paths.silver_event_features_path("alarmlog"))
+
+        aeroup = _standardize_aeroup(
+            self.cache_paths.silver_dir / "Hill_of_Towie_AeroUp_install_dates.parquet",
+            self.spec.dataset_id,
+        )
+        aeroup.write_parquet(self.cache_paths.silver_interventions_path("aeroup"))
+        _featureize_aeroup_interventions(
+            aeroup,
+            self.spec.resolution_minutes,
+            dataset_end=dataset_end,
+        ).write_parquet(
+            self.cache_paths.silver_event_features_path("aeroup")
+        )
         return self.cache_paths.silver_dir
 
     def build_gold_base(self, quality_profile: str | None = None) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        if not self.cache_paths.silver_dir.exists():
+        required_silver_paths = [
+            self.cache_paths.silver_dir,
+            self.cache_paths.silver_shared_ts_path("farm_grid"),
+            self.cache_paths.silver_shared_ts_path("farm_grid_sci"),
+            self.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"),
+            self.cache_paths.silver_shared_ts_path("turbine_count"),
+            self.cache_paths.silver_shared_ts_path("turbine_digi_in"),
+            self.cache_paths.silver_shared_ts_path("turbine_digi_out"),
+            self.cache_paths.silver_shared_ts_path("turbine_intern"),
+            self.cache_paths.silver_shared_ts_path("turbine_press"),
+            self.cache_paths.silver_shared_ts_path("turbine_temp"),
+            self.cache_paths.silver_event_features_path("alarmlog"),
+            self.cache_paths.silver_event_features_path("aeroup"),
+        ]
+        if any(not path.exists() for path in required_silver_paths):
             self.build_silver()
 
         manifest_payload = self.ensure_manifest()
@@ -271,14 +820,18 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         gold_input = gold_input.with_columns(
             [pl.col(column).cast(pl.Float64, strict=False) for column in feature_columns]
         )
-        gold_base = reindex_regular_series(gold_input, self.spec)
         ensure_directory(self.cache_paths.gold_base_profile_dir(resolved_quality_profile))
         series_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
         quality_path = self.cache_paths.gold_base_quality_path_for(resolved_quality_profile)
-        gold_base.write_parquet(series_path)
+        quality_accumulator = _write_hill_gold_with_extras(
+            iter_reindexed_regular_series(gold_input, self.spec),
+            self.cache_paths,
+            series_path,
+            self.spec,
+        )
 
-        report = build_quality_report(
-            gold_base,
+        report = finalize_quality_report(
+            quality_accumulator,
             manifest_payload,
             self.spec,
             extra={

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
+import re
 from typing import Any
 
+import numpy as np
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -34,6 +37,8 @@ TURBINE_STATIC_SCHEMA: dict[str, pl.DataType] = {
     "spatial_source": pl.String,
 }
 
+_SANITIZE_PATTERN = re.compile(r"[^a-z0-9]+")
+
 
 def ensure_turbine_static_schema(df: pl.DataFrame) -> pl.DataFrame:
     missing = [
@@ -48,10 +53,249 @@ def ensure_turbine_static_schema(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def sanitize_feature_name(value: str) -> str:
+    text = value.strip().lower()
+    text = _SANITIZE_PATTERN.sub("_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "unknown"
+
+
+def build_feature_name_mapping(values: list[str], prefix: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    used: dict[str, str] = {}
+    for value in sorted({item.strip() for item in values if item and item.strip()}):
+        base_name = f"{prefix}__{sanitize_feature_name(value)}"
+        name = base_name
+        suffix = 2
+        while name in used and used[name] != value:
+            name = f"{base_name}_{suffix}"
+            suffix += 1
+        used[name] = value
+        mapping[value] = name
+    return mapping
+
+
+def aligned_floor_timestamp(value: datetime, resolution_minutes: int) -> datetime:
+    epoch = datetime(1970, 1, 1, tzinfo=value.tzinfo)
+    step_seconds = resolution_minutes * 60
+    total_seconds = int((value - epoch).total_seconds())
+    floored = (total_seconds // step_seconds) * step_seconds
+    return epoch + timedelta(seconds=floored)
+
+
+def aligned_ceil_timestamp(value: datetime, resolution_minutes: int) -> datetime:
+    floored = aligned_floor_timestamp(value, resolution_minutes)
+    if floored == value:
+        return floored
+    return floored + timedelta(minutes=resolution_minutes)
+
+
+def featureize_interval_events(
+    *,
+    events: pl.DataFrame,
+    resolution_minutes: int,
+    key_columns: tuple[str, ...],
+    start_column: str,
+    end_column: str,
+    base_prefix: str,
+    categorical_prefixes: tuple[tuple[str, str], ...] = (),
+    status_aliases: dict[str, str] | None = None,
+) -> pl.DataFrame:
+    core_columns = [
+        f"{base_prefix}_any_active",
+        f"{base_prefix}_active_count",
+        f"{base_prefix}_total_overlap_seconds",
+    ]
+    if events.is_empty():
+        return pl.DataFrame(
+            schema={
+                **{column: pl.String for column in key_columns},
+                "timestamp": pl.Datetime,
+                core_columns[0]: pl.Boolean,
+                core_columns[1]: pl.Int32,
+                core_columns[2]: pl.Int32,
+            }
+        )
+
+    normalized = events
+    value_mappings: dict[str, dict[str, str]] = {}
+    for source_column, prefix in categorical_prefixes:
+        if source_column not in normalized.columns:
+            continue
+        normalized = normalized.with_columns(
+            pl.col(source_column)
+            .cast(pl.String)
+            .str.strip_chars()
+            .replace({"": None})
+            .alias(source_column)
+        )
+        values = normalized.select(pl.col(source_column).drop_nulls().unique()).to_series().to_list()
+        value_mappings[source_column] = build_feature_name_mapping(values, prefix)
+
+    alias_mapping = {
+        sanitize_feature_name(source): target for source, target in (status_aliases or {}).items()
+    }
+    interval = timedelta(minutes=resolution_minutes)
+    output_frames: list[pl.DataFrame] = []
+
+    interval_seconds = resolution_minutes * 60
+
+    for group in normalized.partition_by(list(key_columns), maintain_order=True):
+        group = group.sort(start_column)
+        rows = group.to_dicts()
+        if not rows:
+            continue
+
+        event_bounds = [
+            row[end_column] if isinstance(row.get(end_column), datetime) else row[start_column]
+            for row in rows
+        ]
+        fallback_end = aligned_ceil_timestamp(max(event_bounds), resolution_minutes) + interval
+        prepared_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            start = row[start_column]
+            raw_end = row.get(end_column)
+            next_start = rows[index + 1][start_column] if index + 1 < len(rows) else None
+            if isinstance(raw_end, datetime) and raw_end > start:
+                effective_end = raw_end
+            elif isinstance(next_start, datetime) and next_start > start:
+                effective_end = next_start
+            else:
+                effective_end = fallback_end
+            prepared_rows.append({**row, "__effective_end": effective_end})
+
+        grid_start = aligned_floor_timestamp(prepared_rows[0][start_column], resolution_minutes)
+        grid_end = aligned_ceil_timestamp(
+            max(row["__effective_end"] for row in prepared_rows),
+            resolution_minutes,
+        )
+        timestamps = pl.datetime_range(
+            start=grid_start,
+            end=grid_end,
+            interval=f"{resolution_minutes}m",
+            eager=True,
+        )
+        timestamp_list = timestamps.to_list()
+        length = len(timestamp_list)
+        active_diff = np.zeros(length + 1, dtype=np.int32)
+        overlap_full_diff = np.zeros(length + 1, dtype=np.int64)
+        overlap_edge = np.zeros(length, dtype=np.int64)
+        categorical_diffs: dict[str, np.ndarray] = {}
+        alias_diffs: dict[str, np.ndarray] = {}
+
+        for row in prepared_rows:
+            start = row[start_column]
+            end = row["__effective_end"]
+            first_idx = bisect_right(timestamp_list, start)
+            last_exclusive = bisect_left(timestamp_list, end + interval)
+            if first_idx >= last_exclusive:
+                continue
+            active_diff[first_idx] += 1
+            active_diff[last_exclusive] -= 1
+            normalized_status = None
+            if "status" in row and row["status"] is not None:
+                normalized_status = sanitize_feature_name(str(row["status"]))
+            if first_idx == last_exclusive - 1:
+                bucket_end = timestamp_list[first_idx]
+                bucket_start = bucket_end - interval
+                overlap_start = max(start, bucket_start)
+                overlap_end = min(end, bucket_end)
+                overlap_seconds = int((overlap_end - overlap_start).total_seconds())
+                if overlap_seconds > 0:
+                    overlap_edge[first_idx] += overlap_seconds
+            else:
+                first_bucket_end = timestamp_list[first_idx]
+                first_overlap = int((first_bucket_end - start).total_seconds())
+                if first_overlap > 0:
+                    overlap_edge[first_idx] += first_overlap
+
+                last_idx = last_exclusive - 1
+                last_bucket_end = timestamp_list[last_idx]
+                last_bucket_start = last_bucket_end - interval
+                last_overlap = int((end - max(start, last_bucket_start)).total_seconds())
+                if last_overlap > 0:
+                    overlap_edge[last_idx] += last_overlap
+
+                full_start = first_idx + 1
+                full_end_exclusive = last_idx
+                if full_start < full_end_exclusive:
+                    overlap_full_diff[full_start] += interval_seconds
+                    overlap_full_diff[full_end_exclusive] -= interval_seconds
+
+            if normalized_status and normalized_status in alias_mapping:
+                output_name = alias_mapping[normalized_status]
+                alias_diff = alias_diffs.setdefault(output_name, np.zeros(length + 1, dtype=np.int32))
+                alias_diff[first_idx] += 1
+                alias_diff[last_exclusive] -= 1
+
+            for source_column, mapping in value_mappings.items():
+                raw_value = row.get(source_column)
+                if raw_value is None:
+                    continue
+                output_name = mapping.get(str(raw_value).strip())
+                if output_name is None:
+                    continue
+                categorical_diff = categorical_diffs.setdefault(output_name, np.zeros(length + 1, dtype=np.int32))
+                categorical_diff[first_idx] += 1
+                categorical_diff[last_exclusive] -= 1
+
+        active_count = np.cumsum(active_diff[:-1], dtype=np.int64).astype(np.int32, copy=False)
+        any_active = active_count > 0
+        total_overlap_seconds = (
+            overlap_edge + np.cumsum(overlap_full_diff[:-1], dtype=np.int64)
+        ).astype(np.int32, copy=False)
+        alias_arrays = {
+            output_name: np.cumsum(diff[:-1], dtype=np.int64) > 0
+            for output_name, diff in alias_diffs.items()
+        }
+        categorical_arrays = {
+            output_name: np.cumsum(diff[:-1], dtype=np.int64) > 0
+            for output_name, diff in categorical_diffs.items()
+        }
+
+        group_payload = {
+            **{
+                column: [prepared_rows[0][column]] * length
+                for column in key_columns
+            },
+            "timestamp": timestamps,
+            f"{base_prefix}_any_active": any_active.tolist(),
+            f"{base_prefix}_active_count": active_count.tolist(),
+            f"{base_prefix}_total_overlap_seconds": total_overlap_seconds.tolist(),
+            **{column: values.tolist() for column, values in alias_arrays.items()},
+            **{column: values.tolist() for column, values in categorical_arrays.items()},
+        }
+        output_frames.append(pl.DataFrame(group_payload))
+
+    if not output_frames:
+        return pl.DataFrame(
+            schema={
+                **{column: pl.String for column in key_columns},
+                "timestamp": pl.Datetime,
+                core_columns[0]: pl.Boolean,
+                core_columns[1]: pl.Int32,
+                core_columns[2]: pl.Int32,
+            }
+        )
+    result = pl.concat(output_frames, how="diagonal_relaxed")
+    boolean_columns = [
+        column
+        for column in [
+            *alias_mapping.values(),
+            *[output_name for mapping in value_mappings.values() for output_name in mapping.values()],
+        ]
+        if column in result.columns
+    ]
+    if boolean_columns:
+        result = result.with_columns([pl.col(column).fill_null(False).alias(column) for column in boolean_columns])
+    return result.sort([*key_columns, "timestamp"])
+
+
 @dataclass
 class ParquetChunkWriter:
     path: Path
     schema: pa.Schema | None = None
+    row_group_size: int | None = None
     _writer: pq.ParquetWriter | None = None
 
     def write_rows(self, rows: list[dict[str, Any]]) -> None:
@@ -59,9 +303,35 @@ class ParquetChunkWriter:
             return
         ensure_directory(self.path.parent)
         table = pa.Table.from_pylist(rows, schema=self.schema)
+        if self.schema is not None and table.schema != self.schema:
+            table = table.cast(self.schema)
         if self._writer is None:
             self._writer = pq.ParquetWriter(self.path, table.schema)
-        self._writer.write_table(table)
+            if self.schema is None:
+                self.schema = table.schema
+        self._writer.write_table(table, row_group_size=self.row_group_size)
+
+    def write_frame(self, frame: pl.DataFrame) -> None:
+        if frame.is_empty():
+            return
+        ensure_directory(self.path.parent)
+        if self.schema is not None:
+            missing_columns = [
+                pl.lit(None).alias(field.name)
+                for field in self.schema
+                if field.name not in frame.columns
+            ]
+            if missing_columns:
+                frame = frame.with_columns(missing_columns)
+            frame = frame.select(self.schema.names)
+        table = frame.to_arrow()
+        if self.schema is not None and table.schema != self.schema:
+            table = table.cast(self.schema)
+        if self._writer is None:
+            self._writer = pq.ParquetWriter(self.path, table.schema)
+            if self.schema is None:
+                self.schema = table.schema
+        self._writer.write_table(table, row_group_size=self.row_group_size)
 
     def close(self) -> None:
         if self._writer is not None:
@@ -75,6 +345,17 @@ class ParquetChunkWriter:
                 schema=self.schema,
             )
             pq.write_table(empty, self.path)
+
+
+@dataclass
+class QualityReportAccumulator:
+    total_rows: int = 0
+    observed_rows: int = 0
+    missing_row_count: int = 0
+    target_missing_count: int = 0
+    duplicate_key_count: int = 0
+    interval_distribution: Counter[int] = field(default_factory=Counter)
+    long_gaps: list[dict[str, Any]] = field(default_factory=list)
 
 
 def cast_numeric_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
@@ -92,18 +373,9 @@ def cast_numeric_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     return df.with_columns(expressions)
 
 
-def reindex_regular_series(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
+def iter_reindexed_regular_series(df: pl.DataFrame, spec: DatasetSpec):
     if df.is_empty():
-        return pl.DataFrame(
-            schema={
-                "dataset": pl.String,
-                "turbine_id": pl.String,
-                "timestamp": pl.Datetime,
-                "target_kw": pl.Float64,
-                "is_observed": pl.Boolean,
-                "quality_flags": pl.String,
-            }
-        )
+        return
 
     feature_columns = [
         column
@@ -122,8 +394,6 @@ def reindex_regular_series(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
         column for column in feature_columns if df.schema.get(column) == pl.Boolean
     ]
     interval = f"{spec.resolution_minutes}m"
-    output_parts: list[pl.DataFrame] = []
-
     for turbine_frame in df.partition_by("turbine_id", maintain_order=True):
         turbine_frame = turbine_frame.sort("timestamp")
         turbine_id = turbine_frame["turbine_id"][0]
@@ -164,21 +434,96 @@ def reindex_regular_series(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
             joined = joined.with_columns(
                 [pl.col(column).fill_null(False).alias(column) for column in boolean_feature_columns]
             )
-        output_parts.append(
-            joined.select(
-                [
-                    "dataset",
-                    "turbine_id",
-                    "timestamp",
-                    "target_kw",
-                    "is_observed",
-                    "quality_flags",
-                    *feature_columns,
-                ]
-            )
+        yield joined.select(
+            [
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                "target_kw",
+                "is_observed",
+                "quality_flags",
+                *feature_columns,
+            ]
         )
 
+def reindex_regular_series(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
+    output_parts = list(iter_reindexed_regular_series(df, spec))
+    if not output_parts:
+        return pl.DataFrame(
+            schema={
+                "dataset": pl.String,
+                "turbine_id": pl.String,
+                "timestamp": pl.Datetime,
+                "target_kw": pl.Float64,
+                "is_observed": pl.Boolean,
+                "quality_flags": pl.String,
+            }
+        )
     return pl.concat(output_parts, how="vertical").sort(["dataset", "turbine_id", "timestamp"])
+
+
+def update_quality_report_accumulator(
+    accumulator: QualityReportAccumulator,
+    df: pl.DataFrame,
+    spec: DatasetSpec,
+) -> QualityReportAccumulator:
+    if df.is_empty():
+        return accumulator
+
+    observed = df.filter(pl.col("is_observed"))
+    accumulator.total_rows += df.height
+    accumulator.observed_rows += observed.height
+    accumulator.missing_row_count += df.filter(~pl.col("is_observed")).height
+    accumulator.target_missing_count += df.filter(pl.col("target_kw").is_null()).height
+    accumulator.duplicate_key_count += (
+        df.group_by(["dataset", "turbine_id", "timestamp"])
+        .len()
+        .filter(pl.col("len") > 1)
+        .height
+    )
+
+    threshold = spec.resolution_minutes
+    for turbine_frame in observed.partition_by("turbine_id", maintain_order=True):
+        turbine_id = turbine_frame["turbine_id"][0]
+        timestamps = turbine_frame.sort("timestamp")["timestamp"].to_list()
+        for previous, current in zip(timestamps, timestamps[1:]):
+            diff_minutes = int((current - previous).total_seconds() // 60)
+            accumulator.interval_distribution[diff_minutes] += 1
+            if diff_minutes > threshold:
+                accumulator.long_gaps.append(
+                    {
+                        "turbine_id": turbine_id,
+                        "gap_minutes": diff_minutes,
+                        "gap_start": previous.isoformat(),
+                        "gap_end": current.isoformat(),
+                    }
+                )
+    return accumulator
+
+
+def finalize_quality_report(
+    accumulator: QualityReportAccumulator,
+    manifest_payload: dict[str, Any],
+    spec: DatasetSpec,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report = {
+        "dataset_id": spec.dataset_id,
+        "resolution_minutes": spec.resolution_minutes,
+        "source_files": [item["relative_path"] for item in manifest_payload["files"]],
+        "total_rows": accumulator.total_rows,
+        "observed_rows": accumulator.observed_rows,
+        "missing_row_count": accumulator.missing_row_count,
+        "target_missing_count": accumulator.target_missing_count,
+        "duplicate_key_count": accumulator.duplicate_key_count,
+        "interval_distribution_minutes": {
+            str(key): value for key, value in sorted(accumulator.interval_distribution.items())
+        },
+        "long_gaps": accumulator.long_gaps,
+    }
+    if extra:
+        report.update(extra)
+    return report
 
 
 def build_quality_report(
@@ -187,51 +532,8 @@ def build_quality_report(
     spec: DatasetSpec,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    observed = df.filter(pl.col("is_observed"))
-    duplicate_key_count = (
-        df.group_by(["dataset", "turbine_id", "timestamp"])
-        .len()
-        .filter(pl.col("len") > 1)
-        .height
-    )
-
-    interval_distribution: Counter[int] = Counter()
-    long_gaps: list[dict[str, Any]] = []
-    threshold = spec.resolution_minutes
-
-    for turbine_frame in observed.partition_by("turbine_id", maintain_order=True):
-        turbine_id = turbine_frame["turbine_id"][0]
-        timestamps = turbine_frame.sort("timestamp")["timestamp"].to_list()
-        for previous, current in zip(timestamps, timestamps[1:]):
-            diff_minutes = int((current - previous).total_seconds() // 60)
-            interval_distribution[diff_minutes] += 1
-            if diff_minutes > threshold:
-                long_gaps.append(
-                    {
-                        "turbine_id": turbine_id,
-                        "gap_minutes": diff_minutes,
-                        "gap_start": previous.isoformat(),
-                        "gap_end": current.isoformat(),
-                    }
-                )
-
-    report = {
-        "dataset_id": spec.dataset_id,
-        "resolution_minutes": spec.resolution_minutes,
-        "source_files": [item["relative_path"] for item in manifest_payload["files"]],
-        "total_rows": df.height,
-        "observed_rows": observed.height,
-        "missing_row_count": df.filter(~pl.col("is_observed")).height,
-        "target_missing_count": df.filter(pl.col("target_kw").is_null()).height,
-        "duplicate_key_count": duplicate_key_count,
-        "interval_distribution_minutes": {
-            str(key): value for key, value in sorted(interval_distribution.items())
-        },
-        "long_gaps": long_gaps,
-    }
-    if extra:
-        report.update(extra)
-    return report
+    accumulator = update_quality_report_accumulator(QualityReportAccumulator(), df, spec)
+    return finalize_quality_report(accumulator, manifest_payload, spec, extra)
 
 
 def write_quality_report(path: Path, payload: dict[str, Any]) -> Path:

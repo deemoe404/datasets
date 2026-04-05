@@ -37,6 +37,24 @@ class BaseDatasetBuilder:
             self.build_silver()
         return pl.read_parquet(self.cache_paths.silver_turbine_static_path)
 
+    def load_shared_timeseries(self, group_name: str) -> pl.DataFrame:
+        path = self.cache_paths.silver_shared_ts_path(group_name)
+        if not path.exists():
+            self.build_silver()
+        return pl.read_parquet(path)
+
+    def load_event_features(self, group_name: str) -> pl.DataFrame:
+        path = self.cache_paths.silver_event_features_path(group_name)
+        if not path.exists():
+            self.build_silver()
+        return pl.read_parquet(path)
+
+    def load_interventions(self, group_name: str) -> pl.DataFrame:
+        path = self.cache_paths.silver_interventions_path(group_name)
+        if not path.exists():
+            self.build_silver()
+        return pl.read_parquet(path)
+
     def build_task_cache(self, task_spec: TaskSpec, quality_profile: str | None = None) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         gold_base_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
@@ -47,7 +65,21 @@ class BaseDatasetBuilder:
         task_dir = ensure_directory(
             self.cache_paths.task_dir_for(resolved_quality_profile, resolved.task_id)
         )
-        df = pl.read_parquet(gold_base_path)
+        available_columns = set(pl.scan_parquet(gold_base_path).collect_schema().names())
+        required_columns = [
+            "dataset",
+            "turbine_id",
+            "timestamp",
+            "target_kw",
+            "is_observed",
+            "quality_flags",
+        ]
+        optional_columns = [
+            column
+            for column in ("sdwpf_is_masked", "sdwpf_is_unknown", "sdwpf_is_abnormal")
+            if column in available_columns
+        ]
+        df = pl.read_parquet(gold_base_path, columns=[*required_columns, *optional_columns])
         return build_window_index(
             df=df,
             task=resolved,

@@ -63,6 +63,36 @@ def load_turbine_static(
     return builder.load_turbine_static()
 
 
+def load_shared_timeseries(
+    dataset_id: str,
+    group_name: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    return builder.load_shared_timeseries(group_name)
+
+
+def load_event_features(
+    dataset_id: str,
+    group_name: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    return builder.load_event_features(group_name)
+
+
+def load_interventions(
+    dataset_id: str,
+    group_name: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    return builder.load_interventions(group_name)
+
+
 def load_window_index(
     dataset_id: str,
     task_spec: TaskSpec | None = None,

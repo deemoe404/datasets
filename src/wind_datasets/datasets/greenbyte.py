@@ -20,7 +20,9 @@ from .common import (
     build_quality_report,
     cast_numeric_columns,
     ensure_turbine_static_schema,
+    featureize_interval_events,
     reindex_regular_series,
+    sanitize_feature_name,
     write_quality_report,
 )
 
@@ -52,13 +54,37 @@ _GREENBYTE_CONFLICT_SCHEMA = pa.schema(
     ]
 )
 
+_GREENBYTE_STATUS_ALIASES = {
+    "stop": "evt_stop_active",
+    "warning": "evt_warning_active",
+    "informational": "evt_informational_active",
+}
 
-def _read_greenbyte_metadata(path: Path) -> dict[str, str]:
+_GREENBYTE_SHARED_STATUS_ALIASES = {
+    "stop": "farm_evt_stop_active",
+    "warning": "farm_evt_warning_active",
+    "informational": "farm_evt_informational_active",
+}
+
+
+def _read_greenbyte_comment_table_metadata(path: Path) -> dict[str, str]:
     metadata: dict[str, str] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for line in handle:
             if line.startswith("# Turbine:"):
-                metadata["turbine_id"] = line.split(":", 1)[1].strip()
+                turbine_id = line.split(":", 1)[1].strip()
+                metadata["entity_id"] = turbine_id
+                metadata["entity_type"] = "turbine"
+                metadata["turbine_id"] = turbine_id
+                metadata["asset_id"] = turbine_id
+                metadata["asset_type"] = "turbine"
+            elif line.startswith("# Device:"):
+                asset_id = line.split(":", 1)[1].strip()
+                metadata["entity_id"] = asset_id
+                metadata["entity_type"] = "device"
+                metadata["asset_id"] = asset_id
+            elif line.startswith("# Device type:"):
+                metadata["asset_type"] = line.split(":", 1)[1].strip()
             elif line.startswith("# Time zone:"):
                 metadata["timezone"] = line.split(":", 1)[1].strip()
             elif line.startswith("# Date and time,"):
@@ -66,6 +92,13 @@ def _read_greenbyte_metadata(path: Path) -> dict[str, str]:
                 break
     if "header_line" not in metadata:
         raise ValueError(f"Failed to find Greenbyte comment header in {path}.")
+    return metadata
+
+
+def _read_greenbyte_metadata(path: Path) -> dict[str, str]:
+    metadata = _read_greenbyte_comment_table_metadata(path)
+    if "turbine_id" not in metadata:
+        raise ValueError(f"Expected turbine metadata in {path}.")
     return metadata
 
 
@@ -129,18 +162,23 @@ def _greenbyte_worker_count(job_count: int) -> int:
     return max(1, min(job_count, os.cpu_count() or 1, 2))
 
 
-def _write_greenbyte_continuous_file(
+def _write_greenbyte_comment_table_file(
     path: Path,
     output_path: Path,
-    conflict_output_path: Path,
     dataset_id: str,
+    entity_column: str,
+    entity_value: str,
+    conflict_output_path: Path | None = None,
 ) -> dict[str, Any]:
-    metadata = _read_greenbyte_metadata(path)
+    metadata = _read_greenbyte_comment_table_metadata(path)
     headers = next(csv.reader([metadata["header_line"]]))
-    turbine_id = metadata["turbine_id"]
     source_file = str(path.relative_to(path.parents[1]))
     data_writer = ParquetChunkWriter(output_path)
-    conflict_writer = ParquetChunkWriter(conflict_output_path, schema=_GREENBYTE_CONFLICT_SCHEMA)
+    conflict_writer = (
+        ParquetChunkWriter(conflict_output_path, schema=_GREENBYTE_CONFLICT_SCHEMA)
+        if conflict_output_path is not None
+        else None
+    )
     column_count = len(headers)
     states: dict[str, dict[str, Any]] = {}
     conflict_count = 0
@@ -215,23 +253,26 @@ def _write_greenbyte_continuous_file(
                 conflict_columns += 1
                 existing_value = best_values[idx]
                 for alternative_value in sorted(value for value in seen_value if value != existing_value):
-                    conflict_buffer.append(
-                        {
-                            "dataset": dataset_id,
-                            "turbine_id": turbine_id,
-                            "timestamp": timestamp,
-                            "column_name": headers[idx],
-                            "existing_value": existing_value,
-                            "conflict_value": alternative_value,
-                            "source_file": source_file,
-                        }
-                    )
-                if len(conflict_buffer) >= 10_000:
+                    if conflict_writer is not None:
+                        conflict_buffer.append(
+                            {
+                                "dataset": dataset_id,
+                                "turbine_id": entity_value,
+                                "timestamp": timestamp,
+                                "column_name": headers[idx],
+                                "existing_value": existing_value,
+                                "conflict_value": alternative_value,
+                                "source_file": source_file,
+                            }
+                        )
+                    else:
+                        conflict_count += 1
+                if conflict_writer is not None and len(conflict_buffer) >= 10_000:
                     conflict_writer.write_rows(conflict_buffer)
                     conflict_count += len(conflict_buffer)
                     conflict_buffer = []
 
-        merged["turbine_id"] = turbine_id
+        merged[entity_column] = entity_value
         merged["source_file"] = source_file
         merged["row_conflict_count"] = conflict_columns
         merged["source_row_count"] = state["source_row_count"]
@@ -241,16 +282,35 @@ def _write_greenbyte_continuous_file(
             merged_buffer = []
 
     data_writer.write_rows(merged_buffer)
-    conflict_writer.write_rows(conflict_buffer)
-    conflict_count += len(conflict_buffer)
+    if conflict_writer is not None:
+        conflict_writer.write_rows(conflict_buffer)
+        conflict_count += len(conflict_buffer)
     data_writer.close()
-    conflict_writer.close()
+    if conflict_writer is not None:
+        conflict_writer.close()
     return {
-        "turbine_id": turbine_id,
+        entity_column: entity_value,
         "source_file": source_file,
         "merged_row_count": len(states),
         "conflict_count": conflict_count,
     }
+
+
+def _write_greenbyte_continuous_file(
+    path: Path,
+    output_path: Path,
+    conflict_output_path: Path,
+    dataset_id: str,
+) -> dict[str, Any]:
+    metadata = _read_greenbyte_metadata(path)
+    return _write_greenbyte_comment_table_file(
+        path,
+        output_path,
+        dataset_id,
+        entity_column="turbine_id",
+        entity_value=metadata["turbine_id"],
+        conflict_output_path=conflict_output_path,
+    )
 
 
 def _process_greenbyte_continuous_source(
@@ -344,14 +404,230 @@ def _read_greenbyte_status_metadata(path: Path) -> dict[str, str]:
     return metadata
 
 
+def _greenbyte_device_group(metadata: dict[str, str], path: Path) -> str | None:
+    asset_type = metadata.get("asset_type", "").strip().lower()
+    stem = path.stem.lower()
+    asset_id = metadata.get("asset_id", "").strip().lower()
+    if "production meter" in asset_type or "pmu" in stem or "pmu" in asset_id:
+        return "farm_pmu"
+    if "grid meter" in asset_type or "grid_meter" in stem or "grid meter" in asset_id:
+        return "farm_grid_meter"
+    return None
+
+
+def _greenbyte_shared_output_schema() -> pl.Schema:
+    return {
+        "dataset": pl.String,
+        "timestamp": pl.Datetime,
+    }
+
+
+def _collect_greenbyte_event_frames(events_dir: Path) -> pl.DataFrame:
+    paths = sorted(path for path in events_dir.glob("*.parquet") if path.name != "status_all.parquet")
+    if not paths:
+        return pl.DataFrame()
+    return pl.concat([pl.read_parquet(path) for path in paths], how="diagonal_relaxed")
+
+
+def _empty_greenbyte_shared_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_greenbyte_shared_output_schema())
+
+
+def _standardize_greenbyte_shared_parts(
+    *,
+    part_paths: list[Path],
+    dataset_id: str,
+    prefix: str,
+) -> pl.DataFrame:
+    if not part_paths:
+        return _empty_greenbyte_shared_frame()
+    frame = pl.concat([pl.read_parquet(path) for path in part_paths], how="diagonal_relaxed")
+    frame = frame.with_columns(
+        pl.col("Date and time")
+        .cast(pl.String)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("timestamp")
+    )
+    payload_columns = [
+        column
+        for column in frame.columns
+        if column
+        not in {
+            "Date and time",
+            "timestamp",
+            "asset_id",
+            "source_file",
+            "row_conflict_count",
+            "source_row_count",
+        }
+    ]
+    numeric_payload = cast_numeric_columns(frame, payload_columns)
+    rename_expressions = [
+        pl.col(column).alias(f"{prefix}__{sanitize_feature_name(column)}")
+        for column in payload_columns
+    ]
+    standardized = numeric_payload.select(
+        pl.lit(dataset_id).alias("dataset"),
+        "timestamp",
+        *rename_expressions,
+    ).sort("timestamp")
+    feature_columns = [column for column in standardized.columns if column not in {"dataset", "timestamp"}]
+    return (
+        standardized.group_by(["dataset", "timestamp"], maintain_order=True)
+        .agg([pl.col(column).drop_nulls().first().alias(column) for column in feature_columns])
+        .sort("timestamp")
+    )
+
+
+def _write_greenbyte_device_part(path: Path, output_path: Path, dataset_id: str) -> dict[str, Any]:
+    metadata = _read_greenbyte_comment_table_metadata(path)
+    return _write_greenbyte_comment_table_file(
+        path,
+        output_path,
+        dataset_id,
+        entity_column="asset_id",
+        entity_value=metadata["asset_id"],
+    )
+
+
+def _build_greenbyte_status_event_features(spec, cache_paths) -> None:
+    raw_events = _collect_greenbyte_event_frames(cache_paths.silver_events_dir)
+    if raw_events.is_empty():
+        cache_paths.silver_event_features_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(schema={"dataset": pl.String, "turbine_id": pl.String, "timestamp": pl.Datetime}).write_parquet(
+            cache_paths.silver_event_features_path("turbine_status")
+        )
+        pl.DataFrame(schema={"dataset": pl.String, "timestamp": pl.Datetime}).write_parquet(
+            cache_paths.silver_event_features_path("farm_status")
+        )
+        return
+
+    standardized = raw_events.with_columns(
+        pl.lit(spec.dataset_id).alias("dataset"),
+        pl.col("Timestamp start")
+        .cast(pl.String)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("event_start"),
+        pl.col("Timestamp end")
+        .cast(pl.String)
+        .str.strip_chars()
+        .replace({"": None, "-": None})
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("event_end"),
+        pl.col("Status").cast(pl.String).str.strip_chars().replace({"": None}).alias("status"),
+        pl.col("Code").cast(pl.String).str.strip_chars().replace({"": None}).alias("code"),
+        pl.col("IEC category").cast(pl.String).str.strip_chars().replace({"": None}).alias("iec_category"),
+        pl.col("Service contract category")
+        .cast(pl.String)
+        .str.strip_chars()
+        .replace({"": None})
+        .alias("service_contract_category"),
+        pl.col("asset_id").cast(pl.String),
+        pl.col("asset_type").cast(pl.String),
+        pl.col("turbine_id").cast(pl.String),
+    ).filter(pl.col("event_start").is_not_null())
+    standardized.write_parquet(cache_paths.silver_events_dir / "status_all.parquet")
+
+    turbine_events = standardized.filter(pl.col("turbine_id").is_in(list(spec.turbine_ids))).select(
+        "dataset",
+        "turbine_id",
+        "event_start",
+        "event_end",
+        "status",
+        "code",
+        "iec_category",
+        "service_contract_category",
+    )
+    farm_events = standardized.filter(~pl.col("turbine_id").is_in(list(spec.turbine_ids))).select(
+        "dataset",
+        "event_start",
+        "event_end",
+        "status",
+        "code",
+        "iec_category",
+        "service_contract_category",
+    )
+
+    turbine_features = featureize_interval_events(
+        events=turbine_events,
+        resolution_minutes=spec.resolution_minutes,
+        key_columns=("dataset", "turbine_id"),
+        start_column="event_start",
+        end_column="event_end",
+        base_prefix="evt",
+        categorical_prefixes=(
+            ("status", "evt_status"),
+            ("code", "evt_status_code"),
+            ("iec_category", "evt_iec_category"),
+            ("service_contract_category", "evt_service_category"),
+        ),
+        status_aliases=_GREENBYTE_STATUS_ALIASES,
+    )
+    farm_features = featureize_interval_events(
+        events=farm_events,
+        resolution_minutes=spec.resolution_minutes,
+        key_columns=("dataset",),
+        start_column="event_start",
+        end_column="event_end",
+        base_prefix="farm_evt",
+        categorical_prefixes=(
+            ("status", "farm_evt_status"),
+            ("code", "farm_evt_status_code"),
+            ("iec_category", "farm_evt_iec_category"),
+            ("service_contract_category", "farm_evt_service_category"),
+        ),
+        status_aliases=_GREENBYTE_SHARED_STATUS_ALIASES,
+    )
+    ensure_directory(cache_paths.silver_event_features_dir)
+    turbine_features.write_parquet(cache_paths.silver_event_features_path("turbine_status"))
+    farm_features.write_parquet(cache_paths.silver_event_features_path("farm_status"))
+
+
+def _join_greenbyte_extra_frames(base: pl.DataFrame, cache_paths) -> pl.DataFrame:
+    joined = base
+    for group_name in ("farm_pmu", "farm_grid_meter"):
+        path = cache_paths.silver_shared_ts_path(group_name)
+        if path.exists():
+            joined = joined.join(pl.read_parquet(path), on=["dataset", "timestamp"], how="left")
+
+    for group_name, keys in (
+        ("turbine_status", ["dataset", "turbine_id", "timestamp"]),
+        ("farm_status", ["dataset", "timestamp"]),
+    ):
+        path = cache_paths.silver_event_features_path(group_name)
+        if path.exists():
+            joined = joined.join(pl.read_parquet(path), on=keys, how="left")
+
+    boolean_columns = [column for column, dtype in joined.schema.items() if dtype == pl.Boolean]
+    event_numeric_columns = [
+        column
+        for column, dtype in joined.schema.items()
+        if (
+            column.startswith(("evt_", "farm_evt_"))
+            and dtype.is_numeric()
+            and not column.endswith("_days_since_aeroup_start")
+            and not column.endswith("_days_since_aeroup_end")
+        )
+    ]
+    if boolean_columns or event_numeric_columns:
+        joined = joined.with_columns(
+            [pl.col(column).fill_null(False).alias(column) for column in boolean_columns]
+            + [pl.col(column).fill_null(0).alias(column) for column in event_numeric_columns]
+        )
+    return joined.sort(["dataset", "turbine_id", "timestamp"])
+
+
 class GreenbyteDatasetBuilder(BaseDatasetBuilder):
     def build_silver(self) -> Path:
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_continuous_dir)
         ensure_directory(self.cache_paths.silver_events_dir)
+        ensure_directory(self.cache_paths.silver_shared_ts_dir)
+        ensure_directory(self.cache_paths.silver_event_features_dir)
         ensure_directory(self.cache_paths.silver_meta_dir)
         conflict_parts_dir = ensure_directory(self.cache_paths.silver_dir / "conflict_parts")
         stats_parts_dir = ensure_directory(self.cache_paths.silver_dir / "continuous_stats")
+        shared_parts_dir = ensure_directory(self.cache_paths.silver_dir / "shared_ts_parts")
 
         stats: list[dict[str, Any]] = []
         pending_jobs: list[tuple[str, str, str, str, str]] = []
@@ -387,9 +663,36 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         _merge_greenbyte_conflict_parts(conflict_parts_dir, self.cache_paths.silver_dir / "conflicts.parquet")
         stats.sort(key=lambda item: item["source_file"])
 
+        pmu_part_paths: list[Path] = []
+        grid_meter_part_paths: list[Path] = []
+        for path in sorted(self.spec.source_root.rglob("Device_Data_*.csv")):
+            metadata = _read_greenbyte_comment_table_metadata(path)
+            group_name = _greenbyte_device_group(metadata, path)
+            if group_name is None:
+                continue
+            part_path = shared_parts_dir / f"{path.stem}.parquet"
+            if not part_path.exists():
+                _write_greenbyte_device_part(path, part_path, self.spec.dataset_id)
+            if group_name == "farm_pmu":
+                pmu_part_paths.append(part_path)
+            elif group_name == "farm_grid_meter":
+                grid_meter_part_paths.append(part_path)
+
+        _standardize_greenbyte_shared_parts(
+            part_paths=pmu_part_paths,
+            dataset_id=self.spec.dataset_id,
+            prefix="farm_pmu",
+        ).write_parquet(self.cache_paths.silver_shared_ts_path("farm_pmu"))
+        _standardize_greenbyte_shared_parts(
+            part_paths=grid_meter_part_paths,
+            dataset_id=self.spec.dataset_id,
+            prefix="farm_grid_meter",
+        ).write_parquet(self.cache_paths.silver_shared_ts_path("farm_grid_meter"))
+
         for path in sorted(self.spec.source_root.rglob("Status_*.csv")):
             frame = _parse_status_csv(path)
             frame.write_parquet(self.cache_paths.silver_events_dir / f"{path.stem}.parquet")
+        _build_greenbyte_status_event_features(self.spec, self.cache_paths)
 
         for path in sorted(self.spec.source_root.glob("*_static.csv")):
             pl.read_csv(path).write_parquet(self.cache_paths.silver_meta_dir / f"{path.stem}.parquet")
@@ -447,7 +750,14 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
 
     def build_gold_base(self, quality_profile: str | None = None) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        if not self.cache_paths.silver_continuous_dir.exists():
+        required_silver_paths = [
+            self.cache_paths.silver_continuous_dir,
+            self.cache_paths.silver_shared_ts_path("farm_pmu"),
+            self.cache_paths.silver_shared_ts_path("farm_grid_meter"),
+            self.cache_paths.silver_event_features_path("turbine_status"),
+            self.cache_paths.silver_event_features_path("farm_status"),
+        ]
+        if any(not path.exists() for path in required_silver_paths):
             self.build_silver()
 
         manifest_payload = self.ensure_manifest()
@@ -496,6 +806,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
             )
 
         gold_base = reindex_regular_series(pl.concat(frames, how="vertical"), self.spec)
+        gold_base = _join_greenbyte_extra_frames(gold_base, self.cache_paths)
         ensure_directory(self.cache_paths.gold_base_profile_dir(resolved_quality_profile))
         series_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
         quality_path = self.cache_paths.gold_base_quality_path_for(resolved_quality_profile)

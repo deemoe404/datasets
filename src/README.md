@@ -21,6 +21,9 @@ Typical entry points:
 - `build_gold_base(dataset_id, quality_profile=None)`
 - `build_task_cache(dataset_id, task_spec, quality_profile=None)`
 - `load_series(dataset_id, quality_profile=None)`
+- `load_shared_timeseries(dataset_id, group_name)`
+- `load_event_features(dataset_id, group_name)`
+- `load_interventions(dataset_id, group_name)`
 - `load_window_index(dataset_id, task_spec, quality_profile=None)`
 - `load_turbine_static(dataset_id)`
 - `profile_dataset(dataset_id, quality_profile=None)`
@@ -37,6 +40,9 @@ cache/<dataset>/
   silver/
     continuous/
     events/
+    shared_ts/
+    event_features/
+    interventions/
     meta/
       turbine_static.parquet
   gold_base/<quality_profile>/
@@ -48,6 +54,9 @@ Layer meanings:
 - `manifest`: source file inventory, official release metadata, source layout checks, release warnings
 - `silver`: dataset-specific normalized artifacts
 - `silver/meta/turbine_static.parquet`: unified turbine-level spatial/static sidecar
+- `silver/shared_ts/*`: standardized regular shared or turbine-level auxiliary time series
+- `silver/event_features/*`: regularized causal features derived from interval events
+- `silver/interventions/*`: normalized intervention timelines kept outside the default graph assumptions
 - `gold_base/<quality_profile>`: default regular time-series table for forecasting
 - `tasks/<quality_profile>/<task_id>`: task-specific window index and task metadata
 
@@ -89,6 +98,7 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - The package is forecasting-oriented, not a faithful table-by-table mirror of the official releases.
 - `silver` tries to preserve dataset-specific structure; `gold_base` is a default modeling projection.
 - `gold_base` intentionally keeps only a subset of official assets and fields.
+- Suitable regular time assets now flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is an audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented rule flagged it.
 - `sdwpf_full` defaults to `quality_profile="official_v1"`.
 - `sdwpf_full official_v1` means “official rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
@@ -119,13 +129,19 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - turbine SCADA
   - status/event logs
   - signal mapping
+  - PMU meter time series
+  - grid meter time series
+  - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
   - 13 selected SCADA continuous features
+  - farm-shared PMU features
+  - farm-shared grid meter features
+  - turbine status event features
+  - farm status event features
 - Current exclusions:
   - KMZ layout
-  - PMU meter
-  - grid meter
+  - raw `Message` / `Comment` text
 - Source layout expectation: official archives must already be extracted before build
 - Spatial sidecar: yes, from `*_WT_static.csv`
 
@@ -152,13 +168,19 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - turbine SCADA
   - status/event logs
   - signal mapping
+  - PMU meter time series
+  - grid meter time series
+  - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
   - 13 selected SCADA continuous features
+  - farm-shared PMU features
+  - farm-shared grid meter features
+  - turbine status event features
+  - farm status event features
 - Current exclusions:
   - KMZ layout
-  - PMU meter
-  - grid meter
+  - raw `Message` / `Comment` text
 - Source layout expectation: official archives must already be extracted before build
 - Spatial sidecar: yes, from `*_WT_static.csv`
 
@@ -188,13 +210,29 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Current `silver` ingest:
   - all CSV tables are converted to parquet
   - turbine metadata is also standardized into `turbine_static.parquet`
+  - standardized shared/turbine regular sidecars under `silver/shared_ts`
+  - standardized alarm event table under `silver/events/alarmlog.parquet`
+  - causal alarm and AeroUp features under `silver/event_features`
 - Current default `gold_base`:
   - `tblSCTurbine`
   - `tblSCTurGrid`
   - `tblSCTurFlag`
+  - `tblGrid`
+  - `tblGridScientific`
+  - `tblSCTurCount`
+  - `tblSCTurDigiIn`
+  - `tblSCTurDigiOut`
+  - `tblSCTurIntern`
+  - `tblSCTurPress`
+  - `tblSCTurTemp`
+  - `ShutdownDuration`
+  - causal `tblAlarmLog` features
+  - causal `AeroUp` regime features
   - target `wtc_ActPower_mean`
 - Current exclusions from default `gold_base`:
-  - all other table families remain in `silver` only
+  - `tblDailySummary`
+  - raw interval `tblAlarmLog` table
+  - raw AeroUp timeline file
 - Duplicate handling:
   - default-table duplicate keys are audited in `silver/meta/default_table_duplicate_audit.parquet`
   - non-conflicting duplicates keep the first row
@@ -251,7 +289,10 @@ from wind_datasets import (
     build_manifest,
     build_silver,
     build_task_cache,
+    load_event_features,
+    load_interventions,
     load_series,
+    load_shared_timeseries,
     load_turbine_static,
     load_window_index,
 )
@@ -267,6 +308,8 @@ build_task_cache(dataset_id, task)
 
 series = load_series(dataset_id)
 turbine_static = load_turbine_static(dataset_id)
+farm_pmu = load_shared_timeseries(dataset_id, "farm_pmu")
+status_features = load_event_features(dataset_id, "turbine_status")
 window_index = load_window_index(dataset_id, task)
 ```
 
