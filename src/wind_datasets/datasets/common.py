@@ -13,6 +13,40 @@ import pyarrow.parquet as pq
 from ..models import DatasetSpec, ResolvedTaskSpec
 from ..utils import ensure_directory, join_flags, write_json
 
+TURBINE_STATIC_SCHEMA: dict[str, pl.DataType] = {
+    "dataset": pl.String,
+    "turbine_id": pl.String,
+    "source_turbine_key": pl.String,
+    "latitude": pl.Float64,
+    "longitude": pl.Float64,
+    "coord_x": pl.Float64,
+    "coord_y": pl.Float64,
+    "coord_kind": pl.String,
+    "coord_crs": pl.String,
+    "elevation_m": pl.Float64,
+    "rated_power_kw": pl.Float64,
+    "hub_height_m": pl.Float64,
+    "rotor_diameter_m": pl.Float64,
+    "manufacturer": pl.String,
+    "model": pl.String,
+    "country": pl.String,
+    "commercial_operation_date": pl.String,
+    "spatial_source": pl.String,
+}
+
+
+def ensure_turbine_static_schema(df: pl.DataFrame) -> pl.DataFrame:
+    missing = [
+        pl.lit(None).cast(dtype).alias(column)
+        for column, dtype in TURBINE_STATIC_SCHEMA.items()
+        if column not in df.columns
+    ]
+    if missing:
+        df = df.with_columns(missing)
+    return df.select(
+        [pl.col(column).cast(dtype, strict=False).alias(column) for column, dtype in TURBINE_STATIC_SCHEMA.items()]
+    )
+
 
 @dataclass
 class ParquetChunkWriter:

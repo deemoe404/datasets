@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .models import DatasetSpec
+from .models import DatasetSpec, OfficialRelease
 
 _SOURCE_ROOT = Path("/Users/sam/Developer/Datasets/Wind Power Forecasting")
 
@@ -18,6 +18,38 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         timestamp_convention="source_utc_naive",
         default_feature_groups=("continuous_main",),
         handler="greenbyte",
+        official_name="Kelmarsh wind farm data",
+        official_releases=(
+            OfficialRelease(
+                release_id="legacy_2022",
+                source_url="https://zenodo.org/records/5841834",
+                published_date="2022-02-01",
+                coverage_start="2016-01-03",
+                coverage_end="2021-06-30",
+                notes="Original 2022 open release with SCADA/events to mid-2021.",
+            ),
+            OfficialRelease(
+                release_id="extended_2025",
+                source_url="https://zenodo.org/records/16807551",
+                published_date="2025-08-12",
+                coverage_start="2016-01-03",
+                coverage_end="2024-12-31",
+                notes="Expanded release with SCADA/events through end-2024.",
+            ),
+        ),
+        default_expected_release_id="extended_2025",
+        requires_pre_extracted_sources=True,
+        official_assets=(
+            "kmz_layout",
+            "turbine_static",
+            "turbine_scada",
+            "status_events",
+            "signal_mapping",
+            "pmu_meter",
+            "grid_meter",
+        ),
+        default_ingested_assets=("turbine_static", "turbine_scada", "status_events", "signal_mapping"),
+        default_excluded_assets=("kmz_layout", "pmu_meter", "grid_meter"),
     ),
     "penmanshiel": DatasetSpec(
         dataset_id="penmanshiel",
@@ -30,6 +62,38 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         timestamp_convention="source_utc_naive",
         default_feature_groups=("continuous_main",),
         handler="greenbyte",
+        official_name="Penmanshiel wind farm data",
+        official_releases=(
+            OfficialRelease(
+                release_id="legacy_2022",
+                source_url="https://zenodo.org/records/5946808",
+                published_date="2022-02-07",
+                coverage_start="2016-06-02",
+                coverage_end="2021-06-30",
+                notes="Original 2022 open release with SCADA/events to mid-2021 and no WT03.",
+            ),
+            OfficialRelease(
+                release_id="extended_2025",
+                source_url="https://zenodo.org/records/16807304",
+                published_date="2025-08-13",
+                coverage_start="2016-06-02",
+                coverage_end="2024-12-31",
+                notes="Expanded release with SCADA/events through end-2024 and no WT03.",
+            ),
+        ),
+        default_expected_release_id="extended_2025",
+        requires_pre_extracted_sources=True,
+        official_assets=(
+            "kmz_layout",
+            "turbine_static",
+            "turbine_scada",
+            "status_events",
+            "signal_mapping",
+            "pmu_meter",
+            "grid_meter",
+        ),
+        default_ingested_assets=("turbine_static", "turbine_scada", "status_events", "signal_mapping"),
+        default_excluded_assets=("kmz_layout", "pmu_meter", "grid_meter"),
     ),
     "hill_of_towie": DatasetSpec(
         dataset_id="hill_of_towie",
@@ -38,10 +102,49 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         turbine_ids=tuple(f"T{idx:02d}" for idx in range(1, 22)),
         target_column="wtc_ActPower_mean",
         target_unit="kW",
-        timezone_policy="unknown_unverified",
-        timestamp_convention="source_local_or_naive",
+        timezone_policy="utc_documented",
+        timestamp_convention="source_utc_naive_interval_end",
         default_feature_groups=("tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag"),
         handler="hill_of_towie",
+        official_name="Hill of Towie wind farm open dataset",
+        official_releases=(
+            OfficialRelease(
+                release_id="v1_2025",
+                source_url="https://zenodo.org/records/14870023",
+                published_date="2025-03-28",
+                coverage_start="2016-01-01",
+                coverage_end="2024-08-31",
+                notes="UTC timestamps. 10-minute timestamps denote interval end.",
+            ),
+        ),
+        default_expected_release_id="v1_2025",
+        requires_pre_extracted_sources=True,
+        official_assets=(
+            "turbine_metadata",
+            "tblSCTurbine",
+            "tblSCTurGrid",
+            "tblSCTurFlag",
+            "tblAlarmLog",
+            "tblDailySummary",
+            "tblGrid",
+            "tblGridScientific",
+            "tblSCTurCount",
+            "tblSCTurDigiIn",
+            "tblSCTurDigiOut",
+            "tblSCTurIntern",
+            "tblSCTurPress",
+            "tblSCTurTemp",
+            "aeroup_timeline",
+            "shutdown_duration",
+        ),
+        default_ingested_assets=(
+            "turbine_metadata",
+            "tblSCTurbine",
+            "tblSCTurGrid",
+            "tblSCTurFlag",
+            "all_other_csv_tables_to_silver",
+        ),
+        default_excluded_assets=("zip_archives",),
     ),
     "sdwpf_full": DatasetSpec(
         dataset_id="sdwpf_full",
@@ -55,6 +158,22 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         default_feature_groups=("main",),
         handler="sdwpf_full",
         default_quality_profile="official_v1",
+        official_name="SDWPF_full",
+        official_releases=(
+            OfficialRelease(
+                release_id="scientific_data_2024",
+                source_url="https://www.nature.com/articles/s41597-024-03427-5",
+                published_date="2024-06-24",
+                coverage_start="2020-01-01",
+                coverage_end="2021-12-31",
+                notes="10-minute wind power forecasting dataset. Timestamps are UTC+08:00.",
+            ),
+        ),
+        default_expected_release_id="scientific_data_2024",
+        requires_pre_extracted_sources=False,
+        official_assets=("main_csv", "main_parquet", "turbine_location_elevation"),
+        default_ingested_assets=("main_parquet", "turbine_location_elevation"),
+        default_excluded_assets=("main_csv",),
     ),
 }
 

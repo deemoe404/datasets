@@ -135,6 +135,6 @@ def test_persistence_eligible_windows_match_clean_window_index(tmp_path) -> None
     assert result.summary["eligible_windows"][0] == strict_window_index.height
     assert result.summary["prediction_count"][0] == strict_window_index.height * resolved_task.forecast_steps
     assert result.summary["rated_power_kw"][0] == 2300.0
-    assert per_turbine_counts == {"T01": 5, "T02": 2}
+    assert per_turbine_counts == {"T01": 4, "T02": 2}
     assert per_turbine_counts == {"T01": strict_counts["T01"], "T02": strict_counts["T02"]}
     assert set(result.per_turbine["rated_power_kw"].to_list()) == {2300.0}

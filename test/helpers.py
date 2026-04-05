@@ -5,7 +5,7 @@ from textwrap import dedent
 
 import polars as pl
 
-from wind_datasets.models import DatasetSpec
+from wind_datasets.models import DatasetSpec, OfficialRelease
 
 
 def _write_text(path: Path, content: str) -> Path:
@@ -14,9 +14,16 @@ def _write_text(path: Path, content: str) -> Path:
     return path
 
 
-def build_greenbyte_fixture(root: Path, dataset_name: str, turbine_name: str) -> DatasetSpec:
+def build_greenbyte_fixture(
+    root: Path,
+    dataset_name: str,
+    turbine_name: str,
+    file_end: str = "2025-01-01",
+) -> DatasetSpec:
     static_name = f"{dataset_name}_WT_static.csv"
     scada_dir = root / f"{dataset_name}_SCADA_2024_0001"
+    turbine_file_stem = f"Turbine_Data_{turbine_name.replace(' ', '_')}_2024-01-01_-_{file_end}_0001"
+    status_file_stem = f"Status_{turbine_name.replace(' ', '_')}_2024-01-01_-_{file_end}_0001"
     _write_text(
         root / static_name,
         f"""
@@ -25,7 +32,7 @@ def build_greenbyte_fixture(root: Path, dataset_name: str, turbine_name: str) ->
         """,
     )
     _write_text(
-        scada_dir / f"Turbine_Data_{turbine_name.replace(' ', '_')}_sample.csv",
+        scada_dir / f"{turbine_file_stem}.csv",
         f"""
         # This file was exported by Greenbyte.
         #
@@ -44,7 +51,7 @@ def build_greenbyte_fixture(root: Path, dataset_name: str, turbine_name: str) ->
         """,
     )
     _write_text(
-        scada_dir / f"Status_{turbine_name.replace(' ', '_')}_sample.csv",
+        scada_dir / f"{status_file_stem}.csv",
         f"""
         # Status export
         #
@@ -54,6 +61,40 @@ def build_greenbyte_fixture(root: Path, dataset_name: str, turbine_name: str) ->
         2024-01-01 00:05:00,-,-,Informational,0,System OK,,System OK,Full Performance,,
         """,
     )
+    if dataset_name.lower() == "kelmarsh":
+        releases = (
+            OfficialRelease(
+                release_id="legacy_2022",
+                source_url="https://zenodo.org/records/5841834",
+                published_date="2022-02-01",
+                coverage_start="2016-01-03",
+                coverage_end="2021-06-30",
+            ),
+            OfficialRelease(
+                release_id="extended_2025",
+                source_url="https://zenodo.org/records/16807551",
+                published_date="2025-08-12",
+                coverage_start="2016-01-03",
+                coverage_end="2024-12-31",
+            ),
+        )
+    else:
+        releases = (
+            OfficialRelease(
+                release_id="legacy_2022",
+                source_url="https://zenodo.org/records/5946808",
+                published_date="2022-02-07",
+                coverage_start="2016-06-02",
+                coverage_end="2021-06-30",
+            ),
+            OfficialRelease(
+                release_id="extended_2025",
+                source_url="https://zenodo.org/records/16807304",
+                published_date="2025-08-13",
+                coverage_start="2016-06-02",
+                coverage_end="2024-12-31",
+            ),
+        )
     return DatasetSpec(
         dataset_id=dataset_name.lower(),
         source_root=root,
@@ -65,6 +106,13 @@ def build_greenbyte_fixture(root: Path, dataset_name: str, turbine_name: str) ->
         timestamp_convention="source_utc_naive",
         default_feature_groups=("continuous_main",),
         handler="greenbyte",
+        official_name=f"{dataset_name} wind farm data",
+        official_releases=releases,
+        default_expected_release_id="extended_2025",
+        requires_pre_extracted_sources=True,
+        official_assets=("turbine_static", "turbine_scada", "status_events", "signal_mapping"),
+        default_ingested_assets=("turbine_static", "turbine_scada", "status_events"),
+        default_excluded_assets=("pmu_meter", "grid_meter"),
     )
 
 
@@ -94,7 +142,7 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
         2024-01-01 00:50:00,1001,8.0
         2024-01-01 00:50:00,1002,7.4
         2024-01-01 01:00:00,1001,8.1
-        2024-01-01 01:00:00,1001,8.1
+        2024-01-01 01:00:00,1001,8.2
         2024-01-01 01:00:00,1002,7.5
         """,
     )
@@ -146,10 +194,25 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
         turbine_ids=("T01", "T02"),
         target_column="wtc_ActPower_mean",
         target_unit="kW",
-        timezone_policy="unknown_unverified",
-        timestamp_convention="source_local_or_naive",
+        timezone_policy="utc_documented",
+        timestamp_convention="source_utc_naive_interval_end",
         default_feature_groups=("tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag"),
         handler="hill_of_towie",
+        official_name="Hill of Towie wind farm open dataset",
+        official_releases=(
+            OfficialRelease(
+                release_id="v1_2025",
+                source_url="https://zenodo.org/records/14870023",
+                published_date="2025-03-28",
+                coverage_start="2016-01-01",
+                coverage_end="2024-08-31",
+                notes="UTC timestamps. 10-minute timestamps denote interval end.",
+            ),
+        ),
+        default_expected_release_id="v1_2025",
+        requires_pre_extracted_sources=True,
+        official_assets=("turbine_metadata", "tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag"),
+        default_ingested_assets=("turbine_metadata", "tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag"),
     )
 
 
@@ -196,9 +259,22 @@ def build_sdwpf_fixture(root: Path) -> DatasetSpec:
         turbine_ids=("1", "2"),
         target_column="Patv",
         target_unit="kW",
-        timezone_policy="unknown_unverified",
-        timestamp_convention="source_naive",
+        timezone_policy="utc_plus_8_documented",
+        timestamp_convention="source_local_naive_utc_plus_8",
         default_feature_groups=("main",),
         handler="sdwpf_full",
         default_quality_profile="official_v1",
+        official_name="SDWPF_full",
+        official_releases=(
+            OfficialRelease(
+                release_id="scientific_data_2024",
+                source_url="https://www.nature.com/articles/s41597-024-03427-5",
+                published_date="2024-06-24",
+                coverage_start="2020-01-01",
+                coverage_end="2021-12-31",
+            ),
+        ),
+        default_expected_release_id="scientific_data_2024",
+        official_assets=("main_parquet", "turbine_location_elevation"),
+        default_ingested_assets=("main_parquet", "turbine_location_elevation"),
     )

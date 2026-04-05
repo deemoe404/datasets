@@ -6,7 +6,7 @@ import polars as pl
 
 from ..utils import ensure_directory
 from .base import BaseDatasetBuilder
-from .common import build_quality_report, reindex_regular_series, write_quality_report
+from .common import build_quality_report, ensure_turbine_static_schema, reindex_regular_series, write_quality_report
 
 _SDWPF_SUPPORTED_QUALITY_PROFILES = {
     "official_v1",
@@ -33,9 +33,36 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
             self.spec.source_root / "sdwpf_2001_2112_full.parquet",
             self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet",
         )
-        pl.read_csv(self.spec.source_root / "sdwpf_turb_location_elevation.csv").write_parquet(
+        location_frame = pl.read_csv(self.spec.source_root / "sdwpf_turb_location_elevation.csv")
+        location_frame.write_parquet(
             self.cache_paths.silver_meta_dir / "sdwpf_turb_location_elevation.parquet"
         )
+        turbine_static = ensure_turbine_static_schema(
+            location_frame.select(
+                pl.lit(self.spec.dataset_id).alias("dataset"),
+                pl.col("TurbID").cast(pl.String).alias("turbine_id"),
+                pl.col("TurbID").cast(pl.String).alias("source_turbine_key"),
+                pl.lit(None).cast(pl.Float64).alias("latitude"),
+                pl.lit(None).cast(pl.Float64).alias("longitude"),
+                pl.col("x").cast(pl.Float64, strict=False).alias("coord_x"),
+                pl.col("y").cast(pl.Float64, strict=False).alias("coord_y"),
+                pl.lit("projected_xy").alias("coord_kind"),
+                pl.lit("unknown_unverified").alias("coord_crs"),
+                pl.col("Ele").cast(pl.Float64, strict=False).alias("elevation_m"),
+                pl.lit(None).cast(pl.Float64).alias("rated_power_kw"),
+                pl.lit(None).cast(pl.Float64).alias("hub_height_m"),
+                pl.lit(None).cast(pl.Float64).alias("rotor_diameter_m"),
+                pl.lit(None).cast(pl.String).alias("manufacturer"),
+                pl.lit(None).cast(pl.String).alias("model"),
+                pl.lit(None).cast(pl.String).alias("country"),
+                pl.lit(None).cast(pl.String).alias("commercial_operation_date"),
+                pl.lit("sdwpf_turb_location_elevation.csv").alias("spatial_source"),
+            )
+        ).filter(
+            pl.col("turbine_id").is_not_null()
+            & pl.col("turbine_id").is_in(list(self.spec.turbine_ids))
+        ).unique(subset=["turbine_id"], keep="first")
+        turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
         return self.cache_paths.silver_dir
 
     def build_gold_base(self, quality_profile: str | None = None) -> Path:

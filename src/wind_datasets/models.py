@@ -1,10 +1,30 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
 from .utils import duration_to_steps, format_duration, parse_duration
+
+
+@dataclass(frozen=True)
+class OfficialRelease:
+    release_id: str
+    source_url: str
+    published_date: str
+    coverage_start: str
+    coverage_end: str
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "release_id": self.release_id,
+            "source_url": self.source_url,
+            "published_date": self.published_date,
+            "coverage_start": self.coverage_start,
+            "coverage_end": self.coverage_end,
+            "notes": self.notes,
+        }
 
 
 @dataclass(frozen=True)
@@ -20,6 +40,13 @@ class DatasetSpec:
     default_feature_groups: tuple[str, ...]
     handler: str
     default_quality_profile: str = "default"
+    official_name: str = ""
+    official_releases: tuple[OfficialRelease, ...] = field(default_factory=tuple)
+    default_expected_release_id: str | None = None
+    requires_pre_extracted_sources: bool = False
+    official_assets: tuple[str, ...] = field(default_factory=tuple)
+    default_ingested_assets: tuple[str, ...] = field(default_factory=tuple)
+    default_excluded_assets: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

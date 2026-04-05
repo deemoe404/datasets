@@ -19,6 +19,7 @@ from .common import (
     ParquetChunkWriter,
     build_quality_report,
     cast_numeric_columns,
+    ensure_turbine_static_schema,
     reindex_regular_series,
     write_quality_report,
 )
@@ -398,6 +399,48 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
 
         for path in sorted(self.spec.source_root.glob("*_dataSignalMapping.xlsx")):
             shutil.copy2(path, self.cache_paths.silver_meta_dir / path.name)
+
+        static_frames: list[pl.DataFrame] = []
+        for path in sorted(self.spec.source_root.glob("*_WT_static.csv")):
+            frame = pl.read_csv(path).select(
+                pl.lit(self.spec.dataset_id).alias("dataset"),
+                pl.col("Title").cast(pl.String).alias("turbine_id"),
+                pl.coalesce(
+                    [
+                        pl.col("Identity").cast(pl.String),
+                        pl.col("Title").cast(pl.String),
+                    ]
+                ).alias("source_turbine_key"),
+                pl.col("Latitude").cast(pl.Float64, strict=False).alias("latitude"),
+                pl.col("Longitude").cast(pl.Float64, strict=False).alias("longitude"),
+                pl.lit(None).cast(pl.Float64).alias("coord_x"),
+                pl.lit(None).cast(pl.Float64).alias("coord_y"),
+                pl.lit("geographic_latlon").alias("coord_kind"),
+                pl.lit("EPSG:4326").alias("coord_crs"),
+                pl.col("Elevation (m)").cast(pl.Float64, strict=False).alias("elevation_m"),
+                pl.col("Rated power (kW)").cast(pl.Float64, strict=False).alias("rated_power_kw"),
+                pl.col("Hub Height (m)").cast(pl.Float64, strict=False).alias("hub_height_m"),
+                pl.col("Rotor Diameter (m)").cast(pl.Float64, strict=False).alias("rotor_diameter_m"),
+                pl.col("Manufacturer").cast(pl.String).alias("manufacturer"),
+                pl.col("Model").cast(pl.String).alias("model"),
+                pl.col("Country").cast(pl.String).alias("country"),
+                pl.col("Commercial Operations Date").cast(pl.String).alias("commercial_operation_date"),
+                pl.lit(path.name).alias("spatial_source"),
+            )
+            static_frames.append(
+                frame.filter(
+                    pl.col("turbine_id").is_not_null()
+                    & pl.col("turbine_id").is_in(list(self.spec.turbine_ids))
+                )
+            )
+        turbine_static = ensure_turbine_static_schema(
+            (
+                pl.concat(static_frames, how="vertical").unique(subset=["turbine_id"], keep="first")
+                if static_frames
+                else pl.DataFrame()
+            )
+        )
+        turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
 
         pl.DataFrame(stats).write_parquet(self.cache_paths.silver_meta_dir / "continuous_build_stats.parquet")
         return self.cache_paths.silver_dir

@@ -23,9 +23,12 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
 
     builder.build_gold_base()
     series = builder.load_series()
+    turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
 
     assert "quality_flags" in series.columns
+    assert turbine_static.height == len(spec.turbine_ids)
+    assert turbine_static["turbine_id"].to_list() == [spec.turbine_ids[0]]
     assert series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")[
         "is_observed"
     ][0] is False
@@ -46,14 +49,25 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
 
     builder.build_gold_base()
     series = builder.load_series()
+    turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
+    duplicate_audit = pl.read_parquet(builder.cache_paths.hill_duplicate_audit_path)
 
     _assert_unique_series_keys(series)
+    assert turbine_static.height == len(spec.turbine_ids)
+    assert duplicate_audit.filter(pl.col("is_conflicting")).height == 1
+    assert duplicate_audit.filter(pl.col("is_conflicting"))["conflicting_columns"][0] == "wtc_PrWindSp_mean"
+    assert "duplicate_conflict_resolved" in series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 01:00:00")
+    )["quality_flags"][0]
     assert series.filter(
         (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
     )["target_kw"][0] is None
     assert report["target_missing_count"] >= 1
+    assert report["duplicate_key_audit_count"] == 3
+    assert report["duplicate_conflict_key_count"] == 1
 
 
 def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_path) -> None:
@@ -67,6 +81,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     default_series = builder.load_series()
     raw_series = builder.load_series("raw_v1")
     zeroed_series = builder.load_series("official_v1_zero_negative_patv")
+    turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
 
     default_negative = default_series.filter(
@@ -84,6 +99,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
 
     assert before_mtime == gold_path.stat().st_mtime_ns
     _assert_unique_series_keys(default_series)
+    assert turbine_static.height == len(spec.turbine_ids)
     assert default_negative["target_kw_raw"][0] == -5
     assert default_negative["target_kw"][0] == -5
     assert default_negative["sdwpf_has_negative_patv"][0] is True

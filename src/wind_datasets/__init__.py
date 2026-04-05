@@ -4,14 +4,16 @@ from .api import (
     build_silver,
     build_task_cache,
     load_series,
+    load_turbine_static,
     load_window_index,
     profile_dataset,
 )
-from .models import DatasetSpec, ResolvedTaskSpec, TaskSpec
+from .models import DatasetSpec, OfficialRelease, ResolvedTaskSpec, TaskSpec
 from .registry import get_dataset_spec, list_dataset_specs
 
 __all__ = [
     "DatasetSpec",
+    "OfficialRelease",
     "ResolvedTaskSpec",
     "TaskSpec",
     "build_gold_base",
@@ -21,6 +23,7 @@ __all__ = [
     "get_dataset_spec",
     "list_dataset_specs",
     "load_series",
+    "load_turbine_static",
     "load_window_index",
     "profile_dataset",
 ]

@@ -32,6 +32,11 @@ class BaseDatasetBuilder:
     def build_gold_base(self, quality_profile: str | None = None) -> Path:
         raise NotImplementedError
 
+    def load_turbine_static(self) -> pl.DataFrame:
+        if not self.cache_paths.silver_turbine_static_path.exists():
+            self.build_silver()
+        return pl.read_parquet(self.cache_paths.silver_turbine_static_path)
+
     def build_task_cache(self, task_spec: TaskSpec, quality_profile: str | None = None) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         gold_base_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)

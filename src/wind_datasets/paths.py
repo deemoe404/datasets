@@ -16,6 +16,14 @@ class DatasetCachePaths:
     gold_base_dir: Path
     tasks_dir: Path
 
+    @property
+    def silver_turbine_static_path(self) -> Path:
+        return self.silver_meta_dir / "turbine_static.parquet"
+
+    @property
+    def hill_duplicate_audit_path(self) -> Path:
+        return self.silver_meta_dir / "default_table_duplicate_audit.parquet"
+
     def gold_base_profile_dir(self, quality_profile: str) -> Path:
         return self.gold_base_dir / quality_profile
 

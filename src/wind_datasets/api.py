@@ -54,6 +54,15 @@ def load_series(
     return builder.load_series(quality_profile=quality_profile)
 
 
+def load_turbine_static(
+    dataset_id: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    return builder.load_turbine_static()
+
+
 def load_window_index(
     dataset_id: str,
     task_spec: TaskSpec | None = None,
