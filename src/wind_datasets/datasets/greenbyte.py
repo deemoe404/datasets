@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 import csv
+import gc
 import multiprocessing as mp
 import os
 import shutil
@@ -17,16 +18,18 @@ from ..utils import ensure_directory, read_json, write_json
 from .base import BaseDatasetBuilder
 from .common import (
     ParquetChunkWriter,
+    build_coverage_summary,
     build_quality_report,
     cast_numeric_columns,
     ensure_turbine_static_schema,
     featureize_interval_events,
+    load_quality_report_frame,
     reindex_regular_series,
     sanitize_feature_name,
     write_quality_report,
 )
 
-_GREENBYTE_DEFAULT_FEATURES = [
+_GREENBYTE_LIGHTWEIGHT_FEATURES = [
     "Wind speed (m/s)",
     "Wind direction (°)",
     "Nacelle position (°)",
@@ -41,6 +44,14 @@ _GREENBYTE_DEFAULT_FEATURES = [
     "Blade angle (pitch position) B (°)",
     "Blade angle (pitch position) C (°)",
 ]
+_GREENBYTE_SUPPORTED_FEATURE_SETS = {"default", "lightweight"}
+_GREENBYTE_NON_FEATURE_COLUMNS = {
+    "Date and time",
+    "turbine_id",
+    "source_file",
+    "row_conflict_count",
+    "source_row_count",
+}
 
 _GREENBYTE_CONFLICT_SCHEMA = pa.schema(
     [
@@ -65,6 +76,20 @@ _GREENBYTE_SHARED_STATUS_ALIASES = {
     "warning": "farm_evt_warning_active",
     "informational": "farm_evt_informational_active",
 }
+
+
+def _discover_greenbyte_feature_columns(paths: list[Path], target_column: str) -> list[str]:
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        for column in pl.scan_parquet(path).collect_schema().names():
+            if column in _GREENBYTE_NON_FEATURE_COLUMNS or column == target_column:
+                continue
+            if column in seen:
+                continue
+            seen.add(column)
+            discovered.append(column)
+    return discovered
 
 
 def _read_greenbyte_comment_table_metadata(path: Path) -> dict[str, str]:
@@ -618,6 +643,15 @@ def _join_greenbyte_extra_frames(base: pl.DataFrame, cache_paths) -> pl.DataFram
 
 
 class GreenbyteDatasetBuilder(BaseDatasetBuilder):
+    def resolve_feature_set(self, feature_set: str | None = None) -> str:
+        resolved = feature_set or "default"
+        if resolved not in _GREENBYTE_SUPPORTED_FEATURE_SETS:
+            supported = ", ".join(sorted(_GREENBYTE_SUPPORTED_FEATURE_SETS))
+            raise ValueError(
+                f"Unsupported greenbyte feature_set {resolved!r}. Expected one of: {supported}."
+            )
+        return resolved
+
     def build_silver(self) -> Path:
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_continuous_dir)
@@ -748,8 +782,15 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         pl.DataFrame(stats).write_parquet(self.cache_paths.silver_meta_dir / "continuous_build_stats.parquet")
         return self.cache_paths.silver_dir
 
-    def build_gold_base(self, quality_profile: str | None = None) -> Path:
+    def build_gold_base(
+        self,
+        quality_profile: str | None = None,
+        layout: str | None = None,
+        feature_set: str | None = None,
+    ) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
+        resolved_layout = self.resolve_series_layout(layout)
+        resolved_feature_set = self.resolve_feature_set(feature_set)
         required_silver_paths = [
             self.cache_paths.silver_continuous_dir,
             self.cache_paths.silver_shared_ts_path("farm_pmu"),
@@ -764,9 +805,16 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         frames: list[pl.DataFrame] = []
         duplicate_source_rows = 0
         conflict_value_count = 0
-        selected_feature_columns = list(_GREENBYTE_DEFAULT_FEATURES)
+        continuous_paths = sorted(self.cache_paths.silver_continuous_dir.glob("*.parquet"))
+        if resolved_feature_set == "lightweight":
+            selected_feature_columns = list(_GREENBYTE_LIGHTWEIGHT_FEATURES)
+        else:
+            selected_feature_columns = _discover_greenbyte_feature_columns(
+                continuous_paths,
+                self.spec.target_column,
+            )
 
-        for path in sorted(self.cache_paths.silver_continuous_dir.glob("*.parquet")):
+        for path in continuous_paths:
             frame = pl.read_parquet(path)
             available_feature_columns = [column for column in selected_feature_columns if column in frame.columns]
             numeric_columns = [self.spec.target_column, *available_feature_columns]
@@ -805,21 +853,46 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
                 )
             )
 
-        gold_base = reindex_regular_series(pl.concat(frames, how="vertical"), self.spec)
+        gold_base = reindex_regular_series(
+            pl.concat(frames, how="vertical"),
+            self.spec,
+            layout=resolved_layout,
+        )
         gold_base = _join_greenbyte_extra_frames(gold_base, self.cache_paths)
-        ensure_directory(self.cache_paths.gold_base_profile_dir(resolved_quality_profile))
-        series_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
-        quality_path = self.cache_paths.gold_base_quality_path_for(resolved_quality_profile)
+        ensure_directory(
+            self.cache_paths.gold_base_profile_dir(
+                resolved_quality_profile,
+                layout=resolved_layout,
+                feature_set=resolved_feature_set,
+            )
+        )
+        series_path = self.cache_paths.gold_base_series_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
+        quality_path = self.cache_paths.gold_base_quality_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
         gold_base.write_parquet(series_path)
+        del gold_base
+        del frames
+        gc.collect()
+        report_frame = load_quality_report_frame(series_path)
 
         report = build_quality_report(
-            gold_base,
+            report_frame,
             manifest_payload,
             self.spec,
             extra={
                 "quality_profile": resolved_quality_profile,
+                "layout": resolved_layout,
+                "feature_set": resolved_feature_set,
                 "duplicate_source_row_groups": duplicate_source_rows,
                 "conflict_value_count": conflict_value_count,
+                **build_coverage_summary(report_frame, self.spec),
             },
         )
         write_quality_report(quality_path, report)

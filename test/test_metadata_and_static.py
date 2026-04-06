@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+from textwrap import dedent
+
+import polars as pl
 import pytest
 
 from wind_datasets import api as api_module
 from wind_datasets.api import (
+    build_task_cache,
     build_silver,
     load_event_features,
     load_interventions,
     load_shared_timeseries,
+    load_task_turbine_static,
     load_turbine_static,
 )
 from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
+from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
+from wind_datasets.datasets.sdwpf_full import SDWPFFullDatasetBuilder
 from wind_datasets.manifest import build_manifest as build_manifest_for_spec
-from wind_datasets.models import DatasetSpec, OfficialRelease
+from wind_datasets.models import DatasetSpec, OfficialRelease, TaskSpec
 from wind_datasets.registry import get_dataset_spec
 from wind_datasets.utils import read_json
 
@@ -128,3 +135,138 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     assert "farm_grid__activepower" in hill_grid.columns
     assert "alarm_code__42" in hill_alarm.columns
     assert hill_aeroup.columns == ["dataset", "turbine_id", "aeroup_start", "aeroup_end"]
+
+
+def test_api_build_farm_task_cache_then_load_task_turbine_static(tmp_path, monkeypatch) -> None:
+    hill_spec = build_hill_fixture(tmp_path / "raw" / "hill")
+
+    def _fake_get_dataset_spec(requested_dataset_id: str):
+        assert requested_dataset_id == "hill_of_towie"
+        return hill_spec
+
+    monkeypatch.setattr(api_module, "get_dataset_spec", _fake_get_dataset_spec)
+
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        task_id="farm_short",
+        granularity="farm",
+    )
+    build_task_cache("hill_of_towie", task_spec=task, cache_root=tmp_path / "cache")
+    turbine_static = load_task_turbine_static("hill_of_towie", task_spec=task, cache_root=tmp_path / "cache")
+
+    assert turbine_static["turbine_id"].to_list() == ["T01", "T02"]
+    assert turbine_static["turbine_index"].to_list() == [0, 1]
+
+
+def test_manifest_audits_sdwpf_time_semantics_and_reports_incompatible_minutes(tmp_path) -> None:
+    spec = build_sdwpf_fixture(tmp_path / "raw" / "sdwpf_bad")
+    path = spec.source_root / "sdwpf_2001_2112_full.parquet"
+    frame = pl.read_parquet(path).with_row_index("row_nr")
+    frame = frame.with_columns(
+        pl.when(pl.col("row_nr") == 3)
+        .then(pl.lit("2024-01-01 00:25:00"))
+        .otherwise(pl.col("Tmstamp"))
+        .alias("Tmstamp")
+    ).drop("row_nr")
+    frame.write_parquet(path)
+
+    manifest = read_json(build_manifest_for_spec(spec, tmp_path / "cache"))
+
+    assert manifest["time_semantics_check"]["status"] == "incompatible_with_documented_10min_grid"
+    assert 25 in manifest["time_semantics_check"]["invalid_minutes"]
+    assert manifest["warnings"]
+
+
+def test_sdwpf_incompatible_time_semantics_block_gold_build(tmp_path) -> None:
+    spec = build_sdwpf_fixture(tmp_path / "raw" / "sdwpf_blocked")
+    path = spec.source_root / "sdwpf_2001_2112_full.parquet"
+    frame = pl.read_parquet(path).with_row_index("row_nr")
+    frame = frame.with_columns(
+        pl.when(pl.col("row_nr") == 3)
+        .then(pl.lit("2024-01-01 00:25:00"))
+        .otherwise(pl.col("Tmstamp"))
+        .alias("Tmstamp")
+    ).drop("row_nr")
+    frame.write_parquet(path)
+
+    builder = SDWPFFullDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    builder.build_silver()
+
+    with pytest.raises(ValueError, match="Refusing to build sdwpf_full gold/task cache"):
+        builder.build_gold_base()
+
+
+def test_penmanshiel_quality_report_records_common_coverage_summary(tmp_path) -> None:
+    base_spec = build_greenbyte_fixture(tmp_path / "raw" / "pen_cov", "Penmanshiel", "Penmanshiel 11")
+    root = base_spec.source_root
+    (root / "Penmanshiel_WT_static.csv").write_text(
+        dedent(
+            """
+            Wind Farm,Title,Alternative Title,Identity,Manufacturer,Model,Rated power (kW),Hub Height (m),Rotor Diameter (m),Latitude,Longitude,Elevation (m),Country,Commercial Operations Date
+            Penmanshiel,Penmanshiel 11,Penmanshiel 11,ID-11,Senvion,MM82,2050,78.5,92,52.4,-0.94,140,UK,2016-01-01
+            Penmanshiel,Penmanshiel 12,Penmanshiel 12,ID-12,Senvion,MM82,2050,78.5,92,52.5,-0.95,142,UK,2016-01-01
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    scada_dir = root / "Penmanshiel_SCADA_2024_0001"
+    (scada_dir / "Turbine_Data_Penmanshiel_12_2024-01-01_-_2025-01-01_0002.csv").write_text(
+        dedent(
+            """
+            # This file was exported by Greenbyte.
+            #
+            # Turbine: Penmanshiel 12
+            # Time zone: UTC
+            # Date and time,Power (kW),Wind speed (m/s),Wind direction (°),Nacelle position (°),Generator RPM (RPM),Rotor speed (RPM),Ambient temperature (converter) (°C),Nacelle temperature (°C),Grid frequency (Hz),Blade angle (pitch position) A (°),Blade angle (pitch position) B (°),Blade angle (pitch position) C (°)
+            2024-01-01 00:10:00,210,8.4,181,175,1510,12.1,5.1,10.2,50,1,1,1
+            2024-01-01 00:20:00,220,8.8,182,176,1520,12.2,5.2,10.4,50,1,1,1
+            2024-01-01 00:30:00,230,9.1,183,177,1530,12.3,5.3,10.6,50,1,1,1
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (scada_dir / "Status_Penmanshiel_12_2024-01-01_-_2025-01-01_0002.csv").write_text(
+        dedent(
+            """
+            # Status export
+            #
+            # Turbine: Penmanshiel 12
+            Timestamp start,Timestamp end,Duration,Status,Code,Message,Comment,Service contract category,IEC category,Global contract category,Custom contract category
+            2024-01-01 00:10:00,2024-01-01 00:20:00,00:10:00,Informational,0,System OK,,System OK,Full Performance,,
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = DatasetSpec(
+        dataset_id=base_spec.dataset_id,
+        source_root=base_spec.source_root,
+        resolution_minutes=base_spec.resolution_minutes,
+        turbine_ids=("Penmanshiel 11", "Penmanshiel 12"),
+        target_column=base_spec.target_column,
+        target_unit=base_spec.target_unit,
+        timezone_policy=base_spec.timezone_policy,
+        timestamp_convention=base_spec.timestamp_convention,
+        default_feature_groups=base_spec.default_feature_groups,
+        handler=base_spec.handler,
+        official_name=base_spec.official_name,
+        official_releases=base_spec.official_releases,
+        default_expected_release_id=base_spec.default_expected_release_id,
+        requires_pre_extracted_sources=base_spec.requires_pre_extracted_sources,
+        official_assets=base_spec.official_assets,
+        default_ingested_assets=base_spec.default_ingested_assets,
+        default_excluded_assets=base_spec.default_excluded_assets,
+    )
+
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    builder.build_gold_base()
+    report = builder.profile_dataset()
+
+    assert report["common_coverage_start"] == "2024-01-01T00:10:00"
+    assert report["common_coverage_end"] == "2024-01-01T00:30:00"
+    assert report["full_synchrony_ratio"] < 1.0
+    per_turbine = {row["turbine_id"]: row for row in report["per_turbine_coverage_summary"]}
+    assert per_turbine["Penmanshiel 12"]["observed_ratio"] < per_turbine["Penmanshiel 11"]["observed_ratio"]

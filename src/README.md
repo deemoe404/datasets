@@ -18,15 +18,16 @@ Typical entry points:
 
 - `build_manifest(dataset_id)`
 - `build_silver(dataset_id)`
-- `build_gold_base(dataset_id, quality_profile=None)`
+- `build_gold_base(dataset_id, quality_profile=None, layout=None, feature_set=None)`
 - `build_task_cache(dataset_id, task_spec, quality_profile=None)`
-- `load_series(dataset_id, quality_profile=None)`
+- `load_series(dataset_id, quality_profile=None, layout=None, feature_set=None)`
 - `load_shared_timeseries(dataset_id, group_name)`
 - `load_event_features(dataset_id, group_name)`
 - `load_interventions(dataset_id, group_name)`
 - `load_window_index(dataset_id, task_spec, quality_profile=None)`
+- `load_task_turbine_static(dataset_id, task_spec, quality_profile=None)`
 - `load_turbine_static(dataset_id)`
-- `profile_dataset(dataset_id, quality_profile=None)`
+- `profile_dataset(dataset_id, quality_profile=None, layout=None, feature_set=None)`
 
 `TaskSpec` lives in [wind_datasets/models.py](/Users/sam/Developer/Code/Wind%20Power%20Forecasting/datasets/src/wind_datasets/models.py). It is duration-based, not step-based. Runtime step counts are derived from each dataset's native resolution.
 
@@ -45,8 +46,12 @@ cache/<dataset>/
     interventions/
     meta/
       turbine_static.parquet
-  gold_base/<quality_profile>/
-  tasks/<quality_profile>/<task_id>/
+  gold_base/<quality_profile>/<layout>/<feature_set>/
+  tasks/<quality_profile>/<granularity>/<task_id>/
+    window_index.parquet
+    task_report.json
+    turbine_static.parquet
+    task_context.json
 ```
 
 Layer meanings:
@@ -57,8 +62,8 @@ Layer meanings:
 - `silver/shared_ts/*`: standardized regular shared or turbine-level auxiliary time series
 - `silver/event_features/*`: regularized causal features derived from interval events
 - `silver/interventions/*`: normalized intervention timelines kept outside the default graph assumptions
-- `gold_base/<quality_profile>`: default regular time-series table for forecasting
-- `tasks/<quality_profile>/<task_id>`: task-specific window index and task metadata
+- `gold_base/<quality_profile>/<layout>/<feature_set>`: model-ready regular series cache
+- `tasks/<quality_profile>/<granularity>/<task_id>`: task-specific window index and task-local metadata
 
 The cache is disposable and can be rebuilt from the read-only source dataset directories.
 
@@ -96,13 +101,17 @@ This sidecar is the repository's default spatial interface. It does not precompu
 ## Current Semantics
 
 - The package is forecasting-oriented, not a faithful table-by-table mirror of the official releases.
-- `silver` tries to preserve dataset-specific structure; `gold_base` is a default modeling projection.
-- `gold_base` intentionally keeps only a subset of official assets and fields.
-- Suitable regular time assets now flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
+- `silver` preserves dataset-specific structure; `gold_base` is the model-ready projection.
+- Default `gold_base` layout is farm-synchronous long form on a shared farm time axis.
+- Explicit `layout="turbine"` remains available for single-turbine baselines and compatibility consumers.
+- Farm-synchronous rows expose `farm_turbines_expected`, `farm_turbines_observed`, `farm_turbines_with_target`, and synchronous-coverage flags.
+- Farm task caches write a task-local `turbine_static.parquet` with stable `turbine_index` ordering.
+- Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is an audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented rule flagged it.
 - `sdwpf_full` defaults to `quality_profile="official_v1"`.
 - `sdwpf_full official_v1` means “official rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
-- `masked_output` windows remain in `window_index`. If an experiment needs official-evaluation-aligned filtering, it must apply that filter explicitly downstream.
+- `sdwpf_full` gold/task builds are fail-closed when manifest time-semantics audit finds timestamps incompatible with the documented 10-minute grid.
+- `TaskSpec.next_6h_from_24h()` now defaults to `granularity="farm"`.
 
 ## Dataset Cards
 
@@ -134,7 +143,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
-  - 13 selected SCADA continuous features
+  - default feature set: all numeric turbine SCADA predictors found in the continuous exports
+  - explicit `feature_set="lightweight"`: 13 selected SCADA continuous features
   - farm-shared PMU features
   - farm-shared grid meter features
   - turbine status event features
@@ -173,7 +183,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
-  - 13 selected SCADA continuous features
+  - default feature set: all numeric turbine SCADA predictors found in the continuous exports
+  - explicit `feature_set="lightweight"`: 13 selected SCADA continuous features
   - farm-shared PMU features
   - farm-shared grid meter features
   - turbine status event features
@@ -235,8 +246,9 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - raw AeroUp timeline file
 - Duplicate handling:
   - default-table duplicate keys are audited in `silver/meta/default_table_duplicate_audit.parquet`
+  - duplicate audit distinguishes `identical`, `normalized_equal`, and `true_conflict`
   - non-conflicting duplicates keep the first row
-  - conflicting duplicates keep the first row and add `duplicate_conflict_resolved` to `quality_flags`
+  - `true_conflict` duplicates keep the first row and add `duplicate_conflict_resolved` to `quality_flags`
 - Source layout expectation: official year archives must already be extracted before build
 - Spatial sidecar: yes, from `Hill_of_Towie_turbine_metadata.csv`
 
@@ -254,9 +266,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - main parquet
   - turbine location/elevation CSV
 - Current default `gold_base`:
-  - target `Patv`
-  - all dynamic predictors from the main time-series table
-  - SDWPF quality-rule flags and mask columns in official profiles
+  - blocked unless manifest time-semantics audit matches the documented 10-minute grid
+  - when unblocked: target `Patv`, all dynamic predictors from the main time-series table, and SDWPF quality-rule flags/mask columns
 - Current exclusions:
   - main CSV is not copied into `silver`
 - Source layout expectation: extracted parquet and location CSV must be present
@@ -279,7 +290,7 @@ Implemented SDWPF-specific flags:
 - `sdwpf_abnormal_wdir`
 - `sdwpf_patv_zeroed`
 
-Window-level `masked_input` / `masked_output` flags are available in `window_index.parquet`, but those windows are still retained by default.
+Window-level mask counts remain available in turbine `window_index.parquet`. Farm windows instead carry per-step turbine availability and mask-count lists.
 
 ## Minimal Usage
 
@@ -293,24 +304,31 @@ from wind_datasets import (
     load_interventions,
     load_series,
     load_shared_timeseries,
+    load_task_turbine_static,
     load_turbine_static,
     load_window_index,
 )
 from wind_datasets.models import TaskSpec
 
 dataset_id = "kelmarsh"
-task = TaskSpec.next_6h_from_24h()
+farm_task = TaskSpec.next_6h_from_24h()
+turbine_task = TaskSpec.next_6h_from_24h(granularity="turbine")
 
 build_manifest(dataset_id)
 build_silver(dataset_id)
-build_gold_base(dataset_id)
-build_task_cache(dataset_id, task)
+build_gold_base(dataset_id)  # default: farm layout
+build_gold_base(dataset_id, layout="turbine")  # explicit compatibility layout
+build_task_cache(dataset_id, farm_task)
+build_task_cache(dataset_id, turbine_task)
 
 series = load_series(dataset_id)
+turbine_series = load_series(dataset_id, layout="turbine")
 turbine_static = load_turbine_static(dataset_id)
+farm_task_turbine_static = load_task_turbine_static(dataset_id, farm_task)
 farm_pmu = load_shared_timeseries(dataset_id, "farm_pmu")
 status_features = load_event_features(dataset_id, "turbine_status")
-window_index = load_window_index(dataset_id, task)
+farm_window_index = load_window_index(dataset_id, farm_task)
+turbine_window_index = load_window_index(dataset_id, turbine_task)
 ```
 
 ## Environment

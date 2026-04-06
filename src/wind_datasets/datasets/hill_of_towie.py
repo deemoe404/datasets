@@ -4,16 +4,20 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import pyarrow.parquet as pq
 
 from ..utils import ensure_directory
 from .base import BaseDatasetBuilder
 from .common import (
     ParquetChunkWriter,
     QualityReportAccumulator,
+    build_quality_report,
+    build_coverage_summary,
     ensure_turbine_static_schema,
     featureize_interval_events,
     finalize_quality_report,
     iter_reindexed_regular_series,
+    load_quality_report_frame,
     sanitize_feature_name,
     update_quality_report_accumulator,
     write_quality_report,
@@ -25,7 +29,9 @@ _DUPLICATE_AUDIT_SCHEMA = {
     "timestamp": pl.Datetime,
     "station_id": pl.String,
     "duplicate_count": pl.Int64,
+    "duplicate_kind": pl.String,
     "is_conflicting": pl.Boolean,
+    "normalized_equal_columns": pl.String,
     "conflicting_columns": pl.String,
 }
 
@@ -82,6 +88,16 @@ def _normalize_duplicate_value(value, dtype):
     return text or None
 
 
+def _unique_non_null(values: list[object]) -> list[object]:
+    unique_values: list[object] = []
+    for value in values:
+        if value is None:
+            continue
+        if value not in unique_values:
+            unique_values.append(value)
+    return unique_values
+
+
 def _audit_hill_duplicate_keys(
     frame: pl.DataFrame,
     table_name: str,
@@ -119,8 +135,10 @@ def _audit_hill_duplicate_keys(
     audit_rows: list[dict[str, object]] = []
     conflict_rows: list[dict[str, object]] = []
     for group in duplicate_rows.partition_by(["timestamp", "StationId"], maintain_order=True):
+        normalized_equal_columns: list[str] = []
         conflicting_columns: list[str] = []
         for column in payload_columns:
+            raw_values = _unique_non_null(group[column].to_list())
             normalized_values: list[object] = []
             dtype = group.schema[column]
             for value in group[column].to_list():
@@ -131,13 +149,24 @@ def _audit_hill_duplicate_keys(
                     normalized_values.append(normalized)
             if len(normalized_values) > 1:
                 conflicting_columns.append(column)
+            elif len(raw_values) > 1:
+                normalized_equal_columns.append(column)
+        duplicate_kind = (
+            "true_conflict"
+            if conflicting_columns
+            else "normalized_equal"
+            if normalized_equal_columns
+            else "identical"
+        )
         audit_rows.append(
             {
                 "table_name": table_name,
                 "timestamp": group["timestamp"][0],
                 "station_id": group["StationId"][0],
                 "duplicate_count": group.height,
+                "duplicate_kind": duplicate_kind,
                 "is_conflicting": bool(conflicting_columns),
+                "normalized_equal_columns": "|".join(normalized_equal_columns),
                 "conflicting_columns": "|".join(conflicting_columns),
             }
         )
@@ -562,9 +591,11 @@ def _write_hill_gold_with_extras(
     cache_paths,
     output_path: Path,
     spec,
+    layout: str,
     batch_rows: int = 2_000,
-) -> QualityReportAccumulator:
+) -> tuple[QualityReportAccumulator, dict[str, Any]]:
     ensure_directory(output_path.parent)
+    temp_output_path = output_path.with_suffix(".tmp.parquet") if layout == "farm" else output_path
     shared_frames = {
         group_name: pl.read_parquet(cache_paths.silver_shared_ts_path(group_name))
         for group_name in _HILL_BROADCAST_SHARED_GROUPS
@@ -580,7 +611,7 @@ def _write_hill_gold_with_extras(
         for column, dtype in schema.items():
             if column not in {"dataset", "turbine_id", "timestamp"}:
                 expected_extra_schema[column] = dtype
-    writer = ParquetChunkWriter(output_path, row_group_size=1_000)
+    writer = ParquetChunkWriter(temp_output_path, row_group_size=1_000)
     accumulator = QualityReportAccumulator()
     for base_chunk in base_chunks:
         if base_chunk.is_empty():
@@ -590,7 +621,41 @@ def _write_hill_gold_with_extras(
             batch = base_chunk.slice(offset, batch_rows)
             writer.write_frame(_augment_hill_batch(batch, cache_paths, shared_frames, expected_extra_schema))
     writer.close()
-    return accumulator
+    if layout == "farm":
+        coverage_summary = _finalize_hill_farm_temp(temp_output_path, output_path, spec, batch_rows=batch_rows * 10)
+        return accumulator, coverage_summary
+
+    return accumulator, build_coverage_summary(pl.read_parquet(output_path), spec)
+
+
+def _finalize_hill_farm_temp(
+    temp_output_path: Path,
+    output_path: Path,
+    spec,
+    batch_rows: int = 20_000,
+) -> dict[str, Any]:
+    timestamp_summary = (
+        pl.scan_parquet(temp_output_path)
+        .group_by(["dataset", "timestamp"], maintain_order=True)
+        .agg(
+            pl.col("is_observed").cast(pl.Int32).sum().alias("farm_turbines_observed"),
+            pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("farm_turbines_with_target"),
+        )
+        .with_columns(
+            pl.lit(len(spec.turbine_ids)).cast(pl.Int32).alias("farm_turbines_expected"),
+            (pl.col("farm_turbines_observed") == len(spec.turbine_ids)).alias("farm_is_fully_synchronous"),
+            (pl.col("farm_turbines_with_target") == len(spec.turbine_ids)).alias("farm_has_all_targets"),
+        )
+        .collect()
+    )
+    writer = ParquetChunkWriter(output_path, row_group_size=1_000)
+    parquet_file = pq.ParquetFile(temp_output_path)
+    for batch in parquet_file.iter_batches(batch_size=batch_rows):
+        frame = pl.from_arrow(batch)
+        writer.write_frame(frame.join(timestamp_summary, on=["dataset", "timestamp"], how="left"))
+    writer.close()
+    temp_output_path.unlink(missing_ok=True)
+    return build_coverage_summary(load_quality_report_frame(output_path), spec)
 
 
 class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
@@ -693,8 +758,15 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         )
         return self.cache_paths.silver_dir
 
-    def build_gold_base(self, quality_profile: str | None = None) -> Path:
+    def build_gold_base(
+        self,
+        quality_profile: str | None = None,
+        layout: str | None = None,
+        feature_set: str | None = None,
+    ) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
+        resolved_layout = self.resolve_series_layout(layout)
+        resolved_feature_set = self.resolve_feature_set(feature_set)
         required_silver_paths = [
             self.cache_paths.silver_dir,
             self.cache_paths.silver_shared_ts_path("farm_grid"),
@@ -713,6 +785,58 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             self.build_silver()
 
         manifest_payload = self.ensure_manifest()
+        ensure_directory(
+            self.cache_paths.gold_base_profile_dir(
+                resolved_quality_profile,
+                layout=resolved_layout,
+                feature_set=resolved_feature_set,
+            )
+        )
+        series_path = self.cache_paths.gold_base_series_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
+        quality_path = self.cache_paths.gold_base_quality_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
+        temp_series_path = series_path.with_suffix(".tmp.parquet") if resolved_layout == "farm" else None
+        duplicate_audit_path = self.cache_paths.hill_duplicate_audit_path
+        existing_duplicate_audit = (
+            pl.read_parquet(duplicate_audit_path)
+            if duplicate_audit_path.exists()
+            else pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA)
+        )
+        existing_report_extra = {
+            "quality_profile": resolved_quality_profile,
+            "layout": resolved_layout,
+            "feature_set": resolved_feature_set,
+            "duplicate_key_audit_count": existing_duplicate_audit.height,
+            "duplicate_conflict_key_count": existing_duplicate_audit.filter(pl.col("is_conflicting")).height,
+        }
+        if resolved_layout == "farm" and temp_series_path is not None and temp_series_path.exists() and not series_path.exists():
+            coverage_summary = _finalize_hill_farm_temp(temp_series_path, series_path, self.spec)
+            report_frame = load_quality_report_frame(series_path)
+            report = build_quality_report(
+                report_frame,
+                manifest_payload,
+                self.spec,
+                extra={**existing_report_extra, **coverage_summary},
+            )
+            write_quality_report(quality_path, report)
+            return series_path
+        if series_path.exists() and not quality_path.exists():
+            report_frame = load_quality_report_frame(series_path)
+            report = build_quality_report(
+                report_frame,
+                manifest_payload,
+                self.spec,
+                extra={**existing_report_extra, **build_coverage_summary(report_frame, self.spec)},
+            )
+            write_quality_report(quality_path, report)
+            return series_path
         metadata_path = self.cache_paths.silver_dir / "Hill_of_Towie_turbine_metadata.parquet"
         metadata = pl.read_parquet(metadata_path).select(
             pl.col("Station ID").cast(pl.String).alias("StationId"),
@@ -820,25 +944,47 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         gold_input = gold_input.with_columns(
             [pl.col(column).cast(pl.Float64, strict=False) for column in feature_columns]
         )
-        ensure_directory(self.cache_paths.gold_base_profile_dir(resolved_quality_profile))
-        series_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
-        quality_path = self.cache_paths.gold_base_quality_path_for(resolved_quality_profile)
-        quality_accumulator = _write_hill_gold_with_extras(
-            iter_reindexed_regular_series(gold_input, self.spec),
+        report_extra = {
+            "quality_profile": resolved_quality_profile,
+            "layout": resolved_layout,
+            "feature_set": resolved_feature_set,
+            "duplicate_key_audit_count": duplicate_audit.height,
+            "duplicate_conflict_key_count": duplicate_audit.filter(pl.col("is_conflicting")).height,
+        }
+        if resolved_layout == "farm" and temp_series_path is not None and temp_series_path.exists() and not series_path.exists():
+            coverage_summary = _finalize_hill_farm_temp(temp_series_path, series_path, self.spec)
+            report_frame = load_quality_report_frame(series_path)
+            report = build_quality_report(
+                report_frame,
+                manifest_payload,
+                self.spec,
+                extra={**report_extra, **coverage_summary},
+            )
+            write_quality_report(quality_path, report)
+            return series_path
+        if series_path.exists() and not quality_path.exists():
+            report_frame = load_quality_report_frame(series_path)
+            report = build_quality_report(
+                report_frame,
+                manifest_payload,
+                self.spec,
+                extra={**report_extra, **build_coverage_summary(report_frame, self.spec)},
+            )
+            write_quality_report(quality_path, report)
+            return series_path
+        quality_accumulator, coverage_summary = _write_hill_gold_with_extras(
+            iter_reindexed_regular_series(gold_input, self.spec, layout=resolved_layout),
             self.cache_paths,
             series_path,
             self.spec,
+            layout=resolved_layout,
         )
 
         report = finalize_quality_report(
             quality_accumulator,
             manifest_payload,
             self.spec,
-            extra={
-                "quality_profile": resolved_quality_profile,
-                "duplicate_key_audit_count": duplicate_audit.height,
-                "duplicate_conflict_key_count": duplicate_audit.filter(pl.col("is_conflicting")).height,
-            },
+            extra={**report_extra, **coverage_summary},
         )
         write_quality_report(quality_path, report)
         return series_path

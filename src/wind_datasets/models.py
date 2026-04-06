@@ -105,14 +105,14 @@ class TaskSpec:
         object.__setattr__(self, "task_id", generated_task_id)
 
     @classmethod
-    def next_6h_from_24h(cls) -> "TaskSpec":
+    def next_6h_from_24h(cls, *, granularity: str = "farm") -> "TaskSpec":
         return cls(
             task_id="next_6h_from_24h",
             history_duration="24h",
             forecast_duration="6h",
             stride_duration=None,
             target_mode="multi_step",
-            granularity="turbine",
+            granularity=granularity,
         )
 
     def resolve(self, resolution_minutes: int) -> ResolvedTaskSpec:

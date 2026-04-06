@@ -48,7 +48,9 @@ def run_persistence_experiment(
 ) -> PersistenceExperimentResult:
     spec = get_dataset_spec(dataset_id)
     resolved_quality_profile = quality_profile or spec.default_quality_profile
-    resolved_task = (task_spec or TaskSpec.next_6h_from_24h()).resolve(spec.resolution_minutes)
+    resolved_task = (
+        task_spec or TaskSpec.next_6h_from_24h(granularity="turbine")
+    ).resolve(spec.resolution_minutes)
     rated_power_by_turbine = _resolve_rated_power_by_turbine(spec)
     series = _load_persistence_series(
         spec=spec,
@@ -71,12 +73,17 @@ def _load_persistence_series(
     quality_profile: str,
 ) -> pl.DataFrame:
     cache_paths = dataset_cache_paths(cache_root, spec.dataset_id)
-    gold_base_path = cache_paths.gold_base_series_path_for(quality_profile)
+    gold_base_path = cache_paths.gold_base_series_path_for(
+        quality_profile,
+        layout="turbine",
+        feature_set="default",
+    )
     if not gold_base_path.exists():
         build_gold_base(
             spec.dataset_id,
             cache_root=cache_root,
             quality_profile=quality_profile,
+            layout="turbine",
         )
     return (
         pl.scan_parquet(gold_base_path)

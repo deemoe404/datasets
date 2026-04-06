@@ -1,18 +1,35 @@
 from __future__ import annotations
 
+import gc
 import shutil
 
 import polars as pl
 
 from ..utils import ensure_directory
 from .base import BaseDatasetBuilder
-from .common import build_quality_report, ensure_turbine_static_schema, reindex_regular_series, write_quality_report
+from .common import (
+    build_coverage_summary,
+    build_quality_report,
+    ensure_turbine_static_schema,
+    load_quality_report_frame,
+    reindex_regular_series,
+    write_quality_report,
+)
 
 _SDWPF_SUPPORTED_QUALITY_PROFILES = {
     "official_v1",
     "raw_v1",
     "official_v1_zero_negative_patv",
 }
+
+
+def _assert_sdwpf_time_semantics_supported(manifest_payload: dict[str, object]) -> None:
+    time_check = manifest_payload.get("time_semantics_check")
+    if not isinstance(time_check, dict):
+        raise ValueError("SDWPF manifest is missing time_semantics_check; rebuild the manifest first.")
+    if time_check.get("status") != "match_documented_10min_grid":
+        details = time_check.get("details", "SDWPF source timestamps are incompatible with the documented 10-minute grid.")
+        raise ValueError(f"Refusing to build sdwpf_full gold/task cache. {details}")
 
 
 class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
@@ -49,7 +66,7 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
                 pl.lit("projected_xy").alias("coord_kind"),
                 pl.lit("unknown_unverified").alias("coord_crs"),
                 pl.col("Ele").cast(pl.Float64, strict=False).alias("elevation_m"),
-                pl.lit(None).cast(pl.Float64).alias("rated_power_kw"),
+                pl.lit(1500.0).cast(pl.Float64).alias("rated_power_kw"),
                 pl.lit(None).cast(pl.Float64).alias("hub_height_m"),
                 pl.lit(None).cast(pl.Float64).alias("rotor_diameter_m"),
                 pl.lit(None).cast(pl.String).alias("manufacturer"),
@@ -65,12 +82,20 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
         turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
         return self.cache_paths.silver_dir
 
-    def build_gold_base(self, quality_profile: str | None = None) -> Path:
+    def build_gold_base(
+        self,
+        quality_profile: str | None = None,
+        layout: str | None = None,
+        feature_set: str | None = None,
+    ) -> Path:
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
+        resolved_layout = self.resolve_series_layout(layout)
+        resolved_feature_set = self.resolve_feature_set(feature_set)
         if not (self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet").exists():
             self.build_silver()
 
         manifest_payload = self.ensure_manifest()
+        _assert_sdwpf_time_semantics_supported(manifest_payload)
         frame = pl.read_parquet(self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet")
         timestamp_dtype = frame.schema["Tmstamp"]
         if timestamp_dtype == pl.Utf8:
@@ -174,10 +199,24 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
             ]
         )
 
-        gold_base = reindex_regular_series(gold_input, self.spec)
-        ensure_directory(self.cache_paths.gold_base_profile_dir(resolved_quality_profile))
-        series_path = self.cache_paths.gold_base_series_path_for(resolved_quality_profile)
-        quality_path = self.cache_paths.gold_base_quality_path_for(resolved_quality_profile)
+        gold_base = reindex_regular_series(gold_input, self.spec, layout=resolved_layout)
+        ensure_directory(
+            self.cache_paths.gold_base_profile_dir(
+                resolved_quality_profile,
+                layout=resolved_layout,
+                feature_set=resolved_feature_set,
+            )
+        )
+        series_path = self.cache_paths.gold_base_series_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
+        quality_path = self.cache_paths.gold_base_quality_path_for(
+            resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
         gold_base.write_parquet(series_path)
 
         flag_counts = gold_input.select(
@@ -216,12 +255,19 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
             pl.col("sdwpf_is_abnormal").cast(pl.Int64).sum().alias("sdwpf_abnormal_count"),
             pl.col("sdwpf_is_masked").cast(pl.Int64).sum().alias("sdwpf_masked_count"),
         ).row(0, named=True)
+        del frame
+        del gold_input
+        del gold_base
+        gc.collect()
+        report_frame = load_quality_report_frame(series_path)
         report = build_quality_report(
-            gold_base,
+            report_frame,
             manifest_payload,
             self.spec,
             extra={
                 "quality_profile": resolved_quality_profile,
+                "layout": resolved_layout,
+                "feature_set": resolved_feature_set,
                 "sdwpf_negative_patv_count": int(flag_counts["sdwpf_patv_negative"] or 0),
                 "sdwpf_unknown_count": int(flag_counts["sdwpf_unknown_count"] or 0),
                 "sdwpf_abnormal_count": int(flag_counts["sdwpf_abnormal_count"] or 0),
@@ -234,6 +280,7 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
                     "sdwpf_abnormal_wdir": int(flag_counts["sdwpf_abnormal_wdir"] or 0),
                     "sdwpf_patv_zeroed": int(flag_counts["sdwpf_patv_zeroed"] or 0),
                 },
+                **build_coverage_summary(report_frame, self.spec),
             },
         )
         write_quality_report(quality_path, report)

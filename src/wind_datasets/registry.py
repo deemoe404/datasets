@@ -202,7 +202,7 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
             OfficialRelease(
                 release_id="scientific_data_2024",
                 source_url="https://www.nature.com/articles/s41597-024-03427-5",
-                published_date="2024-06-24",
+                published_date="2024-06-19",
                 coverage_start="2020-01-01",
                 coverage_end="2021-12-31",
                 notes="10-minute wind power forecasting dataset. Timestamps are UTC+08:00.",

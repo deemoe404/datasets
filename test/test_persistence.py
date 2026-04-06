@@ -103,12 +103,13 @@ def test_persistence_eligible_windows_match_clean_window_index(tmp_path) -> None
         history_duration="20m",
         forecast_duration="10m",
         task_id="persistence_check",
+        granularity="turbine",
     )
     resolved_task = task_spec.resolve(spec.resolution_minutes)
 
-    builder.build_gold_base()
+    builder.build_gold_base(layout="turbine")
     builder.build_task_cache(task_spec)
-    series = builder.load_series()
+    series = builder.load_series(layout="turbine")
     window_index = builder.load_window_index(task_spec)
 
     result = _evaluate_persistence_series(

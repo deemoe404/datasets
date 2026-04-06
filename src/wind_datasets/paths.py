@@ -36,26 +36,47 @@ class DatasetCachePaths:
     def silver_interventions_path(self, group_name: str) -> Path:
         return self.silver_interventions_dir / f"{group_name}.parquet"
 
-    def gold_base_profile_dir(self, quality_profile: str) -> Path:
-        return self.gold_base_dir / quality_profile
+    def gold_base_profile_dir(
+        self,
+        quality_profile: str,
+        layout: str = "farm",
+        feature_set: str = "default",
+    ) -> Path:
+        return self.gold_base_dir / quality_profile / layout / feature_set
 
-    def gold_base_series_path_for(self, quality_profile: str) -> Path:
-        return self.gold_base_profile_dir(quality_profile) / "series.parquet"
+    def gold_base_series_path_for(
+        self,
+        quality_profile: str,
+        layout: str = "farm",
+        feature_set: str = "default",
+    ) -> Path:
+        return self.gold_base_profile_dir(quality_profile, layout=layout, feature_set=feature_set) / "series.parquet"
 
-    def gold_base_quality_path_for(self, quality_profile: str) -> Path:
-        return self.gold_base_profile_dir(quality_profile) / "quality_report.json"
+    def gold_base_quality_path_for(
+        self,
+        quality_profile: str,
+        layout: str = "farm",
+        feature_set: str = "default",
+    ) -> Path:
+        return self.gold_base_profile_dir(quality_profile, layout=layout, feature_set=feature_set) / "quality_report.json"
 
-    def task_profile_dir(self, quality_profile: str) -> Path:
-        return self.tasks_dir / quality_profile
+    def task_profile_dir(self, quality_profile: str, granularity: str = "farm") -> Path:
+        return self.tasks_dir / quality_profile / granularity
 
-    def task_dir_for(self, quality_profile: str, task_id: str) -> Path:
-        return self.task_profile_dir(quality_profile) / task_id
+    def task_dir_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_profile_dir(quality_profile, granularity=granularity) / task_id
 
-    def task_window_index_path_for(self, quality_profile: str, task_id: str) -> Path:
-        return self.task_dir_for(quality_profile, task_id) / "window_index.parquet"
+    def task_window_index_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_dir_for(quality_profile, granularity, task_id) / "window_index.parquet"
 
-    def task_report_path_for(self, quality_profile: str, task_id: str) -> Path:
-        return self.task_dir_for(quality_profile, task_id) / "task_report.json"
+    def task_report_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_dir_for(quality_profile, granularity, task_id) / "task_report.json"
+
+    def task_turbine_static_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_dir_for(quality_profile, granularity, task_id) / "turbine_static.parquet"
+
+    def task_context_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_dir_for(quality_profile, granularity, task_id) / "task_context.json"
 
 
 def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:

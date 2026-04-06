@@ -37,6 +37,14 @@ TURBINE_STATIC_SCHEMA: dict[str, pl.DataType] = {
     "spatial_source": pl.String,
 }
 
+FARM_SYNC_SCHEMA: dict[str, pl.DataType] = {
+    "farm_turbines_expected": pl.Int32,
+    "farm_turbines_observed": pl.Int32,
+    "farm_turbines_with_target": pl.Int32,
+    "farm_is_fully_synchronous": pl.Boolean,
+    "farm_has_all_targets": pl.Boolean,
+}
+
 _SANITIZE_PATTERN = re.compile(r"[^a-z0-9]+")
 
 
@@ -373,7 +381,31 @@ def cast_numeric_columns(df: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     return df.with_columns(expressions)
 
 
-def iter_reindexed_regular_series(df: pl.DataFrame, spec: DatasetSpec):
+def _empty_regular_series(layout: str = "turbine") -> pl.DataFrame:
+    schema: dict[str, pl.DataType] = {
+        "dataset": pl.String,
+        "turbine_id": pl.String,
+        "timestamp": pl.Datetime,
+        "target_kw": pl.Float64,
+        "is_observed": pl.Boolean,
+        "quality_flags": pl.String,
+    }
+    if layout == "farm":
+        schema.update(FARM_SYNC_SCHEMA)
+    return pl.DataFrame(schema=schema)
+
+
+def _serialize_datetime(value: datetime | None) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def iter_reindexed_regular_series(
+    df: pl.DataFrame,
+    spec: DatasetSpec,
+    layout: str = "turbine",
+):
+    if layout not in {"farm", "turbine"}:
+        raise ValueError(f"Unsupported regular series layout {layout!r}.")
     if df.is_empty():
         return
 
@@ -394,21 +426,45 @@ def iter_reindexed_regular_series(df: pl.DataFrame, spec: DatasetSpec):
         column for column in feature_columns if df.schema.get(column) == pl.Boolean
     ]
     interval = f"{spec.resolution_minutes}m"
-    for turbine_frame in df.partition_by("turbine_id", maintain_order=True):
-        turbine_frame = turbine_frame.sort("timestamp")
-        turbine_id = turbine_frame["turbine_id"][0]
+    partitions = {
+        turbine_frame["turbine_id"][0]: turbine_frame.sort("timestamp")
+        for turbine_frame in df.partition_by("turbine_id", maintain_order=True)
+    }
+    global_start = df["timestamp"].min() if layout == "farm" else None
+    global_end = df["timestamp"].max() if layout == "farm" else None
+    turbine_ids = list(spec.turbine_ids) if layout == "farm" else list(partitions)
+
+    for turbine_id in turbine_ids:
+        turbine_frame = partitions.get(turbine_id)
+        if turbine_frame is None and layout != "farm":
+            continue
+        grid_start = global_start if layout == "farm" else turbine_frame["timestamp"].min()
+        grid_end = global_end if layout == "farm" else turbine_frame["timestamp"].max()
+        if grid_start is None or grid_end is None:
+            continue
         grid = pl.DataFrame(
             {
                 "timestamp": pl.datetime_range(
-                    turbine_frame["timestamp"].min(),
-                    turbine_frame["timestamp"].max(),
+                    grid_start,
+                    grid_end,
                     interval=interval,
                     eager=True,
                 )
             }
         ).with_columns(pl.lit(turbine_id).alias("turbine_id"))
 
-        joined = grid.join(turbine_frame, on=["turbine_id", "timestamp"], how="left")
+        joined = (
+            grid.join(turbine_frame, on=["turbine_id", "timestamp"], how="left")
+            if turbine_frame is not None
+            else grid
+        )
+        missing_columns = [
+            pl.lit(None).cast(df.schema[column]).alias(column)
+            for column in ("dataset", "target_kw", "__row_present", "__base_quality_flags", *feature_columns)
+            if column not in joined.columns
+        ]
+        if missing_columns:
+            joined = joined.with_columns(missing_columns)
         joined = joined.with_columns(
             pl.coalesce([pl.col("dataset"), pl.lit(spec.dataset_id)]).alias("dataset"),
             pl.col("__row_present").fill_null(False).alias("is_observed"),
@@ -446,20 +502,137 @@ def iter_reindexed_regular_series(df: pl.DataFrame, spec: DatasetSpec):
             ]
         )
 
-def reindex_regular_series(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
-    output_parts = list(iter_reindexed_regular_series(df, spec))
-    if not output_parts:
-        return pl.DataFrame(
-            schema={
-                "dataset": pl.String,
-                "turbine_id": pl.String,
-                "timestamp": pl.Datetime,
-                "target_kw": pl.Float64,
-                "is_observed": pl.Boolean,
-                "quality_flags": pl.String,
+def attach_farm_sync_columns(df: pl.DataFrame, spec: DatasetSpec) -> pl.DataFrame:
+    if df.is_empty():
+        return _empty_regular_series(layout="farm")
+
+    base = df.drop([column for column in FARM_SYNC_SCHEMA if column in df.columns])
+    expected_turbines = int(len(spec.turbine_ids))
+    summary = (
+        base.group_by(["dataset", "timestamp"], maintain_order=True)
+        .agg(
+            pl.col("is_observed").cast(pl.Int32).sum().alias("farm_turbines_observed"),
+            pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("farm_turbines_with_target"),
+        )
+        .with_columns(
+            pl.lit(expected_turbines).cast(pl.Int32).alias("farm_turbines_expected"),
+            (pl.col("farm_turbines_observed") == expected_turbines).alias("farm_is_fully_synchronous"),
+            (pl.col("farm_turbines_with_target") == expected_turbines).alias("farm_has_all_targets"),
+        )
+    )
+    return base.join(summary, on=["dataset", "timestamp"], how="left").sort(["dataset", "timestamp", "turbine_id"])
+
+
+def build_coverage_summary(df: pl.DataFrame, spec: DatasetSpec) -> dict[str, Any]:
+    if df.is_empty():
+        return {
+            "timestamp_count": 0,
+            "farm_turbines_expected": len(spec.turbine_ids),
+            "full_synchrony_ratio": 0.0,
+            "full_target_ratio": 0.0,
+            "common_coverage_start": None,
+            "common_coverage_end": None,
+            "full_target_coverage_start": None,
+            "full_target_coverage_end": None,
+            "per_turbine_coverage_summary": [],
+        }
+
+    expected_turbines = int(len(spec.turbine_ids))
+    if all(column in df.columns for column in FARM_SYNC_SCHEMA):
+        timestamp_summary = (
+            df.select(
+                [
+                    "dataset",
+                    "timestamp",
+                    "farm_turbines_expected",
+                    "farm_turbines_observed",
+                    "farm_turbines_with_target",
+                    "farm_is_fully_synchronous",
+                    "farm_has_all_targets",
+                ]
+            )
+            .unique(subset=["dataset", "timestamp"], keep="first", maintain_order=True)
+            .sort(["dataset", "timestamp"])
+        )
+    else:
+        timestamp_summary = (
+            df.group_by(["dataset", "timestamp"], maintain_order=True)
+            .agg(
+                pl.col("is_observed").cast(pl.Int32).sum().alias("farm_turbines_observed"),
+                pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("farm_turbines_with_target"),
+            )
+            .with_columns(
+                pl.lit(expected_turbines).cast(pl.Int32).alias("farm_turbines_expected"),
+                (pl.col("farm_turbines_observed") == expected_turbines).alias("farm_is_fully_synchronous"),
+                (pl.col("farm_turbines_with_target") == expected_turbines).alias("farm_has_all_targets"),
+            )
+            .sort(["dataset", "timestamp"])
+        )
+
+    timestamp_count = int(timestamp_summary.height)
+    synchronous = timestamp_summary.filter(pl.col("farm_is_fully_synchronous"))
+    target_complete = timestamp_summary.filter(pl.col("farm_has_all_targets"))
+    per_turbine = (
+        df.group_by("turbine_id", maintain_order=True)
+        .agg(
+            pl.col("is_observed").cast(pl.Int64).sum().alias("observed_rows"),
+            pl.col("target_kw").is_not_null().cast(pl.Int64).sum().alias("target_rows"),
+            pl.when(pl.col("is_observed"))
+            .then(pl.col("timestamp"))
+            .otherwise(None)
+            .min()
+            .alias("first_observed_timestamp"),
+            pl.when(pl.col("is_observed"))
+            .then(pl.col("timestamp"))
+            .otherwise(None)
+            .max()
+            .alias("last_observed_timestamp"),
+        )
+        .sort("turbine_id")
+    )
+    per_turbine_rows = []
+    for row in per_turbine.to_dicts():
+        per_turbine_rows.append(
+            {
+                "turbine_id": row["turbine_id"],
+                "observed_rows": int(row["observed_rows"] or 0),
+                "target_rows": int(row["target_rows"] or 0),
+                "observed_ratio": float((row["observed_rows"] or 0) / timestamp_count) if timestamp_count else 0.0,
+                "target_ratio": float((row["target_rows"] or 0) / timestamp_count) if timestamp_count else 0.0,
+                "first_observed_timestamp": _serialize_datetime(row["first_observed_timestamp"]),
+                "last_observed_timestamp": _serialize_datetime(row["last_observed_timestamp"]),
             }
         )
-    return pl.concat(output_parts, how="vertical").sort(["dataset", "turbine_id", "timestamp"])
+
+    return {
+        "timestamp_count": timestamp_count,
+        "farm_turbines_expected": expected_turbines,
+        "full_synchrony_ratio": float(synchronous.height / timestamp_count) if timestamp_count else 0.0,
+        "full_target_ratio": float(target_complete.height / timestamp_count) if timestamp_count else 0.0,
+        "common_coverage_start": _serialize_datetime(synchronous["timestamp"].min() if not synchronous.is_empty() else None),
+        "common_coverage_end": _serialize_datetime(synchronous["timestamp"].max() if not synchronous.is_empty() else None),
+        "full_target_coverage_start": _serialize_datetime(
+            target_complete["timestamp"].min() if not target_complete.is_empty() else None
+        ),
+        "full_target_coverage_end": _serialize_datetime(
+            target_complete["timestamp"].max() if not target_complete.is_empty() else None
+        ),
+        "per_turbine_coverage_summary": per_turbine_rows,
+    }
+
+
+def reindex_regular_series(
+    df: pl.DataFrame,
+    spec: DatasetSpec,
+    layout: str = "turbine",
+) -> pl.DataFrame:
+    output_parts = list(iter_reindexed_regular_series(df, spec, layout=layout))
+    if not output_parts:
+        return _empty_regular_series(layout=layout)
+    result = pl.concat(output_parts, how="vertical").sort(["dataset", "turbine_id", "timestamp"])
+    if layout == "farm":
+        return attach_farm_sync_columns(result, spec)
+    return result
 
 
 def update_quality_report_accumulator(
@@ -540,7 +713,28 @@ def write_quality_report(path: Path, payload: dict[str, Any]) -> Path:
     return write_json(path, payload)
 
 
-def build_window_index(
+def load_quality_report_frame(
+    series_path: Path,
+    extra_columns: list[str] | None = None,
+) -> pl.DataFrame:
+    available = set(pl.scan_parquet(series_path).collect_schema().names())
+    columns: list[str] = []
+    for column in [
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        *FARM_SYNC_SCHEMA.keys(),
+        *(extra_columns or []),
+    ]:
+        if column in available and column not in columns:
+            columns.append(column)
+    return pl.read_parquet(series_path, columns=columns)
+
+
+def build_turbine_window_index(
     df: pl.DataFrame,
     task: ResolvedTaskSpec,
     output_path: Path,
@@ -679,3 +873,197 @@ def build_window_index(
     writer.close()
     write_json(report_path, {"quality_profile": quality_profile, "task": task.to_dict(), **counts})
     return output_path
+
+
+def build_farm_window_index(
+    df: pl.DataFrame,
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+) -> Path:
+    schema = pa.schema(
+        [
+            ("dataset", pa.string()),
+            ("input_start_ts", pa.timestamp("us")),
+            ("input_end_ts", pa.timestamp("us")),
+            ("output_start_ts", pa.timestamp("us")),
+            ("output_end_ts", pa.timestamp("us")),
+            ("farm_turbines_expected", pa.int32()),
+            ("input_steps_expected", pa.int64()),
+            ("output_steps_expected", pa.int64()),
+            ("input_turbines_observed_per_step", pa.list_(pa.int32())),
+            ("output_turbines_with_target_per_step", pa.list_(pa.int32())),
+            ("input_turbines_masked_per_step", pa.list_(pa.int32())),
+            ("output_turbines_masked_per_step", pa.list_(pa.int32())),
+            ("input_turbines_unknown_per_step", pa.list_(pa.int32())),
+            ("output_turbines_unknown_per_step", pa.list_(pa.int32())),
+            ("input_turbines_abnormal_per_step", pa.list_(pa.int32())),
+            ("output_turbines_abnormal_per_step", pa.list_(pa.int32())),
+            ("input_turbines_observed_min", pa.int32()),
+            ("output_turbines_with_target_min", pa.int32()),
+            ("input_turbines_masked_max", pa.int32()),
+            ("output_turbines_masked_max", pa.int32()),
+            ("is_complete_input", pa.bool_()),
+            ("is_complete_output", pa.bool_()),
+            ("is_fully_synchronous_input", pa.bool_()),
+            ("is_fully_synchronous_output", pa.bool_()),
+            ("quality_flags", pa.string()),
+        ]
+    )
+    writer = ParquetChunkWriter(output_path, schema=schema)
+    counts = Counter()
+    buffer: list[dict[str, Any]] = []
+
+    masked_expr = (
+        pl.col("sdwpf_is_masked").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_masked" in df.columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+    unknown_expr = (
+        pl.col("sdwpf_is_unknown").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_unknown" in df.columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+    abnormal_expr = (
+        pl.col("sdwpf_is_abnormal").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_abnormal" in df.columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+
+    timestamp_summary = (
+        df.group_by(["dataset", "timestamp"], maintain_order=True)
+        .agg(
+            pl.col("is_observed").cast(pl.Int32).sum().alias("turbines_observed"),
+            pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("turbines_with_target"),
+            masked_expr.sum().alias("turbines_masked"),
+            unknown_expr.sum().alias("turbines_unknown"),
+            abnormal_expr.sum().alias("turbines_abnormal"),
+            (pl.col("quality_flags").fill_null("") != "").any().alias("has_row_quality_issues"),
+        )
+        .sort(["dataset", "timestamp"])
+    )
+
+    for dataset_frame in timestamp_summary.partition_by("dataset", maintain_order=True):
+        dataset_id = dataset_frame["dataset"][0]
+        timestamps = dataset_frame["timestamp"].to_list()
+        observed_counts = [int(value) for value in dataset_frame["turbines_observed"].to_list()]
+        target_counts = [int(value) for value in dataset_frame["turbines_with_target"].to_list()]
+        masked_counts = [int(value) for value in dataset_frame["turbines_masked"].to_list()]
+        unknown_counts = [int(value) for value in dataset_frame["turbines_unknown"].to_list()]
+        abnormal_counts = [int(value) for value in dataset_frame["turbines_abnormal"].to_list()]
+        quality_issue_steps = [bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()]
+        expected_turbines = int(
+            df.filter(pl.col("dataset") == dataset_id).select(pl.col("turbine_id").n_unique()).item()
+        )
+
+        last_anchor = len(timestamps) - task.forecast_steps - 1
+        if last_anchor < task.history_steps - 1:
+            continue
+
+        for anchor in range(task.history_steps - 1, last_anchor + 1, task.stride_steps):
+            input_start_idx = anchor - task.history_steps + 1
+            output_end_idx = anchor + task.forecast_steps
+            input_observed_counts = observed_counts[input_start_idx : anchor + 1]
+            output_target_counts = target_counts[anchor + 1 : output_end_idx + 1]
+            input_masked_counts = masked_counts[input_start_idx : anchor + 1]
+            output_masked_counts = masked_counts[anchor + 1 : output_end_idx + 1]
+            input_unknown_counts = unknown_counts[input_start_idx : anchor + 1]
+            output_unknown_counts = unknown_counts[anchor + 1 : output_end_idx + 1]
+            input_abnormal_counts = abnormal_counts[input_start_idx : anchor + 1]
+            output_abnormal_counts = abnormal_counts[anchor + 1 : output_end_idx + 1]
+            complete_input = min(input_observed_counts, default=0) == expected_turbines
+            complete_output = min(output_target_counts, default=0) == expected_turbines
+            any_row_quality_issue = any(quality_issue_steps[input_start_idx : output_end_idx + 1])
+
+            flags = []
+            if not complete_input:
+                flags.append("partial_input")
+            if not complete_output:
+                flags.append("partial_output")
+            if max(input_masked_counts, default=0) > 0:
+                flags.append("masked_input")
+            if max(output_masked_counts, default=0) > 0:
+                flags.append("masked_output")
+            if any_row_quality_issue:
+                flags.append("row_quality_issues")
+
+            buffer.append(
+                {
+                    "dataset": dataset_id,
+                    "input_start_ts": timestamps[input_start_idx],
+                    "input_end_ts": timestamps[anchor],
+                    "output_start_ts": timestamps[anchor + 1],
+                    "output_end_ts": timestamps[output_end_idx],
+                    "farm_turbines_expected": expected_turbines,
+                    "input_steps_expected": task.history_steps,
+                    "output_steps_expected": task.forecast_steps,
+                    "input_turbines_observed_per_step": input_observed_counts,
+                    "output_turbines_with_target_per_step": output_target_counts,
+                    "input_turbines_masked_per_step": input_masked_counts,
+                    "output_turbines_masked_per_step": output_masked_counts,
+                    "input_turbines_unknown_per_step": input_unknown_counts,
+                    "output_turbines_unknown_per_step": output_unknown_counts,
+                    "input_turbines_abnormal_per_step": input_abnormal_counts,
+                    "output_turbines_abnormal_per_step": output_abnormal_counts,
+                    "input_turbines_observed_min": min(input_observed_counts, default=0),
+                    "output_turbines_with_target_min": min(output_target_counts, default=0),
+                    "input_turbines_masked_max": max(input_masked_counts, default=0),
+                    "output_turbines_masked_max": max(output_masked_counts, default=0),
+                    "is_complete_input": complete_input,
+                    "is_complete_output": complete_output,
+                    "is_fully_synchronous_input": complete_input,
+                    "is_fully_synchronous_output": complete_output,
+                    "quality_flags": join_flags(*flags),
+                }
+            )
+            counts["window_count"] += 1
+            if complete_input:
+                counts["complete_input_windows"] += 1
+                counts["fully_synchronous_input_windows"] += 1
+            if complete_output:
+                counts["complete_output_windows"] += 1
+                counts["fully_synchronous_output_windows"] += 1
+            if max(input_masked_counts, default=0) == 0:
+                counts["unmasked_input_windows"] += 1
+            else:
+                counts["masked_input_windows"] += 1
+            if max(output_masked_counts, default=0) == 0:
+                counts["unmasked_output_windows"] += 1
+            else:
+                counts["masked_output_windows"] += 1
+            if complete_input and complete_output:
+                counts["fully_synchronous_windows"] += 1
+            if complete_output and max(output_masked_counts, default=0) == 0:
+                counts["fully_synchronous_and_unmasked_output_windows"] += 1
+            if complete_input and complete_output and max(input_masked_counts, default=0) == 0 and max(output_masked_counts, default=0) == 0:
+                counts["fully_synchronous_and_unmasked_all_windows"] += 1
+
+            if len(buffer) >= 50_000:
+                writer.write_rows(buffer)
+                buffer = []
+
+    writer.write_rows(buffer)
+    writer.close()
+    write_json(
+        report_path,
+        {
+            "quality_profile": quality_profile,
+            "task": task.to_dict(),
+            "granularity": task.granularity,
+            **counts,
+        },
+    )
+    return output_path
+
+
+def build_window_index(
+    df: pl.DataFrame,
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+) -> Path:
+    if task.granularity == "farm":
+        return build_farm_window_index(df, task, output_path, report_path, quality_profile)
+    return build_turbine_window_index(df, task, output_path, report_path, quality_profile)
