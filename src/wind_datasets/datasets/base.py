@@ -9,7 +9,7 @@ from ..manifest import build_manifest
 from ..models import DatasetSpec, TaskSpec
 from ..paths import dataset_cache_paths
 from ..utils import ensure_directory, read_json, write_json
-from .common import build_window_index
+from .common import build_window_index_from_series_path
 
 
 class BaseDatasetBuilder:
@@ -96,26 +96,13 @@ class BaseDatasetBuilder:
             )
         )
         available_columns = set(pl.scan_parquet(gold_base_path).collect_schema().names())
-        required_columns = [
-            "dataset",
-            "turbine_id",
-            "timestamp",
-            "target_kw",
-            "is_observed",
-            "quality_flags",
-        ]
-        optional_columns = [
-            column
-            for column in ("sdwpf_is_masked", "sdwpf_is_unknown", "sdwpf_is_abnormal")
-            if column in available_columns
-        ]
-        df = pl.read_parquet(gold_base_path, columns=[*required_columns, *optional_columns])
-        output_path = build_window_index(
-            df=df,
+        output_path = build_window_index_from_series_path(
+            series_path=gold_base_path,
             task=resolved,
             output_path=task_dir / "window_index.parquet",
             report_path=task_dir / "task_report.json",
             quality_profile=resolved_quality_profile,
+            available_columns=available_columns,
         )
         if resolved.granularity == "farm":
             self._write_task_turbine_static(resolved_quality_profile, resolved.task_id, resolved.granularity)

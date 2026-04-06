@@ -297,10 +297,10 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
         root / "ShutdownDuration.csv",
         """
         TimeStamp_StartFormat,TurbineName,ShutdownDuration
-        2024-01-01 00:20:00,T01,600
-        2024-01-01 00:20:00,T02,0
-        2024-01-01 00:30:00,T01,300
-        2024-01-01 00:30:00,T02,120
+        2024-01-01 00:20:00+00:00,T01,600
+        2024-01-01 00:20:00+00:00,T02,0
+        2024-01-01 00:30:00+00:00,T01,300
+        2024-01-01 00:30:00+00:00,T02,120
         """,
     )
     _write_text(

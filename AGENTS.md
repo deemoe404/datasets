@@ -9,7 +9,7 @@
 | Kelmarsh      |        6 | 绝对经纬度 + 海拔 |     10 min | Greenbyte 10 分钟 SCADA 功率相关通道           |  2050 kW |
 | Penmanshiel   |       14 | 绝对经纬度 + 海拔 |     10 min | Greenbyte 10 分钟 SCADA 功率相关通道           |  2050 kW |
 | Hill of Towie |       21 | 绝对经纬度        |     10 min | 官方 10 分钟 turbine/grid 统计表中的功率列     |  2300 kW |
-| sdwpf_kddcup |      134 |          相对坐标 |     10 min | 官方主表 `Patv`                                |  1500 kW |
+| sdwpf_kddcup  |      134 |          相对坐标 |     10 min | 官方主表 `Patv`                                |  1500 kW |
 
 Kelmarsh/Penmanshiel 的 Greenbyte 连续 CSV 不是天然一条时间戳一行，同一时间戳会出现很多条记录，必须先聚合整理
 Hill of Towie 的月表在月边界有重复行，需要先审计再去重

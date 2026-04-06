@@ -835,133 +835,39 @@ def build_turbine_window_index(
     report_path: Path,
     quality_profile: str,
 ) -> Path:
-    schema = pa.schema(
-        [
-            ("dataset", pa.string()),
-            ("turbine_id", pa.string()),
-            ("input_start_ts", pa.timestamp("us")),
-            ("input_end_ts", pa.timestamp("us")),
-            ("output_start_ts", pa.timestamp("us")),
-            ("output_end_ts", pa.timestamp("us")),
-            ("input_steps_expected", pa.int64()),
-            ("output_steps_expected", pa.int64()),
-            ("input_steps_observed", pa.int64()),
-            ("output_steps_observed", pa.int64()),
-            ("input_masked_steps", pa.int64()),
-            ("output_masked_steps", pa.int64()),
-            ("input_unknown_steps", pa.int64()),
-            ("output_unknown_steps", pa.int64()),
-            ("input_abnormal_steps", pa.int64()),
-            ("output_abnormal_steps", pa.int64()),
-            ("is_complete_input", pa.bool_()),
-            ("is_complete_output", pa.bool_()),
-            ("quality_flags", pa.string()),
-        ]
-    )
-    writer = ParquetChunkWriter(output_path, schema=schema)
+    writer = ParquetChunkWriter(output_path, schema=_TURBINE_WINDOW_INDEX_SCHEMA)
     counts = Counter()
     buffer: list[dict[str, Any]] = []
 
     for turbine_frame in df.partition_by("turbine_id", maintain_order=True):
         turbine_frame = turbine_frame.sort("timestamp")
-        dataset_id = turbine_frame["dataset"][0]
-        turbine_id = turbine_frame["turbine_id"][0]
-        timestamps = turbine_frame["timestamp"].to_list()
-        input_observed = turbine_frame["is_observed"].to_list()
-        output_observed = turbine_frame["target_kw"].is_not_null().to_list()
-        row_quality_flags = turbine_frame["quality_flags"].to_list()
-        masked_values = (
-            turbine_frame["sdwpf_is_masked"].fill_null(False).to_list()
-            if "sdwpf_is_masked" in turbine_frame.columns
-            else [False] * len(timestamps)
+        _append_turbine_windows(
+            dataset_id=turbine_frame["dataset"][0],
+            turbine_id=turbine_frame["turbine_id"][0],
+            timestamps=turbine_frame["timestamp"].to_list(),
+            input_observed=[bool(value) for value in turbine_frame["is_observed"].to_list()],
+            output_observed=[value is not None for value in turbine_frame["target_kw"].to_list()],
+            row_quality_flags=[bool(value) for value in turbine_frame["quality_flags"].to_list()],
+            masked_values=(
+                [bool(value) for value in turbine_frame["sdwpf_is_masked"].fill_null(False).to_list()]
+                if "sdwpf_is_masked" in turbine_frame.columns
+                else [False] * turbine_frame.height
+            ),
+            unknown_values=(
+                [bool(value) for value in turbine_frame["sdwpf_is_unknown"].fill_null(False).to_list()]
+                if "sdwpf_is_unknown" in turbine_frame.columns
+                else [False] * turbine_frame.height
+            ),
+            abnormal_values=(
+                [bool(value) for value in turbine_frame["sdwpf_is_abnormal"].fill_null(False).to_list()]
+                if "sdwpf_is_abnormal" in turbine_frame.columns
+                else [False] * turbine_frame.height
+            ),
+            task=task,
+            writer=writer,
+            counts=counts,
+            buffer=buffer,
         )
-        unknown_values = (
-            turbine_frame["sdwpf_is_unknown"].fill_null(False).to_list()
-            if "sdwpf_is_unknown" in turbine_frame.columns
-            else [False] * len(timestamps)
-        )
-        abnormal_values = (
-            turbine_frame["sdwpf_is_abnormal"].fill_null(False).to_list()
-            if "sdwpf_is_abnormal" in turbine_frame.columns
-            else [False] * len(timestamps)
-        )
-
-        last_anchor = len(timestamps) - task.forecast_steps - 1
-        if last_anchor < task.history_steps - 1:
-            continue
-
-        for anchor in range(task.history_steps - 1, last_anchor + 1, task.stride_steps):
-            input_start_idx = anchor - task.history_steps + 1
-            output_end_idx = anchor + task.forecast_steps
-            input_count = sum(bool(value) for value in input_observed[input_start_idx : anchor + 1])
-            output_count = sum(bool(value) for value in output_observed[anchor + 1 : output_end_idx + 1])
-            input_masked_count = sum(bool(value) for value in masked_values[input_start_idx : anchor + 1])
-            output_masked_count = sum(bool(value) for value in masked_values[anchor + 1 : output_end_idx + 1])
-            input_unknown_count = sum(bool(value) for value in unknown_values[input_start_idx : anchor + 1])
-            output_unknown_count = sum(bool(value) for value in unknown_values[anchor + 1 : output_end_idx + 1])
-            input_abnormal_count = sum(bool(value) for value in abnormal_values[input_start_idx : anchor + 1])
-            output_abnormal_count = sum(bool(value) for value in abnormal_values[anchor + 1 : output_end_idx + 1])
-            complete_input = input_count == task.history_steps
-            complete_output = output_count == task.forecast_steps
-
-            flags = []
-            if not complete_input:
-                flags.append("partial_input")
-            if not complete_output:
-                flags.append("partial_output")
-            if input_masked_count > 0:
-                flags.append("masked_input")
-            if output_masked_count > 0:
-                flags.append("masked_output")
-            if any(row_quality_flags[input_start_idx : output_end_idx + 1]):
-                flags.append("row_quality_issues")
-
-            buffer.append(
-                {
-                    "dataset": dataset_id,
-                    "turbine_id": turbine_id,
-                    "input_start_ts": timestamps[input_start_idx],
-                    "input_end_ts": timestamps[anchor],
-                    "output_start_ts": timestamps[anchor + 1],
-                    "output_end_ts": timestamps[output_end_idx],
-                    "input_steps_expected": task.history_steps,
-                    "output_steps_expected": task.forecast_steps,
-                    "input_steps_observed": input_count,
-                    "output_steps_observed": output_count,
-                    "input_masked_steps": input_masked_count,
-                    "output_masked_steps": output_masked_count,
-                    "input_unknown_steps": input_unknown_count,
-                    "output_unknown_steps": output_unknown_count,
-                    "input_abnormal_steps": input_abnormal_count,
-                    "output_abnormal_steps": output_abnormal_count,
-                    "is_complete_input": complete_input,
-                    "is_complete_output": complete_output,
-                    "quality_flags": join_flags(*flags),
-                }
-            )
-            counts["window_count"] += 1
-            if complete_input:
-                counts["complete_input_windows"] += 1
-            if complete_output:
-                counts["complete_output_windows"] += 1
-            if input_masked_count == 0:
-                counts["unmasked_input_windows"] += 1
-            else:
-                counts["masked_input_windows"] += 1
-            if output_masked_count == 0:
-                counts["unmasked_output_windows"] += 1
-            else:
-                counts["masked_output_windows"] += 1
-            if complete_input and complete_output:
-                counts["fully_complete_windows"] += 1
-            if complete_output and output_masked_count == 0:
-                counts["fully_complete_and_unmasked_output_windows"] += 1
-            if complete_input and complete_output and input_masked_count == 0 and output_masked_count == 0:
-                counts["fully_complete_and_unmasked_all_windows"] += 1
-
-            if len(buffer) >= 50_000:
-                writer.write_rows(buffer)
-                buffer = []
 
     writer.write_rows(buffer)
     writer.close()
@@ -976,36 +882,7 @@ def build_farm_window_index(
     report_path: Path,
     quality_profile: str,
 ) -> Path:
-    schema = pa.schema(
-        [
-            ("dataset", pa.string()),
-            ("input_start_ts", pa.timestamp("us")),
-            ("input_end_ts", pa.timestamp("us")),
-            ("output_start_ts", pa.timestamp("us")),
-            ("output_end_ts", pa.timestamp("us")),
-            ("farm_turbines_expected", pa.int32()),
-            ("input_steps_expected", pa.int64()),
-            ("output_steps_expected", pa.int64()),
-            ("input_turbines_observed_per_step", pa.list_(pa.int32())),
-            ("output_turbines_with_target_per_step", pa.list_(pa.int32())),
-            ("input_turbines_masked_per_step", pa.list_(pa.int32())),
-            ("output_turbines_masked_per_step", pa.list_(pa.int32())),
-            ("input_turbines_unknown_per_step", pa.list_(pa.int32())),
-            ("output_turbines_unknown_per_step", pa.list_(pa.int32())),
-            ("input_turbines_abnormal_per_step", pa.list_(pa.int32())),
-            ("output_turbines_abnormal_per_step", pa.list_(pa.int32())),
-            ("input_turbines_observed_min", pa.int32()),
-            ("output_turbines_with_target_min", pa.int32()),
-            ("input_turbines_masked_max", pa.int32()),
-            ("output_turbines_masked_max", pa.int32()),
-            ("is_complete_input", pa.bool_()),
-            ("is_complete_output", pa.bool_()),
-            ("is_fully_synchronous_input", pa.bool_()),
-            ("is_fully_synchronous_output", pa.bool_()),
-            ("quality_flags", pa.string()),
-        ]
-    )
-    writer = ParquetChunkWriter(output_path, schema=schema)
+    writer = ParquetChunkWriter(output_path, schema=_FARM_WINDOW_INDEX_SCHEMA)
     counts = Counter()
     buffer: list[dict[str, Any]] = []
 
@@ -1038,104 +915,28 @@ def build_farm_window_index(
         .sort(["dataset", "timestamp"])
     )
 
+    expected_turbines_by_dataset = {
+        row["dataset"]: int(row["expected_turbines"])
+        for row in df.group_by("dataset", maintain_order=True)
+        .agg(pl.col("turbine_id").n_unique().alias("expected_turbines"))
+        .iter_rows(named=True)
+    }
     for dataset_frame in timestamp_summary.partition_by("dataset", maintain_order=True):
-        dataset_id = dataset_frame["dataset"][0]
-        timestamps = dataset_frame["timestamp"].to_list()
-        observed_counts = [int(value) for value in dataset_frame["turbines_observed"].to_list()]
-        target_counts = [int(value) for value in dataset_frame["turbines_with_target"].to_list()]
-        masked_counts = [int(value) for value in dataset_frame["turbines_masked"].to_list()]
-        unknown_counts = [int(value) for value in dataset_frame["turbines_unknown"].to_list()]
-        abnormal_counts = [int(value) for value in dataset_frame["turbines_abnormal"].to_list()]
-        quality_issue_steps = [bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()]
-        expected_turbines = int(
-            df.filter(pl.col("dataset") == dataset_id).select(pl.col("turbine_id").n_unique()).item()
+        _append_farm_windows(
+            dataset_id=dataset_frame["dataset"][0],
+            timestamps=dataset_frame["timestamp"].to_list(),
+            observed_counts=[int(value) for value in dataset_frame["turbines_observed"].to_list()],
+            target_counts=[int(value) for value in dataset_frame["turbines_with_target"].to_list()],
+            masked_counts=[int(value) for value in dataset_frame["turbines_masked"].to_list()],
+            unknown_counts=[int(value) for value in dataset_frame["turbines_unknown"].to_list()],
+            abnormal_counts=[int(value) for value in dataset_frame["turbines_abnormal"].to_list()],
+            quality_issue_steps=[bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()],
+            expected_turbines=expected_turbines_by_dataset.get(dataset_frame["dataset"][0], 0),
+            task=task,
+            writer=writer,
+            counts=counts,
+            buffer=buffer,
         )
-
-        last_anchor = len(timestamps) - task.forecast_steps - 1
-        if last_anchor < task.history_steps - 1:
-            continue
-
-        for anchor in range(task.history_steps - 1, last_anchor + 1, task.stride_steps):
-            input_start_idx = anchor - task.history_steps + 1
-            output_end_idx = anchor + task.forecast_steps
-            input_observed_counts = observed_counts[input_start_idx : anchor + 1]
-            output_target_counts = target_counts[anchor + 1 : output_end_idx + 1]
-            input_masked_counts = masked_counts[input_start_idx : anchor + 1]
-            output_masked_counts = masked_counts[anchor + 1 : output_end_idx + 1]
-            input_unknown_counts = unknown_counts[input_start_idx : anchor + 1]
-            output_unknown_counts = unknown_counts[anchor + 1 : output_end_idx + 1]
-            input_abnormal_counts = abnormal_counts[input_start_idx : anchor + 1]
-            output_abnormal_counts = abnormal_counts[anchor + 1 : output_end_idx + 1]
-            complete_input = min(input_observed_counts, default=0) == expected_turbines
-            complete_output = min(output_target_counts, default=0) == expected_turbines
-            any_row_quality_issue = any(quality_issue_steps[input_start_idx : output_end_idx + 1])
-
-            flags = []
-            if not complete_input:
-                flags.append("partial_input")
-            if not complete_output:
-                flags.append("partial_output")
-            if max(input_masked_counts, default=0) > 0:
-                flags.append("masked_input")
-            if max(output_masked_counts, default=0) > 0:
-                flags.append("masked_output")
-            if any_row_quality_issue:
-                flags.append("row_quality_issues")
-
-            buffer.append(
-                {
-                    "dataset": dataset_id,
-                    "input_start_ts": timestamps[input_start_idx],
-                    "input_end_ts": timestamps[anchor],
-                    "output_start_ts": timestamps[anchor + 1],
-                    "output_end_ts": timestamps[output_end_idx],
-                    "farm_turbines_expected": expected_turbines,
-                    "input_steps_expected": task.history_steps,
-                    "output_steps_expected": task.forecast_steps,
-                    "input_turbines_observed_per_step": input_observed_counts,
-                    "output_turbines_with_target_per_step": output_target_counts,
-                    "input_turbines_masked_per_step": input_masked_counts,
-                    "output_turbines_masked_per_step": output_masked_counts,
-                    "input_turbines_unknown_per_step": input_unknown_counts,
-                    "output_turbines_unknown_per_step": output_unknown_counts,
-                    "input_turbines_abnormal_per_step": input_abnormal_counts,
-                    "output_turbines_abnormal_per_step": output_abnormal_counts,
-                    "input_turbines_observed_min": min(input_observed_counts, default=0),
-                    "output_turbines_with_target_min": min(output_target_counts, default=0),
-                    "input_turbines_masked_max": max(input_masked_counts, default=0),
-                    "output_turbines_masked_max": max(output_masked_counts, default=0),
-                    "is_complete_input": complete_input,
-                    "is_complete_output": complete_output,
-                    "is_fully_synchronous_input": complete_input,
-                    "is_fully_synchronous_output": complete_output,
-                    "quality_flags": join_flags(*flags),
-                }
-            )
-            counts["window_count"] += 1
-            if complete_input:
-                counts["complete_input_windows"] += 1
-                counts["fully_synchronous_input_windows"] += 1
-            if complete_output:
-                counts["complete_output_windows"] += 1
-                counts["fully_synchronous_output_windows"] += 1
-            if max(input_masked_counts, default=0) == 0:
-                counts["unmasked_input_windows"] += 1
-            else:
-                counts["masked_input_windows"] += 1
-            if max(output_masked_counts, default=0) == 0:
-                counts["unmasked_output_windows"] += 1
-            else:
-                counts["masked_output_windows"] += 1
-            if complete_input and complete_output:
-                counts["fully_synchronous_windows"] += 1
-            if complete_output and max(output_masked_counts, default=0) == 0:
-                counts["fully_synchronous_and_unmasked_output_windows"] += 1
-            if complete_input and complete_output and max(input_masked_counts, default=0) == 0 and max(output_masked_counts, default=0) == 0:
-                counts["fully_synchronous_and_unmasked_all_windows"] += 1
-
-            if len(buffer) >= 50_000:
-                writer.write_rows(buffer)
-                buffer = []
 
     writer.write_rows(buffer)
     writer.close()
@@ -1161,3 +962,516 @@ def build_window_index(
     if task.granularity == "farm":
         return build_farm_window_index(df, task, output_path, report_path, quality_profile)
     return build_turbine_window_index(df, task, output_path, report_path, quality_profile)
+
+
+_TASK_WINDOW_REQUIRED_COLUMNS = [
+    "dataset",
+    "turbine_id",
+    "timestamp",
+    "target_kw",
+    "is_observed",
+    "quality_flags",
+]
+_TASK_WINDOW_OPTIONAL_COLUMNS = (
+    "sdwpf_is_masked",
+    "sdwpf_is_unknown",
+    "sdwpf_is_abnormal",
+)
+_TURBINE_WINDOW_INDEX_SCHEMA = pa.schema(
+    [
+        ("dataset", pa.string()),
+        ("turbine_id", pa.string()),
+        ("input_start_ts", pa.timestamp("us")),
+        ("input_end_ts", pa.timestamp("us")),
+        ("output_start_ts", pa.timestamp("us")),
+        ("output_end_ts", pa.timestamp("us")),
+        ("input_steps_expected", pa.int64()),
+        ("output_steps_expected", pa.int64()),
+        ("input_steps_observed", pa.int64()),
+        ("output_steps_observed", pa.int64()),
+        ("input_masked_steps", pa.int64()),
+        ("output_masked_steps", pa.int64()),
+        ("input_unknown_steps", pa.int64()),
+        ("output_unknown_steps", pa.int64()),
+        ("input_abnormal_steps", pa.int64()),
+        ("output_abnormal_steps", pa.int64()),
+        ("is_complete_input", pa.bool_()),
+        ("is_complete_output", pa.bool_()),
+        ("quality_flags", pa.string()),
+    ]
+)
+_FARM_WINDOW_INDEX_SCHEMA = pa.schema(
+    [
+        ("dataset", pa.string()),
+        ("input_start_ts", pa.timestamp("us")),
+        ("input_end_ts", pa.timestamp("us")),
+        ("output_start_ts", pa.timestamp("us")),
+        ("output_end_ts", pa.timestamp("us")),
+        ("farm_turbines_expected", pa.int32()),
+        ("input_steps_expected", pa.int64()),
+        ("output_steps_expected", pa.int64()),
+        ("input_turbines_observed_per_step", pa.list_(pa.int32())),
+        ("output_turbines_with_target_per_step", pa.list_(pa.int32())),
+        ("input_turbines_masked_per_step", pa.list_(pa.int32())),
+        ("output_turbines_masked_per_step", pa.list_(pa.int32())),
+        ("input_turbines_unknown_per_step", pa.list_(pa.int32())),
+        ("output_turbines_unknown_per_step", pa.list_(pa.int32())),
+        ("input_turbines_abnormal_per_step", pa.list_(pa.int32())),
+        ("output_turbines_abnormal_per_step", pa.list_(pa.int32())),
+        ("input_turbines_observed_min", pa.int32()),
+        ("output_turbines_with_target_min", pa.int32()),
+        ("input_turbines_masked_max", pa.int32()),
+        ("output_turbines_masked_max", pa.int32()),
+        ("is_complete_input", pa.bool_()),
+        ("is_complete_output", pa.bool_()),
+        ("is_fully_synchronous_input", pa.bool_()),
+        ("is_fully_synchronous_output", pa.bool_()),
+        ("quality_flags", pa.string()),
+    ]
+)
+
+
+def _task_window_columns(available_columns: set[str]) -> list[str]:
+    return [
+        *_TASK_WINDOW_REQUIRED_COLUMNS,
+        *[column for column in _TASK_WINDOW_OPTIONAL_COLUMNS if column in available_columns],
+    ]
+
+
+def _iter_series_row_batches(series_path: Path, columns: list[str], batch_size: int = 200_000):
+    parquet_file = pq.ParquetFile(series_path)
+    for batch in parquet_file.iter_batches(columns=columns, batch_size=batch_size):
+        yield batch.to_pydict()
+
+
+def _append_turbine_windows(
+    *,
+    dataset_id: str,
+    turbine_id: str,
+    timestamps: list[Any],
+    input_observed: list[bool],
+    output_observed: list[bool],
+    row_quality_flags: list[bool],
+    masked_values: list[bool],
+    unknown_values: list[bool],
+    abnormal_values: list[bool],
+    task: ResolvedTaskSpec,
+    writer: ParquetChunkWriter,
+    counts: Counter,
+    buffer: list[dict[str, Any]],
+) -> None:
+    last_anchor = len(timestamps) - task.forecast_steps - 1
+    if last_anchor < task.history_steps - 1:
+        return
+
+    for anchor in range(task.history_steps - 1, last_anchor + 1, task.stride_steps):
+        input_start_idx = anchor - task.history_steps + 1
+        output_end_idx = anchor + task.forecast_steps
+        input_count = sum(bool(value) for value in input_observed[input_start_idx : anchor + 1])
+        output_count = sum(bool(value) for value in output_observed[anchor + 1 : output_end_idx + 1])
+        input_masked_count = sum(bool(value) for value in masked_values[input_start_idx : anchor + 1])
+        output_masked_count = sum(bool(value) for value in masked_values[anchor + 1 : output_end_idx + 1])
+        input_unknown_count = sum(bool(value) for value in unknown_values[input_start_idx : anchor + 1])
+        output_unknown_count = sum(bool(value) for value in unknown_values[anchor + 1 : output_end_idx + 1])
+        input_abnormal_count = sum(bool(value) for value in abnormal_values[input_start_idx : anchor + 1])
+        output_abnormal_count = sum(bool(value) for value in abnormal_values[anchor + 1 : output_end_idx + 1])
+        complete_input = input_count == task.history_steps
+        complete_output = output_count == task.forecast_steps
+
+        flags = []
+        if not complete_input:
+            flags.append("partial_input")
+        if not complete_output:
+            flags.append("partial_output")
+        if input_masked_count > 0:
+            flags.append("masked_input")
+        if output_masked_count > 0:
+            flags.append("masked_output")
+        if any(row_quality_flags[input_start_idx : output_end_idx + 1]):
+            flags.append("row_quality_issues")
+
+        buffer.append(
+            {
+                "dataset": dataset_id,
+                "turbine_id": turbine_id,
+                "input_start_ts": timestamps[input_start_idx],
+                "input_end_ts": timestamps[anchor],
+                "output_start_ts": timestamps[anchor + 1],
+                "output_end_ts": timestamps[output_end_idx],
+                "input_steps_expected": task.history_steps,
+                "output_steps_expected": task.forecast_steps,
+                "input_steps_observed": input_count,
+                "output_steps_observed": output_count,
+                "input_masked_steps": input_masked_count,
+                "output_masked_steps": output_masked_count,
+                "input_unknown_steps": input_unknown_count,
+                "output_unknown_steps": output_unknown_count,
+                "input_abnormal_steps": input_abnormal_count,
+                "output_abnormal_steps": output_abnormal_count,
+                "is_complete_input": complete_input,
+                "is_complete_output": complete_output,
+                "quality_flags": join_flags(*flags),
+            }
+        )
+        counts["window_count"] += 1
+        if complete_input:
+            counts["complete_input_windows"] += 1
+        if complete_output:
+            counts["complete_output_windows"] += 1
+        if input_masked_count == 0:
+            counts["unmasked_input_windows"] += 1
+        else:
+            counts["masked_input_windows"] += 1
+        if output_masked_count == 0:
+            counts["unmasked_output_windows"] += 1
+        else:
+            counts["masked_output_windows"] += 1
+        if complete_input and complete_output:
+            counts["fully_complete_windows"] += 1
+        if complete_output and output_masked_count == 0:
+            counts["fully_complete_and_unmasked_output_windows"] += 1
+        if complete_input and complete_output and input_masked_count == 0 and output_masked_count == 0:
+            counts["fully_complete_and_unmasked_all_windows"] += 1
+
+        if len(buffer) >= 50_000:
+            writer.write_rows(buffer)
+            buffer.clear()
+
+
+def _append_farm_windows(
+    *,
+    dataset_id: str,
+    timestamps: list[Any],
+    observed_counts: list[int],
+    target_counts: list[int],
+    masked_counts: list[int],
+    unknown_counts: list[int],
+    abnormal_counts: list[int],
+    quality_issue_steps: list[bool],
+    expected_turbines: int,
+    task: ResolvedTaskSpec,
+    writer: ParquetChunkWriter,
+    counts: Counter,
+    buffer: list[dict[str, Any]],
+) -> None:
+    last_anchor = len(timestamps) - task.forecast_steps - 1
+    if last_anchor < task.history_steps - 1:
+        return
+
+    for anchor in range(task.history_steps - 1, last_anchor + 1, task.stride_steps):
+        input_start_idx = anchor - task.history_steps + 1
+        output_end_idx = anchor + task.forecast_steps
+        input_observed_counts = observed_counts[input_start_idx : anchor + 1]
+        output_target_counts = target_counts[anchor + 1 : output_end_idx + 1]
+        input_masked_counts = masked_counts[input_start_idx : anchor + 1]
+        output_masked_counts = masked_counts[anchor + 1 : output_end_idx + 1]
+        input_unknown_counts = unknown_counts[input_start_idx : anchor + 1]
+        output_unknown_counts = unknown_counts[anchor + 1 : output_end_idx + 1]
+        input_abnormal_counts = abnormal_counts[input_start_idx : anchor + 1]
+        output_abnormal_counts = abnormal_counts[anchor + 1 : output_end_idx + 1]
+        complete_input = min(input_observed_counts, default=0) == expected_turbines
+        complete_output = min(output_target_counts, default=0) == expected_turbines
+
+        flags = []
+        if not complete_input:
+            flags.append("partial_input")
+        if not complete_output:
+            flags.append("partial_output")
+        if max(input_masked_counts, default=0) > 0:
+            flags.append("masked_input")
+        if max(output_masked_counts, default=0) > 0:
+            flags.append("masked_output")
+        if any(quality_issue_steps[input_start_idx : output_end_idx + 1]):
+            flags.append("row_quality_issues")
+
+        buffer.append(
+            {
+                "dataset": dataset_id,
+                "input_start_ts": timestamps[input_start_idx],
+                "input_end_ts": timestamps[anchor],
+                "output_start_ts": timestamps[anchor + 1],
+                "output_end_ts": timestamps[output_end_idx],
+                "farm_turbines_expected": expected_turbines,
+                "input_steps_expected": task.history_steps,
+                "output_steps_expected": task.forecast_steps,
+                "input_turbines_observed_per_step": input_observed_counts,
+                "output_turbines_with_target_per_step": output_target_counts,
+                "input_turbines_masked_per_step": input_masked_counts,
+                "output_turbines_masked_per_step": output_masked_counts,
+                "input_turbines_unknown_per_step": input_unknown_counts,
+                "output_turbines_unknown_per_step": output_unknown_counts,
+                "input_turbines_abnormal_per_step": input_abnormal_counts,
+                "output_turbines_abnormal_per_step": output_abnormal_counts,
+                "input_turbines_observed_min": min(input_observed_counts, default=0),
+                "output_turbines_with_target_min": min(output_target_counts, default=0),
+                "input_turbines_masked_max": max(input_masked_counts, default=0),
+                "output_turbines_masked_max": max(output_masked_counts, default=0),
+                "is_complete_input": complete_input,
+                "is_complete_output": complete_output,
+                "is_fully_synchronous_input": complete_input,
+                "is_fully_synchronous_output": complete_output,
+                "quality_flags": join_flags(*flags),
+            }
+        )
+        counts["window_count"] += 1
+        if complete_input:
+            counts["complete_input_windows"] += 1
+            counts["fully_synchronous_input_windows"] += 1
+        if complete_output:
+            counts["complete_output_windows"] += 1
+            counts["fully_synchronous_output_windows"] += 1
+        if max(input_masked_counts, default=0) == 0:
+            counts["unmasked_input_windows"] += 1
+        else:
+            counts["masked_input_windows"] += 1
+        if max(output_masked_counts, default=0) == 0:
+            counts["unmasked_output_windows"] += 1
+        else:
+            counts["masked_output_windows"] += 1
+        if complete_input and complete_output:
+            counts["fully_synchronous_windows"] += 1
+        if complete_output and max(output_masked_counts, default=0) == 0:
+            counts["fully_synchronous_and_unmasked_output_windows"] += 1
+        if complete_input and complete_output and max(input_masked_counts, default=0) == 0 and max(output_masked_counts, default=0) == 0:
+            counts["fully_synchronous_and_unmasked_all_windows"] += 1
+
+        if len(buffer) >= 50_000:
+            writer.write_rows(buffer)
+            buffer.clear()
+
+
+def build_turbine_window_index_from_series_path(
+    *,
+    series_path: Path,
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+    available_columns: set[str],
+) -> Path:
+    output_path.unlink(missing_ok=True)
+    writer = ParquetChunkWriter(output_path, schema=_TURBINE_WINDOW_INDEX_SCHEMA)
+    counts = Counter()
+    buffer: list[dict[str, Any]] = []
+    columns = _task_window_columns(available_columns)
+
+    current_dataset: str | None = None
+    current_turbine: str | None = None
+    timestamps: list[Any] = []
+    input_observed: list[bool] = []
+    output_observed: list[bool] = []
+    row_quality_flags: list[bool] = []
+    masked_values: list[bool] = []
+    unknown_values: list[bool] = []
+    abnormal_values: list[bool] = []
+
+    for batch in _iter_series_row_batches(series_path, columns):
+        batch_len = len(batch["timestamp"])
+        batch_masked = batch.get("sdwpf_is_masked")
+        batch_unknown = batch.get("sdwpf_is_unknown")
+        batch_abnormal = batch.get("sdwpf_is_abnormal")
+        for index in range(batch_len):
+            dataset_id = batch["dataset"][index]
+            turbine_id = batch["turbine_id"][index]
+            if current_dataset != dataset_id or current_turbine != turbine_id:
+                if current_dataset is not None and current_turbine is not None:
+                    _append_turbine_windows(
+                        dataset_id=current_dataset,
+                        turbine_id=current_turbine,
+                        timestamps=timestamps,
+                        input_observed=input_observed,
+                        output_observed=output_observed,
+                        row_quality_flags=row_quality_flags,
+                        masked_values=masked_values,
+                        unknown_values=unknown_values,
+                        abnormal_values=abnormal_values,
+                        task=task,
+                        writer=writer,
+                        counts=counts,
+                        buffer=buffer,
+                    )
+                current_dataset = dataset_id
+                current_turbine = turbine_id
+                timestamps = []
+                input_observed = []
+                output_observed = []
+                row_quality_flags = []
+                masked_values = []
+                unknown_values = []
+                abnormal_values = []
+
+            timestamps.append(batch["timestamp"][index])
+            input_observed.append(bool(batch["is_observed"][index]))
+            output_observed.append(batch["target_kw"][index] is not None)
+            row_quality_flags.append(bool(batch["quality_flags"][index]))
+            masked_values.append(bool(batch_masked[index]) if batch_masked is not None else False)
+            unknown_values.append(bool(batch_unknown[index]) if batch_unknown is not None else False)
+            abnormal_values.append(bool(batch_abnormal[index]) if batch_abnormal is not None else False)
+
+    if current_dataset is not None and current_turbine is not None:
+        _append_turbine_windows(
+            dataset_id=current_dataset,
+            turbine_id=current_turbine,
+            timestamps=timestamps,
+            input_observed=input_observed,
+            output_observed=output_observed,
+            row_quality_flags=row_quality_flags,
+            masked_values=masked_values,
+            unknown_values=unknown_values,
+            abnormal_values=abnormal_values,
+            task=task,
+            writer=writer,
+            counts=counts,
+            buffer=buffer,
+        )
+
+    writer.write_rows(buffer)
+    writer.close()
+    write_json(report_path, {"quality_profile": quality_profile, "task": task.to_dict(), **counts})
+    return output_path
+
+
+def build_farm_window_index_from_series_path(
+    *,
+    series_path: Path,
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+    available_columns: set[str],
+) -> Path:
+    output_path.unlink(missing_ok=True)
+    writer = ParquetChunkWriter(output_path, schema=_FARM_WINDOW_INDEX_SCHEMA)
+    counts = Counter()
+    buffer: list[dict[str, Any]] = []
+    columns = _task_window_columns(available_columns)
+    expected_turbines_by_dataset = {
+        row["dataset"]: int(row["expected_turbines"])
+        for row in pl.scan_parquet(series_path)
+        .select(["dataset", "turbine_id"])
+        .unique()
+        .group_by("dataset")
+        .agg(pl.len().alias("expected_turbines"))
+        .collect()
+        .iter_rows(named=True)
+    }
+
+    summary_by_dataset: dict[str, dict[str, list[Any]]] = {}
+    current_dataset: str | None = None
+    current_timestamp: Any | None = None
+    observed_count = 0
+    target_count = 0
+    masked_count = 0
+    unknown_count = 0
+    abnormal_count = 0
+    has_row_quality_issues = False
+
+    def flush_current_group() -> None:
+        if current_dataset is None or current_timestamp is None:
+            return
+        summary = summary_by_dataset.setdefault(
+            current_dataset,
+            {
+                "timestamps": [],
+                "observed_counts": [],
+                "target_counts": [],
+                "masked_counts": [],
+                "unknown_counts": [],
+                "abnormal_counts": [],
+                "quality_issue_steps": [],
+            },
+        )
+        summary["timestamps"].append(current_timestamp)
+        summary["observed_counts"].append(observed_count)
+        summary["target_counts"].append(target_count)
+        summary["masked_counts"].append(masked_count)
+        summary["unknown_counts"].append(unknown_count)
+        summary["abnormal_counts"].append(abnormal_count)
+        summary["quality_issue_steps"].append(has_row_quality_issues)
+
+    for batch in _iter_series_row_batches(series_path, columns):
+        batch_len = len(batch["timestamp"])
+        batch_masked = batch.get("sdwpf_is_masked")
+        batch_unknown = batch.get("sdwpf_is_unknown")
+        batch_abnormal = batch.get("sdwpf_is_abnormal")
+        for index in range(batch_len):
+            dataset_id = batch["dataset"][index]
+            timestamp = batch["timestamp"][index]
+            if current_dataset != dataset_id or current_timestamp != timestamp:
+                flush_current_group()
+                current_dataset = dataset_id
+                current_timestamp = timestamp
+                observed_count = 0
+                target_count = 0
+                masked_count = 0
+                unknown_count = 0
+                abnormal_count = 0
+                has_row_quality_issues = False
+
+            observed_count += int(bool(batch["is_observed"][index]))
+            target_count += int(batch["target_kw"][index] is not None)
+            masked_count += int(bool(batch_masked[index])) if batch_masked is not None else 0
+            unknown_count += int(bool(batch_unknown[index])) if batch_unknown is not None else 0
+            abnormal_count += int(bool(batch_abnormal[index])) if batch_abnormal is not None else 0
+            has_row_quality_issues = has_row_quality_issues or bool(batch["quality_flags"][index])
+
+    flush_current_group()
+
+    for dataset_id, summary in summary_by_dataset.items():
+        _append_farm_windows(
+            dataset_id=dataset_id,
+            timestamps=summary["timestamps"],
+            observed_counts=summary["observed_counts"],
+            target_counts=summary["target_counts"],
+            masked_counts=summary["masked_counts"],
+            unknown_counts=summary["unknown_counts"],
+            abnormal_counts=summary["abnormal_counts"],
+            quality_issue_steps=summary["quality_issue_steps"],
+            expected_turbines=expected_turbines_by_dataset.get(dataset_id, 0),
+            task=task,
+            writer=writer,
+            counts=counts,
+            buffer=buffer,
+        )
+
+    writer.write_rows(buffer)
+    writer.close()
+    write_json(
+        report_path,
+        {
+            "quality_profile": quality_profile,
+            "task": task.to_dict(),
+            "granularity": task.granularity,
+            **counts,
+        },
+    )
+    return output_path
+
+
+def build_window_index_from_series_path(
+    *,
+    series_path: Path,
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+    available_columns: set[str] | None = None,
+) -> Path:
+    resolved_columns = available_columns or set(pl.scan_parquet(series_path).collect_schema().names())
+    if task.granularity == "farm":
+        return build_farm_window_index_from_series_path(
+            series_path=series_path,
+            task=task,
+            output_path=output_path,
+            report_path=report_path,
+            quality_profile=quality_profile,
+            available_columns=resolved_columns,
+        )
+    return build_turbine_window_index_from_series_path(
+        series_path=series_path,
+        task=task,
+        output_path=output_path,
+        report_path=report_path,
+        quality_profile=quality_profile,
+        available_columns=resolved_columns,
+    )

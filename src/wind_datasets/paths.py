@@ -24,11 +24,22 @@ class DatasetCachePaths:
         return self.silver_meta_dir / "turbine_static.parquet"
 
     @property
+    def hill_default_tables_dir(self) -> Path:
+        return self.silver_meta_dir / "default_tables"
+
+    def hill_default_table_path(self, table_name: str) -> Path:
+        return self.hill_default_tables_dir / f"{table_name}.parquet"
+
+    @property
     def hill_duplicate_audit_path(self) -> Path:
         return self.silver_meta_dir / "default_table_duplicate_audit.parquet"
 
     def silver_shared_ts_path(self, group_name: str) -> Path:
         return self.silver_shared_ts_dir / f"{group_name}.parquet"
+
+    @property
+    def hill_default_conflict_keys_path(self) -> Path:
+        return self.silver_meta_dir / "default_table_conflict_keys.parquet"
 
     def silver_event_features_path(self, group_name: str) -> Path:
         return self.silver_event_features_dir / f"{group_name}.parquet"

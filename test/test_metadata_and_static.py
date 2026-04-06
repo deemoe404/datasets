@@ -17,6 +17,7 @@ from wind_datasets.api import (
 )
 from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
+from wind_datasets.datasets.hill_of_towie import HillOfTowieDatasetBuilder
 from wind_datasets.datasets.sdwpf_kddcup import SDWPFKDDCupDatasetBuilder
 from wind_datasets.manifest import build_manifest as build_manifest_for_spec
 from wind_datasets.models import DatasetSpec, OfficialRelease, TaskSpec
@@ -116,6 +117,7 @@ def test_manifest_reports_layout_problem_for_zip_only_sources(tmp_path) -> None:
 def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -> None:
     greenbyte_spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
     hill_spec = build_hill_fixture(tmp_path / "raw" / "hill")
+    hill_builder = HillOfTowieDatasetBuilder(spec=hill_spec, cache_root=tmp_path / "cache")
 
     spec_map = {
         "kelmarsh": greenbyte_spec,
@@ -133,12 +135,25 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     farm_pmu = load_shared_timeseries("kelmarsh", "farm_pmu", cache_root=tmp_path / "cache")
     turbine_status = load_event_features("kelmarsh", "turbine_status", cache_root=tmp_path / "cache")
     hill_grid = load_shared_timeseries("hill_of_towie", "farm_grid", cache_root=tmp_path / "cache")
+    hill_shutdown = load_shared_timeseries("hill_of_towie", "turbine_shutdown_duration", cache_root=tmp_path / "cache")
     hill_alarm = load_event_features("hill_of_towie", "alarmlog", cache_root=tmp_path / "cache")
     hill_aeroup = load_interventions("hill_of_towie", "aeroup", cache_root=tmp_path / "cache")
+    hill_conflict_keys = pl.read_parquet(hill_builder.cache_paths.hill_default_conflict_keys_path)
 
     assert "farm_pmu__gms_power_kw" in farm_pmu.columns
     assert "evt_status_code__710" in turbine_status.columns
     assert "farm_grid__activepower" in hill_grid.columns
+    assert hill_builder.cache_paths.hill_default_table_path("tblSCTurbine").exists()
+    assert hill_builder.cache_paths.hill_default_table_path("tblSCTurGrid").exists()
+    assert hill_builder.cache_paths.hill_default_table_path("tblSCTurFlag").exists()
+    assert hill_builder.cache_paths.hill_duplicate_audit_path.exists()
+    assert hill_builder.cache_paths.hill_default_conflict_keys_path.exists()
+    assert hill_conflict_keys.height == 1
+    assert hill_conflict_keys.filter(
+        (pl.col("StationId") == "1001")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 01:00:00")
+    ).height == 1
+    assert hill_shutdown["timestamp"].null_count() == 0
     assert "alarm_code__42" in hill_alarm.columns
     assert hill_aeroup.columns == ["dataset", "turbine_id", "aeroup_start", "aeroup_end"]
 

@@ -58,9 +58,14 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     )
     builder.build_task_cache(task)
     window_index = builder.load_window_index(task)
+    task_report = json.loads(
+        builder.cache_paths.task_report_path_for("default", "turbine", "short_task").read_text()
+    )
     assert window_index.height > 0
     assert "turbine_id" in window_index.columns
     assert "quality_flags" in window_index.columns
+    assert task_report["task"]["task_id"] == "short_task"
+    assert task_report["window_count"] == window_index.height
 
 
 def test_end_to_end_hill_pipeline(tmp_path) -> None:
@@ -68,10 +73,13 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     builder = HillOfTowieDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     builder.build_gold_base()
+    builder.build_gold_base(layout="turbine")
     series = builder.load_series()
+    turbine_series = builder.load_series(layout="turbine")
     turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
     duplicate_audit = pl.read_parquet(builder.cache_paths.hill_duplicate_audit_path)
+    shutdown = pl.read_parquet(builder.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"))
 
     _assert_unique_series_keys(series)
     assert turbine_static.height == len(spec.turbine_ids)
@@ -90,12 +98,31 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "aeroup_in_install_window" in series.columns
     assert "farm_turbines_observed" in series.columns
     assert "farm_turbines_with_target" in series.columns
+    assert "farm_turbines_observed" not in turbine_series.columns
     assert duplicate_audit.filter(pl.col("is_conflicting")).height == 1
     assert duplicate_audit.filter(pl.col("is_conflicting"))["conflicting_columns"][0] == "wtc_PrWindSp_mean"
     assert duplicate_audit.filter(pl.col("duplicate_kind") == "normalized_equal").height == 1
+    assert shutdown["timestamp"].null_count() == 0
+    assert shutdown.height == 4
+    assert shutdown.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+    )["shutdown_duration_s"][0] == 600.0
+    assert shutdown.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+    ).is_empty()
     t01_0020 = series.filter(
         (pl.col("turbine_id") == "T01")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+    )
+    t01_0030 = series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+    )
+    t01_0040 = series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
     )
     t01_0010 = series.filter(
         (pl.col("turbine_id") == "T01")
@@ -105,9 +132,20 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
     )
+    t02_0040 = series.filter(
+        (pl.col("turbine_id") == "T02")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
+    )
     assert t01_0020["farm_grid__activepower"][0] == 2020.0
     assert t01_0020["farm_grid_sci__activepowermean"][0] == 2020.0
-    assert t01_0020["shutdown_duration_s"][0] == 600.0
+    assert t01_0020["shutdown_duration_s"][0] == 0.0
+    assert t01_0030["shutdown_duration_s"][0] == 600.0
+    assert t01_0040["shutdown_duration_s"][0] == 300.0
+    assert t02_0040["shutdown_duration_s"][0] == 120.0
+    assert turbine_series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+    )["shutdown_duration_s"][0] == 600.0
     assert t01_0020["alarm_any_active"][0] is True
     assert t01_0020["alarm_code__42"][0] is True
     assert t01_0020["farm_turbines_observed"][0] == 2
@@ -139,6 +177,20 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     builder.build_task_cache(farm_task)
     farm_window_index = builder.load_window_index(farm_task)
     farm_task_static = builder.load_task_turbine_static(farm_task)
+    farm_task_report = json.loads(
+        builder.cache_paths.task_report_path_for("default", "farm", "farm_short").read_text()
+    )
+    turbine_task = TaskSpec(
+        history_duration="20m",
+        forecast_duration="10m",
+        task_id="turbine_short",
+        granularity="turbine",
+    )
+    builder.build_task_cache(turbine_task)
+    turbine_window_index = builder.load_window_index(turbine_task)
+    turbine_task_report = json.loads(
+        builder.cache_paths.task_report_path_for("default", "turbine", "turbine_short").read_text()
+    )
     output_gap_window = farm_window_index.filter(
         pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00"
     )
@@ -148,6 +200,12 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert output_gap_window["output_turbines_with_target_min"][0] == 1
     assert output_gap_window["is_complete_output"][0] is False
     assert farm_task_static["turbine_index"].to_list() == [0, 1]
+    assert farm_task_report["window_count"] == farm_window_index.height
+    assert farm_task_report["window_count"] > 0
+    assert turbine_window_index.height > 0
+    assert "turbine_id" in turbine_window_index.columns
+    assert turbine_task_report["window_count"] == turbine_window_index.height
+    assert turbine_task_report["window_count"] > 0
 
 
 def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_path) -> None:
