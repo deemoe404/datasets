@@ -28,7 +28,7 @@ _DATASET_RATED_POWER_KW = {
     "kelmarsh": 2050.0,
     "penmanshiel": 2050.0,
     "hill_of_towie": 2300.0,
-    "sdwpf_full": 1500.0,
+    "sdwpf_kddcup": 1500.0,
 }
 
 

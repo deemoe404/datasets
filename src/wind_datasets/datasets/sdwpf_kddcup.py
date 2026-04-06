@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 import gc
-import shutil
+from pathlib import Path
 
 import polars as pl
 
@@ -21,24 +22,50 @@ _SDWPF_SUPPORTED_QUALITY_PROFILES = {
     "raw_v1",
     "official_v1_zero_negative_patv",
 }
+_KDDCUP_CALENDAR_ANCHOR = datetime(2020, 5, 1)
+_KDDCUP_MAIN_CSV = "sdwpf_245days_v1.csv"
+_KDDCUP_MAIN_PARQUET = "sdwpf_245days_v1.parquet"
+_KDDCUP_LOCATION_CSV = "sdwpf_baidukddcup2022_turb_location.csv"
+_KDDCUP_LOCATION_PARQUET = "sdwpf_baidukddcup2022_turb_location.parquet"
 
 
 def _assert_sdwpf_time_semantics_supported(manifest_payload: dict[str, object]) -> None:
     time_check = manifest_payload.get("time_semantics_check")
     if not isinstance(time_check, dict):
-        raise ValueError("SDWPF manifest is missing time_semantics_check; rebuild the manifest first.")
-    if time_check.get("status") != "match_documented_10min_grid":
-        details = time_check.get("details", "SDWPF source timestamps are incompatible with the documented 10-minute grid.")
-        raise ValueError(f"Refusing to build sdwpf_full gold/task cache. {details}")
+        raise ValueError("sdwpf_kddcup manifest is missing time_semantics_check; rebuild the manifest first.")
+    if time_check.get("status") != "match_documented_245day_10min_grid":
+        details = time_check.get(
+            "details",
+            "sdwpf_kddcup source timestamps are incompatible with the documented 245-day 10-minute grid.",
+        )
+        raise ValueError(f"Refusing to build sdwpf_kddcup gold/task cache. {details}")
 
 
-class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
+def _clock_expr_for_dtype(dtype: pl.DataType) -> pl.Expr:
+    if dtype == pl.Time:
+        return pl.col("Tmstamp").cast(pl.Time, strict=False)
+    return pl.col("Tmstamp").cast(pl.Utf8).str.strptime(pl.Time, format="%H:%M", strict=False)
+
+
+def _timestamp_expr_for_dtypes(clock_dtype: pl.DataType) -> pl.Expr:
+    clock_expr = _clock_expr_for_dtype(clock_dtype)
+    return (
+        pl.lit(_KDDCUP_CALENDAR_ANCHOR)
+        + pl.duration(days=pl.col("Day").cast(pl.Int64, strict=False) - 1)
+        + pl.duration(
+            hours=clock_expr.dt.hour(),
+            minutes=clock_expr.dt.minute(),
+        )
+    ).alias("timestamp")
+
+
+class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
     def resolve_quality_profile(self, quality_profile: str | None = None) -> str:
         resolved = super().resolve_quality_profile(quality_profile)
         if resolved not in _SDWPF_SUPPORTED_QUALITY_PROFILES:
             supported = ", ".join(sorted(_SDWPF_SUPPORTED_QUALITY_PROFILES))
             raise ValueError(
-                f"Unsupported sdwpf_full quality profile {resolved!r}. Expected one of: {supported}."
+                f"Unsupported sdwpf_kddcup quality profile {resolved!r}. Expected one of: {supported}."
             )
         return resolved
 
@@ -46,13 +73,16 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_meta_dir)
         ensure_directory(self.cache_paths.silver_dir)
-        shutil.copy2(
-            self.spec.source_root / "sdwpf_2001_2112_full.parquet",
-            self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet",
+        (
+            pl.scan_csv(
+                self.spec.source_root / _KDDCUP_MAIN_CSV,
+                null_values=["NaN", "nan"],
+            )
+            .sink_parquet(self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET)
         )
-        location_frame = pl.read_csv(self.spec.source_root / "sdwpf_turb_location_elevation.csv")
+        location_frame = pl.read_csv(self.spec.source_root / _KDDCUP_LOCATION_CSV)
         location_frame.write_parquet(
-            self.cache_paths.silver_meta_dir / "sdwpf_turb_location_elevation.parquet"
+            self.cache_paths.silver_meta_dir / _KDDCUP_LOCATION_PARQUET
         )
         turbine_static = ensure_turbine_static_schema(
             location_frame.select(
@@ -65,7 +95,7 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
                 pl.col("y").cast(pl.Float64, strict=False).alias("coord_y"),
                 pl.lit("projected_xy").alias("coord_kind"),
                 pl.lit("unknown_unverified").alias("coord_crs"),
-                pl.col("Ele").cast(pl.Float64, strict=False).alias("elevation_m"),
+                pl.lit(None).cast(pl.Float64).alias("elevation_m"),
                 pl.lit(1500.0).cast(pl.Float64).alias("rated_power_kw"),
                 pl.lit(None).cast(pl.Float64).alias("hub_height_m"),
                 pl.lit(None).cast(pl.Float64).alias("rotor_diameter_m"),
@@ -73,7 +103,7 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
                 pl.lit(None).cast(pl.String).alias("model"),
                 pl.lit(None).cast(pl.String).alias("country"),
                 pl.lit(None).cast(pl.String).alias("commercial_operation_date"),
-                pl.lit("sdwpf_turb_location_elevation.csv").alias("spatial_source"),
+                pl.lit(_KDDCUP_LOCATION_CSV).alias("spatial_source"),
             )
         ).filter(
             pl.col("turbine_id").is_not_null()
@@ -91,24 +121,17 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         resolved_layout = self.resolve_series_layout(layout)
         resolved_feature_set = self.resolve_feature_set(feature_set)
-        if not (self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet").exists():
+        if not (self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET).exists():
             self.build_silver()
 
         manifest_payload = self.ensure_manifest()
         _assert_sdwpf_time_semantics_supported(manifest_payload)
-        frame = pl.read_parquet(self.cache_paths.silver_dir / "sdwpf_2001_2112_full.parquet")
-        timestamp_dtype = frame.schema["Tmstamp"]
-        if timestamp_dtype == pl.Utf8:
-            timestamp_expr = (
-                pl.col("Tmstamp")
-                .cast(pl.Utf8)
-                .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
-                .alias("timestamp")
-            )
-        else:
-            timestamp_expr = pl.col("Tmstamp").cast(pl.Datetime, strict=False).alias("timestamp")
+        frame = pl.read_parquet(self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET)
+        timestamp_expr = _timestamp_expr_for_dtypes(frame.schema["Tmstamp"])
         feature_columns = [
-            column for column in frame.columns if column not in {"TurbID", "Tmstamp", self.spec.target_column}
+            column
+            for column in frame.columns
+            if column not in {"TurbID", "Day", "Tmstamp", self.spec.target_column}
         ]
         target_raw_expr = pl.col(self.spec.target_column).cast(pl.Float64, strict=False)
         negative_patv_expr = target_raw_expr.lt(0).fill_null(False)
@@ -268,6 +291,7 @@ class SDWPFFullDatasetBuilder(BaseDatasetBuilder):
                 "quality_profile": resolved_quality_profile,
                 "layout": resolved_layout,
                 "feature_set": resolved_feature_set,
+                "calendar_anchor_date": _KDDCUP_CALENDAR_ANCHOR.date().isoformat(),
                 "sdwpf_negative_patv_count": int(flag_counts["sdwpf_patv_negative"] or 0),
                 "sdwpf_unknown_count": int(flag_counts["sdwpf_unknown_count"] or 0),
                 "sdwpf_abnormal_count": int(flag_counts["sdwpf_abnormal_count"] or 0),

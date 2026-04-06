@@ -185,34 +185,38 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         ),
         default_excluded_assets=("zip_archives", "tblDailySummary"),
     ),
-    "sdwpf_full": DatasetSpec(
-        dataset_id="sdwpf_full",
-        source_root=_SOURCE_ROOT / "SDWPF_dataset" / "sdwpf_full",
+    "sdwpf_kddcup": DatasetSpec(
+        dataset_id="sdwpf_kddcup",
+        source_root=_SOURCE_ROOT / "SDWPF_dataset" / "sdwpf_kddcup",
         resolution_minutes=10,
         turbine_ids=tuple(str(idx) for idx in range(1, 135)),
         target_column="Patv",
         target_unit="kW",
-        timezone_policy="utc_plus_8_documented",
-        timestamp_convention="source_local_naive_utc_plus_8",
+        timezone_policy="unknown_unverified",
+        timestamp_convention="derived_day_clock_naive",
         default_feature_groups=("main",),
-        handler="sdwpf_full",
+        handler="sdwpf_kddcup",
         default_quality_profile="official_v1",
-        official_name="SDWPF_full",
+        official_name="sdwpf_kddcup",
         official_releases=(
             OfficialRelease(
-                release_id="scientific_data_2024",
-                source_url="https://www.nature.com/articles/s41597-024-03427-5",
-                published_date="2024-06-19",
-                coverage_start="2020-01-01",
-                coverage_end="2021-12-31",
-                notes="10-minute wind power forecasting dataset. Timestamps are UTC+08:00.",
+                release_id="figshare_v2_2024",
+                source_url="https://figshare.com/articles/dataset/SDWPF_dataset/24798654",
+                published_date="2024-04-30",
+                coverage_start="2020-05-01",
+                coverage_end="2020-12-31",
+                notes=(
+                    "Public release of the original Baidu KDD Cup 2022 package. "
+                    "The source CSV exposes Day + Tmstamp only; this repository derives calendar "
+                    "timestamps by anchoring Day 1 to 2020-05-01 based on public reproduction references."
+                ),
             ),
         ),
-        default_expected_release_id="scientific_data_2024",
+        default_expected_release_id="figshare_v2_2024",
         requires_pre_extracted_sources=False,
-        official_assets=("main_csv", "main_parquet", "turbine_location_elevation"),
-        default_ingested_assets=("main_parquet", "turbine_location_elevation"),
-        default_excluded_assets=("main_csv",),
+        official_assets=("main_csv", "turbine_location", "final_phase_test"),
+        default_ingested_assets=("main_csv", "turbine_location"),
+        default_excluded_assets=("final_phase_test",),
     ),
 }
 

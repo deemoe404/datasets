@@ -621,6 +621,100 @@ def build_coverage_summary(df: pl.DataFrame, spec: DatasetSpec) -> dict[str, Any
     }
 
 
+def build_coverage_summary_from_series_path(series_path: Path, spec: DatasetSpec) -> dict[str, Any]:
+    available = set(pl.scan_parquet(series_path).collect_schema().names())
+    expected_turbines = int(len(spec.turbine_ids))
+    if not available:
+        return build_coverage_summary(pl.DataFrame(), spec)
+
+    base_scan = pl.scan_parquet(series_path)
+    if all(column in available for column in FARM_SYNC_SCHEMA):
+        timestamp_summary = (
+            base_scan.select(
+                [
+                    "dataset",
+                    "timestamp",
+                    "farm_turbines_expected",
+                    "farm_turbines_observed",
+                    "farm_turbines_with_target",
+                    "farm_is_fully_synchronous",
+                    "farm_has_all_targets",
+                ]
+            )
+            .unique(subset=["dataset", "timestamp"])
+            .sort(["dataset", "timestamp"])
+            .collect()
+        )
+    else:
+        timestamp_summary = (
+            base_scan.group_by(["dataset", "timestamp"])
+            .agg(
+                pl.col("is_observed").cast(pl.Int32).sum().alias("farm_turbines_observed"),
+                pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("farm_turbines_with_target"),
+            )
+            .with_columns(
+                pl.lit(expected_turbines).cast(pl.Int32).alias("farm_turbines_expected"),
+                (pl.col("farm_turbines_observed") == expected_turbines).alias("farm_is_fully_synchronous"),
+                (pl.col("farm_turbines_with_target") == expected_turbines).alias("farm_has_all_targets"),
+            )
+            .sort(["dataset", "timestamp"])
+            .collect()
+        )
+
+    timestamp_count = int(timestamp_summary.height)
+    synchronous = timestamp_summary.filter(pl.col("farm_is_fully_synchronous"))
+    target_complete = timestamp_summary.filter(pl.col("farm_has_all_targets"))
+    per_turbine = (
+        pl.scan_parquet(series_path)
+        .group_by("turbine_id")
+        .agg(
+            pl.col("is_observed").cast(pl.Int64).sum().alias("observed_rows"),
+            pl.col("target_kw").is_not_null().cast(pl.Int64).sum().alias("target_rows"),
+            pl.when(pl.col("is_observed"))
+            .then(pl.col("timestamp"))
+            .otherwise(None)
+            .min()
+            .alias("first_observed_timestamp"),
+            pl.when(pl.col("is_observed"))
+            .then(pl.col("timestamp"))
+            .otherwise(None)
+            .max()
+            .alias("last_observed_timestamp"),
+        )
+        .sort("turbine_id")
+        .collect()
+    )
+    per_turbine_rows = []
+    for row in per_turbine.to_dicts():
+        per_turbine_rows.append(
+            {
+                "turbine_id": row["turbine_id"],
+                "observed_rows": int(row["observed_rows"] or 0),
+                "target_rows": int(row["target_rows"] or 0),
+                "observed_ratio": float((row["observed_rows"] or 0) / timestamp_count) if timestamp_count else 0.0,
+                "target_ratio": float((row["target_rows"] or 0) / timestamp_count) if timestamp_count else 0.0,
+                "first_observed_timestamp": _serialize_datetime(row["first_observed_timestamp"]),
+                "last_observed_timestamp": _serialize_datetime(row["last_observed_timestamp"]),
+            }
+        )
+
+    return {
+        "timestamp_count": timestamp_count,
+        "farm_turbines_expected": expected_turbines,
+        "full_synchrony_ratio": float(synchronous.height / timestamp_count) if timestamp_count else 0.0,
+        "full_target_ratio": float(target_complete.height / timestamp_count) if timestamp_count else 0.0,
+        "common_coverage_start": _serialize_datetime(synchronous["timestamp"].min() if not synchronous.is_empty() else None),
+        "common_coverage_end": _serialize_datetime(synchronous["timestamp"].max() if not synchronous.is_empty() else None),
+        "full_target_coverage_start": _serialize_datetime(
+            target_complete["timestamp"].min() if not target_complete.is_empty() else None
+        ),
+        "full_target_coverage_end": _serialize_datetime(
+            target_complete["timestamp"].max() if not target_complete.is_empty() else None
+        ),
+        "per_turbine_coverage_summary": per_turbine_rows,
+    }
+
+
 def reindex_regular_series(
     df: pl.DataFrame,
     spec: DatasetSpec,

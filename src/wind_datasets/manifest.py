@@ -18,6 +18,7 @@ _GREENBYTE_RANGE_PATTERN = re.compile(
     r"Turbine_Data_.*?_(?P<start>\d{4}-\d{2}-\d{2})_-_(?P<end>\d{4}-\d{2}-\d{2})(?:_|\.csv)"
 )
 _TEN_MINUTE_MINUTES = {0, 10, 20, 30, 40, 50}
+_KDDCUP_CALENDAR_ANCHOR_DATE = "2020-05-01"
 
 
 def _iter_source_files(root: Path) -> list[Path]:
@@ -55,10 +56,10 @@ def _build_source_layout(spec: DatasetSpec, relative_paths: list[str]) -> tuple[
             "tblSCTurGrid_csv": "**/tblSCTurGrid_*.csv",
             "tblSCTurFlag_csv": "**/tblSCTurFlag_*.csv",
         }
-    elif spec.handler == "sdwpf_full":
+    elif spec.handler == "sdwpf_kddcup":
         required = {
-            "main_parquet": "sdwpf_2001_2112_full.parquet",
-            "location_csv": "sdwpf_turb_location_elevation.csv",
+            "main_csv": "sdwpf_245days_v1.csv",
+            "location_csv": "sdwpf_baidukddcup2022_turb_location.csv",
         }
     else:
         required = {}
@@ -160,35 +161,40 @@ def _build_source_release_check(
 
 
 def _build_sdwpf_time_semantics_check(spec: DatasetSpec) -> tuple[dict[str, object], list[str]]:
-    path = spec.source_root / "sdwpf_2001_2112_full.parquet"
+    path = spec.source_root / "sdwpf_245days_v1.csv"
     if not path.exists():
         return (
             {
                 "status": "missing_source",
-                "details": "sdwpf_2001_2112_full.parquet is missing.",
+                "details": "sdwpf_245days_v1.csv is missing.",
             },
-            ["Unable to audit SDWPF time semantics because the parquet source file is missing."],
+            ["Unable to audit SDWPF time semantics because the CSV source file is missing."],
         )
 
-    scan = pl.scan_parquet(path)
-    timestamp_dtype = scan.collect_schema()["Tmstamp"]
-    if timestamp_dtype == pl.Utf8:
-        timestamp_expr = (
-            pl.col("Tmstamp")
-            .cast(pl.Utf8)
-            .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
-        )
-    else:
-        timestamp_expr = pl.col("Tmstamp").cast(pl.Datetime, strict=False)
+    scan = pl.scan_csv(path, null_values=["NaN", "nan"])
+    schema = scan.collect_schema()
+    clock_expr = (
+        pl.col("Tmstamp").cast(pl.Time, strict=False)
+        if schema["Tmstamp"] == pl.Time
+        else pl.col("Tmstamp").cast(pl.Utf8).str.strptime(pl.Time, format="%H:%M", strict=False)
+    )
+    timestamp_expr = (
+        pl.lit(datetime.fromisoformat(_KDDCUP_CALENDAR_ANCHOR_DATE))
+        + pl.duration(days=pl.col("Day").cast(pl.Int64, strict=False) - 1)
+        + pl.duration(hours=clock_expr.dt.hour(), minutes=clock_expr.dt.minute())
+    )
     minutes = (
-        scan
-        .select(timestamp_expr.dt.minute().alias("minute"))
+        scan.select(clock_expr.dt.minute().alias("minute"))
         .collect()["minute"]
         .drop_nulls()
         .unique()
         .sort()
         .to_list()
     )
+    day_bounds = scan.select(
+        pl.col("Day").cast(pl.Int64, strict=False).min().alias("min_day"),
+        pl.col("Day").cast(pl.Int64, strict=False).max().alias("max_day"),
+    ).collect().row(0, named=True)
     turbine_ids = (
         scan
         .select(pl.col("TurbID").cast(pl.String).alias("turbine_id"))
@@ -200,6 +206,20 @@ def _build_sdwpf_time_semantics_check(spec: DatasetSpec) -> tuple[dict[str, obje
     )
     sample_turbine_id = turbine_ids[0] if turbine_ids else None
     invalid_minutes = [int(value) for value in minutes if int(value) not in _TEN_MINUTE_MINUTES]
+    invalid_clock_rows = int(
+        scan.select(clock_expr.is_null().sum().alias("invalid_clock_rows")).collect()["invalid_clock_rows"][0] or 0
+    )
+    count_bounds = (
+        scan
+        .group_by(pl.col("TurbID").cast(pl.String).alias("turbine_id"))
+        .len()
+        .select(
+            pl.col("len").min().alias("min_rows"),
+            pl.col("len").max().alias("max_rows"),
+        )
+        .collect()
+        .row(0, named=True)
+    )
 
     sample_interval_distribution: dict[str, int] = {}
     invalid_intervals: list[int] = []
@@ -223,26 +243,52 @@ def _build_sdwpf_time_semantics_check(spec: DatasetSpec) -> tuple[dict[str, obje
         invalid_intervals = [
             int(row["delta_minutes"])
             for row in interval_frame.to_dicts()
-            if int(row["delta_minutes"]) % 10 != 0
+            if int(row["delta_minutes"]) != 10
         ]
 
-    is_valid = not invalid_minutes and not invalid_intervals
-    status = "match_documented_10min_grid" if is_valid else "incompatible_with_documented_10min_grid"
-    details = (
-        "Observed timestamps are compatible with a 10-minute grid."
+    min_day = int(day_bounds["min_day"]) if day_bounds["min_day"] is not None else None
+    max_day = int(day_bounds["max_day"]) if day_bounds["max_day"] is not None else None
+    min_rows = int(count_bounds["min_rows"]) if count_bounds["min_rows"] is not None else 0
+    max_rows = int(count_bounds["max_rows"]) if count_bounds["max_rows"] is not None else 0
+    problems: list[str] = []
+    if invalid_clock_rows:
+        problems.append(f"{invalid_clock_rows} rows have an unparsable Tmstamp value")
+    if invalid_minutes:
+        problems.append(f"distinct minutes {invalid_minutes} fall outside the documented 10-minute grid")
+    if invalid_intervals:
+        problems.append(f"sample turbine deltas {invalid_intervals} are not exactly 10 minutes")
+    if min_day != 1 or max_day != 245:
+        problems.append(f"observed Day range is {min_day}..{max_day}, expected 1..245")
+    if min_rows != max_rows:
+        problems.append(f"per-turbine row counts differ ({min_rows}..{max_rows})")
+
+    is_valid = not problems
+    status = (
+        "match_documented_245day_10min_grid"
         if is_valid
-        else "Observed timestamps include minute offsets or single-turbine deltas that are incompatible with a 10-minute grid."
+        else "incompatible_with_documented_245day_10min_grid"
+    )
+    details = (
+        "Observed Day + Tmstamp values are compatible with the documented 245-day 10-minute grid."
+        if is_valid
+        else "; ".join(problems) + "."
     )
     warnings: list[str] = []
     if not is_valid:
         warnings.append(
-            "SDWPF source timestamps are incompatible with the documented 10-minute grid; gold/task builds are blocked."
+            "sdwpf_kddcup source Day + Tmstamp values are incompatible with the documented 245-day 10-minute grid; gold/task builds are blocked."
         )
     return (
         {
             "status": status,
             "details": details,
+            "calendar_anchor_date": _KDDCUP_CALENDAR_ANCHOR_DATE,
+            "min_day": min_day,
+            "max_day": max_day,
             "distinct_minutes": [int(value) for value in minutes],
+            "invalid_clock_rows": invalid_clock_rows,
+            "per_turbine_row_count_min": min_rows,
+            "per_turbine_row_count_max": max_rows,
             "sample_turbine_id": sample_turbine_id,
             "sample_interval_distribution_minutes": sample_interval_distribution,
             "invalid_minutes": invalid_minutes,
@@ -261,7 +307,7 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
     release_check, release_warnings = _build_source_release_check(spec, relative_paths, source_layout)
     time_semantics_check: dict[str, object] | None = None
     time_semantics_warnings: list[str] = []
-    if spec.handler == "sdwpf_full":
+    if spec.handler == "sdwpf_kddcup":
         time_semantics_check, time_semantics_warnings = _build_sdwpf_time_semantics_check(spec)
     payload = {
         "dataset_id": spec.dataset_id,

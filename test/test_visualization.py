@@ -11,7 +11,7 @@ from wind_datasets.visualization import build_power_tile, resolve_turbine_select
 
 def test_resolve_turbine_selector_accepts_index_and_exact_id() -> None:
     assert resolve_turbine_selector("kelmarsh", 0) == "Kelmarsh 1"
-    assert resolve_turbine_selector("sdwpf_full", "134") == "134"
+    assert resolve_turbine_selector("sdwpf_kddcup", "134") == "134"
 
 
 def test_resolve_turbine_selector_rejects_out_of_range_and_unknown() -> None:

@@ -6,10 +6,10 @@ import polars as pl
 
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
 from wind_datasets.datasets.hill_of_towie import HillOfTowieDatasetBuilder
-from wind_datasets.datasets.sdwpf_full import SDWPFFullDatasetBuilder
+from wind_datasets.datasets.sdwpf_kddcup import SDWPFKDDCupDatasetBuilder
 from wind_datasets.models import TaskSpec
 
-from .helpers import build_greenbyte_fixture, build_hill_fixture, build_sdwpf_fixture
+from .helpers import build_greenbyte_fixture, build_hill_fixture, build_sdwpf_kddcup_fixture
 
 
 def _assert_unique_series_keys(series: pl.DataFrame) -> None:
@@ -151,8 +151,8 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
 
 
 def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_path) -> None:
-    spec = build_sdwpf_fixture(tmp_path / "raw" / "sdwpf")
-    builder = SDWPFFullDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    spec = build_sdwpf_kddcup_fixture(tmp_path / "raw" / "sdwpf")
+    builder = SDWPFKDDCupDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     gold_path = builder.build_gold_base()
     assert gold_path.parts[-4:] == ("official_v1", "farm", "default", "series.parquet")
@@ -163,24 +163,27 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     zeroed_series = builder.load_series("official_v1_zero_negative_patv")
     turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
+    manifest = json.loads(builder.cache_paths.manifest_path.read_text())
 
     default_negative = default_series.filter(
         (pl.col("turbine_id") == "1")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
     )
     raw_negative = raw_series.filter(
         (pl.col("turbine_id") == "1")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
     )
     zeroed_negative = zeroed_series.filter(
         (pl.col("turbine_id") == "1")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
     )
 
     assert before_mtime == gold_path.stat().st_mtime_ns
     _assert_unique_series_keys(default_series)
     assert turbine_static.height == len(spec.turbine_ids)
     assert "farm_turbines_observed" in default_series.columns
+    assert turbine_static["elevation_m"].null_count() == turbine_static.height
+    assert manifest["time_semantics_check"]["calendar_anchor_date"] == "2020-05-01"
     assert default_negative["target_kw_raw"][0] == -5
     assert default_negative["target_kw"][0] == -5
     assert default_negative["sdwpf_has_negative_patv"][0] is True
@@ -202,7 +205,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert report["sdwpf_flag_counts"]["sdwpf_unknown_pitch"] == 1
     assert report["sdwpf_flag_counts"]["sdwpf_abnormal_ndir"] == 1
     assert report["sdwpf_flag_counts"]["sdwpf_abnormal_wdir"] == 1
-    assert report["long_gaps"]
+    assert not report["long_gaps"]
 
     task_a = TaskSpec(history_duration="30m", forecast_duration="20m", task_id="short_a", granularity="turbine")
     task_b = TaskSpec(history_duration="40m", forecast_duration="20m", task_id="short_b", granularity="turbine")
@@ -217,7 +220,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     )
     anchor_window = window_index.filter(
         (pl.col("turbine_id") == "1")
-        & (pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+        & (pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:20:00")
     )
 
     assert before_mtime == after_mtime
@@ -226,7 +229,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert "input_unknown_steps" in window_index.columns
     assert "output_abnormal_steps" in window_index.columns
     assert anchor_window["input_masked_steps"][0] == 1
-    assert anchor_window["output_masked_steps"][0] == 1
+    assert anchor_window["output_masked_steps"][0] == 2
     assert anchor_window["input_unknown_steps"][0] == 1
     assert anchor_window["output_unknown_steps"][0] == 1
     assert "masked_input" in anchor_window["quality_flags"][0]

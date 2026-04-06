@@ -340,65 +340,125 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
     )
 
 
-def build_sdwpf_fixture(root: Path) -> DatasetSpec:
-    (root / "sdwpf_full").mkdir(parents=True, exist_ok=True)
-    pl.DataFrame(
-        {
-            "TurbID": [1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2],
-            "Tmstamp": [
-                "2024-01-01 00:00:00",
-                "2024-01-01 00:10:00",
-                "2024-01-01 00:20:00",
-                "2024-01-01 00:40:00",
-                "2024-01-01 00:50:00",
-                "2024-01-01 01:00:00",
-                "2024-01-01 00:00:00",
-                "2024-01-01 00:10:00",
-                "2024-01-01 00:20:00",
-                "2024-01-01 00:40:00",
-                "2024-01-01 00:50:00",
-                "2024-01-01 01:00:00",
-            ],
-            "Wspd": [6.0, 2.0, 6.5, 7.0, 7.2, 7.4, 5.8, 6.0, 6.1, 6.4, 6.7, 6.9],
-            "Wdir": [180, 180, 180, 180, 180, 200, 170, 170, 170, 170, 170, 170],
-            "Ndir": [0, 0, 0, 0, 800, 0, 5, 5, 5, 5, 5, 5],
-            "Pab1": [10, 10, 10, 10, 10, 10, 12, 12, 12, 12, 12, 12],
-            "Pab2": [10, 10, 10, 95, 10, 10, 12, 12, 12, 12, 12, 12],
-            "Pab3": [10, 10, 10, 10, 10, 10, 12, 12, 12, 12, 12, 12],
-            "Patv": [500, -5, 0, 560, 580, 590, 450, 460, 470, 490, 510, 520],
-        }
-    ).write_parquet(root / "sdwpf_full" / "sdwpf_2001_2112_full.parquet")
+def build_sdwpf_kddcup_fixture(root: Path) -> DatasetSpec:
+    (root / "sdwpf_kddcup").mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    for turbine_id in (1, 2):
+        for day in range(1, 246):
+            for hour in range(24):
+                for minute in range(0, 60, 10):
+                    rows.append(
+                        {
+                            "TurbID": turbine_id,
+                            "Day": day,
+                            "Tmstamp": f"{hour:02d}:{minute:02d}",
+                            "Wspd": 6.0 + turbine_id * 0.1,
+                            "Wdir": 170 + turbine_id,
+                            "Etmp": 14.0 + turbine_id * 0.5,
+                            "Itmp": 24.0 + turbine_id * 0.5,
+                            "Ndir": 5 * turbine_id,
+                            "Pab1": 10 + turbine_id,
+                            "Pab2": 10 + turbine_id,
+                            "Pab3": 10 + turbine_id,
+                            "Prtv": 500 + turbine_id * 20,
+                            "Patv": 450 + turbine_id * 25,
+                        }
+                    )
+
+    frame = pl.DataFrame(rows)
+    frame = frame.with_columns(
+        pl.when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:00")
+        )
+        .then(pl.lit(500.0))
+        .when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:10")
+        )
+        .then(pl.lit(-5.0))
+        .when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:20")
+        )
+        .then(pl.lit(0.0))
+        .otherwise(pl.col("Patv"))
+        .alias("Patv"),
+        pl.when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:10")
+        )
+        .then(pl.lit(2.0))
+        .when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:20")
+        )
+        .then(pl.lit(6.5))
+        .otherwise(pl.col("Wspd"))
+        .alias("Wspd"),
+        pl.when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:30")
+        )
+        .then(pl.lit(95.0))
+        .otherwise(pl.col("Pab2"))
+        .alias("Pab2"),
+        pl.when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:40")
+        )
+        .then(pl.lit(800.0))
+        .otherwise(pl.col("Ndir"))
+        .alias("Ndir"),
+        pl.when(
+            (pl.col("TurbID") == 1)
+            & (pl.col("Day") == 1)
+            & (pl.col("Tmstamp") == "00:50")
+        )
+        .then(pl.lit(200.0))
+        .otherwise(pl.col("Wdir"))
+        .alias("Wdir"),
+    )
+    frame.write_csv(root / "sdwpf_kddcup" / "sdwpf_245days_v1.csv")
     _write_text(
-        root / "sdwpf_full" / "sdwpf_turb_location_elevation.csv",
+        root / "sdwpf_kddcup" / "sdwpf_baidukddcup2022_turb_location.csv",
         """
-        TurbID,x,y,Ele
-        1,0,0,100
-        2,1,1,101
+        TurbID,x,y
+        1,0,0
+        2,1,1
         """,
     )
     return DatasetSpec(
-        dataset_id="sdwpf_full",
-        source_root=root / "sdwpf_full",
+        dataset_id="sdwpf_kddcup",
+        source_root=root / "sdwpf_kddcup",
         resolution_minutes=10,
         turbine_ids=("1", "2"),
         target_column="Patv",
         target_unit="kW",
-        timezone_policy="utc_plus_8_documented",
-        timestamp_convention="source_local_naive_utc_plus_8",
+        timezone_policy="unknown_unverified",
+        timestamp_convention="derived_day_clock_naive",
         default_feature_groups=("main",),
-        handler="sdwpf_full",
+        handler="sdwpf_kddcup",
         default_quality_profile="official_v1",
-        official_name="SDWPF_full",
+        official_name="sdwpf_kddcup",
         official_releases=(
             OfficialRelease(
-                release_id="scientific_data_2024",
-                source_url="https://www.nature.com/articles/s41597-024-03427-5",
-                published_date="2024-06-19",
-                coverage_start="2020-01-01",
-                coverage_end="2021-12-31",
+                release_id="figshare_v2_2024",
+                source_url="https://figshare.com/articles/dataset/SDWPF_dataset/24798654",
+                published_date="2024-04-30",
+                coverage_start="2020-05-01",
+                coverage_end="2020-12-31",
             ),
         ),
-        default_expected_release_id="scientific_data_2024",
-        official_assets=("main_parquet", "turbine_location_elevation"),
-        default_ingested_assets=("main_parquet", "turbine_location_elevation"),
+        default_expected_release_id="figshare_v2_2024",
+        official_assets=("main_csv", "turbine_location", "final_phase_test"),
+        default_ingested_assets=("main_csv", "turbine_location"),
+        default_excluded_assets=("final_phase_test",),
     )

@@ -11,8 +11,9 @@ from .base import BaseDatasetBuilder
 from .common import (
     ParquetChunkWriter,
     QualityReportAccumulator,
-    build_quality_report,
     build_coverage_summary,
+    build_coverage_summary_from_series_path,
+    build_quality_report,
     ensure_turbine_static_schema,
     featureize_interval_events,
     finalize_quality_report,
@@ -625,7 +626,7 @@ def _write_hill_gold_with_extras(
         coverage_summary = _finalize_hill_farm_temp(temp_output_path, output_path, spec, batch_rows=batch_rows * 10)
         return accumulator, coverage_summary
 
-    return accumulator, build_coverage_summary(pl.read_parquet(output_path), spec)
+    return accumulator, build_coverage_summary_from_series_path(output_path, spec)
 
 
 def _finalize_hill_farm_temp(

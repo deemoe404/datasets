@@ -17,13 +17,13 @@ from wind_datasets.api import (
 )
 from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
-from wind_datasets.datasets.sdwpf_full import SDWPFFullDatasetBuilder
+from wind_datasets.datasets.sdwpf_kddcup import SDWPFKDDCupDatasetBuilder
 from wind_datasets.manifest import build_manifest as build_manifest_for_spec
 from wind_datasets.models import DatasetSpec, OfficialRelease, TaskSpec
 from wind_datasets.registry import get_dataset_spec
 from wind_datasets.utils import read_json
 
-from .helpers import build_greenbyte_fixture, build_hill_fixture, build_sdwpf_fixture
+from .helpers import build_greenbyte_fixture, build_hill_fixture, build_sdwpf_kddcup_fixture
 
 
 def test_registry_hill_time_metadata_matches_documented_utc_interval_end() -> None:
@@ -32,13 +32,19 @@ def test_registry_hill_time_metadata_matches_documented_utc_interval_end() -> No
     assert spec.timestamp_convention == "source_utc_naive_interval_end"
 
 
+def test_registry_sdwpf_kddcup_time_metadata_matches_repo_contract() -> None:
+    spec = get_dataset_spec("sdwpf_kddcup")
+    assert spec.timezone_policy == "unknown_unverified"
+    assert spec.timestamp_convention == "derived_day_clock_naive"
+
+
 @pytest.mark.parametrize(
     ("dataset_id", "spec_factory"),
     [
         ("kelmarsh", lambda root: build_greenbyte_fixture(root, "Kelmarsh", "Kelmarsh 1")),
         ("penmanshiel", lambda root: build_greenbyte_fixture(root, "Penmanshiel", "Penmanshiel 11")),
         ("hill_of_towie", build_hill_fixture),
-        ("sdwpf_full", build_sdwpf_fixture),
+        ("sdwpf_kddcup", build_sdwpf_kddcup_fixture),
     ],
 )
 def test_api_build_silver_then_load_turbine_static(tmp_path, monkeypatch, dataset_id, spec_factory) -> None:
@@ -160,40 +166,41 @@ def test_api_build_farm_task_cache_then_load_task_turbine_static(tmp_path, monke
 
 
 def test_manifest_audits_sdwpf_time_semantics_and_reports_incompatible_minutes(tmp_path) -> None:
-    spec = build_sdwpf_fixture(tmp_path / "raw" / "sdwpf_bad")
-    path = spec.source_root / "sdwpf_2001_2112_full.parquet"
-    frame = pl.read_parquet(path).with_row_index("row_nr")
+    spec = build_sdwpf_kddcup_fixture(tmp_path / "raw" / "sdwpf_bad")
+    path = spec.source_root / "sdwpf_245days_v1.csv"
+    frame = pl.read_csv(path).with_row_index("row_nr")
     frame = frame.with_columns(
         pl.when(pl.col("row_nr") == 3)
-        .then(pl.lit("2024-01-01 00:25:00"))
+        .then(pl.lit("00:25"))
         .otherwise(pl.col("Tmstamp"))
         .alias("Tmstamp")
     ).drop("row_nr")
-    frame.write_parquet(path)
+    frame.write_csv(path)
 
     manifest = read_json(build_manifest_for_spec(spec, tmp_path / "cache"))
 
-    assert manifest["time_semantics_check"]["status"] == "incompatible_with_documented_10min_grid"
+    assert manifest["time_semantics_check"]["status"] == "incompatible_with_documented_245day_10min_grid"
+    assert manifest["time_semantics_check"]["calendar_anchor_date"] == "2020-05-01"
     assert 25 in manifest["time_semantics_check"]["invalid_minutes"]
     assert manifest["warnings"]
 
 
 def test_sdwpf_incompatible_time_semantics_block_gold_build(tmp_path) -> None:
-    spec = build_sdwpf_fixture(tmp_path / "raw" / "sdwpf_blocked")
-    path = spec.source_root / "sdwpf_2001_2112_full.parquet"
-    frame = pl.read_parquet(path).with_row_index("row_nr")
+    spec = build_sdwpf_kddcup_fixture(tmp_path / "raw" / "sdwpf_blocked")
+    path = spec.source_root / "sdwpf_245days_v1.csv"
+    frame = pl.read_csv(path).with_row_index("row_nr")
     frame = frame.with_columns(
         pl.when(pl.col("row_nr") == 3)
-        .then(pl.lit("2024-01-01 00:25:00"))
+        .then(pl.lit("00:25"))
         .otherwise(pl.col("Tmstamp"))
         .alias("Tmstamp")
     ).drop("row_nr")
-    frame.write_parquet(path)
+    frame.write_csv(path)
 
-    builder = SDWPFFullDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    builder = SDWPFKDDCupDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
     builder.build_silver()
 
-    with pytest.raises(ValueError, match="Refusing to build sdwpf_full gold/task cache"):
+    with pytest.raises(ValueError, match="Refusing to build sdwpf_kddcup gold/task cache"):
         builder.build_gold_base()
 
 

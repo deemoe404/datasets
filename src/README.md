@@ -108,9 +108,9 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Farm task caches write a task-local `turbine_static.parquet` with stable `turbine_index` ordering.
 - Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is an audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented rule flagged it.
-- `sdwpf_full` defaults to `quality_profile="official_v1"`.
-- `sdwpf_full official_v1` means “official rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
-- `sdwpf_full` gold/task builds are fail-closed when manifest time-semantics audit finds timestamps incompatible with the documented 10-minute grid.
+- `sdwpf_kddcup` defaults to `quality_profile="official_v1"`.
+- `sdwpf_kddcup official_v1` means “official rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
+- `sdwpf_kddcup` gold/task builds are fail-closed when manifest time-semantics audit finds `Day + Tmstamp` values incompatible with the documented 245-day 10-minute grid.
 - `TaskSpec.next_6h_from_24h()` now defaults to `granularity="farm"`.
 
 ## Dataset Cards
@@ -252,28 +252,38 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Source layout expectation: official year archives must already be extracted before build
 - Spatial sidecar: yes, from `Hill_of_Towie_turbine_metadata.csv`
 
-### `sdwpf_full`
+### `sdwpf_kddcup`
 
-- Official source: [Scientific Data paper / dataset description](https://www.nature.com/articles/s41597-024-03427-5)
-- Default expected release: `scientific_data_2024`
-- Coverage: `2020-01-01` to `2021-12-31`
-- Time semantics: 10-minute resolution, source timestamps are documented as `UTC+08:00`
+- Official source:
+  - [Figshare dataset page](https://figshare.com/articles/dataset/SDWPF_dataset/24798654)
+  - [Baidu KDD Cup paper](https://arxiv.org/abs/2208.04360)
+- Default expected release: `figshare_v2_2024`
+- Coverage: `2020-05-01` to `2020-12-31`
+- Time semantics:
+  - source file exposes `Day + Tmstamp`, not explicit calendar dates
+  - this repository derives `timestamp` by anchoring `Day 1 = 2020-05-01`
+  - that anchor is a repository convention based on public reproduction references, not a field stored in the original CSV
 - Official assets:
-  - main CSV
-  - main parquet
-  - turbine location/elevation CSV
+  - `sdwpf_245days_v1.csv`
+  - `sdwpf_baidukddcup2022_turb_location.csv`
+  - `final_phase_test`
 - Current `silver` ingest:
-  - main parquet
-  - turbine location/elevation CSV
+  - normalized parquet converted from `sdwpf_245days_v1.csv`
+  - turbine location CSV converted to parquet
 - Current default `gold_base`:
-  - blocked unless manifest time-semantics audit matches the documented 10-minute grid
-  - when unblocked: target `Patv`, all dynamic predictors from the main time-series table, and SDWPF quality-rule flags/mask columns
+  - blocked unless manifest time-semantics audit matches the documented 245-day 10-minute grid
+  - when unblocked: target `Patv`, KDDCup turbine-level dynamic predictors, and SDWPF quality-rule flags/mask columns
 - Current exclusions:
-  - main CSV is not copied into `silver`
-- Source layout expectation: extracted parquet and location CSV must be present
-- Spatial sidecar: yes, from `sdwpf_turb_location_elevation.csv`
+  - `final_phase_test`
+  - `Day` and raw `Tmstamp` are used for timestamp recovery and audit, not default model features
+- Source layout expectation: extracted CSV files must be present
+- Spatial sidecar: yes, from `sdwpf_baidukddcup2022_turb_location.csv`
+- Differences from `sdwpf_full`:
+  - shorter coverage: 245 days instead of two years
+  - no elevation column
+  - no `T2m`, `Sp`, `RelH`, `Wspd_w`, `Wdir_w`, or `Tp`
 
-## `sdwpf_full` Quality Profiles
+## `sdwpf_kddcup` Quality Profiles
 
 Three quality profiles are currently supported:
 
