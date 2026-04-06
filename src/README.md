@@ -276,12 +276,10 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Current exclusions:
   - `final_phase_test`
   - `Day` and raw `Tmstamp` are used for timestamp recovery and audit, not default model features
+  - no elevation column in the spatial sidecar
+  - source release does not include `T2m`, `Sp`, `RelH`, `Wspd_w`, `Wdir_w`, or `Tp`
 - Source layout expectation: extracted CSV files must be present
 - Spatial sidecar: yes, from `sdwpf_baidukddcup2022_turb_location.csv`
-- Differences from `sdwpf_full`:
-  - shorter coverage: 245 days instead of two years
-  - no elevation column
-  - no `T2m`, `Sp`, `RelH`, `Wspd_w`, `Wdir_w`, or `Tp`
 
 ## `sdwpf_kddcup` Quality Profiles
 
