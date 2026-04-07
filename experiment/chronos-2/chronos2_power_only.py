@@ -8,7 +8,7 @@ from math import sqrt
 from pathlib import Path
 import sys
 import time
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -20,12 +20,31 @@ DEFAULT_DATASETS = ("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup")
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_NEIGHBOR_COUNT = 6
 UNIVARIATE_SUFFIX = "_univariate"
+UNIVARIATE_POWER_STATS_SUFFIX = "_univariate_power_stats"
 MULTIVARIATE_KNN6_SUFFIX = "_multivariate_knn6"
-MODE_CHOICES = ("all", "univariate", "multivariate_knn6")
+MODE_CHOICES = ("all", "univariate", "multivariate_knn6", "univariate_power_stats")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_ROOT = _REPO_ROOT / "cache"
 _OUTPUT_PATH = _REPO_ROOT / "experiment" / "chronos-2.csv"
 _POWER_ONLY_COLUMNS = ("dataset", "turbine_id", "timestamp", "target_kw", "quality_flags")
+_POWER_STATS_COVARIATE_COLUMNS = {
+    "kelmarsh": (
+        "Power, Minimum (kW)",
+        "Power, Maximum (kW)",
+        "Power, Standard deviation (kW)",
+    ),
+    "penmanshiel": (
+        "Power, Minimum (kW)",
+        "Power, Maximum (kW)",
+        "Power, Standard deviation (kW)",
+    ),
+    "hill_of_towie": (
+        "wtc_ActPower_min",
+        "wtc_ActPower_max",
+        "wtc_ActPower_stddev",
+        "wtc_ActPower_endvalue",
+    ),
+}
 _DATASET_RATED_POWER_KW = {
     "kelmarsh": 2050.0,
     "penmanshiel": 2050.0,
@@ -62,6 +81,13 @@ _RESULT_COLUMNS = [
 class TurbineSeries:
     timestamps_us: np.ndarray
     target_kw_masked: np.ndarray
+
+
+@dataclass(frozen=True)
+class TurbinePowerStatsSeries:
+    timestamps_us: np.ndarray
+    target_kw_masked: np.ndarray
+    past_covariates: dict[str, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -205,6 +231,31 @@ def resolve_dataset_task(
     return spec, resolved_task_spec.resolve(spec.resolution_minutes)
 
 
+def supports_univariate_power_stats(dataset_id: str) -> bool:
+    return resolve_dataset_id(dataset_id) in _POWER_STATS_COVARIATE_COLUMNS
+
+
+def resolve_power_stats_covariate_columns(dataset_id: str) -> tuple[str, ...]:
+    resolved_dataset_id = resolve_dataset_id(dataset_id)
+    try:
+        return _POWER_STATS_COVARIATE_COLUMNS[resolved_dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"Dataset {resolved_dataset_id!r} does not support univariate power_stats covariates."
+        ) from exc
+
+
+def resolve_power_only_columns(
+    dataset_id: str,
+    *,
+    include_power_stats: bool = False,
+) -> tuple[str, ...]:
+    columns = list(_POWER_ONLY_COLUMNS)
+    if include_power_stats:
+        columns.extend(resolve_power_stats_covariate_columns(dataset_id))
+    return tuple(columns)
+
+
 def resolve_power_only_series_path(
     dataset_id: str,
     *,
@@ -236,11 +287,22 @@ def load_power_only_series_frame(
     *,
     cache_root: str | Path = _CACHE_ROOT,
     turbine_ids: Sequence[str] | None = None,
+    include_power_stats: bool = False,
 ) -> tuple[Any, Path, pl.DataFrame]:
     spec, series_path = resolve_power_only_series_path(dataset_id, cache_root=cache_root)
     requested_turbine_ids = _ordered_unique(turbine_ids) if turbine_ids is not None else tuple(spec.turbine_ids)
+    selected_columns = resolve_power_only_columns(
+        spec.dataset_id,
+        include_power_stats=include_power_stats,
+    )
+    available_columns = set(pl.read_parquet_schema(series_path))
+    missing_columns = [column for column in selected_columns if column not in available_columns]
+    if missing_columns:
+        raise ValueError(
+            f"Series {series_path} for dataset {spec.dataset_id!r} is missing required columns {missing_columns!r}."
+        )
     load_started = time.monotonic()
-    series_scan = pl.scan_parquet(series_path).select(list(_POWER_ONLY_COLUMNS))
+    series_scan = pl.scan_parquet(series_path).select(list(selected_columns))
     if requested_turbine_ids != tuple(spec.turbine_ids):
         series_scan = series_scan.filter(pl.col("turbine_id").is_in(list(requested_turbine_ids)))
     series = series_scan.collect()
@@ -249,7 +311,7 @@ def load_power_only_series_frame(
         spec.dataset_id,
         "load_power_only_series",
         path=str(series_path),
-        columns=len(_POWER_ONLY_COLUMNS),
+        columns=len(selected_columns),
         rows=series.height,
         target_turbines=None if turbine_ids is None else len(_ordered_unique(turbine_ids)),
         input_turbines=len(requested_turbine_ids),
@@ -310,6 +372,45 @@ def prepare_power_only_series(series: pl.DataFrame, rated_power_kw: float) -> pl
     )
 
 
+def prepare_power_stats_series(
+    series: pl.DataFrame,
+    *,
+    dataset_id: str,
+    rated_power_kw: float,
+) -> pl.DataFrame:
+    covariate_columns = resolve_power_stats_covariate_columns(dataset_id)
+    invalid_expr = pl.col("target_kw").is_null() | (pl.col("quality_flags").fill_null("") != "")
+    return (
+        series.sort(["turbine_id", "timestamp"])
+        .with_columns(
+            invalid_expr.alias("invalid_target"),
+            pl.when(invalid_expr)
+            .then(pl.lit(None, dtype=pl.Float64))
+            .otherwise(pl.col("target_kw").clip(0.0, rated_power_kw))
+            .alias("target_kw_masked"),
+            *[
+                pl.when(invalid_expr)
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise(pl.col(column).clip(0.0, rated_power_kw))
+                .alias(column)
+                for column in covariate_columns
+            ],
+        )
+        .select(
+            [
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                "target_kw",
+                "quality_flags",
+                "invalid_target",
+                "target_kw_masked",
+                *covariate_columns,
+            ]
+        )
+    )
+
+
 def select_device(torch_module: Any | None = None) -> str:
     if torch_module is None:
         import torch as torch_module
@@ -341,12 +442,14 @@ def load_dataset_inputs(
     cache_root: str | Path = _CACHE_ROOT,
     task_spec=None,
     turbine_ids: Sequence[str] | None = None,
+    include_power_stats: bool = False,
 ) -> tuple[Any, Any, pl.DataFrame]:
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
     _, _, series = load_power_only_series_frame(
         dataset_id,
         cache_root=cache_root,
         turbine_ids=turbine_ids,
+        include_power_stats=include_power_stats,
     )
     return spec, resolved_task, series
 
@@ -370,6 +473,25 @@ def build_turbine_series_map(series: pl.DataFrame) -> dict[str, TurbineSeries]:
         turbines[turbine_id] = TurbineSeries(
             timestamps_us=turbine_frame["timestamp"].cast(pl.Int64).to_numpy(),
             target_kw_masked=turbine_frame["target_kw_masked"].cast(pl.Float32).to_numpy(),
+        )
+    return turbines
+
+
+def build_turbine_power_stats_series_map(
+    series: pl.DataFrame,
+    *,
+    covariate_columns: Sequence[str],
+) -> dict[str, TurbinePowerStatsSeries]:
+    turbines: dict[str, TurbinePowerStatsSeries] = {}
+    for turbine_frame in series.partition_by("turbine_id", maintain_order=True):
+        turbine_id = turbine_frame["turbine_id"][0]
+        turbines[turbine_id] = TurbinePowerStatsSeries(
+            timestamps_us=turbine_frame["timestamp"].cast(pl.Int64).to_numpy(),
+            target_kw_masked=turbine_frame["target_kw_masked"].cast(pl.Float32).to_numpy(),
+            past_covariates={
+                column: turbine_frame[column].cast(pl.Float32).to_numpy()
+                for column in covariate_columns
+            },
         )
     return turbines
 
@@ -596,6 +718,19 @@ def _extract_median_forecast(prediction: Any) -> np.ndarray:
     return array[:, :, 0].astype(np.float64, copy=False)
 
 
+def resolve_selected_turbine_ids(
+    spec: Any,
+    turbine_ids: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if turbine_ids is None:
+        return tuple(spec.turbine_ids)
+    selected_turbine_ids = _ordered_unique(turbine_ids)
+    unknown_turbine_ids = [turbine_id for turbine_id in selected_turbine_ids if turbine_id not in spec.turbine_ids]
+    if unknown_turbine_ids:
+        raise ValueError(f"Unknown turbine ids for dataset {spec.dataset_id!r}: {unknown_turbine_ids!r}")
+    return selected_turbine_ids
+
+
 def _iter_univariate_batches(
     *,
     turbine_series: TurbineSeries,
@@ -647,6 +782,70 @@ def _iter_univariate_batches(
     if context_batch:
         yield (
             np.stack(context_batch)[:, None, :],
+            np.stack(future_rows),
+            np.stack(future_timestamps),
+        )
+
+
+def _iter_univariate_power_stats_batches(
+    *,
+    turbine_series: TurbinePowerStatsSeries,
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    batch_size: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> Iterable[tuple[list[dict[str, object]], np.ndarray, np.ndarray]]:
+    input_batch: list[dict[str, object]] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamps: list[np.ndarray] = []
+    emitted_windows = 0
+    skipped_windows = 0
+    max_anchor_index = turbine_series.timestamps_us.shape[0] - forecast_steps
+
+    for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+        context = turbine_series.target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1]
+        future = turbine_series.target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps]
+        if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
+            continue
+        if np.isnan(context).all() or np.isnan(future).all():
+            continue
+        if skipped_windows < window_offset:
+            skipped_windows += 1
+            continue
+
+        input_batch.append(
+            {
+                "target": context.astype(np.float32, copy=True),
+                "past_covariates": {
+                    column: values[anchor_index - history_steps + 1 : anchor_index + 1].astype(np.float32, copy=True)
+                    for column, values in turbine_series.past_covariates.items()
+                },
+            }
+        )
+        future_rows.append(future.astype(np.float64, copy=True))
+        future_timestamps.append(
+            turbine_series.timestamps_us[anchor_index + 1 : anchor_index + 1 + forecast_steps].astype(np.int64, copy=True)
+        )
+        emitted_windows += 1
+
+        if len(input_batch) >= batch_size:
+            yield (
+                input_batch,
+                np.stack(future_rows),
+                np.stack(future_timestamps),
+            )
+            input_batch = []
+            future_rows = []
+            future_timestamps = []
+
+        if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+            break
+
+    if input_batch:
+        yield (
+            input_batch,
             np.stack(future_rows),
             np.stack(future_timestamps),
         )
@@ -791,13 +990,44 @@ def _iter_multivariate_batches_for_runs(
             break
 
 
-def resolve_pipeline_batch_size(context_batch: np.ndarray) -> int:
-    if context_batch.ndim != 3:
-        raise ValueError(
-            f"Expected context_batch with shape (batch, n_variates, history_length), got {context_batch.shape}."
-        )
-    batch_windows, n_variates, _ = context_batch.shape
-    return max(1, int(batch_windows * n_variates))
+def _count_variates(value: Any) -> int:
+    array = _coerce_array(value)
+    if array.ndim == 1:
+        return 1
+    if array.ndim == 2:
+        return int(array.shape[0])
+    raise ValueError(f"Expected a 1d or 2d time series target, got shape {array.shape}.")
+
+
+def resolve_pipeline_batch_size(inputs: Any) -> int:
+    if isinstance(inputs, np.ndarray):
+        if inputs.ndim != 3:
+            raise ValueError(
+                f"Expected context_batch with shape (batch, n_variates, history_length), got {inputs.shape}."
+            )
+        batch_windows, n_variates, _ = inputs.shape
+        return max(1, int(batch_windows * n_variates))
+
+    if isinstance(inputs, Sequence) and not isinstance(inputs, (str, bytes)):
+        total_series = 0
+        for item in inputs:
+            if isinstance(item, Mapping):
+                if "target" not in item:
+                    raise ValueError("Chronos covariate input dictionaries must include a 'target' key.")
+                total_series += _count_variates(item["target"])
+                covariate_names = set()
+                past_covariates = item.get("past_covariates", {})
+                future_covariates = item.get("future_covariates", {})
+                if isinstance(past_covariates, Mapping):
+                    covariate_names.update(str(name) for name in past_covariates)
+                if isinstance(future_covariates, Mapping):
+                    covariate_names.update(str(name) for name in future_covariates)
+                total_series += len(covariate_names)
+            else:
+                total_series += _count_variates(item)
+        return max(1, total_series)
+
+    raise ValueError(f"Unsupported Chronos input type for batch-size resolution: {type(inputs)!r}.")
 
 
 def _valid_timestamp_span_from_univariate(
@@ -889,13 +1119,7 @@ def evaluate_univariate_dataset(
 ) -> dict[str, object]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
-    if turbine_ids is None:
-        selected_turbine_ids = tuple(spec.turbine_ids)
-    else:
-        selected_turbine_ids = _ordered_unique(turbine_ids)
-        unknown_turbine_ids = [turbine_id for turbine_id in selected_turbine_ids if turbine_id not in spec.turbine_ids]
-        if unknown_turbine_ids:
-            raise ValueError(f"Unknown turbine ids for dataset {spec.dataset_id!r}: {unknown_turbine_ids!r}")
+    selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
 
     spec, resolved_task, series = load_dataset_inputs(
         dataset_id,
@@ -980,6 +1204,112 @@ def evaluate_univariate_dataset(
     )
 
 
+def evaluate_univariate_power_stats_dataset(
+    dataset_id: str,
+    *,
+    pipeline: Any,
+    cache_root: str | Path = _CACHE_ROOT,
+    task_spec=None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+    device: str | None = None,
+    turbine_ids: Sequence[str] | None = None,
+) -> dict[str, object]:
+    dataset_start = time.monotonic()
+    spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
+    covariate_columns = resolve_power_stats_covariate_columns(spec.dataset_id)
+    selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+
+    spec, resolved_task, series = load_dataset_inputs(
+        dataset_id,
+        cache_root=cache_root,
+        task_spec=task_spec,
+        turbine_ids=selected_turbine_ids,
+        include_power_stats=True,
+    )
+    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
+    prepare_started = time.monotonic()
+    prepared_series = prepare_power_stats_series(
+        series,
+        dataset_id=spec.dataset_id,
+        rated_power_kw=rated_power_kw,
+    )
+    _profile_log(
+        spec.dataset_id,
+        "prepare_power_stats_series",
+        rows=prepared_series.height,
+        columns=prepared_series.width,
+        target_turbines=len(selected_turbine_ids),
+        input_turbines=len(selected_turbine_ids),
+        covariates=len(covariate_columns),
+        duration_seconds=round(time.monotonic() - prepare_started, 6),
+    )
+    turbine_series_map = build_turbine_power_stats_series_map(
+        prepared_series,
+        covariate_columns=covariate_columns,
+    )
+    metrics = _initialize_metrics()
+
+    for turbine_id in selected_turbine_ids:
+        turbine_series = turbine_series_map[turbine_id]
+        for input_batch, actual_batch, future_timestamps_batch in _iter_univariate_power_stats_batches(
+            turbine_series=turbine_series,
+            history_steps=resolved_task.history_steps,
+            forecast_steps=resolved_task.forecast_steps,
+            stride_steps=resolved_task.stride_steps,
+            batch_size=batch_size,
+            window_offset=window_offset,
+            max_windows_per_dataset=max_windows_per_dataset,
+        ):
+            quantiles, _ = pipeline.predict_quantiles(
+                inputs=input_batch,
+                prediction_length=resolved_task.forecast_steps,
+                quantile_levels=[0.5],
+                batch_size=resolve_pipeline_batch_size(input_batch),
+                limit_prediction_length=False,
+            )
+            prediction_batch = np.stack([_extract_median_forecast(prediction)[0] for prediction in quantiles])
+            valid_mask = ~np.isnan(actual_batch)
+            if not valid_mask.any():
+                continue
+
+            errors = prediction_batch - actual_batch
+            valid_errors = errors[valid_mask]
+            normalized_valid_errors = valid_errors / rated_power_kw
+
+            metrics["window_count"] = int(metrics["window_count"]) + prediction_batch.shape[0]
+            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
+            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
+            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
+            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(np.abs(normalized_valid_errors).sum())
+            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
+                np.square(normalized_valid_errors).sum()
+            )
+            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(future_timestamps_batch, valid_mask)
+            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+
+    runtime_seconds = time.monotonic() - dataset_start
+    _profile_log(
+        spec.dataset_id,
+        "evaluate_univariate_power_stats_complete",
+        target_turbines=len(selected_turbine_ids),
+        input_turbines=len(selected_turbine_ids),
+        runtime_seconds=round(runtime_seconds, 6),
+        window_count=int(metrics["window_count"]),
+        prediction_count=int(metrics["prediction_count"]),
+    )
+    return _build_result_row(
+        dataset_id=spec.dataset_id,
+        suffix=UNIVARIATE_POWER_STATS_SUFFIX,
+        resolved_task=resolved_task,
+        rated_power_kw=rated_power_kw,
+        metrics=metrics,
+        runtime_seconds=runtime_seconds,
+        device=device or select_device(),
+    )
+
+
 def evaluate_multivariate_knn6_dataset(
     dataset_id: str,
     *,
@@ -994,13 +1324,7 @@ def evaluate_multivariate_knn6_dataset(
 ) -> dict[str, object]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
-    if turbine_ids is None:
-        target_turbine_ids = tuple(spec.turbine_ids)
-    else:
-        target_turbine_ids = _ordered_unique(turbine_ids)
-        unknown_turbine_ids = [turbine_id for turbine_id in target_turbine_ids if turbine_id not in spec.turbine_ids]
-        if unknown_turbine_ids:
-            raise ValueError(f"Unknown turbine ids for dataset {spec.dataset_id!r}: {unknown_turbine_ids!r}")
+    target_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
     epoch_configs = resolve_multivariate_epoch_configs(
         spec,
         target_turbine_ids=target_turbine_ids,
@@ -1173,30 +1497,40 @@ def run_experiment(
     if mode not in MODE_CHOICES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {MODE_CHOICES}.")
 
+    power_stats_dataset_ids = tuple(dataset_id for dataset_id in dataset_ids if supports_univariate_power_stats(dataset_id))
+    if mode == "univariate_power_stats" and not power_stats_dataset_ids:
+        raise ValueError(
+            "Mode 'univariate_power_stats' requires at least one dataset with power_stats support."
+        )
+
     resolved_task_spec = task_spec or build_task_spec()
     resolved_device = device or select_device()
     resolved_pipeline = pipeline or load_pipeline(device=resolved_device)
-    evaluators = []
-    if mode in {"all", "univariate"}:
-        evaluators.append(evaluate_univariate_dataset)
-    if mode in {"all", "multivariate_knn6"}:
-        evaluators.append(evaluate_multivariate_knn6_dataset)
+    rows: list[dict[str, object]] = []
 
-    rows = [
-        evaluator(
-            dataset_id,
-            pipeline=resolved_pipeline,
-            cache_root=cache_root,
-            task_spec=resolved_task_spec,
-            batch_size=batch_size,
-            window_offset=window_offset,
-            max_windows_per_dataset=max_windows_per_dataset,
-            device=resolved_device,
-            turbine_ids=turbine_ids,
+    def _run_evaluator(evaluator, active_dataset_ids: Sequence[str]) -> None:
+        rows.extend(
+            evaluator(
+                dataset_id,
+                pipeline=resolved_pipeline,
+                cache_root=cache_root,
+                task_spec=resolved_task_spec,
+                batch_size=batch_size,
+                window_offset=window_offset,
+                max_windows_per_dataset=max_windows_per_dataset,
+                device=resolved_device,
+                turbine_ids=turbine_ids,
+            )
+            for dataset_id in active_dataset_ids
         )
-        for evaluator in evaluators
-        for dataset_id in dataset_ids
-    ]
+
+    if mode in {"all", "univariate"}:
+        _run_evaluator(evaluate_univariate_dataset, dataset_ids)
+    if mode in {"all", "univariate", "univariate_power_stats"}:
+        _run_evaluator(evaluate_univariate_power_stats_dataset, power_stats_dataset_ids)
+    if mode in {"all", "multivariate_knn6"}:
+        _run_evaluator(evaluate_multivariate_knn6_dataset, dataset_ids)
+
     results = pl.DataFrame(rows).select(_RESULT_COLUMNS).sort("dataset_id")
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1253,7 +1587,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=list(MODE_CHOICES),
         default="all",
-        help="Run all experiments, or only the univariate or multivariate_knn6 subset.",
+        help="Run all experiments, or only the univariate, multivariate_knn6, or univariate_power_stats subset.",
     )
     parser.add_argument(
         "--turbine-id",

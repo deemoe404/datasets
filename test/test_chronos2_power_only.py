@@ -99,6 +99,56 @@ def test_prepare_power_only_series_masks_flagged_values_and_clips_clean_values()
     assert np.isnan(masked[4])
 
 
+def test_prepare_power_stats_series_masks_invalid_rows_and_clips_covariates() -> None:
+    module = _load_module()
+    timestamps = pl.datetime_range(
+        start=datetime(2024, 1, 1, 0, 0, 0),
+        end=datetime(2024, 1, 1, 0, 40, 0),
+        interval="10m",
+        eager=True,
+    )
+    series = pl.DataFrame(
+        {
+            "dataset": ["kelmarsh"] * len(timestamps),
+            "turbine_id": ["Kelmarsh 1"] * len(timestamps),
+            "timestamp": timestamps,
+            "target_kw": [10.0, -2.0, 2200.0, 15.0, None],
+            "quality_flags": ["", "", "", "conflict_resolved", ""],
+            "Power, Minimum (kW)": [-1.0, 0.0, 2100.0, 4.0, 5.0],
+            "Power, Maximum (kW)": [11.0, 22.0, None, 44.0, 55.0],
+            "Power, Standard deviation (kW)": [1.0, -3.0, 3000.0, 5.0, 6.0],
+        }
+    )
+
+    prepared = module.prepare_power_stats_series(
+        series,
+        dataset_id="kelmarsh",
+        rated_power_kw=2050.0,
+    )
+
+    assert prepared["invalid_target"].to_list() == [False, False, False, True, True]
+    np.testing.assert_allclose(
+        prepared["target_kw_masked"].to_numpy(),
+        np.array([10.0, 0.0, 2050.0, np.nan, np.nan], dtype=np.float64),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        prepared["Power, Minimum (kW)"].to_numpy(),
+        np.array([0.0, 0.0, 2050.0, np.nan, np.nan], dtype=np.float64),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        prepared["Power, Maximum (kW)"].to_numpy(),
+        np.array([11.0, 22.0, np.nan, np.nan, np.nan], dtype=np.float64),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        prepared["Power, Standard deviation (kW)"].to_numpy(),
+        np.array([1.0, 0.0, 2050.0, np.nan, np.nan], dtype=np.float64),
+        equal_nan=True,
+    )
+
+
 def test_load_power_only_series_frame_projects_only_required_columns(monkeypatch, tmp_path) -> None:
     module = _load_module()
     spec = DatasetSpec(
@@ -158,6 +208,103 @@ def test_load_power_only_series_frame_projects_only_required_columns(monkeypatch
     assert selected_columns == [module._POWER_ONLY_COLUMNS]
     assert loaded.columns == list(module._POWER_ONLY_COLUMNS)
     assert loaded["turbine_id"].to_list() == ["T01"]
+
+
+def test_load_power_only_series_frame_projects_power_stats_columns_and_requires_declared_covariates(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    spec = DatasetSpec(
+        dataset_id="hill_of_towie",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=("T01", "T02"),
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+    series_path = tmp_path / "series.parquet"
+    pl.DataFrame(
+        {
+            "dataset": ["hill_of_towie", "hill_of_towie"],
+            "turbine_id": ["T01", "T02"],
+            "timestamp": [datetime(2024, 1, 1, 0, 0, 0), datetime(2024, 1, 1, 0, 10, 0)],
+            "target_kw": [100.0, 200.0],
+            "quality_flags": ["", ""],
+            "wtc_ActPower_min": [95.0, 195.0],
+            "wtc_ActPower_max": [110.0, 210.0],
+            "wtc_ActPower_stddev": [3.0, 4.0],
+            "wtc_ActPower_endvalue": [101.0, 201.0],
+            "unused_feature": [1.0, 2.0],
+        }
+    ).write_parquet(series_path)
+
+    selected_columns: list[tuple[str, ...]] = []
+    original_scan_parquet = module.pl.scan_parquet
+
+    class _RecordingScan:
+        def __init__(self, wrapped) -> None:
+            self._wrapped = wrapped
+
+        def select(self, columns):
+            selected_columns.append(tuple(columns))
+            self._wrapped = self._wrapped.select(columns)
+            return self
+
+        def filter(self, expr):
+            self._wrapped = self._wrapped.filter(expr)
+            return self
+
+        def collect(self):
+            return self._wrapped.collect()
+
+    monkeypatch.setattr(
+        module,
+        "resolve_power_only_series_path",
+        lambda dataset_id, *, cache_root: (spec, series_path),
+    )
+    monkeypatch.setattr(module.pl, "scan_parquet", lambda path: _RecordingScan(original_scan_parquet(path)))
+
+    expected_columns = module.resolve_power_only_columns("hill_of_towie", include_power_stats=True)
+    loaded_spec, loaded_path, loaded = module.load_power_only_series_frame(
+        "hill_of_towie",
+        turbine_ids=("T01",),
+        include_power_stats=True,
+    )
+
+    assert loaded_spec == spec
+    assert loaded_path == series_path
+    assert selected_columns == [expected_columns]
+    assert loaded.columns == list(expected_columns)
+    assert loaded["turbine_id"].to_list() == ["T01"]
+
+    missing_series_path = tmp_path / "series_missing.parquet"
+    pl.DataFrame(
+        {
+            "dataset": ["hill_of_towie"],
+            "turbine_id": ["T01"],
+            "timestamp": [datetime(2024, 1, 1, 0, 0, 0)],
+            "target_kw": [100.0],
+            "quality_flags": [""],
+            "wtc_ActPower_min": [95.0],
+            "wtc_ActPower_max": [110.0],
+            "wtc_ActPower_stddev": [3.0],
+        }
+    ).write_parquet(missing_series_path)
+    monkeypatch.setattr(
+        module,
+        "resolve_power_only_series_path",
+        lambda dataset_id, *, cache_root: (spec, missing_series_path),
+    )
+
+    try:
+        module.load_power_only_series_frame("hill_of_towie", include_power_stats=True)
+    except ValueError as exc:
+        assert "missing required columns" in str(exc)
+        assert "wtc_ActPower_endvalue" in str(exc)
+    else:
+        raise AssertionError("Expected power_stats loading to fail when a declared covariate column is missing.")
 
 
 def test_iter_univariate_batches_keeps_partial_nan_windows_and_drops_empty_ones() -> None:
@@ -261,6 +408,111 @@ def test_evaluate_univariate_dataset_masks_invalid_future_positions(monkeypatch)
     )
     assert pipeline.batch_sizes == [1]
     assert result["dataset_id"] == "kelmarsh_univariate"
+    assert result["window_count"] == 1
+    assert result["prediction_count"] == 1
+    assert result["mae_kw"] == 5.0
+    assert result["rmse_kw"] == 5.0
+    assert result["start_timestamp"] == "2024-01-01 00:30:00"
+    assert result["end_timestamp"] == "2024-01-01 00:30:00"
+
+
+def test_evaluate_univariate_power_stats_dataset_uses_past_covariates_and_scores_target(monkeypatch) -> None:
+    module = _load_module()
+    spec = DatasetSpec(
+        dataset_id="kelmarsh",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=("Kelmarsh 1",),
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+    task_spec = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        stride_duration="20m",
+        task_id="synthetic_task",
+        granularity="turbine",
+    )
+    resolved_task = task_spec.resolve(spec.resolution_minutes)
+    timestamps = pl.datetime_range(
+        start=datetime(2024, 1, 1, 0, 0, 0),
+        end=datetime(2024, 1, 1, 0, 50, 0),
+        interval="10m",
+        eager=True,
+    )
+    series = pl.DataFrame(
+        {
+            "dataset": ["kelmarsh"] * len(timestamps),
+            "turbine_id": ["Kelmarsh 1"] * len(timestamps),
+            "timestamp": timestamps,
+            "target_kw": [10.0, -10.0, 2200.0, 40.0, 50.0, 60.0],
+            "quality_flags": ["", "", "", "", "conflict_resolved", ""],
+            "Power, Minimum (kW)": [0.0, -3.0, 2201.0, 20.0, 30.0, 40.0],
+            "Power, Maximum (kW)": [15.0, 25.0, 2300.0, 45.0, 55.0, 65.0],
+            "Power, Standard deviation (kW)": [1.0, -4.0, 2100.0, 4.0, 5.0, 6.0],
+        }
+    )
+
+    def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None, include_power_stats=False):
+        assert dataset_id == "kelmarsh"
+        assert turbine_ids == ("Kelmarsh 1",)
+        assert include_power_stats is True
+        return spec, resolved_task, series
+
+    class _FakePipeline:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+            self.batch_sizes: list[int] = []
+
+        def predict_quantiles(self, *, inputs, prediction_length, quantile_levels, batch_size, limit_prediction_length):
+            assert prediction_length == resolved_task.forecast_steps
+            assert quantile_levels == [0.5]
+            self.calls.append(inputs)
+            self.batch_sizes.append(batch_size)
+            return [np.array([[[35.0], [70.0]]], dtype=np.float32)], [np.array([[35.0, 70.0]], dtype=np.float32)]
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+
+    result = module.evaluate_univariate_power_stats_dataset(
+        "kelmarsh",
+        pipeline=pipeline,
+        task_spec=task_spec,
+        batch_size=8,
+        device="cpu",
+    )
+
+    assert len(pipeline.calls) == 1
+    assert len(pipeline.calls[0]) == 1
+    first_call = pipeline.calls[0][0]
+    np.testing.assert_allclose(first_call["target"], np.array([10.0, 0.0, 2050.0], dtype=np.float32), equal_nan=True)
+    assert set(first_call["past_covariates"]) == {
+        "Power, Minimum (kW)",
+        "Power, Maximum (kW)",
+        "Power, Standard deviation (kW)",
+    }
+    np.testing.assert_allclose(
+        first_call["past_covariates"]["Power, Minimum (kW)"],
+        np.array([0.0, 0.0, 2050.0], dtype=np.float32),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        first_call["past_covariates"]["Power, Maximum (kW)"],
+        np.array([15.0, 25.0, 2050.0], dtype=np.float32),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        first_call["past_covariates"]["Power, Standard deviation (kW)"],
+        np.array([1.0, 0.0, 2050.0], dtype=np.float32),
+        equal_nan=True,
+    )
+    assert pipeline.batch_sizes == [4]
+    assert result["dataset_id"] == "kelmarsh_univariate_power_stats"
     assert result["window_count"] == 1
     assert result["prediction_count"] == 1
     assert result["mae_kw"] == 5.0
@@ -979,26 +1231,41 @@ def test_resolve_pipeline_batch_size_counts_series_not_windows() -> None:
 
     assert module.resolve_pipeline_batch_size(np.zeros((32, 1, 144), dtype=np.float32)) == 32
     assert module.resolve_pipeline_batch_size(np.zeros((32, 6, 144), dtype=np.float32)) == 192
+    assert module.resolve_pipeline_batch_size(
+        [
+            {
+                "target": np.zeros(144, dtype=np.float32),
+                "past_covariates": {
+                    "a": np.zeros(144, dtype=np.float32),
+                    "b": np.zeros(144, dtype=np.float32),
+                },
+            },
+            {
+                "target": np.zeros(144, dtype=np.float32),
+                "past_covariates": {
+                    "a": np.zeros(144, dtype=np.float32),
+                    "b": np.zeros(144, dtype=np.float32),
+                },
+            },
+        ]
+    ) == 6
 
 
-def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> None:
-    module = _load_module()
-
+def _install_run_experiment_fakes(monkeypatch, module):
     class _FakePipeline:
         pass
 
-    def _fake_evaluate_univariate_dataset(dataset_id, **kwargs):
-        resolved = module.resolve_dataset_id(dataset_id)
+    def _build_row(resolved: str, suffix: str, *, window_count: int, prediction_count: int) -> dict[str, object]:
         return {
-            "dataset_id": f"{resolved}{module.UNIVARIATE_SUFFIX}",
+            "dataset_id": f"{resolved}{suffix}",
             "model_id": module.MODEL_ID,
             "task_id": module.TASK_ID,
             "history_steps": 144,
             "forecast_steps": 36,
             "stride_steps": 36,
             "target_policy": module.TARGET_POLICY,
-            "window_count": 10,
-            "prediction_count": 360,
+            "window_count": window_count,
+            "prediction_count": prediction_count,
             "start_timestamp": "2024-01-01 00:10:00",
             "end_timestamp": "2024-01-10 00:00:00",
             "mae_kw": 1.0,
@@ -1009,31 +1276,39 @@ def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> 
             "runtime_seconds": 0.5,
         }
 
+    def _fake_evaluate_univariate_dataset(dataset_id, **kwargs):
+        return _build_row(
+            module.resolve_dataset_id(dataset_id),
+            module.UNIVARIATE_SUFFIX,
+            window_count=10,
+            prediction_count=360,
+        )
+
+    def _fake_evaluate_univariate_power_stats_dataset(dataset_id, **kwargs):
+        return _build_row(
+            module.resolve_dataset_id(dataset_id),
+            module.UNIVARIATE_POWER_STATS_SUFFIX,
+            window_count=9,
+            prediction_count=359,
+        )
+
     def _fake_evaluate_multivariate_knn6_dataset(dataset_id, **kwargs):
-        resolved = module.resolve_dataset_id(dataset_id)
-        return {
-            "dataset_id": f"{resolved}{module.MULTIVARIATE_KNN6_SUFFIX}",
-            "model_id": module.MODEL_ID,
-            "task_id": module.TASK_ID,
-            "history_steps": 144,
-            "forecast_steps": 36,
-            "stride_steps": 36,
-            "target_policy": module.TARGET_POLICY,
-            "window_count": 11,
-            "prediction_count": 361,
-            "start_timestamp": "2024-02-01 00:10:00",
-            "end_timestamp": "2024-02-10 00:00:00",
-            "mae_kw": 3.0,
-            "rmse_kw": 4.0,
-            "mae_pu": 0.3,
-            "rmse_pu": 0.4,
-            "device": "cpu",
-            "runtime_seconds": 0.6,
-        }
+        return _build_row(
+            module.resolve_dataset_id(dataset_id),
+            module.MULTIVARIATE_KNN6_SUFFIX,
+            window_count=11,
+            prediction_count=361,
+        )
 
     monkeypatch.setattr(module, "load_pipeline", lambda **kwargs: _FakePipeline())
     monkeypatch.setattr(module, "evaluate_univariate_dataset", _fake_evaluate_univariate_dataset)
+    monkeypatch.setattr(module, "evaluate_univariate_power_stats_dataset", _fake_evaluate_univariate_power_stats_dataset)
     monkeypatch.setattr(module, "evaluate_multivariate_knn6_dataset", _fake_evaluate_multivariate_knn6_dataset)
+
+
+def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
 
     output_path = tmp_path / "chronos-2.csv"
     result = module.run_experiment(
@@ -1045,14 +1320,96 @@ def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> 
 
     assert output_path.exists()
     assert result.columns == module._RESULT_COLUMNS
-    assert result.height == 8
+    assert result.height == 11
     assert sorted(result["dataset_id"].to_list()) == [
         "hill_of_towie_multivariate_knn6",
         "hill_of_towie_univariate",
+        "hill_of_towie_univariate_power_stats",
         "kelmarsh_multivariate_knn6",
         "kelmarsh_univariate",
+        "kelmarsh_univariate_power_stats",
         "penmanshiel_multivariate_knn6",
         "penmanshiel_univariate",
+        "penmanshiel_univariate_power_stats",
         "sdwpf_kddcup_multivariate_knn6",
         "sdwpf_kddcup_univariate",
     ]
+
+
+def test_run_experiment_univariate_mode_includes_power_stats_rows(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
+
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup"),
+        output_path=tmp_path / "chronos-2.csv",
+        device="cpu",
+        mode="univariate",
+    )
+
+    assert result.height == 7
+    assert sorted(result["dataset_id"].to_list()) == [
+        "hill_of_towie_univariate",
+        "hill_of_towie_univariate_power_stats",
+        "kelmarsh_univariate",
+        "kelmarsh_univariate_power_stats",
+        "penmanshiel_univariate",
+        "penmanshiel_univariate_power_stats",
+        "sdwpf_kddcup_univariate",
+    ]
+
+
+def test_run_experiment_multivariate_mode_writes_expected_rows(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
+
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup"),
+        output_path=tmp_path / "chronos-2.csv",
+        device="cpu",
+        mode="multivariate_knn6",
+    )
+
+    assert result.height == 4
+    assert sorted(result["dataset_id"].to_list()) == [
+        "hill_of_towie_multivariate_knn6",
+        "kelmarsh_multivariate_knn6",
+        "penmanshiel_multivariate_knn6",
+        "sdwpf_kddcup_multivariate_knn6",
+    ]
+
+
+def test_run_experiment_univariate_power_stats_mode_filters_supported_datasets(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
+
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup"),
+        output_path=tmp_path / "chronos-2.csv",
+        device="cpu",
+        mode="univariate_power_stats",
+    )
+
+    assert result.height == 3
+    assert sorted(result["dataset_id"].to_list()) == [
+        "hill_of_towie_univariate_power_stats",
+        "kelmarsh_univariate_power_stats",
+        "penmanshiel_univariate_power_stats",
+    ]
+
+
+def test_run_experiment_univariate_power_stats_rejects_unsupported_only_dataset(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
+
+    try:
+        module.run_experiment(
+            dataset_ids=("sdwpf_kddcup",),
+            output_path=tmp_path / "chronos-2.csv",
+            device="cpu",
+            mode="univariate_power_stats",
+        )
+    except ValueError as exc:
+        assert "requires at least one dataset with power_stats support" in str(exc)
+    else:
+        raise AssertionError("Expected univariate_power_stats mode to reject dataset selections without support.")

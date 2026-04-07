@@ -6,3 +6,4 @@ __pycache__/
 cache/
 experiment/*/.conda/
 experiment/*/.work/
+.DS_Store

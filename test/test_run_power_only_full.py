@@ -115,9 +115,27 @@ def test_validate_final_results_requires_exact_dataset_ids() -> None:
     try:
         module.validate_final_results(frame)
     except RuntimeError as exc:
-        assert "Expected 8 result rows" in str(exc)
+        assert "Expected 11 result rows" in str(exc)
     else:
         raise AssertionError("validate_final_results should reject incomplete result sets.")
+
+
+def test_expected_dataset_ids_includes_power_stats_variants() -> None:
+    module = _load_module()
+
+    assert module.expected_dataset_ids() == [
+        "hill_of_towie_multivariate_knn6",
+        "hill_of_towie_univariate",
+        "hill_of_towie_univariate_power_stats",
+        "kelmarsh_multivariate_knn6",
+        "kelmarsh_univariate",
+        "kelmarsh_univariate_power_stats",
+        "penmanshiel_multivariate_knn6",
+        "penmanshiel_univariate",
+        "penmanshiel_univariate_power_stats",
+        "sdwpf_kddcup_multivariate_knn6",
+        "sdwpf_kddcup_univariate",
+    ]
 
 
 def test_run_target_group_chunks_splits_after_failure(monkeypatch, tmp_path) -> None:

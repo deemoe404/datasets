@@ -10,9 +10,10 @@ This experiment evaluates Chronos-2 zero-shot forecasting on:
 The task is fixed to `24h look back -> 6h ahead` with a `6h` stride and uses
 only turbine power histories.
 
-It supports two evaluation layouts:
+It supports three evaluation layouts:
 
 - `univariate`: each turbine is forecast independently and aggregated at the farm level
+- `univariate_power_stats`: univariate target forecasting with same-turbine historical power-stat covariates on the three supported datasets
 - `multivariate_knn6`: each target turbine is forecast with `self + 5 nearest turbines`,
   and only the target turbine forecast is scored
 
@@ -64,7 +65,15 @@ Run only one layout:
 ./.conda/bin/python run_power_only.py --dataset sdwpf_kddcup --mode multivariate_knn6 --batch-size 16
 ```
 
-To run the full 8-row benchmark safely, use the repo-tracked orchestrator instead
+Run only the added power-stat covariate variant:
+
+```bash
+./.conda/bin/python run_power_only.py --mode univariate_power_stats --dataset hill_of_towie --batch-size 16
+```
+
+`univariate_power_stats` is supported only for `kelmarsh`, `penmanshiel`, and `hill_of_towie`.
+
+To run the full 11-row benchmark safely, use the repo-tracked orchestrator instead
 of ad hoc shell loops. It runs serially, chunks the heavy datasets, falls back to
 CPU when an MPS chunk fails, can split heavy `multivariate_knn6` target groups
 into smaller chunks, and writes chunk logs under `./.work/`:
