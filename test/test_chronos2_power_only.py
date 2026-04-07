@@ -27,6 +27,10 @@ def _load_module():
     return module
 
 
+def _penmanshiel_turbine_ids() -> tuple[str, ...]:
+    return tuple(f"Penmanshiel {index:02d}" for index in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+
+
 def test_apply_target_policy_masks_invalid_and_clips_remaining_values() -> None:
     module = _load_module()
 
@@ -309,6 +313,65 @@ def test_build_knn_neighbor_map_falls_back_to_haversine_and_uses_all_neighbors_w
     assert len(neighborhoods["B"]) == 3
 
 
+def test_resolve_multivariate_epoch_configs_penmanshiel_splits_post_2023_targets() -> None:
+    module = _load_module()
+    spec = DatasetSpec(
+        dataset_id="penmanshiel",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=_penmanshiel_turbine_ids(),
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+
+    configs = module.resolve_multivariate_epoch_configs(
+        spec,
+        target_turbine_ids=("Penmanshiel 10", "Penmanshiel 11", "Penmanshiel 12"),
+    )
+
+    boundary_us = module._datetime_to_timestamp_us(module._PENMANSHIEL_EPOCH_BOUNDARY)
+    assert [config.name for config in configs] == ["pre_2024_full_farm", "post_2023_active_subset"]
+    assert configs[0].active_turbine_ids == spec.turbine_ids
+    assert configs[0].target_turbine_ids == ("Penmanshiel 10", "Penmanshiel 11", "Penmanshiel 12")
+    assert configs[0].forecast_start_us_min is None
+    assert configs[0].forecast_start_us_max == boundary_us - 1
+    assert configs[1].active_turbine_ids == module._PENMANSHIEL_POST_2023_TURBINE_IDS
+    assert configs[1].target_turbine_ids == ("Penmanshiel 11", "Penmanshiel 12")
+    assert configs[1].forecast_start_us_min == boundary_us
+    assert configs[1].forecast_start_us_max is None
+
+
+def test_build_epoch_knn_neighbor_map_penmanshiel_post_2023_uses_active_turbine_count() -> None:
+    module = _load_module()
+    turbine_static = pl.DataFrame(
+        {
+            "turbine_id": list(module._PENMANSHIEL_POST_2023_TURBINE_IDS),
+            "coord_x": [0.0, 1.0, 2.0, 3.0, 4.0],
+            "coord_y": [0.0] * 5,
+            "latitude": [None] * 5,
+            "longitude": [None] * 5,
+        }
+    )
+
+    neighborhoods = module.build_epoch_knn_neighbor_map(
+        turbine_static,
+        active_turbine_ids=module._PENMANSHIEL_POST_2023_TURBINE_IDS,
+    )
+
+    assert neighborhoods["Penmanshiel 11"] == (
+        "Penmanshiel 11",
+        "Penmanshiel 12",
+        "Penmanshiel 13",
+        "Penmanshiel 14",
+        "Penmanshiel 15",
+    )
+    assert len(neighborhoods["Penmanshiel 11"]) == 5
+
+
 def test_build_local_panel_reindexes_async_neighbors_and_preserves_order() -> None:
     module = _load_module()
     turbine_series_map = {
@@ -344,6 +407,184 @@ def test_build_local_panel_reindexes_async_neighbors_and_preserves_order() -> No
         np.array([1.0, 2.0, np.nan, 4.0], dtype=np.float32),
         equal_nan=True,
     )
+
+
+def test_evaluate_multivariate_knn6_dataset_penmanshiel_switches_epoch_neighbors_at_2024_boundary(monkeypatch) -> None:
+    module = _load_module()
+    turbine_ids = _penmanshiel_turbine_ids()
+    spec = DatasetSpec(
+        dataset_id="penmanshiel",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=turbine_ids,
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+    task_spec = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        stride_duration="30m",
+        task_id="synthetic_task",
+        granularity="turbine",
+    )
+    resolved_task = task_spec.resolve(spec.resolution_minutes)
+    timestamps = pl.datetime_range(
+        start=datetime(2023, 12, 31, 23, 0, 0),
+        end=datetime(2024, 1, 1, 0, 20, 0),
+        interval="10m",
+        eager=True,
+    )
+    retired_timestamps = timestamps[:6]
+    rows: list[dict[str, object]] = []
+    values_by_turbine = {
+        "Penmanshiel 11": list(range(1, 10)),
+        "Penmanshiel 12": list(range(11, 20)),
+        "Penmanshiel 13": list(range(21, 30)),
+        "Penmanshiel 14": list(range(31, 40)),
+        "Penmanshiel 15": list(range(41, 50)),
+        "Penmanshiel 10": list(range(101, 107)),
+        "Penmanshiel 09": list(range(201, 207)),
+    }
+    for turbine_id in ("Penmanshiel 11", "Penmanshiel 12", "Penmanshiel 13", "Penmanshiel 14", "Penmanshiel 15"):
+        for timestamp, target_kw in zip(timestamps, values_by_turbine[turbine_id], strict=True):
+            rows.append(
+                {
+                    "dataset": "penmanshiel",
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "target_kw": float(target_kw),
+                    "quality_flags": "",
+                }
+            )
+    for turbine_id in ("Penmanshiel 10", "Penmanshiel 09"):
+        for timestamp, target_kw in zip(retired_timestamps, values_by_turbine[turbine_id], strict=True):
+            rows.append(
+                {
+                    "dataset": "penmanshiel",
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "target_kw": float(target_kw),
+                    "quality_flags": "",
+                }
+            )
+    full_series = pl.DataFrame(rows)
+    turbine_static = pl.DataFrame(
+        {
+            "turbine_id": list(turbine_ids),
+            "coord_x": [-50.0, -40.0, -30.0, -25.0, -20.0, -15.0, -10.0, -1.5, -1.0, 0.0, 1.0, 2.0, 2.1, 2.2],
+            "coord_y": [0.0] * len(turbine_ids),
+            "latitude": [None] * len(turbine_ids),
+            "longitude": [None] * len(turbine_ids),
+        }
+    )
+    seen_loader_turbines: list[tuple[str, ...] | None] = []
+
+    def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None):
+        assert dataset_id == "penmanshiel"
+        resolved_turbine_ids = tuple(turbine_ids) if turbine_ids is not None else None
+        seen_loader_turbines.append(resolved_turbine_ids)
+        series = full_series
+        if resolved_turbine_ids is not None:
+            series = series.filter(pl.col("turbine_id").is_in(list(resolved_turbine_ids)))
+        return spec, resolved_task, series
+
+    class _FakePipeline:
+        def __init__(self) -> None:
+            self.calls: list[np.ndarray] = []
+            self.batch_sizes: list[int] = []
+
+        def predict_quantiles(self, *, inputs, prediction_length, quantile_levels, batch_size, limit_prediction_length, cross_learning):
+            assert prediction_length == resolved_task.forecast_steps
+            assert quantile_levels == [0.5]
+            assert cross_learning is False
+            batch_inputs = np.asarray(inputs)
+            self.calls.append(batch_inputs)
+            self.batch_sizes.append(batch_size)
+            forecast = np.zeros((batch_inputs.shape[1], 2), dtype=np.float32)
+            target_last_value = float(batch_inputs[0, 0, -1])
+            if batch_inputs.shape[1] == 6:
+                assert target_last_value == 3.0
+                forecast[0] = np.array([4.0, 5.0], dtype=np.float32)
+            elif batch_inputs.shape[1] == 5:
+                assert target_last_value == 6.0
+                forecast[0] = np.array([7.0, 8.0], dtype=np.float32)
+            else:
+                raise AssertionError(f"Unexpected variate count {batch_inputs.shape[1]}.")
+            return [forecast[:, :, None]], [forecast]
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
+    monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+
+    result = module.evaluate_multivariate_knn6_dataset(
+        "penmanshiel",
+        pipeline=pipeline,
+        task_spec=task_spec,
+        batch_size=4,
+        device="cpu",
+        turbine_ids=("Penmanshiel 11",),
+    )
+
+    assert seen_loader_turbines == [
+        (
+            "Penmanshiel 11",
+            "Penmanshiel 10",
+            "Penmanshiel 12",
+            "Penmanshiel 09",
+            "Penmanshiel 13",
+            "Penmanshiel 14",
+        ),
+        (
+            "Penmanshiel 11",
+            "Penmanshiel 12",
+            "Penmanshiel 13",
+            "Penmanshiel 14",
+            "Penmanshiel 15",
+        ),
+    ]
+    assert len(pipeline.calls) == 2
+    assert pipeline.batch_sizes == [6, 5]
+    np.testing.assert_allclose(
+        pipeline.calls[0],
+        np.array(
+            [[
+                [1.0, 2.0, 3.0],
+                [101.0, 102.0, 103.0],
+                [11.0, 12.0, 13.0],
+                [201.0, 202.0, 203.0],
+                [21.0, 22.0, 23.0],
+                [31.0, 32.0, 33.0],
+            ]],
+            dtype=np.float32,
+        ),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        pipeline.calls[1],
+        np.array(
+            [[
+                [4.0, 5.0, 6.0],
+                [14.0, 15.0, 16.0],
+                [24.0, 25.0, 26.0],
+                [34.0, 35.0, 36.0],
+                [44.0, 45.0, 46.0],
+            ]],
+            dtype=np.float32,
+        ),
+        equal_nan=True,
+    )
+    assert result["dataset_id"] == "penmanshiel_multivariate_knn6"
+    assert result["window_count"] == 2
+    assert result["prediction_count"] == 4
+    assert result["mae_kw"] == 0.0
+    assert result["rmse_kw"] == 0.0
+    assert result["start_timestamp"] == "2023-12-31 23:30:00"
+    assert result["end_timestamp"] == "2024-01-01 00:10:00"
 
 
 def test_evaluate_multivariate_knn6_dataset_scores_only_target_turbine(monkeypatch) -> None:

@@ -35,6 +35,8 @@ _DATASET_RATED_POWER_KW = {
 _DATASET_ID_ALIASES = {
     "sdwpf_full": "sdwpf_kddcup",
 }
+_PENMANSHIEL_EPOCH_BOUNDARY = datetime(2024, 1, 1, 0, 0, 0)
+_PENMANSHIEL_POST_2023_TURBINE_IDS = tuple(f"Penmanshiel {index:02d}" for index in range(11, 16))
 _RESULT_COLUMNS = [
     "dataset_id",
     "model_id",
@@ -69,6 +71,32 @@ class FarmPanel:
     target_kw_masked: np.ndarray
 
 
+@dataclass(frozen=True)
+class MultivariateEpochConfig:
+    name: str
+    active_turbine_ids: tuple[str, ...]
+    target_turbine_ids: tuple[str, ...]
+    forecast_start_us_min: int | None = None
+    forecast_start_us_max: int | None = None
+
+
+@dataclass(frozen=True)
+class PreparedMultivariateEpoch:
+    config: MultivariateEpochConfig
+    required_input_turbine_ids: tuple[str, ...]
+    neighbor_map: dict[str, tuple[str, ...]]
+    turbine_series_map: dict[str, TurbineSeries]
+
+
+@dataclass(frozen=True)
+class TargetPanelRun:
+    name: str
+    farm_panel: FarmPanel
+    scored_row_index: int
+    forecast_start_us_min: int | None = None
+    forecast_start_us_max: int | None = None
+
+
 def _ensure_repo_src_on_path() -> None:
     src_path = _REPO_ROOT / "src"
     if str(src_path) not in sys.path:
@@ -90,6 +118,60 @@ def build_task_spec():
 
 def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
+
+
+def _ordered_intersection(values: Sequence[str], allowed_values: Sequence[str]) -> tuple[str, ...]:
+    allowed = set(allowed_values)
+    return tuple(value for value in values if value in allowed)
+
+
+def _datetime_to_timestamp_us(value: datetime) -> int:
+    return int(value.replace(tzinfo=UTC).timestamp() * 1_000_000)
+
+
+def resolve_multivariate_epoch_configs(
+    spec: Any,
+    *,
+    target_turbine_ids: Sequence[str],
+) -> tuple[MultivariateEpochConfig, ...]:
+    resolved_target_turbine_ids = tuple(target_turbine_ids)
+    if spec.dataset_id != "penmanshiel":
+        return (
+            MultivariateEpochConfig(
+                name="default",
+                active_turbine_ids=tuple(spec.turbine_ids),
+                target_turbine_ids=resolved_target_turbine_ids,
+            ),
+        )
+
+    boundary_us = _datetime_to_timestamp_us(_PENMANSHIEL_EPOCH_BOUNDARY)
+    epoch_configs: list[MultivariateEpochConfig] = []
+    if resolved_target_turbine_ids:
+        epoch_configs.append(
+            MultivariateEpochConfig(
+                name="pre_2024_full_farm",
+                active_turbine_ids=tuple(spec.turbine_ids),
+                target_turbine_ids=resolved_target_turbine_ids,
+                forecast_start_us_max=boundary_us - 1,
+            )
+        )
+    post_2023_targets = _ordered_intersection(
+        resolved_target_turbine_ids,
+        _PENMANSHIEL_POST_2023_TURBINE_IDS,
+    )
+    if post_2023_targets:
+        epoch_configs.append(
+            MultivariateEpochConfig(
+                name="post_2023_active_subset",
+                active_turbine_ids=_ordered_intersection(
+                    spec.turbine_ids,
+                    _PENMANSHIEL_POST_2023_TURBINE_IDS,
+                ),
+                target_turbine_ids=post_2023_targets,
+                forecast_start_us_min=boundary_us,
+            )
+        )
+    return tuple(epoch_configs)
 
 
 def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
@@ -417,6 +499,30 @@ def build_knn_neighbor_map(
     return neighborhoods
 
 
+def build_epoch_knn_neighbor_map(
+    turbine_static: pl.DataFrame,
+    *,
+    active_turbine_ids: Sequence[str],
+) -> dict[str, tuple[str, ...]]:
+    resolved_active_turbine_ids = tuple(active_turbine_ids)
+    return build_knn_neighbor_map(
+        turbine_static,
+        turbine_ids=resolved_active_turbine_ids,
+        max_neighbors=min(DEFAULT_NEIGHBOR_COUNT, len(resolved_active_turbine_ids)),
+    )
+
+
+def build_epoch_required_input_turbine_ids(
+    target_turbine_ids: Sequence[str],
+    neighbor_map: dict[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    return _ordered_unique(
+        turbine_id
+        for target_turbine_id in target_turbine_ids
+        for turbine_id in neighbor_map[target_turbine_id]
+    )
+
+
 def build_local_panel(
     turbine_series_map: dict[str, TurbineSeries],
     *,
@@ -603,6 +709,86 @@ def _iter_multivariate_batches(
             np.stack(future_rows),
             np.stack(future_timestamps),
         )
+
+
+def _iter_multivariate_batches_for_runs(
+    *,
+    panel_runs: Sequence[TargetPanelRun],
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    batch_size: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    context_batch: list[np.ndarray] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamps: list[np.ndarray] = []
+    emitted_windows = 0
+    skipped_windows = 0
+    max_windows_reached = False
+
+    def flush_batch() -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        nonlocal context_batch, future_rows, future_timestamps
+        if not context_batch:
+            return None
+        batch = (
+            np.stack(context_batch),
+            np.stack(future_rows),
+            np.stack(future_timestamps),
+        )
+        context_batch = []
+        future_rows = []
+        future_timestamps = []
+        return batch
+
+    for panel_run in panel_runs:
+        farm_panel = panel_run.farm_panel
+        max_anchor_index = farm_panel.timestamps_us.shape[0] - forecast_steps
+        for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+            forecast_start_us = int(farm_panel.timestamps_us[anchor_index + 1])
+            if panel_run.forecast_start_us_min is not None and forecast_start_us < panel_run.forecast_start_us_min:
+                continue
+            if panel_run.forecast_start_us_max is not None and forecast_start_us > panel_run.forecast_start_us_max:
+                continue
+
+            context = farm_panel.target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1].T
+            future = farm_panel.target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps].T
+            if context.shape != (len(farm_panel.turbine_ids), history_steps):
+                continue
+            if future.shape != (len(farm_panel.turbine_ids), forecast_steps):
+                continue
+            if (
+                np.isnan(context).all()
+                or np.isnan(future).all()
+                or np.isnan(future[panel_run.scored_row_index]).all()
+            ):
+                continue
+            if skipped_windows < window_offset:
+                skipped_windows += 1
+                continue
+
+            context_batch.append(context.astype(np.float32, copy=True))
+            future_rows.append(future.astype(np.float64, copy=True))
+            future_timestamps.append(
+                farm_panel.timestamps_us[anchor_index + 1 : anchor_index + 1 + forecast_steps].astype(np.int64, copy=True)
+            )
+            emitted_windows += 1
+
+            if len(context_batch) >= batch_size:
+                batch = flush_batch()
+                if batch is not None:
+                    yield batch
+
+            if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+                max_windows_reached = True
+                break
+
+        batch = flush_batch()
+        if batch is not None:
+            yield batch
+        if max_windows_reached:
+            break
 
 
 def resolve_pipeline_batch_size(context_batch: np.ndarray) -> int:
@@ -815,69 +1001,103 @@ def evaluate_multivariate_knn6_dataset(
         unknown_turbine_ids = [turbine_id for turbine_id in target_turbine_ids if turbine_id not in spec.turbine_ids]
         if unknown_turbine_ids:
             raise ValueError(f"Unknown turbine ids for dataset {spec.dataset_id!r}: {unknown_turbine_ids!r}")
-    neighborhood_map = build_knn_neighbor_map(
-        load_dataset_turbine_static(spec.dataset_id, cache_root=cache_root),
-        turbine_ids=spec.turbine_ids,
-        max_neighbors=DEFAULT_NEIGHBOR_COUNT,
+    epoch_configs = resolve_multivariate_epoch_configs(
+        spec,
+        target_turbine_ids=target_turbine_ids,
     )
-    required_input_turbine_ids = _ordered_unique(
-        turbine_id
-        for target_turbine_id in target_turbine_ids
-        for turbine_id in neighborhood_map[target_turbine_id]
-    )
-    _profile_log(
-        spec.dataset_id,
-        "multivariate_scope",
-        target_turbines=len(target_turbine_ids),
-        input_turbines=len(required_input_turbine_ids),
-    )
-    spec, resolved_task, series = load_dataset_inputs(
-        dataset_id,
-        cache_root=cache_root,
-        task_spec=task_spec,
-        turbine_ids=required_input_turbine_ids,
-    )
+    turbine_static = load_dataset_turbine_static(spec.dataset_id, cache_root=cache_root)
     rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
-    prepare_started = time.monotonic()
-    prepared_series = prepare_power_only_series(series, rated_power_kw=rated_power_kw)
-    _profile_log(
-        spec.dataset_id,
-        "prepare_power_only_series",
-        rows=prepared_series.height,
-        columns=prepared_series.width,
-        target_turbines=len(target_turbine_ids),
-        input_turbines=len(required_input_turbine_ids),
-        duration_seconds=round(time.monotonic() - prepare_started, 6),
-    )
-    turbine_series_map = build_turbine_series_map(prepared_series)
+    epoch_contexts: list[PreparedMultivariateEpoch] = []
+    all_required_input_turbine_ids: list[str] = []
+
+    for epoch_config in epoch_configs:
+        neighbor_map = build_epoch_knn_neighbor_map(
+            turbine_static,
+            active_turbine_ids=epoch_config.active_turbine_ids,
+        )
+        required_input_turbine_ids = build_epoch_required_input_turbine_ids(
+            epoch_config.target_turbine_ids,
+            neighbor_map,
+        )
+        all_required_input_turbine_ids.extend(required_input_turbine_ids)
+        _profile_log(
+            spec.dataset_id,
+            "multivariate_epoch_scope",
+            epoch_name=epoch_config.name,
+            target_turbines=len(epoch_config.target_turbine_ids),
+            input_turbines=len(required_input_turbine_ids),
+            forecast_start_us_min=epoch_config.forecast_start_us_min,
+            forecast_start_us_max=epoch_config.forecast_start_us_max,
+        )
+        _, _, series = load_dataset_inputs(
+            dataset_id,
+            cache_root=cache_root,
+            task_spec=task_spec,
+            turbine_ids=required_input_turbine_ids,
+        )
+        prepare_started = time.monotonic()
+        prepared_series = prepare_power_only_series(series, rated_power_kw=rated_power_kw)
+        _profile_log(
+            spec.dataset_id,
+            "prepare_power_only_series",
+            epoch_name=epoch_config.name,
+            rows=prepared_series.height,
+            columns=prepared_series.width,
+            target_turbines=len(epoch_config.target_turbine_ids),
+            input_turbines=len(required_input_turbine_ids),
+            duration_seconds=round(time.monotonic() - prepare_started, 6),
+        )
+        epoch_contexts.append(
+            PreparedMultivariateEpoch(
+                config=epoch_config,
+                required_input_turbine_ids=required_input_turbine_ids,
+                neighbor_map=neighbor_map,
+                turbine_series_map=build_turbine_series_map(prepared_series),
+            )
+        )
+
     metrics = _initialize_metrics()
 
     for target_turbine_id in target_turbine_ids:
-        panel_started = time.monotonic()
-        local_panel = build_local_panel(
-            turbine_series_map,
-            turbine_ids=neighborhood_map[target_turbine_id],
-            resolution_minutes=spec.resolution_minutes,
-        )
-        _profile_log(
-            spec.dataset_id,
-            "build_local_panel",
-            target_turbine_id=target_turbine_id,
-            input_turbines=len(neighborhood_map[target_turbine_id]),
-            timestamps=len(local_panel.timestamps_us),
-            rows=int(local_panel.target_kw_masked.shape[0]),
-            columns=int(local_panel.target_kw_masked.shape[1]),
-            duration_seconds=round(time.monotonic() - panel_started, 6),
-        )
-        for context_batch, actual_batch, future_timestamps_batch in _iter_multivariate_batches(
-            farm_panel=local_panel,
+        panel_runs: list[TargetPanelRun] = []
+        for epoch_context in epoch_contexts:
+            if target_turbine_id not in epoch_context.config.target_turbine_ids:
+                continue
+            panel_started = time.monotonic()
+            local_panel = build_local_panel(
+                epoch_context.turbine_series_map,
+                turbine_ids=epoch_context.neighbor_map[target_turbine_id],
+                resolution_minutes=spec.resolution_minutes,
+            )
+            _profile_log(
+                spec.dataset_id,
+                "build_local_panel",
+                epoch_name=epoch_context.config.name,
+                target_turbine_id=target_turbine_id,
+                input_turbines=len(epoch_context.neighbor_map[target_turbine_id]),
+                timestamps=len(local_panel.timestamps_us),
+                rows=int(local_panel.target_kw_masked.shape[0]),
+                columns=int(local_panel.target_kw_masked.shape[1]),
+                duration_seconds=round(time.monotonic() - panel_started, 6),
+            )
+            panel_runs.append(
+                TargetPanelRun(
+                    name=epoch_context.config.name,
+                    farm_panel=local_panel,
+                    scored_row_index=0,
+                    forecast_start_us_min=epoch_context.config.forecast_start_us_min,
+                    forecast_start_us_max=epoch_context.config.forecast_start_us_max,
+                )
+            )
+
+        for context_batch, actual_batch, future_timestamps_batch in _iter_multivariate_batches_for_runs(
+            panel_runs=panel_runs,
             history_steps=resolved_task.history_steps,
             forecast_steps=resolved_task.forecast_steps,
             stride_steps=resolved_task.stride_steps,
             batch_size=batch_size,
             window_offset=window_offset,
             max_windows_per_dataset=max_windows_per_dataset,
-            scored_row_index=0,
         ):
             quantiles, _ = pipeline.predict_quantiles(
                 inputs=context_batch,
@@ -920,7 +1140,7 @@ def evaluate_multivariate_knn6_dataset(
         spec.dataset_id,
         "evaluate_multivariate_complete",
         target_turbines=len(target_turbine_ids),
-        input_turbines=len(required_input_turbine_ids),
+        input_turbines=len(_ordered_unique(all_required_input_turbine_ids)),
         runtime_seconds=round(runtime_seconds, 6),
         window_count=int(metrics["window_count"]),
         prediction_count=int(metrics["prediction_count"]),
