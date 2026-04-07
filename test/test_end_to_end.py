@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import polars as pl
+import pytest
 
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
 from wind_datasets.datasets.hill_of_towie import HillOfTowieDatasetBuilder
@@ -213,12 +214,11 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     builder = SDWPFKDDCupDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     gold_path = builder.build_gold_base()
-    assert gold_path.parts[-4:] == ("official_v1", "farm", "default", "series.parquet")
+    assert gold_path.parts[-4:] == ("default", "farm", "default", "series.parquet")
     before_mtime = gold_path.stat().st_mtime_ns
 
     default_series = builder.load_series()
-    raw_series = builder.load_series("raw_v1")
-    zeroed_series = builder.load_series("official_v1_zero_negative_patv")
+    explicit_default_series = builder.load_series("default")
     turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
     manifest = json.loads(builder.cache_paths.manifest_path.read_text())
@@ -227,35 +227,19 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
         (pl.col("turbine_id") == "1")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
     )
-    raw_negative = raw_series.filter(
-        (pl.col("turbine_id") == "1")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
-    )
-    zeroed_negative = zeroed_series.filter(
-        (pl.col("turbine_id") == "1")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:10:00")
-    )
 
     assert before_mtime == gold_path.stat().st_mtime_ns
+    assert default_series.equals(explicit_default_series)
     _assert_unique_series_keys(default_series)
     assert turbine_static.height == len(spec.turbine_ids)
     assert "farm_turbines_observed" in default_series.columns
     assert turbine_static["elevation_m"].null_count() == turbine_static.height
     assert manifest["time_semantics_check"]["calendar_anchor_date"] == "2020-05-01"
-    assert default_negative["target_kw_raw"][0] == -5
     assert default_negative["target_kw"][0] == -5
-    assert default_negative["sdwpf_has_negative_patv"][0] is True
-    assert default_negative["quality_flags"][0] == "sdwpf_patv_negative"
-    assert raw_negative["target_kw_raw"][0] == -5
-    assert raw_negative["target_kw"][0] == -5
-    assert raw_negative["sdwpf_has_negative_patv"][0] is False
-    assert raw_negative["quality_flags"][0] == ""
-    assert zeroed_negative["target_kw_raw"][0] == -5
-    assert zeroed_negative["target_kw"][0] == 0
-    assert zeroed_negative["quality_flags"][0] == "sdwpf_patv_negative|sdwpf_patv_zeroed"
-
-    assert report["quality_profile"] == "official_v1"
-    assert report["sdwpf_negative_patv_count"] == 1
+    assert default_negative["quality_flags"][0] == ""
+    assert "target_kw_raw" not in default_series.columns
+    assert "sdwpf_has_negative_patv" not in default_series.columns
+    assert report["quality_profile"] == "default"
     assert report["sdwpf_unknown_count"] == 2
     assert report["sdwpf_abnormal_count"] == 2
     assert report["sdwpf_masked_count"] == 4
@@ -263,18 +247,19 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert report["sdwpf_flag_counts"]["sdwpf_unknown_pitch"] == 1
     assert report["sdwpf_flag_counts"]["sdwpf_abnormal_ndir"] == 1
     assert report["sdwpf_flag_counts"]["sdwpf_abnormal_wdir"] == 1
+    assert "sdwpf_patv_negative" not in report["sdwpf_flag_counts"]
+    assert "sdwpf_patv_zeroed" not in report["sdwpf_flag_counts"]
     assert not report["long_gaps"]
 
     task_a = TaskSpec(history_duration="30m", forecast_duration="20m", task_id="short_a", granularity="turbine")
     task_b = TaskSpec(history_duration="40m", forecast_duration="20m", task_id="short_b", granularity="turbine")
     builder.build_task_cache(task_a)
     builder.build_task_cache(task_b)
-    builder.build_task_cache(task_a, quality_profile="raw_v1")
 
     after_mtime = gold_path.stat().st_mtime_ns
     window_index = builder.load_window_index(task_a)
     task_report = json.loads(
-        (builder.cache_paths.tasks_dir / "official_v1" / "turbine" / "short_a" / "task_report.json").read_text()
+        (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_a" / "task_report.json").read_text()
     )
     anchor_window = window_index.filter(
         (pl.col("turbine_id") == "1")
@@ -292,13 +277,18 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert anchor_window["output_unknown_steps"][0] == 1
     assert "masked_input" in anchor_window["quality_flags"][0]
     assert "masked_output" in anchor_window["quality_flags"][0]
-    assert task_report["quality_profile"] == "official_v1"
+    assert task_report["quality_profile"] == "default"
     assert task_report["masked_input_windows"] > 0
     assert task_report["masked_output_windows"] > 0
     assert task_report["fully_complete_and_unmasked_output_windows"] > 0
-    assert (builder.cache_paths.tasks_dir / "official_v1" / "turbine" / "short_a" / "window_index.parquet").exists()
-    assert (builder.cache_paths.tasks_dir / "official_v1" / "turbine" / "short_b" / "window_index.parquet").exists()
-    assert (builder.cache_paths.tasks_dir / "raw_v1" / "turbine" / "short_a" / "window_index.parquet").exists()
+    assert (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_a" / "window_index.parquet").exists()
+    assert (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_b" / "window_index.parquet").exists()
+
+    for legacy_profile in ("official_v1", "raw_v1", "official_v1_zero_negative_patv"):
+        with pytest.raises(ValueError):
+            builder.build_gold_base(quality_profile=legacy_profile)
+        with pytest.raises(ValueError):
+            builder.build_task_cache(task_a, quality_profile=legacy_profile)
 
 
 def test_end_to_end_penmanshiel_pipeline(tmp_path) -> None:

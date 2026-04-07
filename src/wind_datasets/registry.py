@@ -196,7 +196,7 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
         timestamp_convention="derived_day_clock_naive",
         default_feature_groups=("main",),
         handler="sdwpf_kddcup",
-        default_quality_profile="official_v1",
+        default_quality_profile="default",
         official_name="sdwpf_kddcup",
         official_releases=(
             OfficialRelease(

@@ -108,8 +108,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Farm task caches write a task-local `turbine_static.parquet` with stable `turbine_index` ordering.
 - Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is an audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented rule flagged it.
-- `sdwpf_kddcup` defaults to `quality_profile="official_v1"`.
-- `sdwpf_kddcup official_v1` means “official rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
+- `sdwpf_kddcup` defaults to `quality_profile="default"`.
+- `sdwpf_kddcup default` means “implemented SDWPF unknown/abnormal rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
 - `sdwpf_kddcup` gold/task builds are fail-closed when manifest time-semantics audit finds `Day + Tmstamp` values incompatible with the documented 245-day 10-minute grid.
 - `TaskSpec.next_6h_from_24h()` now defaults to `granularity="farm"`.
 
@@ -283,20 +283,16 @@ This sidecar is the repository's default spatial interface. It does not precompu
 
 ## `sdwpf_kddcup` Quality Profiles
 
-Three quality profiles are currently supported:
+`sdwpf_kddcup` supports a single quality profile:
 
-- `official_v1`: default. Keeps raw target values, adds official flags and boolean mask columns.
-- `raw_v1`: disables SDWPF-specific official flags and keeps only generic missing-row / missing-target flags.
-- `official_v1_zero_negative_patv`: same as `official_v1`, but writes `target_kw=0` when `Patv < 0` and preserves the original value in `target_kw_raw`.
+- `default`: keeps raw `Patv` values, including negatives, and adds SDWPF unknown/abnormal flags plus boolean mask columns.
 
 Implemented SDWPF-specific flags:
 
-- `sdwpf_patv_negative`
 - `sdwpf_unknown_patv_wspd`
 - `sdwpf_unknown_pitch`
 - `sdwpf_abnormal_ndir`
 - `sdwpf_abnormal_wdir`
-- `sdwpf_patv_zeroed`
 
 Window-level mask counts remain available in turbine `window_index.parquet`. Farm windows instead carry per-step turbine availability and mask-count lists.
 

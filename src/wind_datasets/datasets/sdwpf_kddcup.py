@@ -17,11 +17,7 @@ from .common import (
     write_quality_report,
 )
 
-_SDWPF_SUPPORTED_QUALITY_PROFILES = {
-    "official_v1",
-    "raw_v1",
-    "official_v1_zero_negative_patv",
-}
+_SDWPF_SUPPORTED_QUALITY_PROFILES = {"default"}
 _KDDCUP_CALENDAR_ANCHOR = datetime(2020, 5, 1)
 _KDDCUP_MAIN_CSV = "sdwpf_245days_v1.csv"
 _KDDCUP_MAIN_PARQUET = "sdwpf_245days_v1.parquet"
@@ -133,10 +129,9 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             for column in frame.columns
             if column not in {"TurbID", "Day", "Tmstamp", self.spec.target_column}
         ]
-        target_raw_expr = pl.col(self.spec.target_column).cast(pl.Float64, strict=False)
-        negative_patv_expr = target_raw_expr.lt(0).fill_null(False)
+        target_expr = pl.col(self.spec.target_column).cast(pl.Float64, strict=False)
         unknown_patv_wspd_expr = (
-            target_raw_expr.le(0) & pl.col("Wspd").cast(pl.Float64, strict=False).gt(2.5)
+            target_expr.le(0) & pl.col("Wspd").cast(pl.Float64, strict=False).gt(2.5)
         ).fill_null(False)
         pitch_columns = [column for column in ("Pab1", "Pab2", "Pab3") if column in frame.columns]
         if pitch_columns:
@@ -153,51 +148,27 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             pl.col("Wdir").cast(pl.Float64, strict=False).lt(-180)
             | pl.col("Wdir").cast(pl.Float64, strict=False).gt(180)
         ).fill_null(False)
-        zero_negative_patv = resolved_quality_profile == "official_v1_zero_negative_patv"
-        use_official_rules = resolved_quality_profile != "raw_v1"
-        if use_official_rules:
-            is_unknown_value_expr = (unknown_patv_wspd_expr | unknown_pitch_expr).fill_null(False)
-            is_abnormal_value_expr = (abnormal_ndir_expr | abnormal_wdir_expr).fill_null(False)
-            base_quality_flags_expr = pl.concat_str(
-                [
-                    pl.when(negative_patv_expr).then(pl.lit("sdwpf_patv_negative")).otherwise(None),
-                    pl.when(unknown_patv_wspd_expr)
-                    .then(pl.lit("sdwpf_unknown_patv_wspd"))
-                    .otherwise(None),
-                    pl.when(unknown_pitch_expr).then(pl.lit("sdwpf_unknown_pitch")).otherwise(None),
-                    pl.when(abnormal_ndir_expr).then(pl.lit("sdwpf_abnormal_ndir")).otherwise(None),
-                    pl.when(abnormal_wdir_expr).then(pl.lit("sdwpf_abnormal_wdir")).otherwise(None),
-                    pl.when(negative_patv_expr & pl.lit(zero_negative_patv))
-                    .then(pl.lit("sdwpf_patv_zeroed"))
-                    .otherwise(None),
-                ],
-                separator="|",
-                ignore_nulls=True,
-            ).fill_null("")
-            target_kw_expr = (
-                pl.when(negative_patv_expr & pl.lit(zero_negative_patv))
-                .then(pl.lit(0.0))
-                .otherwise(target_raw_expr)
-                .alias("target_kw")
-            )
-        else:
-            is_unknown_value_expr = pl.lit(False)
-            is_abnormal_value_expr = pl.lit(False)
-            base_quality_flags_expr = pl.lit("")
-            target_kw_expr = target_raw_expr.alias("target_kw")
+        is_unknown_value_expr = (unknown_patv_wspd_expr | unknown_pitch_expr).fill_null(False)
+        is_abnormal_value_expr = (abnormal_ndir_expr | abnormal_wdir_expr).fill_null(False)
+        base_quality_flags_expr = pl.concat_str(
+            [
+                pl.when(unknown_patv_wspd_expr)
+                .then(pl.lit("sdwpf_unknown_patv_wspd"))
+                .otherwise(None),
+                pl.when(unknown_pitch_expr).then(pl.lit("sdwpf_unknown_pitch")).otherwise(None),
+                pl.when(abnormal_ndir_expr).then(pl.lit("sdwpf_abnormal_ndir")).otherwise(None),
+                pl.when(abnormal_wdir_expr).then(pl.lit("sdwpf_abnormal_wdir")).otherwise(None),
+            ],
+            separator="|",
+            ignore_nulls=True,
+        ).fill_null("")
 
         gold_input = frame.with_columns(
             pl.col("TurbID").cast(pl.String).alias("turbine_id"),
             timestamp_expr,
-            target_raw_expr.alias("target_kw_raw"),
-            target_kw_expr,
+            target_expr.alias("target_kw"),
             pl.lit(self.spec.dataset_id).alias("dataset"),
             pl.lit(True).alias("__row_present"),
-            (
-                negative_patv_expr.alias("sdwpf_has_negative_patv")
-                if use_official_rules
-                else pl.lit(False).alias("sdwpf_has_negative_patv")
-            ),
             is_unknown_value_expr.alias("sdwpf_is_unknown"),
             is_abnormal_value_expr.alias("sdwpf_is_abnormal"),
             (is_unknown_value_expr | is_abnormal_value_expr)
@@ -210,11 +181,9 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
                 "dataset",
                 "turbine_id",
                 "timestamp",
-                "target_kw_raw",
                 "target_kw",
                 "__row_present",
                 "__base_quality_flags",
-                "sdwpf_has_negative_patv",
                 "sdwpf_is_unknown",
                 "sdwpf_is_abnormal",
                 "sdwpf_is_masked",
@@ -243,7 +212,6 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
         gold_base.write_parquet(series_path)
 
         flag_counts = gold_input.select(
-            pl.col("sdwpf_has_negative_patv").cast(pl.Int64).sum().alias("sdwpf_patv_negative"),
             (
                 pl.col("__base_quality_flags")
                 .str.contains(r"(^|\|)sdwpf_unknown_patv_wspd($|\|)")
@@ -269,12 +237,8 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
                 .sum()
             ).alias("sdwpf_abnormal_wdir"),
             (
-                pl.col("__base_quality_flags")
-                .str.contains(r"(^|\|)sdwpf_patv_zeroed($|\|)")
-                .cast(pl.Int64)
-                .sum()
-            ).alias("sdwpf_patv_zeroed"),
-            pl.col("sdwpf_is_unknown").cast(pl.Int64).sum().alias("sdwpf_unknown_count"),
+                pl.col("sdwpf_is_unknown").cast(pl.Int64).sum()
+            ).alias("sdwpf_unknown_count"),
             pl.col("sdwpf_is_abnormal").cast(pl.Int64).sum().alias("sdwpf_abnormal_count"),
             pl.col("sdwpf_is_masked").cast(pl.Int64).sum().alias("sdwpf_masked_count"),
         ).row(0, named=True)
@@ -292,17 +256,14 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
                 "layout": resolved_layout,
                 "feature_set": resolved_feature_set,
                 "calendar_anchor_date": _KDDCUP_CALENDAR_ANCHOR.date().isoformat(),
-                "sdwpf_negative_patv_count": int(flag_counts["sdwpf_patv_negative"] or 0),
                 "sdwpf_unknown_count": int(flag_counts["sdwpf_unknown_count"] or 0),
                 "sdwpf_abnormal_count": int(flag_counts["sdwpf_abnormal_count"] or 0),
                 "sdwpf_masked_count": int(flag_counts["sdwpf_masked_count"] or 0),
                 "sdwpf_flag_counts": {
-                    "sdwpf_patv_negative": int(flag_counts["sdwpf_patv_negative"] or 0),
                     "sdwpf_unknown_patv_wspd": int(flag_counts["sdwpf_unknown_patv_wspd"] or 0),
                     "sdwpf_unknown_pitch": int(flag_counts["sdwpf_unknown_pitch"] or 0),
                     "sdwpf_abnormal_ndir": int(flag_counts["sdwpf_abnormal_ndir"] or 0),
                     "sdwpf_abnormal_wdir": int(flag_counts["sdwpf_abnormal_wdir"] or 0),
-                    "sdwpf_patv_zeroed": int(flag_counts["sdwpf_patv_zeroed"] or 0),
                 },
                 **build_coverage_summary(report_frame, self.spec),
             },
