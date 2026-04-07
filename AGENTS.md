@@ -17,9 +17,9 @@
 
 | 数据集        | 机组级风功率预测目标                                         | 外生变量                                                   |
 | ------------- | -----------------------------------------------------------: | ---------------------------------------------------------: |
-| Kelmarsh      |              `Power (kW)` 的 mean/min/max/stddev over 10 min |               机组 SCADA 连续量 + 场级 PMU/电表 + 状态事件 |
-| Penmanshiel   |              `Power (kW)` 的 mean/min/max/stddev over 10 min |               机组 SCADA 连续量 + 场级 PMU/电表 + 状态事件 |
-| Hill of Towie | `wtc_ActPower_*` 的 mean/min/max/stddev/endvalue over 10 min |            机组/场级 SCADA 多表 + 告警事件 + AeroUp/TuneUp |
+| Kelmarsh      |              `Power (kW)` 的 min/max/stddev/mean over 10 min |               机组 SCADA 连续量 + 场级 PMU/电表 + 状态事件 |
+| Penmanshiel   |              `Power (kW)` 的 min/max/stddev/mean over 10 min |               机组 SCADA 连续量 + 场级 PMU/电表 + 状态事件 |
+| Hill of Towie | `wtc_ActPower_*` 的 min/max/stddev/endvalue/mean over 10 min |            机组/场级 SCADA 多表 + 告警事件 + AeroUp/TuneUp |
 | sdwpf_kddcup  |                                      `Patv` mean over 10 min | `Wspd/Wdir/Etmp/Itmp/Ndir/Pab1/Pab2/Pab3/Prtv` + 质量 flag |
 
 Kelmarsh/Penmanshiel 的 Greenbyte 连续 CSV 不是天然一条时间戳一行，同一时间戳会出现很多条记录，必须先聚合整理
