@@ -351,16 +351,14 @@ That default command rebuilds the standard cache stack for all four supported da
 - `manifest`
 - `silver`
 - `gold_base/default/farm/default`
-- `gold_base/default/turbine/default`
 - `tasks/default/farm/next_6h_from_24h`
-- `tasks/default/turbine/next_6h_from_24h`
-- `tasks/default/turbine/next_6h_from_24h_stride_6h`
 
 Common variants:
 
 ```bash
 ./scripts/rebuild_cache.sh hill_of_towie
 ./scripts/rebuild_cache.sh kelmarsh penmanshiel
+./scripts/rebuild_cache.sh --include-turbine hill_of_towie
 ./scripts/rebuild_cache.sh --clean hill_of_towie
 ./scripts/rebuild_cache.sh --cache-root /tmp/wind-cache sdwpf_kddcup
 ```
@@ -368,8 +366,11 @@ Common variants:
 Notes:
 
 - The script uses the repository's `./.conda/bin/python` by default.
-- The script exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
+- The wrapper exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
+- The underlying Python entrypoint is `python -m wind_datasets.rebuild_cache`.
 - `--clean` removes `cache/<dataset>` before rebuilding.
+- `--include-turbine` opts into the compatibility turbine `gold_base/task` artifacts; the default rebuild stays farm-only.
+- When rebuilding multiple datasets, the command continues after a dataset-level failure, then exits non-zero with a failure summary.
 - `sdwpf_kddcup` still fail-closes at `gold_base/task` if the manifest time-semantics audit does not match the documented 245-day 10-minute grid.
 
 If an experiment needs a non-standard task, build it directly from Python:
