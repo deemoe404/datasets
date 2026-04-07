@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from importlib import resources
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +67,11 @@ _HILL_TURBINE_SHARED_GROUPS = (
 _HILL_EVENT_FEATURE_GROUPS = (
     "alarmlog",
     "aeroup",
+    "tuneup",
 )
+
+_HILL_TUNEUP_METADATA_PACKAGE = "wind_datasets.data"
+_HILL_TUNEUP_METADATA_RESOURCE = "hill_of_towie_tuneup_2024.csv"
 
 
 def _read_csv_with_fallback(path):
@@ -75,6 +81,20 @@ def _read_csv_with_fallback(path):
         except pl.exceptions.ComputeError:
             continue
     return pl.read_csv(path, encoding="utf8-lossy")
+
+
+def _load_packaged_hill_tuneup_metadata() -> pl.DataFrame:
+    resource = resources.files(_HILL_TUNEUP_METADATA_PACKAGE).joinpath(_HILL_TUNEUP_METADATA_RESOURCE)
+    return pl.read_csv(
+        BytesIO(resource.read_bytes()),
+        schema_overrides={
+            "turbine_id": pl.String,
+            "tuneup_deployment_start": pl.String,
+            "tuneup_effective_start": pl.String,
+            "tuneup_deployment_end": pl.String,
+            "source_configs": pl.String,
+        },
+    )
 
 
 def _normalize_duplicate_value(value, dtype):
@@ -702,6 +722,42 @@ def _standardize_aeroup(path: Path, dataset_id: str) -> pl.DataFrame:
     ).filter(pl.col("turbine_id").is_not_null())
 
 
+def _standardize_tuneup(
+    dataset_id: str,
+    turbine_ids: tuple[str, ...],
+) -> pl.DataFrame:
+    frame = _load_packaged_hill_tuneup_metadata().with_columns(
+        pl.col("turbine_id").cast(pl.String),
+        pl.col("tuneup_deployment_start")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("tuneup_deployment_start"),
+        pl.col("tuneup_effective_start")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("tuneup_effective_start"),
+        pl.col("tuneup_deployment_end")
+        .cast(pl.Utf8)
+        .str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        .alias("tuneup_deployment_end"),
+    )
+    return (
+        frame.select(
+            pl.lit(dataset_id).alias("dataset"),
+            "turbine_id",
+            "tuneup_deployment_start",
+            "tuneup_effective_start",
+            "tuneup_deployment_end",
+        )
+        .filter(
+            pl.col("turbine_id").is_not_null()
+            & pl.col("turbine_id").is_in(list(turbine_ids))
+        )
+        .unique(subset=["dataset", "turbine_id"], keep="first")
+        .sort(["dataset", "turbine_id"])
+    )
+
+
 def _featureize_aeroup_interventions(
     frame: pl.DataFrame,
     resolution_minutes: int,
@@ -764,6 +820,84 @@ def _featureize_aeroup_interventions(
                     "aeroup_post_install": post_install,
                     "days_since_aeroup_start": days_since_start,
                     "days_since_aeroup_end": days_since_end,
+                }
+            )
+        output_frames.append(pl.DataFrame(rows, schema=output_schema))
+    return pl.concat(output_frames, how="vertical").sort(["dataset", "turbine_id", "timestamp"])
+
+
+def _featureize_tuneup_interventions(
+    frame: pl.DataFrame,
+    resolution_minutes: int,
+    dataset_end: Any | None = None,
+) -> pl.DataFrame:
+    if frame.is_empty():
+        return pl.DataFrame(
+            schema={
+                "dataset": pl.String,
+                "turbine_id": pl.String,
+                "timestamp": pl.Datetime,
+                "tuneup_in_deployment_window": pl.Boolean,
+                "tuneup_post_effective": pl.Boolean,
+                "days_since_tuneup_effective_start": pl.Float64,
+                "days_since_tuneup_deployment_end": pl.Float64,
+            }
+        )
+    output_schema = {
+        "dataset": pl.String,
+        "turbine_id": pl.String,
+        "timestamp": pl.Datetime,
+        "tuneup_in_deployment_window": pl.Boolean,
+        "tuneup_post_effective": pl.Boolean,
+        "days_since_tuneup_effective_start": pl.Float64,
+        "days_since_tuneup_deployment_end": pl.Float64,
+    }
+    output_frames: list[pl.DataFrame] = []
+    for group in frame.partition_by(["dataset", "turbine_id"], maintain_order=True):
+        dataset_id = group["dataset"][0]
+        turbine_id = group["turbine_id"][0]
+        deployment_start = group["tuneup_deployment_start"].min()
+        effective_start = group["tuneup_effective_start"].min()
+        deployment_end = group["tuneup_deployment_end"].max()
+        grid_start = min(
+            value for value in (deployment_start, effective_start, deployment_end) if value is not None
+        )
+        grid_end = max(
+            value for value in (dataset_end, deployment_end, effective_start, grid_start) if value is not None
+        )
+        timestamps = pl.datetime_range(
+            start=grid_start,
+            end=grid_end,
+            interval=f"{resolution_minutes}m",
+            eager=True,
+        )
+        rows: list[dict[str, Any]] = []
+        for timestamp in timestamps.to_list():
+            in_window = bool(
+                deployment_start is not None
+                and deployment_start <= timestamp
+                and (deployment_end is None or timestamp <= deployment_end)
+            )
+            post_effective = bool(effective_start is not None and timestamp >= effective_start)
+            days_since_effective = (
+                (timestamp - effective_start).total_seconds() / 86_400
+                if effective_start is not None and timestamp >= effective_start
+                else None
+            )
+            days_since_deployment_end = (
+                (timestamp - deployment_end).total_seconds() / 86_400
+                if deployment_end is not None and timestamp > deployment_end
+                else None
+            )
+            rows.append(
+                {
+                    "dataset": dataset_id,
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "tuneup_in_deployment_window": in_window,
+                    "tuneup_post_effective": post_effective,
+                    "days_since_tuneup_effective_start": days_since_effective,
+                    "days_since_tuneup_deployment_end": days_since_deployment_end,
                 }
             )
         output_frames.append(pl.DataFrame(rows, schema=output_schema))
@@ -866,6 +1000,30 @@ def _write_hill_aeroup_features(
         output_path=output_path,
         empty_frame=empty_frame,
         builder=lambda frame: _featureize_aeroup_interventions(
+            frame,
+            resolution_minutes,
+            dataset_end=dataset_end,
+        ),
+    )
+
+
+def _write_hill_tuneup_features(
+    *,
+    interventions_path: Path,
+    output_path: Path,
+    resolution_minutes: int,
+    dataset_end: Any | None,
+) -> None:
+    empty_frame = _featureize_tuneup_interventions(
+        pl.DataFrame(),
+        resolution_minutes,
+        dataset_end=dataset_end,
+    )
+    _write_hill_feature_frame_per_turbine(
+        source_path=interventions_path,
+        output_path=output_path,
+        empty_frame=empty_frame,
+        builder=lambda frame: _featureize_tuneup_interventions(
             frame,
             resolution_minutes,
             dataset_end=dataset_end,
@@ -1213,6 +1371,8 @@ def _augment_hill_batch(
         and not column.startswith("days_since_")
         and not column.endswith("days_since_aeroup_start")
         and not column.endswith("days_since_aeroup_end")
+        and not column.endswith("days_since_tuneup_effective_start")
+        and not column.endswith("days_since_tuneup_deployment_end")
     ]
     if boolean_columns or count_like_columns:
         joined = joined.with_columns(
@@ -1450,6 +1610,14 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         _write_hill_aeroup_features(
             interventions_path=self.cache_paths.silver_interventions_path("aeroup"),
             output_path=self.cache_paths.silver_event_features_path("aeroup"),
+            resolution_minutes=self.spec.resolution_minutes,
+            dataset_end=dataset_end,
+        )
+        tuneup = _standardize_tuneup(self.spec.dataset_id, self.spec.turbine_ids)
+        tuneup.write_parquet(self.cache_paths.silver_interventions_path("tuneup"))
+        _write_hill_tuneup_features(
+            interventions_path=self.cache_paths.silver_interventions_path("tuneup"),
+            output_path=self.cache_paths.silver_event_features_path("tuneup"),
             resolution_minutes=self.spec.resolution_minutes,
             dataset_end=dataset_end,
         )

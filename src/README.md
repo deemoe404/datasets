@@ -216,14 +216,15 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - `tblSCTurIntern`
   - `tblSCTurPress`
   - `tblSCTurTemp`
-  - AeroUp / TuneUp supporting files
+  - AeroUp supporting file plus repo-vendored official TuneUp metadata
   - ShutdownDuration-derived files
 - Current `silver` ingest:
   - all CSV tables are converted to parquet
   - turbine metadata is also standardized into `turbine_static.parquet`
   - standardized shared/turbine regular sidecars under `silver/shared_ts`
   - standardized alarm event table under `silver/events/alarmlog.parquet`
-  - causal alarm and AeroUp features under `silver/event_features`
+  - standardized AeroUp and TuneUp interventions under `silver/interventions`
+  - causal alarm, AeroUp, and TuneUp features under `silver/event_features`
 - Current default `gold_base`:
   - `tblSCTurbine`
   - `tblSCTurGrid`
@@ -239,11 +240,13 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - `ShutdownDuration`
   - causal `tblAlarmLog` features
   - causal `AeroUp` regime features
+  - causal `TuneUp` regime features
   - target `wtc_ActPower_mean`
 - Current exclusions from default `gold_base`:
   - `tblDailySummary`
   - raw interval `tblAlarmLog` table
   - raw AeroUp timeline file
+  - vendored TuneUp provenance metadata
 - Duplicate handling:
   - default-table duplicate keys are audited in `silver/meta/default_table_duplicate_audit.parquet`
   - duplicate audit distinguishes `identical`, `normalized_equal`, and `true_conflict`
@@ -333,6 +336,61 @@ farm_pmu = load_shared_timeseries(dataset_id, "farm_pmu")
 status_features = load_event_features(dataset_id, "turbine_status")
 farm_window_index = load_window_index(dataset_id, farm_task)
 turbine_window_index = load_window_index(dataset_id, turbine_task)
+```
+
+## Cache Rebuild
+
+For routine rebuilds, use the repo wrapper script:
+
+```bash
+./scripts/rebuild_cache.sh
+```
+
+That default command rebuilds the standard cache stack for all four supported datasets:
+
+- `manifest`
+- `silver`
+- `gold_base/default/farm/default`
+- `gold_base/default/turbine/default`
+- `tasks/default/farm/next_6h_from_24h`
+- `tasks/default/turbine/next_6h_from_24h`
+- `tasks/default/turbine/next_6h_from_24h_stride_6h`
+
+Common variants:
+
+```bash
+./scripts/rebuild_cache.sh hill_of_towie
+./scripts/rebuild_cache.sh kelmarsh penmanshiel
+./scripts/rebuild_cache.sh --clean hill_of_towie
+./scripts/rebuild_cache.sh --cache-root /tmp/wind-cache sdwpf_kddcup
+```
+
+Notes:
+
+- The script uses the repository's `./.conda/bin/python` by default.
+- The script exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
+- `--clean` removes `cache/<dataset>` before rebuilding.
+- `sdwpf_kddcup` still fail-closes at `gold_base/task` if the manifest time-semantics audit does not match the documented 245-day 10-minute grid.
+
+If an experiment needs a non-standard task, build it directly from Python:
+
+```bash
+PYTHONPATH=src ./.conda/bin/python - <<'PY'
+from wind_datasets import build_task_cache
+from wind_datasets.models import TaskSpec
+
+build_task_cache(
+    "hill_of_towie",
+    TaskSpec(
+        task_id="custom_task",
+        history_duration="24h",
+        forecast_duration="6h",
+        stride_duration="30m",
+        granularity="farm",
+    ),
+    cache_root="cache",
+)
+PY
 ```
 
 ## Environment

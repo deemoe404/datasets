@@ -1,0 +1,10 @@
+turbine_id,tuneup_deployment_start,tuneup_effective_start,tuneup_deployment_end,source_configs
+T02,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_south.yaml
+T03,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_south.yaml
+T06,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_south.yaml
+T08,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_north.yaml|HoT_PitchTuneUp2024_south.yaml
+T09,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_north.yaml
+T13,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_north.yaml
+T16,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_east.yaml
+T20,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_east.yaml
+T21,2024-03-14 07:00:00,2024-03-14 17:00:00,2024-03-14 18:00:00,HoT_PitchTuneUp2024_east.yaml

@@ -97,6 +97,8 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "alarm_code__42" in series.columns
     assert "aeroup_post_install" in series.columns
     assert "aeroup_in_install_window" in series.columns
+    assert "tuneup_in_deployment_window" in series.columns
+    assert "tuneup_post_effective" in series.columns
     assert "farm_turbines_observed" in series.columns
     assert "farm_turbines_with_target" in series.columns
     assert "farm_turbines_observed" not in turbine_series.columns
@@ -107,60 +109,67 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert shutdown.height == 4
     assert shutdown.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:40:00")
     )["shutdown_duration_s"][0] == 600.0
     assert shutdown.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:30:00")
     ).is_empty()
-    t01_0020 = series.filter(
+    t01_1730 = series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:30:00")
     )
-    t01_0030 = series.filter(
+    t01_1740 = series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:40:00")
     )
-    t01_0040 = series.filter(
+    t01_1750 = series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:50:00")
     )
-    t01_0010 = series.filter(
+    t01_1720 = series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:20:00")
     )
-    t02_0010 = series.filter(
+    t02_1720 = series.filter(
         (pl.col("turbine_id") == "T02")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:20:00")
     )
-    t02_0040 = series.filter(
+    t02_1750 = series.filter(
         (pl.col("turbine_id") == "T02")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:50:00")
     )
-    assert t01_0020["farm_grid__activepower"][0] == 2020.0
-    assert t01_0020["farm_grid_sci__activepowermean"][0] == 2020.0
-    assert t01_0020["shutdown_duration_s"][0] == 0.0
-    assert t01_0030["shutdown_duration_s"][0] == 600.0
-    assert t01_0040["shutdown_duration_s"][0] == 300.0
-    assert t02_0040["shutdown_duration_s"][0] == 120.0
+    t02_1810 = series.filter(
+        (pl.col("turbine_id") == "T02")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )
+    assert t01_1730["farm_grid__activepower"][0] == 2020.0
+    assert t01_1730["farm_grid_sci__activepowermean"][0] == 2020.0
+    assert t01_1730["shutdown_duration_s"][0] == 0.0
+    assert t01_1740["shutdown_duration_s"][0] == 600.0
+    assert t01_1750["shutdown_duration_s"][0] == 300.0
+    assert t02_1750["shutdown_duration_s"][0] == 120.0
     assert turbine_series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:40:00")
     )["shutdown_duration_s"][0] == 600.0
-    assert t01_0020["alarm_any_active"][0] is True
-    assert t01_0020["alarm_code__42"][0] is True
-    assert t01_0020["farm_turbines_observed"][0] == 2
-    assert t01_0020["farm_turbines_with_target"][0] == 1
-    assert t01_0020["farm_is_fully_synchronous"][0] is True
-    assert t01_0010["aeroup_post_install"][0] is True
-    assert t02_0010["aeroup_in_install_window"][0] is True
+    assert t01_1730["alarm_any_active"][0] is True
+    assert t01_1730["alarm_code__42"][0] is True
+    assert t01_1730["farm_turbines_observed"][0] == 2
+    assert t01_1730["farm_turbines_with_target"][0] == 1
+    assert t01_1730["farm_is_fully_synchronous"][0] is True
+    assert t01_1720["aeroup_post_install"][0] is True
+    assert t02_1720["aeroup_in_install_window"][0] is True
+    assert t02_1720["tuneup_in_deployment_window"][0] is True
+    assert t01_1720["tuneup_in_deployment_window"][0] is False
+    assert t02_1810["tuneup_post_effective"][0] is True
     assert "duplicate_conflict_resolved" in series.filter(
         (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 01:00:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     )["quality_flags"][0]
     assert series.filter(
         (pl.col("turbine_id") == "T02")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:30:00")
     )["target_kw"][0] is None
     assert report["target_missing_count"] >= 1
     assert report["duplicate_key_audit_count"] == 4
@@ -193,7 +202,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         builder.cache_paths.task_report_path_for("default", "turbine", "turbine_short").read_text()
     )
     output_gap_window = farm_window_index.filter(
-        pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00"
+        pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:20:00"
     )
     assert "turbine_id" not in farm_window_index.columns
     assert "input_turbines_observed_per_step" in farm_window_index.columns

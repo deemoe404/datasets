@@ -133,6 +133,7 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
             "tblAlarmLog",
             "shutdown_duration",
             "aeroup_timeline",
+            "tuneup_timeline",
         ),
         handler="hill_of_towie",
         official_name="Hill of Towie wind farm open dataset",
@@ -164,6 +165,7 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
             "tblSCTurPress",
             "tblSCTurTemp",
             "aeroup_timeline",
+            "tuneup_timeline",
             "shutdown_duration",
         ),
         default_ingested_assets=(
@@ -181,6 +183,7 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
             "tblSCTurPress",
             "tblSCTurTemp",
             "aeroup_timeline",
+            "tuneup_timeline",
             "shutdown_duration",
         ),
         default_excluded_assets=("zip_archives", "tblDailySummary"),

@@ -17,7 +17,10 @@ from wind_datasets.api import (
 )
 from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
-from wind_datasets.datasets.hill_of_towie import HillOfTowieDatasetBuilder
+from wind_datasets.datasets.hill_of_towie import (
+    HillOfTowieDatasetBuilder,
+    _load_packaged_hill_tuneup_metadata,
+)
 from wind_datasets.datasets.sdwpf_kddcup import SDWPFKDDCupDatasetBuilder
 from wind_datasets.manifest import build_manifest as build_manifest_for_spec
 from wind_datasets.models import DatasetSpec, OfficialRelease, TaskSpec
@@ -138,6 +141,8 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     hill_shutdown = load_shared_timeseries("hill_of_towie", "turbine_shutdown_duration", cache_root=tmp_path / "cache")
     hill_alarm = load_event_features("hill_of_towie", "alarmlog", cache_root=tmp_path / "cache")
     hill_aeroup = load_interventions("hill_of_towie", "aeroup", cache_root=tmp_path / "cache")
+    hill_tuneup = load_interventions("hill_of_towie", "tuneup", cache_root=tmp_path / "cache")
+    hill_tuneup_features = load_event_features("hill_of_towie", "tuneup", cache_root=tmp_path / "cache")
     hill_conflict_keys = pl.read_parquet(hill_builder.cache_paths.hill_default_conflict_keys_path)
 
     assert "farm_pmu__gms_power_kw" in farm_pmu.columns
@@ -151,11 +156,45 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     assert hill_conflict_keys.height == 1
     assert hill_conflict_keys.filter(
         (pl.col("StationId") == "1001")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 01:00:00")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     ).height == 1
     assert hill_shutdown["timestamp"].null_count() == 0
     assert "alarm_code__42" in hill_alarm.columns
     assert hill_aeroup.columns == ["dataset", "turbine_id", "aeroup_start", "aeroup_end"]
+    assert hill_tuneup.columns == [
+        "dataset",
+        "turbine_id",
+        "tuneup_deployment_start",
+        "tuneup_effective_start",
+        "tuneup_deployment_end",
+    ]
+    assert hill_tuneup.height == 1
+    assert hill_tuneup["turbine_id"].to_list() == ["T02"]
+    assert hill_tuneup["tuneup_deployment_start"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
+        "2024-03-14 07:00:00"
+    ]
+    assert hill_tuneup["tuneup_effective_start"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
+        "2024-03-14 17:00:00"
+    ]
+    assert hill_tuneup["tuneup_deployment_end"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
+        "2024-03-14 18:00:00"
+    ]
+    assert "tuneup_in_deployment_window" in hill_tuneup_features.columns
+    assert "tuneup_post_effective" in hill_tuneup_features.columns
+
+
+def test_packaged_hill_tuneup_metadata_is_deduplicated_and_uses_official_times() -> None:
+    tuneup = _load_packaged_hill_tuneup_metadata()
+
+    assert tuneup.height == 9
+    assert tuneup["turbine_id"].n_unique() == 9
+    assert tuneup.filter(pl.col("turbine_id") == "T08").height == 1
+    assert tuneup["tuneup_deployment_start"].unique().to_list() == ["2024-03-14 07:00:00"]
+    assert tuneup["tuneup_effective_start"].unique().to_list() == ["2024-03-14 17:00:00"]
+    assert tuneup["tuneup_deployment_end"].unique().to_list() == ["2024-03-14 18:00:00"]
+    assert tuneup.filter(pl.col("turbine_id") == "T08")["source_configs"].to_list() == [
+        "HoT_PitchTuneUp2024_north.yaml|HoT_PitchTuneUp2024_south.yaml"
+    ]
 
 
 def test_api_build_farm_task_cache_then_load_task_turbine_static(tmp_path, monkeypatch) -> None:
