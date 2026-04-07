@@ -361,6 +361,8 @@ Common variants:
 ./scripts/rebuild_cache.sh --include-turbine hill_of_towie
 ./scripts/rebuild_cache.sh --clean hill_of_towie
 ./scripts/rebuild_cache.sh --cache-root /tmp/wind-cache sdwpf_kddcup
+./scripts/rebuild_cache.sh --check
+./scripts/rebuild_cache.sh --check --include-turbine hill_of_towie
 ```
 
 Notes:
@@ -369,9 +371,61 @@ Notes:
 - The wrapper exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
 - The underlying Python entrypoint is `python -m wind_datasets.rebuild_cache`.
 - `--clean` removes `cache/<dataset>` before rebuilding.
+- `--check` reports whether each selected cache layer is `fresh`, `missing`, or `stale`, and exits non-zero if any selected layer is not fresh.
 - `--include-turbine` opts into the compatibility turbine `gold_base/task` artifacts; the default rebuild stays farm-only.
 - When rebuilding multiple datasets, the command continues after a dataset-level failure, then exits non-zero with a failure summary.
 - `sdwpf_kddcup` still fail-closes at `gold_base/task` if the manifest time-semantics audit does not match the documented 245-day 10-minute grid.
+- `load_*` and `profile_dataset(...)` now validate layer freshness via `_build_meta.json` sidecars. Missing or stale cache layers are rebuilt automatically before read.
+
+## Cache Freshness
+
+Cache freshness is tracked as an explicit four-layer DAG:
+
+- `manifest`
+- `silver <- manifest`
+- `gold_base <- silver`
+- `task <- gold_base`
+
+Each cache layer writes a `_build_meta.json` sidecar next to its main outputs:
+
+- `cache/<dataset>/manifest/_build_meta.json`
+- `cache/<dataset>/silver/_build_meta.json`
+- `cache/<dataset>/gold_base/<quality>/<layout>/<feature>/_build_meta.json`
+- `cache/<dataset>/tasks/<quality>/<granularity>/<task_id>/_build_meta.json`
+
+Each sidecar records the layer fingerprint, the parent-layer fingerprint, the layer code fingerprint, the dataset-spec fingerprint, resolved params, the schema version, and the build timestamp.
+
+Fingerprint inputs are layer-specific:
+
+- `manifest`: dataset id, handler, dataset-spec fingerprint, manifest-layer code fingerprint, and a source snapshot fingerprint derived from source file `relative_path + size_bytes + mtime_ns`
+- `silver`: dataset id, handler, dataset-spec fingerprint, silver-layer code fingerprint, and the resolved `manifest` fingerprint
+- `gold_base`: dataset id, handler, dataset-spec fingerprint, gold-layer code fingerprint, the resolved `silver` fingerprint, plus `quality_profile`, `layout`, and `feature_set`
+- `task`: dataset id, handler, dataset-spec fingerprint, task-layer code fingerprint, the resolved `gold_base` fingerprint, plus the resolved `TaskSpec`
+
+This gives the usual layered invalidation behavior:
+
+- source data changes invalidate `manifest`, which in turn invalidates `silver`, `gold_base`, and `task`
+- preprocessing code changes invalidate the layer whose code fingerprint changed, then all descendants
+- parameter changes such as `layout`, `feature_set`, `quality_profile`, or `TaskSpec` invalidate only the affected layer and its descendants
+- caches created before `_build_meta.json` existed are treated as stale and are rebuilt on first read or explicit rebuild
+
+Read paths now require freshness, not just file presence:
+
+- `load_turbine_static`, `load_shared_timeseries`, `load_event_features`, and `load_interventions` ensure `silver` is fresh
+- `load_series` and `profile_dataset(...)` ensure `gold_base` is fresh
+- `load_window_index` and `load_task_turbine_static` ensure `task` is fresh
+
+Explicit `build_*` calls still rebuild the requested target layer, but they now ensure every parent layer is fresh before rebuilding that target. The CLI `--check` mode uses the same DAG metadata and reports `fresh`, `missing`, or `stale` without rebuilding anything.
+
+Typical stale reasons reported by `--check` are:
+
+- `missing_build_meta`
+- `missing_output`
+- `source_snapshot_changed`
+- `code_fingerprint_changed`
+- `parent_fingerprint_changed`
+- `params_changed`
+- `blocked_by_manifest_time_semantics` for `sdwpf_kddcup` `gold_base/task`
 
 If an experiment needs a non-standard task, build it directly from Python:
 

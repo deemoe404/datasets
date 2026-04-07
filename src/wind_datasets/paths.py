@@ -9,6 +9,7 @@ class DatasetCachePaths:
     root: Path
     manifest_dir: Path
     manifest_path: Path
+    manifest_build_meta_path: Path
     silver_dir: Path
     silver_continuous_dir: Path
     silver_events_dir: Path
@@ -16,6 +17,7 @@ class DatasetCachePaths:
     silver_event_features_dir: Path
     silver_interventions_dir: Path
     silver_meta_dir: Path
+    silver_build_meta_path: Path
     gold_base_dir: Path
     tasks_dir: Path
 
@@ -71,6 +73,14 @@ class DatasetCachePaths:
     ) -> Path:
         return self.gold_base_profile_dir(quality_profile, layout=layout, feature_set=feature_set) / "quality_report.json"
 
+    def gold_base_build_meta_path_for(
+        self,
+        quality_profile: str,
+        layout: str = "farm",
+        feature_set: str = "default",
+    ) -> Path:
+        return self.gold_base_profile_dir(quality_profile, layout=layout, feature_set=feature_set) / "_build_meta.json"
+
     def task_profile_dir(self, quality_profile: str, granularity: str = "farm") -> Path:
         return self.tasks_dir / quality_profile / granularity
 
@@ -89,6 +99,9 @@ class DatasetCachePaths:
     def task_context_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
         return self.task_dir_for(quality_profile, granularity, task_id) / "task_context.json"
 
+    def task_build_meta_path_for(self, quality_profile: str, granularity: str, task_id: str) -> Path:
+        return self.task_dir_for(quality_profile, granularity, task_id) / "_build_meta.json"
+
 
 def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:
     root = cache_root / dataset_id
@@ -100,6 +113,7 @@ def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:
         root=root,
         manifest_dir=manifest_dir,
         manifest_path=manifest_dir / "manifest.json",
+        manifest_build_meta_path=manifest_dir / "_build_meta.json",
         silver_dir=silver_dir,
         silver_continuous_dir=silver_dir / "continuous",
         silver_events_dir=silver_dir / "events",
@@ -107,6 +121,7 @@ def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:
         silver_event_features_dir=silver_dir / "event_features",
         silver_interventions_dir=silver_dir / "interventions",
         silver_meta_dir=silver_dir / "meta",
+        silver_build_meta_path=silver_dir / "_build_meta.json",
         gold_base_dir=gold_base_dir,
         tasks_dir=tasks_dir,
     )

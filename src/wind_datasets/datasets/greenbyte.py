@@ -652,6 +652,17 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
             )
         return resolved
 
+    def required_silver_paths(self) -> tuple[Path, ...]:
+        return (
+            self.cache_paths.silver_turbine_static_path,
+            self.cache_paths.silver_dir / "conflicts.parquet",
+            self.cache_paths.silver_meta_dir / "continuous_build_stats.parquet",
+            self.cache_paths.silver_shared_ts_path("farm_pmu"),
+            self.cache_paths.silver_shared_ts_path("farm_grid_meter"),
+            self.cache_paths.silver_event_features_path("turbine_status"),
+            self.cache_paths.silver_event_features_path("farm_status"),
+        )
+
     def build_silver(self) -> Path:
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_continuous_dir)
@@ -780,6 +791,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
 
         pl.DataFrame(stats).write_parquet(self.cache_paths.silver_meta_dir / "continuous_build_stats.parquet")
+        self._write_silver_build_meta()
         return self.cache_paths.silver_dir
 
     def build_gold_base(
@@ -791,15 +803,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         resolved_layout = self.resolve_series_layout(layout)
         resolved_feature_set = self.resolve_feature_set(feature_set)
-        required_silver_paths = [
-            self.cache_paths.silver_continuous_dir,
-            self.cache_paths.silver_shared_ts_path("farm_pmu"),
-            self.cache_paths.silver_shared_ts_path("farm_grid_meter"),
-            self.cache_paths.silver_event_features_path("turbine_status"),
-            self.cache_paths.silver_event_features_path("farm_status"),
-        ]
-        if any(not path.exists() for path in required_silver_paths):
-            self.build_silver()
+        self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
         frames: list[pl.DataFrame] = []
@@ -896,4 +900,9 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
             },
         )
         write_quality_report(quality_path, report)
+        self._write_gold_base_build_meta(
+            quality_profile=resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
         return series_path

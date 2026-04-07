@@ -7,6 +7,7 @@ import re
 
 import polars as pl
 
+from .cache_state import manifest_meta_from_payload, write_build_meta
 from .models import DatasetSpec
 from .paths import dataset_cache_paths
 from .utils import ensure_directory, sha256_file, write_json
@@ -340,4 +341,6 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
     }
     if time_semantics_check is not None:
         payload["time_semantics_check"] = time_semantics_check
-    return write_json(cache_paths.manifest_path, payload)
+    manifest_path = write_json(cache_paths.manifest_path, payload)
+    write_build_meta(cache_paths.manifest_build_meta_path, manifest_meta_from_payload(spec, payload))
+    return manifest_path

@@ -1494,6 +1494,31 @@ def _finalize_hill_farm_temp(
 
 
 class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
+    def required_silver_paths(self) -> tuple[Path, ...]:
+        return (
+            self.cache_paths.silver_turbine_static_path,
+            self.cache_paths.hill_duplicate_audit_path,
+            self.cache_paths.hill_default_conflict_keys_path,
+            self.cache_paths.hill_default_table_path("tblSCTurbine"),
+            self.cache_paths.hill_default_table_path("tblSCTurGrid"),
+            self.cache_paths.hill_default_table_path("tblSCTurFlag"),
+            self.cache_paths.silver_events_dir / "alarmlog.parquet",
+            self.cache_paths.silver_shared_ts_path("farm_grid"),
+            self.cache_paths.silver_shared_ts_path("farm_grid_sci"),
+            self.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"),
+            self.cache_paths.silver_shared_ts_path("turbine_count"),
+            self.cache_paths.silver_shared_ts_path("turbine_digi_in"),
+            self.cache_paths.silver_shared_ts_path("turbine_digi_out"),
+            self.cache_paths.silver_shared_ts_path("turbine_intern"),
+            self.cache_paths.silver_shared_ts_path("turbine_press"),
+            self.cache_paths.silver_shared_ts_path("turbine_temp"),
+            self.cache_paths.silver_event_features_path("alarmlog"),
+            self.cache_paths.silver_event_features_path("aeroup"),
+            self.cache_paths.silver_event_features_path("tuneup"),
+            self.cache_paths.silver_interventions_path("aeroup"),
+            self.cache_paths.silver_interventions_path("tuneup"),
+        )
+
     def build_silver(self) -> Path:
         self.ensure_manifest()
         ensure_directory(self.cache_paths.silver_dir)
@@ -1621,6 +1646,7 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             resolution_minutes=self.spec.resolution_minutes,
             dataset_end=dataset_end,
         )
+        self._write_silver_build_meta()
         return self.cache_paths.silver_dir
 
     def build_gold_base(
@@ -1632,25 +1658,7 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         resolved_layout = self.resolve_series_layout(layout)
         resolved_feature_set = self.resolve_feature_set(feature_set)
-        required_silver_paths = [
-            self.cache_paths.silver_turbine_static_path,
-            self.cache_paths.hill_duplicate_audit_path,
-            self.cache_paths.hill_default_conflict_keys_path,
-            *[self.cache_paths.hill_default_table_path(table_name) for table_name in _DEFAULT_TABLES],
-            self.cache_paths.silver_shared_ts_path("farm_grid"),
-            self.cache_paths.silver_shared_ts_path("farm_grid_sci"),
-            self.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"),
-            self.cache_paths.silver_shared_ts_path("turbine_count"),
-            self.cache_paths.silver_shared_ts_path("turbine_digi_in"),
-            self.cache_paths.silver_shared_ts_path("turbine_digi_out"),
-            self.cache_paths.silver_shared_ts_path("turbine_intern"),
-            self.cache_paths.silver_shared_ts_path("turbine_press"),
-            self.cache_paths.silver_shared_ts_path("turbine_temp"),
-            self.cache_paths.silver_event_features_path("alarmlog"),
-            self.cache_paths.silver_event_features_path("aeroup"),
-        ]
-        if any(not path.exists() for path in required_silver_paths):
-            self.build_silver()
+        self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
         ensure_directory(
@@ -1694,6 +1702,11 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
                 extra={**existing_report_extra, **coverage_summary},
             )
             write_quality_report(quality_path, report)
+            self._write_gold_base_build_meta(
+                quality_profile=resolved_quality_profile,
+                layout=resolved_layout,
+                feature_set=resolved_feature_set,
+            )
             return series_path
         if series_path.exists() and not quality_path.exists():
             report_frame = load_quality_report_frame(series_path)
@@ -1704,6 +1717,11 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
                 extra={**existing_report_extra, **build_coverage_summary(report_frame, self.spec)},
             )
             write_quality_report(quality_path, report)
+            self._write_gold_base_build_meta(
+                quality_profile=resolved_quality_profile,
+                layout=resolved_layout,
+                feature_set=resolved_feature_set,
+            )
             return series_path
 
         global_start, global_end = _hill_default_time_bounds(self.cache_paths)
@@ -1751,4 +1769,9 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             extra={**existing_report_extra, **coverage_summary},
         )
         write_quality_report(quality_path, report)
+        self._write_gold_base_build_meta(
+            quality_profile=resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
         return series_path

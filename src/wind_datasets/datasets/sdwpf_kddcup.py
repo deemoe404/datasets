@@ -6,7 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
-from ..utils import ensure_directory
+from ..utils import ensure_directory, read_json
 from .base import BaseDatasetBuilder
 from .common import (
     build_coverage_summary,
@@ -56,6 +56,13 @@ def _timestamp_expr_for_dtypes(clock_dtype: pl.DataType) -> pl.Expr:
 
 
 class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
+    def required_silver_paths(self) -> tuple[Path, ...]:
+        return (
+            self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET,
+            self.cache_paths.silver_meta_dir / _KDDCUP_LOCATION_PARQUET,
+            self.cache_paths.silver_turbine_static_path,
+        )
+
     def resolve_quality_profile(self, quality_profile: str | None = None) -> str:
         resolved = super().resolve_quality_profile(quality_profile)
         if resolved not in _SDWPF_SUPPORTED_QUALITY_PROFILES:
@@ -106,7 +113,33 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             & pl.col("turbine_id").is_in(list(self.spec.turbine_ids))
         ).unique(subset=["turbine_id"], keep="first")
         turbine_static.write_parquet(self.cache_paths.silver_turbine_static_path)
+        self._write_silver_build_meta()
         return self.cache_paths.silver_dir
+
+    def gold_base_blocked_reason(
+        self,
+        quality_profile: str,
+        layout: str,
+        feature_set: str,
+    ) -> str | None:
+        del quality_profile, layout, feature_set
+        if self.manifest_status().status != "fresh":
+            return None
+        manifest_payload = read_json(self.cache_paths.manifest_path)
+        time_check = manifest_payload.get("time_semantics_check")
+        if not isinstance(time_check, dict):
+            return None
+        if time_check.get("status") != "match_documented_245day_10min_grid":
+            return "blocked_by_manifest_time_semantics"
+        return None
+
+    def task_cache_blocked_reason(
+        self,
+        quality_profile: str,
+        task,
+    ) -> str | None:
+        del quality_profile, task
+        return self.gold_base_blocked_reason("default", "farm", "default")
 
     def build_gold_base(
         self,
@@ -117,8 +150,7 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
         resolved_quality_profile = self.resolve_quality_profile(quality_profile)
         resolved_layout = self.resolve_series_layout(layout)
         resolved_feature_set = self.resolve_feature_set(feature_set)
-        if not (self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET).exists():
-            self.build_silver()
+        self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
         _assert_sdwpf_time_semantics_supported(manifest_payload)
@@ -269,4 +301,9 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             },
         )
         write_quality_report(quality_path, report)
+        self._write_gold_base_build_meta(
+            quality_profile=resolved_quality_profile,
+            layout=resolved_layout,
+            feature_set=resolved_feature_set,
+        )
         return series_path

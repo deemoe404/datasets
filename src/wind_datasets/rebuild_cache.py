@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .api import build_gold_base, build_manifest, build_silver, build_task_cache
+from .datasets import get_builder
 from .models import TaskSpec
-from .registry import list_dataset_specs
+from .registry import get_dataset_spec, list_dataset_specs
 
 SUPPORTED_DATASETS = tuple(spec.dataset_id for spec in list_dataset_specs())
 
@@ -38,15 +39,29 @@ class RebuildFailure:
     error: str
 
 
+@dataclass(frozen=True)
+class CheckResult:
+    dataset: str
+    layer: str
+    status: str
+    reason: str | None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m wind_datasets.rebuild_cache",
         description="Rebuild standard cache layers for one or more datasets.",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--clean",
         action="store_true",
         help="Remove cache/<dataset> before rebuilding the selected datasets.",
+    )
+    mode_group.add_argument(
+        "--check",
+        action="store_true",
+        help="Check whether selected cache layers are fresh without rebuilding them.",
     )
     parser.add_argument(
         "--cache-root",
@@ -134,6 +149,24 @@ def rebuild_stages(include_turbine: bool) -> tuple[RebuildStage, ...]:
     return tuple(stages)
 
 
+def check_targets(include_turbine: bool) -> tuple[tuple[str, str, TaskSpec | None], ...]:
+    targets: list[tuple[str, str, TaskSpec | None]] = [
+        ("manifest", "manifest", None),
+        ("silver", "silver", None),
+        ("gold_base/default/farm/default", "farm", None),
+        ("tasks/default/farm/next_6h_from_24h", "task", _FARM_TASK),
+    ]
+    if include_turbine:
+        targets.extend(
+            [
+                ("gold_base/default/turbine/default", "turbine", None),
+                ("tasks/default/turbine/next_6h_from_24h", "task", _TURBINE_TASK),
+                ("tasks/default/turbine/next_6h_from_24h_stride_6h", "task", _TURBINE_STRIDE_TASK),
+            ]
+        )
+    return tuple(targets)
+
+
 def _clean_cache_dirs(cache_root: Path, datasets: Sequence[str]) -> None:
     for dataset in datasets:
         dataset_dir = cache_root / dataset
@@ -180,6 +213,40 @@ def run_rebuild(
     return failures
 
 
+def run_check(
+    datasets: Sequence[str],
+    cache_root: Path,
+    *,
+    include_turbine: bool = False,
+) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    for dataset in datasets:
+        spec = get_dataset_spec(dataset)
+        builder = get_builder(spec, cache_root)
+        for layer_name, target_kind, task_spec in check_targets(include_turbine):
+            if target_kind == "manifest":
+                status = builder.manifest_status()
+            elif target_kind == "silver":
+                status = builder.silver_status()
+            elif target_kind == "farm":
+                status = builder.gold_base_status()
+            elif target_kind == "turbine":
+                status = builder.gold_base_status(layout="turbine")
+            elif task_spec is not None:
+                status = builder.task_cache_status(task_spec)
+            else:
+                raise ValueError(f"Unsupported check target {target_kind!r}.")
+            results.append(
+                CheckResult(
+                    dataset=dataset,
+                    layer=layer_name,
+                    status=status.status,
+                    reason=status.reason,
+                )
+            )
+    return results
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
@@ -194,9 +261,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"{parser.prog}: error: {exc}", file=sys.stderr)
         return 2
 
+    cache_root = Path(args.cache_root)
+    if args.check:
+        results = run_check(
+            datasets,
+            cache_root,
+            include_turbine=args.include_turbine,
+        )
+        has_problem = False
+        for result in results:
+            if result.status == "fresh":
+                print(
+                    f"[check] dataset={result.dataset} layer={result.layer} status=fresh",
+                    flush=True,
+                )
+                continue
+            has_problem = True
+            reason_text = f" reason={result.reason}" if result.reason else ""
+            print(
+                f"[check] dataset={result.dataset} layer={result.layer} status={result.status}{reason_text}",
+                flush=True,
+            )
+        return 1 if has_problem else 0
+
     failures = run_rebuild(
         datasets,
-        Path(args.cache_root),
+        cache_root,
         clean=args.clean,
         include_turbine=args.include_turbine,
     )
