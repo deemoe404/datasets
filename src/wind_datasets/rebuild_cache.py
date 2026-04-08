@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .api import build_gold_base, build_manifest, build_silver, build_task_cache
+from .config import ProjectConfigError
 from .datasets import get_builder
 from .models import TaskSpec
-from .registry import get_dataset_spec, list_dataset_specs
+from .registry import get_dataset_spec, list_dataset_ids
 
-SUPPORTED_DATASETS = tuple(spec.dataset_id for spec in list_dataset_specs())
+SUPPORTED_DATASETS = list_dataset_ids()
 
 _FARM_TASK = TaskSpec.next_6h_from_24h(granularity="farm")
 _TURBINE_TASK = TaskSpec.next_6h_from_24h(granularity="turbine")
@@ -200,6 +201,8 @@ def run_rebuild(
             _log_stage(dataset, stage.name)
             try:
                 result = stage.run(dataset, cache_root)
+            except ProjectConfigError:
+                raise
             except Exception as exc:
                 failure = RebuildFailure(dataset=dataset, stage=stage.name, error=_format_error(exc))
                 failures.append(failure)
@@ -262,34 +265,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     cache_root = Path(args.cache_root)
-    if args.check:
-        results = run_check(
-            datasets,
-            cache_root,
-            include_turbine=args.include_turbine,
-        )
-        has_problem = False
-        for result in results:
-            if result.status == "fresh":
+    try:
+        if args.check:
+            results = run_check(
+                datasets,
+                cache_root,
+                include_turbine=args.include_turbine,
+            )
+            has_problem = False
+            for result in results:
+                if result.status == "fresh":
+                    print(
+                        f"[check] dataset={result.dataset} layer={result.layer} status=fresh",
+                        flush=True,
+                    )
+                    continue
+                has_problem = True
+                reason_text = f" reason={result.reason}" if result.reason else ""
                 print(
-                    f"[check] dataset={result.dataset} layer={result.layer} status=fresh",
+                    f"[check] dataset={result.dataset} layer={result.layer} status={result.status}{reason_text}",
                     flush=True,
                 )
-                continue
-            has_problem = True
-            reason_text = f" reason={result.reason}" if result.reason else ""
-            print(
-                f"[check] dataset={result.dataset} layer={result.layer} status={result.status}{reason_text}",
-                flush=True,
-            )
-        return 1 if has_problem else 0
+            return 1 if has_problem else 0
 
-    failures = run_rebuild(
-        datasets,
-        cache_root,
-        clean=args.clean,
-        include_turbine=args.include_turbine,
-    )
+        failures = run_rebuild(
+            datasets,
+            cache_root,
+            clean=args.clean,
+            include_turbine=args.include_turbine,
+        )
+    except ProjectConfigError as exc:
+        print(f"{parser.prog}: error: {exc}", file=sys.stderr, flush=True)
+        return 1
+
     if failures:
         print(
             f"[rebuild] completed with {len(failures)} failed dataset(s).",

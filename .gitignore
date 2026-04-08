@@ -7,3 +7,4 @@ cache/
 experiment/*/.conda/
 experiment/*/.work/
 .DS_Store
+wind_datasets.local.toml

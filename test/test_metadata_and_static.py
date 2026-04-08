@@ -8,6 +8,7 @@ import polars as pl
 import pytest
 
 from wind_datasets import api as api_module
+from wind_datasets import registry as registry_module
 from wind_datasets.api import (
     build_task_cache,
     build_silver,
@@ -34,13 +35,23 @@ from wind_datasets.utils import read_json
 from .helpers import build_greenbyte_fixture, build_hill_fixture, build_sdwpf_kddcup_fixture
 
 
-def test_registry_hill_time_metadata_matches_documented_utc_interval_end() -> None:
+@pytest.fixture
+def configured_registry_source_root(tmp_path, monkeypatch) -> Path:
+    source_root = tmp_path / "Wind Power Forecasting"
+    source_root.mkdir()
+    monkeypatch.setattr(registry_module.config, "get_source_data_root", lambda: source_root)
+    return source_root
+
+
+def test_registry_hill_time_metadata_matches_documented_utc_interval_end(configured_registry_source_root) -> None:
+    del configured_registry_source_root
     spec = get_dataset_spec("hill_of_towie")
     assert spec.timezone_policy == "utc_documented"
     assert spec.timestamp_convention == "source_utc_naive_interval_end"
 
 
-def test_registry_sdwpf_kddcup_time_metadata_matches_repo_contract() -> None:
+def test_registry_sdwpf_kddcup_time_metadata_matches_repo_contract(configured_registry_source_root) -> None:
+    del configured_registry_source_root
     spec = get_dataset_spec("sdwpf_kddcup")
     assert spec.timezone_policy == "unknown_unverified"
     assert spec.timestamp_convention == "derived_day_clock_naive"
@@ -308,7 +319,8 @@ def test_packaged_hill_tuneup_metadata_is_deduplicated_and_uses_official_times()
     ]
 
 
-def test_penmanshiel_registry_notes_and_readme_document_partial_2024_coverage() -> None:
+def test_penmanshiel_registry_notes_and_readme_document_partial_2024_coverage(configured_registry_source_root) -> None:
+    del configured_registry_source_root
     spec = get_dataset_spec("penmanshiel")
     extended_release = next(
         release for release in spec.official_releases if release.release_id == "extended_2025"

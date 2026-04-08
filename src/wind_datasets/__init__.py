@@ -14,7 +14,7 @@ from .api import (
     profile_dataset,
 )
 from .models import DatasetSpec, OfficialRelease, ResolvedTaskSpec, TaskSpec
-from .registry import get_dataset_spec, list_dataset_specs
+from .registry import get_dataset_spec, list_dataset_ids, list_dataset_specs
 
 __all__ = [
     "DatasetSpec",
@@ -29,6 +29,7 @@ __all__ = [
     "load_duplicate_audit",
     "load_event_features",
     "load_interventions",
+    "list_dataset_ids",
     "list_dataset_specs",
     "load_series",
     "load_task_turbine_static",
