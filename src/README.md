@@ -390,7 +390,7 @@ Common variants:
 
 Notes:
 
-- Build the root environment first with `./create_env.sh`.
+- Build the root environment first with `./scripts/create_env.sh`.
 - The script uses the repository's `./.conda/bin/python` by default.
 - The wrapper exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
 - The underlying Python entrypoint is `python -m wind_datasets.rebuild_cache`.
@@ -479,7 +479,7 @@ The package is configured in [pyproject.toml](../pyproject.toml) and is intended
 Create or update that environment from the repository root:
 
 ```bash
-./create_env.sh
+./scripts/create_env.sh
 ```
 
 The script creates `./.conda`, upgrades `pip`, and installs the repository in editable mode.

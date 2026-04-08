@@ -12,7 +12,7 @@ source_data_root = "/home/sam/Documents/datasets/Wind Power Forecasting"
 ## 建立项目根环境
 
 ```shell
-./create_env.sh
+./scripts/create_env.sh
 ```
 
 ## 重建数据集缓存

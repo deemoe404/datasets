@@ -239,7 +239,7 @@ def test_rebuild_shell_wrapper_suggests_create_env_for_missing_default_python(tm
     )
 
     assert result.returncode == 1
-    assert "Run ./create_env.sh" in result.stderr
+    assert "Run ./scripts/create_env.sh" in result.stderr
 
 
 def test_rebuild_shell_wrapper_passes_through_to_python_module(tmp_path) -> None:
@@ -278,13 +278,15 @@ def test_rebuild_shell_wrapper_passes_through_to_python_module(tmp_path) -> None
     assert f"pythonpath={repo_root / 'src'}" in result.stdout
 
 
-def test_root_create_env_script_bootstraps_conda_env_and_editable_install(tmp_path) -> None:
+def test_scripts_create_env_script_bootstraps_conda_env_and_editable_install(tmp_path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    script_path = Path(__file__).resolve().parents[1] / "create_env.sh"
-    env_file_path = Path(__file__).resolve().parents[1] / "environment.yml"
-    copied_script = repo_root / "create_env.sh"
-    copied_env_file = repo_root / "environment.yml"
+    scripts_dir = repo_root / "scripts"
+    scripts_dir.mkdir()
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "create_env.sh"
+    env_file_path = Path(__file__).resolve().parents[1] / "scripts" / "environment.yml"
+    copied_script = scripts_dir / "create_env.sh"
+    copied_env_file = scripts_dir / "environment.yml"
     copied_script.write_text(script_path.read_text(encoding="utf-8"), encoding="utf-8")
     copied_env_file.write_text(env_file_path.read_text(encoding="utf-8"), encoding="utf-8")
     copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
@@ -335,19 +337,21 @@ def test_root_create_env_script_bootstraps_conda_env_and_editable_install(tmp_pa
 
     assert result.returncode == 0
     log_text = log_path.read_text(encoding="utf-8")
-    assert f"conda=env create --prefix {repo_root / '.conda'} --file {repo_root / 'environment.yml'}" in log_text
+    assert f"conda=env create --prefix {repo_root / '.conda'} --file {repo_root / 'scripts' / 'environment.yml'}" in log_text
     assert "python=-m pip install --upgrade pip" in log_text
     assert f"python=-m pip install --upgrade --editable {repo_root}" in log_text
     assert "Dataset processing environment is ready" in result.stdout
 
 
-def test_root_create_env_script_requires_conda(tmp_path) -> None:
+def test_scripts_create_env_script_requires_conda(tmp_path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    script_path = Path(__file__).resolve().parents[1] / "create_env.sh"
-    env_file_path = Path(__file__).resolve().parents[1] / "environment.yml"
-    copied_script = repo_root / "create_env.sh"
-    copied_env_file = repo_root / "environment.yml"
+    scripts_dir = repo_root / "scripts"
+    scripts_dir.mkdir()
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "create_env.sh"
+    env_file_path = Path(__file__).resolve().parents[1] / "scripts" / "environment.yml"
+    copied_script = scripts_dir / "create_env.sh"
+    copied_env_file = scripts_dir / "environment.yml"
     copied_script.write_text(script_path.read_text(encoding="utf-8"), encoding="utf-8")
     copied_env_file.write_text(env_file_path.read_text(encoding="utf-8"), encoding="utf-8")
     copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)

@@ -25,7 +25,7 @@ done
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   if [[ "$PYTHON_BIN" == "$REPO_ROOT/.conda/bin/python" ]]; then
-    printf '%s\n' "Python interpreter not found or not executable: $PYTHON_BIN. Run ./create_env.sh or pass --python <path>." >&2
+    printf '%s\n' "Python interpreter not found or not executable: $PYTHON_BIN. Run ./scripts/create_env.sh or pass --python <path>." >&2
   else
     printf '%s\n' "Python interpreter not found or not executable: $PYTHON_BIN" >&2
   fi

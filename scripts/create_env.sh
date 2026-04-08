@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_PREFIX="${REPO_ROOT}/.conda"
-ENV_FILE="${REPO_ROOT}/environment.yml"
+ENV_FILE="${SCRIPT_DIR}/environment.yml"
 CONDA_BIN="${CONDA_BIN:-$(command -v conda || true)}"
 
 if [[ -z "${CONDA_BIN}" ]]; then
