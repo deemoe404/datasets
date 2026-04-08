@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -92,6 +93,7 @@ _GROUP_KEY_COLUMNS = [
     "covariate_count",
     "covariate_policy",
 ]
+PROFILE_LOG_PREFIX = "[chronos2_exogenous] "
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,32 @@ class TurbineExogenousSeries:
     timestamps_us: np.ndarray
     target_kw_masked: np.ndarray
     past_covariates: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class StageProgressPlan:
+    stage: str
+    pack_name: str
+    feature_set: str
+    covariate_count: int
+    window_batch_size: int
+    total_windows: int
+    total_batches: int
+
+
+@dataclass(frozen=True)
+class DatasetProgressPlan:
+    dataset_id: str
+    selected_turbine_ids: tuple[str, ...]
+    retained_windows_by_turbine: dict[str, int]
+    stage_plans: tuple[StageProgressPlan, ...]
+    total_batches: int
+
+
+@dataclass
+class ChunkProgressState:
+    chunk_total_batches: int
+    completed_chunk_batches: int = 0
 
 
 def _ensure_repo_src_on_path() -> None:
@@ -162,7 +190,7 @@ def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
         **fields,
     }
     print(
-        f"[chronos2_exogenous] {json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}",
+        f"{PROFILE_LOG_PREFIX}{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}",
         file=sys.stderr,
         flush=True,
     )
@@ -291,6 +319,38 @@ def load_covariate_series_frame(
     return spec, resolved_feature_set, series_path, covariate_columns, series
 
 
+def load_target_series_frame(
+    dataset_id: str,
+    *,
+    feature_set: str,
+    cache_root: str | Path = _CACHE_ROOT,
+    turbine_ids: Sequence[str] | None = None,
+) -> tuple[Any, str, Path, pl.DataFrame]:
+    spec, resolved_feature_set, series_path = resolve_turbine_series_path(
+        dataset_id,
+        feature_set=feature_set,
+        cache_root=cache_root,
+    )
+    requested_turbine_ids = _ordered_unique(turbine_ids) if turbine_ids is not None else tuple(spec.turbine_ids)
+    load_started = time.monotonic()
+    series_scan = pl.scan_parquet(series_path).select(list(_BASE_COLUMNS))
+    if requested_turbine_ids != tuple(spec.turbine_ids):
+        series_scan = series_scan.filter(pl.col("turbine_id").is_in(list(requested_turbine_ids)))
+    series = series_scan.collect()
+    _profile_log(
+        spec.dataset_id,
+        "load_target_series",
+        feature_set=resolved_feature_set,
+        path=str(series_path),
+        rows=series.height,
+        columns=len(_BASE_COLUMNS),
+        target_turbines=None if turbine_ids is None else len(requested_turbine_ids),
+        input_turbines=len(requested_turbine_ids),
+        duration_seconds=round(time.monotonic() - load_started, 6),
+    )
+    return spec, resolved_feature_set, series_path, series
+
+
 def prepare_exogenous_series(
     series: pl.DataFrame,
     *,
@@ -352,6 +412,150 @@ def build_turbine_exogenous_series_map(
             },
         )
     return turbines
+
+
+def _count_retained_windows_for_turbine(
+    *,
+    turbine_series: TurbineExogenousSeries,
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> int:
+    retained_windows = 0
+    skipped_windows = 0
+    emitted_windows = 0
+    max_anchor_index = turbine_series.timestamps_us.shape[0] - forecast_steps
+
+    for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+        context = turbine_series.target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1]
+        future = turbine_series.target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps]
+        if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
+            continue
+        if np.isnan(context).all() or np.isnan(future).all():
+            continue
+        if skipped_windows < window_offset:
+            skipped_windows += 1
+            continue
+
+        retained_windows += 1
+        emitted_windows += 1
+        if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+            break
+
+    return retained_windows
+
+
+def _selected_packs_for_dataset(
+    dataset_id: str,
+    *,
+    requested_stages: Sequence[str],
+    include_power_only_reference: bool,
+) -> tuple[CovariatePackSpec, ...]:
+    packs: list[CovariatePackSpec] = []
+    if include_power_only_reference:
+        packs.append(reference_pack_for(dataset_id))
+    packs.extend(iter_covariate_packs((dataset_id,), requested_stages))
+    return tuple(packs)
+
+
+def _resolve_dataset_progress_plan(
+    dataset_id: str,
+    *,
+    packs: Sequence[CovariatePackSpec],
+    cache_root: str | Path = _CACHE_ROOT,
+    task_spec=None,
+    series_budget: int = DEFAULT_SERIES_BUDGET,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+    turbine_ids: Sequence[str] | None = None,
+) -> DatasetProgressPlan:
+    if not packs:
+        spec, _ = resolve_dataset_task(dataset_id, task_spec=task_spec)
+        selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+        return DatasetProgressPlan(
+            dataset_id=spec.dataset_id,
+            selected_turbine_ids=selected_turbine_ids,
+            retained_windows_by_turbine={turbine_id: 0 for turbine_id in selected_turbine_ids},
+            stage_plans=(),
+            total_batches=0,
+        )
+
+    spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
+    selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    progress_feature_set = packs[0].feature_set
+    spec, _, series_path, target_series = load_target_series_frame(
+        dataset_id,
+        feature_set=progress_feature_set,
+        cache_root=cache_root,
+        turbine_ids=selected_turbine_ids,
+    )
+    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
+    prepared_target_series = prepare_exogenous_series(
+        target_series,
+        covariate_columns=(),
+        rated_power_kw=rated_power_kw,
+    )
+    turbine_series_map = build_turbine_exogenous_series_map(
+        prepared_target_series,
+        covariate_columns=(),
+    )
+    retained_windows_by_turbine = {
+        turbine_id: _count_retained_windows_for_turbine(
+            turbine_series=turbine_series_map[turbine_id],
+            history_steps=resolved_task.history_steps,
+            forecast_steps=resolved_task.forecast_steps,
+            stride_steps=resolved_task.stride_steps,
+            window_offset=window_offset,
+            max_windows_per_dataset=max_windows_per_dataset,
+        )
+        for turbine_id in selected_turbine_ids
+    }
+    total_windows = sum(retained_windows_by_turbine.values())
+    available_columns = set(pl.read_parquet_schema(series_path))
+    stage_plans: list[StageProgressPlan] = []
+    for pack in packs:
+        covariate_count = len(pack.selected_covariate_columns(available_columns))
+        window_batch_size = resolve_window_batch_size(
+            series_budget=series_budget,
+            covariate_count=covariate_count,
+        )
+        total_batches = sum(
+            math.ceil(window_count / window_batch_size)
+            for window_count in retained_windows_by_turbine.values()
+            if window_count > 0
+        )
+        stage_plans.append(
+            StageProgressPlan(
+                stage=pack.stage,
+                pack_name=pack.pack_name,
+                feature_set=pack.feature_set,
+                covariate_count=covariate_count,
+                window_batch_size=window_batch_size,
+                total_windows=total_windows,
+                total_batches=total_batches,
+            )
+        )
+    return DatasetProgressPlan(
+        dataset_id=spec.dataset_id,
+        selected_turbine_ids=selected_turbine_ids,
+        retained_windows_by_turbine=retained_windows_by_turbine,
+        stage_plans=tuple(stage_plans),
+        total_batches=sum(stage_plan.total_batches for stage_plan in stage_plans),
+    )
+
+
+def _emit_progress_event(
+    dataset_id: str,
+    *,
+    enabled: bool,
+    phase: str,
+    **fields: object,
+) -> None:
+    if not enabled:
+        return
+    _profile_log(dataset_id, phase, **fields)
 
 
 def _iter_univariate_covariate_batches(
@@ -594,6 +798,9 @@ def evaluate_univariate_covariate_pack(
     max_windows_per_dataset: int | None = None,
     device: str | None = None,
     turbine_ids: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
+    progress_state: ChunkProgressState | None = None,
+    stage_progress_plan: StageProgressPlan | None = None,
 ) -> dict[str, object]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
@@ -632,6 +839,27 @@ def evaluate_univariate_covariate_pack(
         covariate_count=len(covariate_columns),
     )
     metrics = _initialize_metrics()
+    if emit_progress_events:
+        if progress_state is None or stage_progress_plan is None:
+            raise ValueError("emit_progress_events requires progress_state and stage_progress_plan.")
+        if stage_progress_plan.pack_name != pack.pack_name:
+            raise ValueError(
+                f"Stage progress plan pack {stage_progress_plan.pack_name!r} does not match {pack.pack_name!r}."
+            )
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_start",
+            stage=pack.stage,
+            pack=pack.pack_name,
+            feature_set=resolved_feature_set,
+            covariate_count=len(covariate_columns),
+            stage_total_batches=stage_progress_plan.total_batches,
+            completed_stage_batches=0,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
+    stage_completed_batches = 0
 
     for turbine_id in selected_turbine_ids:
         turbine_series = turbine_series_map[turbine_id]
@@ -652,6 +880,23 @@ def evaluate_univariate_covariate_pack(
                 batch_size=resolve_pipeline_batch_size(input_batch),
                 limit_prediction_length=False,
             )
+            if emit_progress_events:
+                stage_completed_batches += 1
+                progress_state.completed_chunk_batches += 1
+                _emit_progress_event(
+                    spec.dataset_id,
+                    enabled=True,
+                    phase="progress_batch",
+                    stage=pack.stage,
+                    pack=pack.pack_name,
+                    feature_set=resolved_feature_set,
+                    covariate_count=len(covariate_columns),
+                    turbine_id=turbine_id,
+                    completed_stage_batches=stage_completed_batches,
+                    stage_total_batches=stage_progress_plan.total_batches,
+                    completed_chunk_batches=progress_state.completed_chunk_batches,
+                    chunk_total_batches=progress_state.chunk_total_batches,
+                )
             prediction_batch = np.stack([_extract_median_forecast(prediction)[0] for prediction in quantiles])
             valid_mask = ~np.isnan(actual_batch)
             if not valid_mask.any():
@@ -671,6 +916,21 @@ def evaluate_univariate_covariate_pack(
             )
             batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(future_timestamps_batch, valid_mask)
             _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+
+    if emit_progress_events:
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_complete",
+            stage=pack.stage,
+            pack=pack.pack_name,
+            feature_set=resolved_feature_set,
+            covariate_count=len(covariate_columns),
+            completed_stage_batches=stage_completed_batches,
+            stage_total_batches=stage_progress_plan.total_batches,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
 
     runtime_seconds = time.monotonic() - dataset_start
     _profile_log(
@@ -714,6 +974,7 @@ def run_experiment(
     task_spec=None,
     pipeline: Any | None = None,
     turbine_ids: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
 ) -> pl.DataFrame:
     requested_dataset_ids = tuple(resolve_dataset_id(dataset_id) for dataset_id in dataset_ids)
     requested_stages = tuple(covariate_stages)
@@ -728,26 +989,50 @@ def run_experiment(
     resolved_task_spec = task_spec or build_task_spec()
     resolved_device = device or select_device()
     resolved_pipeline = pipeline or load_pipeline(device=resolved_device)
+    dataset_packs = {
+        dataset_id: _selected_packs_for_dataset(
+            dataset_id,
+            requested_stages=requested_stages,
+            include_power_only_reference=include_power_only_reference,
+        )
+        for dataset_id in requested_dataset_ids
+    }
+    dataset_progress_plans: dict[str, DatasetProgressPlan] = {}
+    progress_state: ChunkProgressState | None = None
+    if emit_progress_events:
+        dataset_progress_plans = {
+            dataset_id: _resolve_dataset_progress_plan(
+                dataset_id,
+                packs=dataset_packs[dataset_id],
+                cache_root=cache_root,
+                task_spec=resolved_task_spec,
+                series_budget=series_budget,
+                window_offset=window_offset,
+                max_windows_per_dataset=max_windows_per_dataset,
+                turbine_ids=turbine_ids,
+            )
+            for dataset_id in requested_dataset_ids
+        }
+        progress_state = ChunkProgressState(
+            chunk_total_batches=sum(plan.total_batches for plan in dataset_progress_plans.values())
+        )
+        progress_dataset_id = requested_dataset_ids[0] if requested_dataset_ids else "multi_dataset"
+        _emit_progress_event(
+            progress_dataset_id,
+            enabled=True,
+            phase="progress_chunk_plan",
+            chunk_total_batches=progress_state.chunk_total_batches,
+            dataset_count=len(requested_dataset_ids),
+        )
     rows: list[dict[str, object]] = []
 
     for dataset_id in requested_dataset_ids:
-        if include_power_only_reference:
-            rows.append(
-                evaluate_univariate_covariate_pack(
-                    dataset_id,
-                    pack=reference_pack_for(dataset_id),
-                    pipeline=resolved_pipeline,
-                    cache_root=cache_root,
-                    task_spec=resolved_task_spec,
-                    series_budget=series_budget,
-                    window_offset=window_offset,
-                    max_windows_per_dataset=max_windows_per_dataset,
-                    device=resolved_device,
-                    turbine_ids=turbine_ids,
-                )
-            )
-
-        for pack in iter_covariate_packs((dataset_id,), requested_stages):
+        dataset_progress_plan = dataset_progress_plans.get(dataset_id)
+        stage_progress_lookup = {
+            stage_plan.pack_name: stage_plan
+            for stage_plan in (() if dataset_progress_plan is None else dataset_progress_plan.stage_plans)
+        }
+        for pack in dataset_packs[dataset_id]:
             rows.append(
                 evaluate_univariate_covariate_pack(
                     dataset_id,
@@ -760,6 +1045,9 @@ def run_experiment(
                     max_windows_per_dataset=max_windows_per_dataset,
                     device=resolved_device,
                     turbine_ids=turbine_ids,
+                    emit_progress_events=emit_progress_events,
+                    progress_state=progress_state,
+                    stage_progress_plan=stage_progress_lookup.get(pack.pack_name),
                 )
             )
 
@@ -837,6 +1125,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="turbine_ids",
         help="Optional turbine subset for univariate runs. May be passed multiple times.",
     )
+    parser.add_argument(
+        "--emit-progress-events",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -854,6 +1147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_windows_per_dataset=args.max_windows_per_dataset,
         device=args.device,
         turbine_ids=tuple(args.turbine_ids) if args.turbine_ids else None,
+        emit_progress_events=bool(args.emit_progress_events),
     )
     print(results)
     return 0

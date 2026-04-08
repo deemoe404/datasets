@@ -86,3 +86,16 @@ Run the full staged benchmark serially:
 ```bash
 ./.conda/bin/python run_exogenous_full.py
 ```
+
+The full-run orchestrator automatically selects `cuda -> mps -> cpu`. When a
+non-CPU chunk fails, it retries the same chunk with fixed series budgets
+`1024 -> 768 -> 512` on the selected accelerator before falling back to
+`cpu + 1024`. Pin the device explicitly when needed:
+
+```bash
+./.conda/bin/python run_exogenous_full.py --device cuda
+```
+
+`--series-budget` remains available for backward compatibility, but it is only
+honored when the full run resolves to `cpu`. Non-CPU full runs always use the
+fixed retry ladder above.

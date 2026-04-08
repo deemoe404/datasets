@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from typing import Sequence
 
 import numpy as np
 import polars as pl
@@ -97,6 +98,33 @@ def _single_turbine_series(
         else:
             base = float(column_index * 10)
             rows[column] = [base + step for step in range(len(timestamps))]
+    return pl.DataFrame(rows)
+
+
+def _single_turbine_series_with_targets(
+    *,
+    dataset_id: str,
+    turbine_id: str,
+    covariate_columns: tuple[str, ...],
+    target_values: Sequence[float],
+) -> pl.DataFrame:
+    timestamps = pl.datetime_range(
+        start=datetime(2024, 1, 1, 0, 0, 0),
+        end=datetime(2024, 1, 1, 0, 0, 0) + timedelta(minutes=10 * (len(target_values) - 1)),
+        interval="10m",
+        eager=True,
+    )
+    rows: dict[str, object] = {
+        "dataset": [dataset_id] * len(target_values),
+        "turbine_id": [turbine_id] * len(target_values),
+        "timestamp": timestamps,
+        "target_kw": list(target_values),
+        "quality_flags": [""] * len(target_values),
+        "feature_quality_flags": [""] * len(target_values),
+    }
+    for column_index, column in enumerate(covariate_columns, start=1):
+        base = float(column_index * 10)
+        rows[column] = [base + step for step in range(len(target_values))]
     return pl.DataFrame(rows)
 
 
@@ -233,6 +261,79 @@ def test_iter_univariate_covariate_batches_builds_past_covariates() -> None:
         future_timestamps_batch,
         np.array([[1_800_000_000, 2_400_000_000]], dtype=np.int64),
     )
+
+
+def test_count_retained_windows_matches_batch_iteration_rules() -> None:
+    module = _load_module()
+    turbine_series = module.TurbineExogenousSeries(
+        timestamps_us=np.arange(9, dtype=np.int64) * 600_000_000,
+        target_kw_masked=np.array([10.0, 20.0, 30.0, 40.0, 50.0, np.nan, 70.0, 80.0, 90.0], dtype=np.float32),
+        past_covariates={},
+    )
+
+    counted_windows = module._count_retained_windows_for_turbine(
+        turbine_series=turbine_series,
+        history_steps=3,
+        forecast_steps=2,
+        stride_steps=2,
+        window_offset=1,
+        max_windows_per_dataset=1,
+    )
+    iterated_windows = sum(
+        len(input_batch)
+        for input_batch, _, _ in module._iter_univariate_covariate_batches(
+            turbine_series=turbine_series,
+            covariate_columns=(),
+            history_steps=3,
+            forecast_steps=2,
+            stride_steps=2,
+            window_batch_size=8,
+            window_offset=1,
+            max_windows_per_dataset=1,
+        )
+    )
+
+    assert counted_windows == 1
+    assert iterated_windows == counted_windows
+
+
+def test_resolve_dataset_progress_plan_counts_batches_from_series_budget(monkeypatch) -> None:
+    module = _load_module()
+    manifest = _load_manifest_module()
+    stage1 = manifest.resolve_covariate_pack("kelmarsh", "stage1_core")
+    stage2 = manifest.resolve_covariate_pack("kelmarsh", "stage2_ops")
+    spec = _synthetic_spec("kelmarsh", ("Kelmarsh 1",))
+    task_spec, resolved_task = _synthetic_task()
+    stage2_series = _single_turbine_series_with_targets(
+        dataset_id="kelmarsh",
+        turbine_id="Kelmarsh 1",
+        covariate_columns=stage2.required_columns,
+        target_values=(10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0),
+    )
+    target_series = stage2_series.select(module._BASE_COLUMNS)
+
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    monkeypatch.setattr(
+        module,
+        "load_target_series_frame",
+        lambda dataset_id, *, feature_set, cache_root, turbine_ids=None: (spec, feature_set, Path("series.parquet"), target_series),
+    )
+    monkeypatch.setattr(module.pl, "read_parquet_schema", lambda path: stage2_series.schema)
+
+    plan = module._resolve_dataset_progress_plan(
+        "kelmarsh",
+        packs=(stage1, stage2),
+        task_spec=task_spec,
+        series_budget=28,
+        turbine_ids=("Kelmarsh 1",),
+    )
+
+    assert plan.dataset_id == "kelmarsh"
+    assert plan.retained_windows_by_turbine == {"Kelmarsh 1": 2}
+    assert [stage_plan.pack_name for stage_plan in plan.stage_plans] == ["stage1_core", "stage2_ops"]
+    assert [stage_plan.window_batch_size for stage_plan in plan.stage_plans] == [2, 1]
+    assert [stage_plan.total_batches for stage_plan in plan.stage_plans] == [1, 2]
+    assert plan.total_batches == 3
 
 
 def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) -> None:
@@ -421,6 +522,90 @@ def test_evaluate_univariate_covariate_pack_sdwpf_stage3_regime(monkeypatch) -> 
     assert pipeline.batch_sizes == [13]
     assert result["covariate_stage"] == "stage3_regime"
     assert result["covariate_count"] == len(pack.required_columns)
+
+
+def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    manifest = _load_manifest_module()
+    stage1 = manifest.resolve_covariate_pack("kelmarsh", "stage1_core")
+    stage2 = manifest.resolve_covariate_pack("kelmarsh", "stage2_ops")
+    spec = _synthetic_spec("kelmarsh", ("Kelmarsh 1",))
+    task_spec, resolved_task = _synthetic_task()
+    stage2_series = _single_turbine_series_with_targets(
+        dataset_id="kelmarsh",
+        turbine_id="Kelmarsh 1",
+        covariate_columns=stage2.required_columns,
+        target_values=(10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0),
+    )
+    target_series = stage2_series.select(module._BASE_COLUMNS)
+    progress_events: list[dict[str, object]] = []
+
+    class _FakePipeline:
+        def predict_quantiles(self, *, inputs, prediction_length, quantile_levels, batch_size, limit_prediction_length):
+            del quantile_levels, batch_size, limit_prediction_length
+            forecasts = [
+                np.array([[[40.0 + index], [50.0 + index]]], dtype=np.float32)
+                for index in range(len(inputs))
+            ]
+            return forecasts, [np.array([[40.0, 50.0]], dtype=np.float32)] * len(inputs)
+
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    monkeypatch.setattr(
+        module,
+        "load_covariate_series_frame",
+        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (
+            spec,
+            pack.feature_set,
+            Path("series.parquet"),
+            pack.required_columns,
+            stage2_series.select(list(module._BASE_COLUMNS) + list(pack.required_columns)),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "load_target_series_frame",
+        lambda dataset_id, *, feature_set, cache_root, turbine_ids=None: (spec, feature_set, Path("series.parquet"), target_series),
+    )
+    monkeypatch.setattr(module.pl, "read_parquet_schema", lambda path: stage2_series.schema)
+    monkeypatch.setattr(
+        module,
+        "_profile_log",
+        lambda dataset_id, phase, **fields: progress_events.append({"dataset_id": dataset_id, "phase": phase, **fields}),
+    )
+
+    output_path = tmp_path / "chronos-2-exogenous.csv"
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        covariate_stages=("stage1_core", "stage2_ops"),
+        output_path=output_path,
+        device="cpu",
+        task_spec=task_spec,
+        pipeline=_FakePipeline(),
+        turbine_ids=("Kelmarsh 1",),
+        series_budget=14,
+        emit_progress_events=True,
+    )
+
+    progress_only = [event for event in progress_events if str(event["phase"]).startswith("progress_")]
+
+    assert output_path.exists()
+    assert result.height == 2
+    assert [event["phase"] for event in progress_only] == [
+        "progress_chunk_plan",
+        "progress_stage_start",
+        "progress_batch",
+        "progress_batch",
+        "progress_stage_complete",
+        "progress_stage_start",
+        "progress_batch",
+        "progress_batch",
+        "progress_stage_complete",
+    ]
+    assert progress_only[0]["chunk_total_batches"] == 4
+    assert [event["completed_chunk_batches"] for event in progress_only if event["phase"] == "progress_batch"] == [1, 2, 3, 4]
+    assert [event["stage_total_batches"] for event in progress_only if event["phase"] == "progress_stage_start"] == [2, 2]
+    assert [event["completed_stage_batches"] for event in progress_only if event["phase"] == "progress_stage_complete"] == [2, 2]
+    assert all(event["dataset_id"] == "kelmarsh" for event in progress_only)
 
 
 def test_run_experiment_includes_reference_and_stage_rows(monkeypatch, tmp_path) -> None:

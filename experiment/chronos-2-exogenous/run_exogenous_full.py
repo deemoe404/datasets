@@ -10,16 +10,21 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import polars as pl
 
 try:
     from tqdm.auto import tqdm
+    HAS_TQDM = True
 except ImportError:
+    HAS_TQDM = False
+
     class tqdm:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
+            self.n = 0
+            self.total = None
 
         def update(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -43,6 +48,8 @@ from chronos2_exogenous import (
     DEFAULT_DATASETS,
     LAYOUT,
     MODEL_ID,
+    PROFILE_LOG_PREFIX,
+    select_device,
     TARGET_POLICY,
     TASK_ID,
     _GROUP_KEY_COLUMNS,
@@ -55,6 +62,14 @@ PYTHON_BIN = EXPERIMENT_DIR / ".conda" / "bin" / "python"
 CLI_ENTRYPOINT = EXPERIMENT_DIR / "run_exogenous.py"
 FINAL_OUTPUT = REPO_ROOT / "experiment" / "chronos-2-exogenous.csv"
 DEFAULT_WORK_ROOT = EXPERIMENT_DIR / ".work"
+FIXED_NON_CPU_SERIES_BUDGETS = (1024, 768, 512)
+CPU_FALLBACK_SERIES_BUDGET = FIXED_NON_CPU_SERIES_BUDGETS[0]
+PROGRESS_PHASES = {
+    "progress_chunk_plan",
+    "progress_stage_start",
+    "progress_batch",
+    "progress_stage_complete",
+}
 
 
 @dataclass(frozen=True)
@@ -70,12 +85,34 @@ class ChunkSpec:
     turbine_ids: tuple[str, ...] | None = None
 
 
+def resolve_full_run_device(device: str | None = None) -> str:
+    return device or select_device()
+
+
+def resolve_attempts(
+    *,
+    device: str | None = None,
+    series_budget: int,
+) -> tuple[Attempt, ...]:
+    resolved_device = resolve_full_run_device(device)
+    if resolved_device == "cpu":
+        return (Attempt(device="cpu", series_budget=series_budget),)
+    return tuple(
+        [Attempt(device=resolved_device, series_budget=budget) for budget in FIXED_NON_CPU_SERIES_BUDGETS]
+        + [Attempt(device="cpu", series_budget=CPU_FALLBACK_SERIES_BUDGET)]
+    )
+
+
 def _timestamp_label() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 def print_status(message: str) -> None:
     tqdm.write(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
+def format_non_cpu_retry_budgets() -> str:
+    return " -> ".join(str(budget) for budget in FIXED_NON_CPU_SERIES_BUDGETS)
 
 
 def expected_result_keys(
@@ -113,6 +150,7 @@ def build_cli_command(
     window_offset: int = 0,
     max_windows_per_dataset: int | None = None,
     turbine_ids: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
 ) -> list[str]:
     command = [
         str(PYTHON_BIN),
@@ -137,7 +175,36 @@ def build_cli_command(
     if turbine_ids:
         for turbine_id in turbine_ids:
             command.extend(["--turbine-id", turbine_id])
+    if emit_progress_events:
+        command.append("--emit-progress-events")
     return command
+
+
+def progress_is_enabled() -> bool:
+    return HAS_TQDM and sys.stderr.isatty()
+
+
+def parse_progress_event(stderr_line: str) -> dict[str, Any] | None:
+    if not stderr_line.startswith(PROFILE_LOG_PREFIX):
+        return None
+    try:
+        payload = json.loads(stderr_line[len(PROFILE_LOG_PREFIX) :].strip())
+    except json.JSONDecodeError:
+        return None
+    if payload.get("phase") not in PROGRESS_PHASES:
+        return None
+    return payload
+
+
+def format_progress_postfix(payload: Mapping[str, object], attempt: Attempt) -> str:
+    parts = [f"{attempt.device}/{attempt.series_budget}"]
+    stage = payload.get("stage")
+    if stage:
+        parts.append(f"stage={stage}")
+    turbine_id = payload.get("turbine_id")
+    if turbine_id:
+        parts.append(f"turbine={turbine_id}")
+    return " ".join(str(part) for part in parts)
 
 
 def execute_chunk(
@@ -145,13 +212,13 @@ def execute_chunk(
     label: str,
     dataset_id: str,
     work_dir: Path,
-    primary: Attempt,
-    fallback: Attempt | None = None,
+    attempts: Sequence[Attempt],
     include_power_only_reference: bool = False,
     covariate_stages: Sequence[str] = DEFAULT_COVARIATE_STAGES,
     window_offset: int = 0,
     max_windows_per_dataset: int | None = None,
     turbine_ids: Sequence[str] | None = None,
+    progress_enabled: bool = False,
 ) -> Path:
     chunk_dir = work_dir / "chunks"
     log_dir = work_dir / "logs"
@@ -161,6 +228,50 @@ def execute_chunk(
     if output_path.exists():
         print_status(f"REUSE {label}: {output_path}")
         return output_path
+
+    if not attempts:
+        raise ValueError("execute_chunk requires at least one attempt.")
+
+    chunk_progress_bar: Any | None = None
+
+    def _close_chunk_progress_bar() -> None:
+        nonlocal chunk_progress_bar
+        if chunk_progress_bar is not None:
+            chunk_progress_bar.close()
+            chunk_progress_bar = None
+
+    def _ensure_chunk_progress_bar(total_batches: int) -> Any | None:
+        nonlocal chunk_progress_bar
+        if not progress_enabled:
+            return None
+        if chunk_progress_bar is None:
+            chunk_progress_bar = tqdm(
+                total=total_batches,
+                desc=label,
+                unit="batch",
+                dynamic_ncols=True,
+                leave=False,
+                position=1,
+                disable=not progress_enabled,
+            )
+        elif getattr(chunk_progress_bar, "total", None) != total_batches:
+            chunk_progress_bar.total = total_batches
+            refresh = getattr(chunk_progress_bar, "refresh", None)
+            if callable(refresh):
+                refresh()
+        return chunk_progress_bar
+
+    def _handle_progress_event(payload: dict[str, Any], attempt: Attempt) -> None:
+        total_batches = int(payload.get("chunk_total_batches", 0) or 0)
+        progress_bar = _ensure_chunk_progress_bar(total_batches)
+        if progress_bar is None:
+            return
+        if payload.get("phase") == "progress_batch":
+            completed_batches = int(payload.get("completed_chunk_batches", 0) or 0)
+            current_batches = int(getattr(progress_bar, "n", 0))
+            if completed_batches > current_batches:
+                progress_bar.update(completed_batches - current_batches)
+        progress_bar.set_postfix_str(format_progress_postfix(payload, attempt))
 
     def _run_attempt(attempt: Attempt, *, log_suffix: str = "") -> subprocess.CompletedProcess[str]:
         command = build_cli_command(
@@ -172,11 +283,39 @@ def execute_chunk(
             window_offset=window_offset,
             max_windows_per_dataset=max_windows_per_dataset,
             turbine_ids=turbine_ids,
+            emit_progress_events=progress_enabled,
         )
         print_status(f"RUN {label}{log_suffix}: {' '.join(command)}")
         started_at = datetime.now().isoformat(timespec="seconds")
-        result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        stdout_text = ""
+        stderr_lines: list[str] = []
+        assert process.stderr is not None
+        for stderr_line in process.stderr:
+            payload = parse_progress_event(stderr_line)
+            if payload is not None:
+                _handle_progress_event(payload, attempt)
+                continue
+            stderr_lines.append(stderr_line)
+        if process.stdout is not None:
+            stdout_text = process.stdout.read()
+            process.stdout.close()
+        process.stderr.close()
+        returncode = process.wait()
         finished_at = datetime.now().isoformat(timespec="seconds")
+        result = subprocess.CompletedProcess(
+            command,
+            returncode,
+            stdout=stdout_text,
+            stderr="".join(stderr_lines),
+        )
         write_log(
             log_dir / f"{label}{log_suffix}.json",
             {
@@ -192,20 +331,30 @@ def execute_chunk(
         )
         return result
 
-    primary_result = _run_attempt(primary)
-    if primary_result.returncode == 0 and output_path.exists():
-        return output_path
-    if fallback is None:
-        raise RuntimeError(f"{label} failed. See {log_dir / f'{label}.json'}")
+    attempted_log_paths: list[Path] = []
+    for attempt_index, attempt in enumerate(attempts):
+        _close_chunk_progress_bar()
+        if attempt_index == 0:
+            log_suffix = ""
+        elif attempt.device == "cpu":
+            log_suffix = "__fallback_cpu"
+            print_status(f"FALLBACK {label}: {attempt.device} series_budget={attempt.series_budget}")
+        else:
+            log_suffix = f"__retry_{attempt_index:02d}"
+            print_status(f"RETRY {label}: {attempt.device} series_budget={attempt.series_budget}")
 
-    print_status(f"FALLBACK {label}: {fallback.device} series_budget={fallback.series_budget}")
-    fallback_result = _run_attempt(fallback, log_suffix="__fallback")
-    if fallback_result.returncode == 0 and output_path.exists():
-        return output_path
-    raise RuntimeError(
-        f"{label} failed on both primary and fallback attempts. "
-        f"See {log_dir / f'{label}.json'} and {log_dir / f'{label}__fallback.json'}."
-    )
+        log_path = log_dir / f"{label}{log_suffix}.json"
+        attempted_log_paths.append(log_path)
+        result = _run_attempt(attempt, log_suffix=log_suffix)
+        if result.returncode == 0 and output_path.exists():
+            _close_chunk_progress_bar()
+            return output_path
+
+    _close_chunk_progress_bar()
+    attempted_logs = ", ".join(str(path) for path in attempted_log_paths)
+    if len(attempted_log_paths) == 1:
+        raise RuntimeError(f"{label} failed. See {attempted_logs}.")
+    raise RuntimeError(f"{label} failed on all attempts. See {attempted_logs}.")
 
 
 def merge_chunk_results(chunk_paths: Sequence[Path]) -> pl.DataFrame:
@@ -333,9 +482,10 @@ def run_full_experiment(
     *,
     work_dir: Path,
     final_output: Path = FINAL_OUTPUT,
-    series_budget: int = 1024,
+    series_budget: int = CPU_FALLBACK_SERIES_BUDGET,
     include_power_only_reference: bool = False,
     covariate_stages: Sequence[str] = DEFAULT_COVARIATE_STAGES,
+    device: str | None = None,
 ) -> pl.DataFrame:
     work_dir.mkdir(parents=True, exist_ok=True)
     if final_output.exists():
@@ -344,14 +494,31 @@ def run_full_experiment(
             shutil.copy2(final_output, backup_path)
             print_status(f"Backed up existing output to {backup_path}")
 
+    resolved_device = resolve_full_run_device(device)
+    attempts = resolve_attempts(device=resolved_device, series_budget=series_budget)
+    if resolved_device == "cpu":
+        print_status(f"Using cpu for full run without fallback (series_budget={attempts[0].series_budget}).")
+    else:
+        retry_budgets = format_non_cpu_retry_budgets()
+        print_status(
+            f"Using {resolved_device} for full run with retry budgets {retry_budgets} before cpu fallback {CPU_FALLBACK_SERIES_BUDGET}."
+        )
+        if series_budget != CPU_FALLBACK_SERIES_BUDGET:
+            print_status(
+                f"Ignoring requested series_budget={series_budget} for non-cpu full run; "
+                f"using fixed retry budgets {retry_budgets} before cpu fallback {CPU_FALLBACK_SERIES_BUDGET}."
+            )
+
     chunk_specs = build_full_chunk_specs()
     chunk_paths: list[Path] = []
+    nested_progress_enabled = progress_is_enabled()
     progress_bar = tqdm(
         total=len(chunk_specs),
         desc="Chronos-2 exogenous",
         unit="chunk",
         dynamic_ncols=True,
-        disable=not sys.stderr.isatty(),
+        position=0,
+        disable=not nested_progress_enabled,
     )
     try:
         for chunk_spec in chunk_specs:
@@ -361,11 +528,11 @@ def run_full_experiment(
                     label=chunk_spec.label,
                     dataset_id=chunk_spec.dataset_id,
                     work_dir=work_dir,
-                    primary=Attempt(device="mps", series_budget=series_budget),
-                    fallback=Attempt(device="cpu", series_budget=series_budget),
+                    attempts=attempts,
                     include_power_only_reference=include_power_only_reference,
                     covariate_stages=covariate_stages,
                     turbine_ids=chunk_spec.turbine_ids,
+                    progress_enabled=nested_progress_enabled,
                 )
             )
             progress_bar.update(1)
@@ -405,13 +572,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--series-budget",
         type=int,
-        default=1024,
-        help="Target-plus-covariate series budget used for each runner invocation.",
+        default=CPU_FALLBACK_SERIES_BUDGET,
+        help=(
+            "Series budget for cpu full runs. Non-cpu full runs ignore this flag and use fixed retry budgets "
+            "1024 -> 768 -> 512 before cpu fallback 1024."
+        ),
     )
     parser.add_argument(
         "--include-power-only-reference",
         action="store_true",
         help="Also include one power-only reference row per dataset.",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=None,
+        help="Override automatic device selection for full-run chunks.",
     )
     return parser
 
@@ -425,6 +601,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         final_output=args.output_path,
         series_budget=args.series_budget,
         include_power_only_reference=bool(args.include_power_only_reference),
+        device=args.device,
     )
     print(result)
     return 0
