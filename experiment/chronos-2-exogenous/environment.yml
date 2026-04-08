@@ -1,0 +1,16 @@
+name: chronos-2-exogenous
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - git+https://github.com/amazon-science/chronos-forecasting.git@6d68ed7c4ed2805d122d77b4660765b4089de5ca
+      - torch
+      - transformers
+      - pandas[pyarrow]
+      - numpy
+      - pyarrow
+      - polars
+      - tqdm
+      - matplotlib
