@@ -24,6 +24,7 @@ from chronos2_power_only import (
     MULTIVARIATE_KNN6_SUFFIX,
     MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
     _RESULT_COLUMNS,
+    select_device,
     supports_univariate_power_stats,
     TARGET_POLICY,
     TASK_ID,
@@ -43,6 +44,24 @@ DEFAULT_WORK_ROOT = EXPERIMENT_DIR / ".work"
 class Attempt:
     device: str
     batch_size: int
+
+
+def resolve_full_run_device(device: str | None = None) -> str:
+    return device or select_device()
+
+
+def resolve_attempts(
+    *,
+    device: str | None = None,
+    batch_size: int,
+    fallback_batch_size: int,
+) -> tuple[Attempt, Attempt | None]:
+    resolved_device = resolve_full_run_device(device)
+    primary = Attempt(device=resolved_device, batch_size=batch_size)
+    fallback = None
+    if resolved_device != "cpu":
+        fallback = Attempt(device="cpu", batch_size=fallback_batch_size)
+    return primary, fallback
 
 
 def _timestamp_label() -> str:
@@ -247,7 +266,7 @@ def run_window_chunks(
     mode: str,
     work_dir: Path,
     primary: Attempt,
-    fallback: Attempt,
+    fallback: Attempt | None,
     windows_per_chunk: int,
 ) -> list[Path]:
     chunk_paths: list[Path] = []
@@ -308,7 +327,7 @@ def run_target_group_chunks(
     mode: str,
     work_dir: Path,
     primary: Attempt,
-    fallback: Attempt,
+    fallback: Attempt | None,
     target_groups: Sequence[Sequence[str]],
 ) -> list[Path]:
     chunk_paths: list[Path] = []
@@ -346,6 +365,7 @@ def run_full_experiment(
     *,
     work_dir: Path,
     final_output: Path = FINAL_OUTPUT,
+    device: str | None = None,
 ) -> pl.DataFrame:
     work_dir.mkdir(parents=True, exist_ok=True)
     if final_output.exists():
@@ -354,63 +374,74 @@ def run_full_experiment(
             shutil.copy2(final_output, backup_path)
             print_status(f"Backed up existing output to {backup_path}")
 
+    resolved_device = resolve_full_run_device(device)
+    if resolved_device == "cpu":
+        print_status("Using cpu for full run without fallback.")
+    else:
+        print_status(f"Using {resolved_device} for full run with cpu fallback.")
+
     chunk_paths: list[Path] = []
 
     for dataset_id in ("kelmarsh", "penmanshiel"):
+        primary, fallback = resolve_attempts(device=resolved_device, batch_size=32, fallback_batch_size=16)
         chunk_paths.append(
             execute_chunk(
                 label=f"{dataset_id}_all",
                 dataset_id=dataset_id,
                 mode="all",
                 work_dir=work_dir,
-                primary=Attempt(device="mps", batch_size=32),
-                fallback=Attempt(device="cpu", batch_size=16),
+                primary=primary,
+                fallback=fallback,
             )
         )
 
     for chunk_index, turbine_ids in enumerate(build_hill_univariate_chunks(), start=1):
+        primary, fallback = resolve_attempts(device=resolved_device, batch_size=4, fallback_batch_size=4)
         chunk_paths.append(
             execute_chunk(
                 label=f"hill_of_towie_univariate_chunk_{chunk_index:02d}",
                 dataset_id="hill_of_towie",
                 mode="univariate",
                 work_dir=work_dir,
-                primary=Attempt(device="mps", batch_size=4),
-                fallback=Attempt(device="cpu", batch_size=4),
+                primary=primary,
+                fallback=fallback,
                 turbine_ids=turbine_ids,
             )
         )
 
     for chunk_index, turbine_ids in enumerate(build_sdwpf_univariate_chunks(), start=1):
+        primary, fallback = resolve_attempts(device=resolved_device, batch_size=16, fallback_batch_size=8)
         chunk_paths.append(
             execute_chunk(
                 label=f"sdwpf_kddcup_univariate_chunk_{chunk_index:02d}",
                 dataset_id="sdwpf_kddcup",
                 mode="univariate",
                 work_dir=work_dir,
-                primary=Attempt(device="mps", batch_size=16),
-                fallback=Attempt(device="cpu", batch_size=8),
+                primary=primary,
+                fallback=fallback,
                 turbine_ids=turbine_ids,
             )
         )
 
+    primary, fallback = resolve_attempts(device=resolved_device, batch_size=4, fallback_batch_size=1)
     chunk_paths.extend(
         run_target_group_chunks(
             dataset_id="hill_of_towie",
             mode="multivariate_knn6",
             work_dir=work_dir,
-            primary=Attempt(device="mps", batch_size=4),
-            fallback=Attempt(device="cpu", batch_size=1),
+            primary=primary,
+            fallback=fallback,
             target_groups=build_hill_multivariate_target_groups(),
         )
     )
+    primary, fallback = resolve_attempts(device=resolved_device, batch_size=4, fallback_batch_size=1)
     chunk_paths.extend(
         run_target_group_chunks(
             dataset_id="sdwpf_kddcup",
             mode="multivariate_knn6",
             work_dir=work_dir,
-            primary=Attempt(device="mps", batch_size=4),
-            fallback=Attempt(device="cpu", batch_size=1),
+            primary=primary,
+            fallback=fallback,
             target_groups=build_sdwpf_multivariate_target_groups(),
         )
     )
@@ -439,6 +470,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=FINAL_OUTPUT,
         help="Final merged CSV path. Defaults to experiment/chronos-2.csv in the repo root.",
     )
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "mps", "cpu"],
+        default=None,
+        help="Override automatic device selection for full-run chunks.",
+    )
     return parser
 
 
@@ -446,7 +483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     work_dir = args.work_dir or (DEFAULT_WORK_ROOT / f"full-run-{_timestamp_label()}")
-    result = run_full_experiment(work_dir=work_dir, final_output=args.output_path)
+    result = run_full_experiment(work_dir=work_dir, final_output=args.output_path, device=args.device)
     print(result)
     return 0
 

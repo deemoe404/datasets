@@ -88,12 +88,19 @@ Run only the added power-stat covariate variant:
 `univariate_power_stats` is supported only for `kelmarsh`, `penmanshiel`, and `hill_of_towie`.
 
 To run the full 14-row benchmark safely, use the repo-tracked orchestrator instead
-of ad hoc shell loops. It runs serially, chunks the heavy datasets, falls back to
-CPU when an MPS chunk fails, can split heavy `multivariate_knn6` target groups
-into smaller chunks, and writes chunk logs under `./.work/`:
+of ad hoc shell loops. It runs serially, chunks the heavy datasets, automatically
+selects `cuda -> mps -> cpu`, falls back to CPU when a non-CPU chunk fails, can
+split heavy `multivariate_knn6` target groups into smaller chunks, and writes
+chunk logs under `./.work/`:
 
 ```bash
 ./.conda/bin/python run_power_only_full.py
+```
+
+Pin the full run to a specific device when needed:
+
+```bash
+./.conda/bin/python run_power_only_full.py --device cuda
 ```
 
 Debug-only options:

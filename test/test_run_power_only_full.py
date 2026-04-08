@@ -141,6 +141,51 @@ def test_expected_dataset_ids_includes_power_stats_variants() -> None:
     ]
 
 
+def test_resolve_attempts_auto_uses_cuda_with_cpu_fallback(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "select_device", lambda: "cuda")
+
+    primary, fallback = module.resolve_attempts(device=None, batch_size=32, fallback_batch_size=16)
+
+    assert primary == module.Attempt(device="cuda", batch_size=32)
+    assert fallback == module.Attempt(device="cpu", batch_size=16)
+
+
+def test_resolve_attempts_auto_uses_mps_with_cpu_fallback(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "select_device", lambda: "mps")
+
+    primary, fallback = module.resolve_attempts(device=None, batch_size=32, fallback_batch_size=16)
+
+    assert primary == module.Attempt(device="mps", batch_size=32)
+    assert fallback == module.Attempt(device="cpu", batch_size=16)
+
+
+def test_resolve_attempts_cpu_has_no_fallback(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "select_device", lambda: "cpu")
+
+    auto_primary, auto_fallback = module.resolve_attempts(device=None, batch_size=32, fallback_batch_size=16)
+    explicit_primary, explicit_fallback = module.resolve_attempts(device="cpu", batch_size=32, fallback_batch_size=16)
+
+    assert auto_primary == module.Attempt(device="cpu", batch_size=32)
+    assert auto_fallback is None
+    assert explicit_primary == module.Attempt(device="cpu", batch_size=32)
+    assert explicit_fallback is None
+
+
+def test_resolve_attempts_explicit_non_cpu_preserves_cpu_fallback() -> None:
+    module = _load_module()
+
+    cuda_primary, cuda_fallback = module.resolve_attempts(device="cuda", batch_size=32, fallback_batch_size=16)
+    mps_primary, mps_fallback = module.resolve_attempts(device="mps", batch_size=32, fallback_batch_size=16)
+
+    assert cuda_primary == module.Attempt(device="cuda", batch_size=32)
+    assert cuda_fallback == module.Attempt(device="cpu", batch_size=16)
+    assert mps_primary == module.Attempt(device="mps", batch_size=32)
+    assert mps_fallback == module.Attempt(device="cpu", batch_size=16)
+
+
 def test_run_target_group_chunks_splits_after_failure(monkeypatch, tmp_path) -> None:
     module = _load_module()
     seen_groups: list[tuple[str, ...]] = []
