@@ -8,9 +8,11 @@ from typing import Any
 import polars as pl
 import pyarrow.parquet as pq
 
-from ..utils import ensure_directory
+from ..utils import ensure_directory, join_flags
 from .base import BaseDatasetBuilder
 from .common import (
+    DUPLICATE_AUDIT_SCHEMA,
+    DUPLICATE_EFFECTS_SCHEMA,
     ParquetChunkWriter,
     QualityReportAccumulator,
     build_feature_name_mapping,
@@ -27,26 +29,40 @@ from .common import (
 )
 
 _DEFAULT_TABLES = ("tblSCTurbine", "tblSCTurGrid", "tblSCTurFlag")
-_DUPLICATE_AUDIT_SCHEMA = {
-    "table_name": pl.String,
-    "timestamp": pl.Datetime,
-    "station_id": pl.String,
-    "duplicate_count": pl.Int64,
-    "duplicate_kind": pl.String,
-    "is_conflicting": pl.Boolean,
-    "normalized_equal_columns": pl.String,
-    "conflicting_columns": pl.String,
+_HILL_ROW_EFFECT_SCOPE = "row"
+_HILL_BROADCAST_EFFECT_SCOPE = "feature_broadcast"
+_HILL_TURBINE_EFFECT_SCOPE = "feature_turbine"
+_HILL_DUPLICATE_RESOLVED_STRATEGY = "per_column_first_non_null_with_true_conflict_nulling"
+_HILL_DEFAULT_DUPLICATE_EXCLUDED_COLUMNS = {
+    "TimeStamp",
+    "timestamp",
+    "StationId",
+    "__source_file_idx",
+    "__source_row_nr",
+}
+_HILL_SHARED_DUPLICATE_EXCLUDED_COLUMNS = {
+    "TimeStamp",
+    "timestamp",
+    "Station",
+    "StationId",
+    "TimestampStation",
+    "WPSStatus",
+    "DataOk",
+    "dataset",
+    "turbine_id",
+    "__source_file_idx",
+    "__source_row_nr",
 }
 
 _HILL_SHARED_TABLE_SPECS = (
-    ("tblGrid", "farm_grid", "farm_grid", ("TimeStamp",)),
-    ("tblGridScientific", "farm_grid_sci", "farm_grid_sci", ("TimeStamp",)),
-    ("tblSCTurCount", "turbine_count", "tur_count", ("TimeStamp", "StationId")),
-    ("tblSCTurDigiIn", "turbine_digi_in", "tur_digi_in", ("TimeStamp", "StationId")),
-    ("tblSCTurDigiOut", "turbine_digi_out", "tur_digi_out", ("TimeStamp", "StationId")),
-    ("tblSCTurIntern", "turbine_intern", "tur_intern", ("TimeStamp", "StationId")),
-    ("tblSCTurPress", "turbine_press", "tur_press", ("TimeStamp", "StationId")),
-    ("tblSCTurTemp", "turbine_temp", "tur_temp", ("TimeStamp", "StationId")),
+    ("tblGrid", "farm_grid", "farm_grid", ("TimeStamp",), _HILL_BROADCAST_EFFECT_SCOPE),
+    ("tblGridScientific", "farm_grid_sci", "farm_grid_sci", ("TimeStamp",), _HILL_BROADCAST_EFFECT_SCOPE),
+    ("tblSCTurCount", "turbine_count", "tur_count", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
+    ("tblSCTurDigiIn", "turbine_digi_in", "tur_digi_in", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
+    ("tblSCTurDigiOut", "turbine_digi_out", "tur_digi_out", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
+    ("tblSCTurIntern", "turbine_intern", "tur_intern", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
+    ("tblSCTurPress", "turbine_press", "tur_press", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
+    ("tblSCTurTemp", "turbine_temp", "tur_temp", ("TimeStamp", "StationId"), _HILL_TURBINE_EFFECT_SCOPE),
 )
 
 _HILL_BROADCAST_SHARED_GROUPS = (
@@ -72,6 +88,13 @@ _HILL_EVENT_FEATURE_GROUPS = (
 
 _HILL_TUNEUP_METADATA_PACKAGE = "wind_datasets.data"
 _HILL_TUNEUP_METADATA_RESOURCE = "hill_of_towie_tuneup_2024.csv"
+_HILL_SERIES_EFFECT_SCHEMA: dict[str, pl.DataType] = {
+    "dataset": pl.String,
+    "turbine_id": pl.String,
+    "timestamp": pl.Datetime,
+    "__duplicate_row_quality_flags": pl.String,
+    "__duplicate_feature_quality_flags": pl.String,
+}
 
 
 def _read_csv_with_fallback(path):
@@ -127,8 +150,12 @@ def _hill_timestamp_parse_expr(source_column: str = "TimeStamp") -> pl.Expr:
     )
 
 
-def _empty_hill_conflict_key_frame() -> pl.DataFrame:
-    return pl.DataFrame(schema={"timestamp": pl.Datetime, "StationId": pl.String})
+def _empty_hill_duplicate_audit_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=DUPLICATE_AUDIT_SCHEMA)
+
+
+def _empty_hill_duplicate_effect_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=DUPLICATE_EFFECTS_SCHEMA)
 
 
 def _scan_ordered_hill_parquets(paths: list[Path]) -> pl.LazyFrame:
@@ -151,33 +178,52 @@ def _sink_hill_lazy_frame(frame: pl.LazyFrame, output_path: Path) -> None:
     frame.sink_parquet(output_path)
 
 
-def _dedupe_hill_duplicate_rows(frame: pl.DataFrame, key_columns: list[str]) -> pl.DataFrame:
-    if frame.is_empty():
-        return frame
-    sort_columns = [column for column in ("__source_file_idx", "__source_row_nr") if column in frame.columns]
-    if sort_columns:
-        frame = frame.sort(sort_columns)
-    return frame.unique(subset=key_columns, keep="first", maintain_order=True)
+def _canonicalize_duplicate_value(value: object, dtype: pl.DataType) -> object:
+    if value is None:
+        return None
+    if dtype.is_numeric() or dtype == pl.Boolean:
+        return value
+    normalized = _normalize_duplicate_value(value, dtype)
+    if normalized is None:
+        return None
+    return normalized
 
 
-def _audit_hill_duplicate_rows(
+def _table_series_column_name(prefix: str | None, source_column: str) -> str:
+    if prefix is None:
+        return source_column
+    return f"{prefix}__{sanitize_feature_name(source_column)}"
+
+
+def _resolve_hill_duplicate_groups(
     frame: pl.DataFrame,
+    *,
     table_name: str,
+    effect_scope: str,
+    key_columns: list[str],
+    dataset_id: str,
+    station_to_turbine: dict[str, str],
+    series_column_prefix: str | None = None,
+    feature_flag_token: str | None = None,
+    excluded_payload_columns: set[str] | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     if frame.is_empty():
-        return frame, pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA), _empty_hill_conflict_key_frame()
+        return frame, _empty_hill_duplicate_audit_frame(), _empty_hill_duplicate_effect_frame()
 
-    payload_columns = [
-        column
-        for column in frame.columns
-        if column not in {"TimeStamp", "timestamp", "StationId", "__source_file_idx", "__source_row_nr"}
-    ]
+    excluded = set(excluded_payload_columns or set()) | set(key_columns)
+    payload_columns = [column for column in frame.columns if column not in excluded]
     source_rows = frame.sort([column for column in ("__source_file_idx", "__source_row_nr") if column in frame.columns])
     audit_rows: list[dict[str, object]] = []
-    conflict_rows: list[dict[str, object]] = []
-    for group in source_rows.partition_by(["timestamp", "StationId"], maintain_order=True):
+    effect_rows: list[dict[str, object]] = []
+    resolved_rows: list[dict[str, object]] = []
+    for group in source_rows.partition_by(key_columns, maintain_order=True):
         normalized_equal_columns: list[str] = []
-        conflicting_columns: list[str] = []
+        conflicting_source_columns: list[str] = []
+        resolved_row = {
+            column: group[column][0]
+            for column in source_rows.columns
+            if column not in {"__source_file_idx", "__source_row_nr"}
+        }
         for column in payload_columns:
             raw_values = _unique_non_null(group[column].to_list())
             normalized_values: list[object] = []
@@ -189,81 +235,76 @@ def _audit_hill_duplicate_rows(
                 if normalized not in normalized_values:
                     normalized_values.append(normalized)
             if len(normalized_values) > 1:
-                conflicting_columns.append(column)
+                conflicting_source_columns.append(column)
+                resolved_row[column] = None
             elif len(raw_values) > 1:
                 normalized_equal_columns.append(column)
+                resolved_row[column] = _canonicalize_duplicate_value(raw_values[0], dtype)
+            elif len(raw_values) == 1:
+                resolved_row[column] = _canonicalize_duplicate_value(raw_values[0], dtype)
+            else:
+                resolved_row[column] = None
         duplicate_kind = (
             "true_conflict"
-            if conflicting_columns
+            if conflicting_source_columns
             else "normalized_equal"
             if normalized_equal_columns
             else "identical"
         )
+        timestamp = group["timestamp"][0]
+        station_id = group["StationId"][0] if "StationId" in group.columns else None
+        turbine_id = station_to_turbine.get(station_id) if station_id is not None else None
+        affected_series_columns = [
+            _table_series_column_name(series_column_prefix, column)
+            for column in conflicting_source_columns
+        ]
         audit_rows.append(
             {
                 "table_name": table_name,
-                "timestamp": group["timestamp"][0],
-                "station_id": group["StationId"][0],
+                "effect_scope": effect_scope,
+                "timestamp": timestamp,
+                "station_id": station_id,
+                "turbine_id": turbine_id,
                 "duplicate_count": group.height,
                 "duplicate_kind": duplicate_kind,
-                "is_conflicting": bool(conflicting_columns),
-                "normalized_equal_columns": "|".join(normalized_equal_columns),
-                "conflicting_columns": "|".join(conflicting_columns),
+                "normalized_equal_columns": normalized_equal_columns,
+                "conflicting_source_columns": conflicting_source_columns,
+                "affected_series_columns": affected_series_columns,
+                "resolved_strategy": _HILL_DUPLICATE_RESOLVED_STRATEGY,
             }
         )
-        if conflicting_columns:
-            conflict_rows.append(
+        if conflicting_source_columns:
+            effect_rows.append(
                 {
-                    "timestamp": group["timestamp"][0],
-                    "StationId": group["StationId"][0],
+                    "dataset": dataset_id,
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "effect_scope": effect_scope,
+                    "source_tables": [table_name],
+                    "row_quality_flags": "duplicate_conflict_resolved" if effect_scope == _HILL_ROW_EFFECT_SCOPE else "",
+                    "feature_quality_flags": feature_flag_token or "",
+                    "affected_series_columns": affected_series_columns,
                 }
             )
+        resolved_rows.append(resolved_row)
 
+    resolved_frame = (
+        pl.DataFrame(resolved_rows, schema={column: dtype for column, dtype in source_rows.schema.items() if column not in {"__source_file_idx", "__source_row_nr"}})
+        .sort(key_columns)
+        if resolved_rows
+        else source_rows.drop([column for column in ("__source_file_idx", "__source_row_nr") if column in source_rows.columns])
+    )
     audit_frame = (
-        pl.DataFrame(audit_rows, schema=_DUPLICATE_AUDIT_SCHEMA).sort(["timestamp", "station_id"])
+        pl.DataFrame(audit_rows, schema=DUPLICATE_AUDIT_SCHEMA).sort(["timestamp", "table_name", "station_id", "turbine_id"])
         if audit_rows
-        else pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA)
+        else _empty_hill_duplicate_audit_frame()
     )
-    conflict_keys = (
-        pl.DataFrame(conflict_rows, schema={"timestamp": pl.Datetime, "StationId": pl.String})
-        .unique()
-        .sort(["timestamp", "StationId"])
-        if conflict_rows
-        else _empty_hill_conflict_key_frame()
+    effects_frame = (
+        pl.DataFrame(effect_rows, schema=DUPLICATE_EFFECTS_SCHEMA).sort(["timestamp", "effect_scope", "turbine_id"])
+        if effect_rows
+        else _empty_hill_duplicate_effect_frame()
     )
-    deduped = _dedupe_hill_duplicate_rows(source_rows, ["timestamp", "StationId"])
-    return deduped, audit_frame, conflict_keys
-
-
-def _combine_hill_shared_duplicates(frame: pl.DataFrame, key_columns: list[str]) -> pl.DataFrame:
-    if frame.is_empty():
-        return frame
-
-    source_rows = frame.sort([column for column in ("__source_file_idx", "__source_row_nr") if column in frame.columns])
-    payload_columns = [
-        column
-        for column in source_rows.columns
-        if column
-        not in {
-            "TimeStamp",
-            "timestamp",
-            "Station",
-            "StationId",
-            "TimestampStation",
-            "WPSStatus",
-            "DataOk",
-            "dataset",
-            "turbine_id",
-            "__source_file_idx",
-            "__source_row_nr",
-            *key_columns,
-        }
-    ]
-    if not payload_columns:
-        return _dedupe_hill_duplicate_rows(source_rows, key_columns)
-    return source_rows.group_by(key_columns, maintain_order=True).agg(
-        [pl.col(column).drop_nulls().first().alias(column) for column in payload_columns]
-    )
+    return resolved_frame, audit_frame, effects_frame
 
 def _standardize_hill_shared_scan(
     *,
@@ -414,57 +455,239 @@ def _hill_shared_output_schema(
     return schema
 
 
-def _hill_default_combined_frame(
+def _aggregate_hill_duplicate_effects(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty():
+        return _empty_hill_duplicate_effect_frame()
+    rows: list[dict[str, object]] = []
+    for group in frame.sort(["timestamp", "effect_scope", "turbine_id"]).partition_by(
+        ["dataset", "timestamp", "turbine_id", "effect_scope"],
+        maintain_order=True,
+    ):
+        source_tables: list[str] = []
+        affected_series_columns: list[str] = []
+        for value in group["source_tables"].to_list():
+            for item in value or []:
+                if item not in source_tables:
+                    source_tables.append(item)
+        for value in group["affected_series_columns"].to_list():
+            for item in value or []:
+                if item not in affected_series_columns:
+                    affected_series_columns.append(item)
+        rows.append(
+            {
+                "dataset": group["dataset"][0],
+                "turbine_id": group["turbine_id"][0],
+                "timestamp": group["timestamp"][0],
+                "effect_scope": group["effect_scope"][0],
+                "source_tables": source_tables,
+                "row_quality_flags": join_flags(*group["row_quality_flags"].to_list()),
+                "feature_quality_flags": join_flags(*group["feature_quality_flags"].to_list()),
+                "affected_series_columns": affected_series_columns,
+            }
+        )
+    return pl.DataFrame(rows, schema=DUPLICATE_EFFECTS_SCHEMA).sort(["timestamp", "effect_scope", "turbine_id"])
+
+
+def _empty_hill_series_effect_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_HILL_SERIES_EFFECT_SCHEMA)
+
+
+def _aggregate_hill_series_effects(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty():
+        return _empty_hill_series_effect_frame()
+
+    rows: list[dict[str, object]] = []
+    for group in frame.sort(["timestamp", "turbine_id"]).partition_by(
+        ["dataset", "turbine_id", "timestamp"],
+        maintain_order=True,
+    ):
+        rows.append(
+            {
+                "dataset": group["dataset"][0],
+                "turbine_id": group["turbine_id"][0],
+                "timestamp": group["timestamp"][0],
+                "__duplicate_row_quality_flags": join_flags(*group["__duplicate_row_quality_flags"].to_list()),
+                "__duplicate_feature_quality_flags": join_flags(
+                    *group["__duplicate_feature_quality_flags"].to_list()
+                ),
+            }
+        )
+    return pl.DataFrame(rows, schema=_HILL_SERIES_EFFECT_SCHEMA).sort(["timestamp", "turbine_id"])
+
+
+def _load_hill_duplicate_effects_slice(base_chunk: pl.DataFrame, cache_paths) -> pl.DataFrame:
+    effects_path = cache_paths.duplicate_effects_path
+    if base_chunk.is_empty() or not effects_path.exists():
+        return _empty_hill_series_effect_frame()
+
+    dataset_id = base_chunk["dataset"][0]
+    chunk_start = base_chunk["timestamp"].min()
+    chunk_end = base_chunk["timestamp"].max()
+    effects = (
+        pl.scan_parquet(effects_path)
+        .filter(
+            (pl.col("dataset") == dataset_id)
+            & (pl.col("timestamp") >= chunk_start)
+            & (pl.col("timestamp") <= chunk_end)
+        )
+        .collect()
+    )
+    if effects.is_empty():
+        return _empty_hill_series_effect_frame()
+
+    frames: list[pl.DataFrame] = []
+    row_effects = effects.filter(pl.col("effect_scope") == _HILL_ROW_EFFECT_SCOPE)
+    if not row_effects.is_empty():
+        frames.append(
+            row_effects.select(
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                pl.col("row_quality_flags").alias("__duplicate_row_quality_flags"),
+                pl.lit("").alias("__duplicate_feature_quality_flags"),
+            )
+        )
+
+    turbine_feature_effects = effects.filter(pl.col("effect_scope") == _HILL_TURBINE_EFFECT_SCOPE)
+    if not turbine_feature_effects.is_empty():
+        frames.append(
+            turbine_feature_effects.select(
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                pl.lit("").alias("__duplicate_row_quality_flags"),
+                pl.col("feature_quality_flags").alias("__duplicate_feature_quality_flags"),
+            )
+        )
+
+    broadcast_effects = effects.filter(pl.col("effect_scope") == _HILL_BROADCAST_EFFECT_SCOPE)
+    if not broadcast_effects.is_empty():
+        base_keys = base_chunk.select(["dataset", "turbine_id", "timestamp"]).unique(maintain_order=True)
+        frames.append(
+            base_keys.join(
+                broadcast_effects.select(["dataset", "timestamp", "feature_quality_flags"]),
+                on=["dataset", "timestamp"],
+                how="inner",
+            ).select(
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                pl.lit("").alias("__duplicate_row_quality_flags"),
+                pl.col("feature_quality_flags").alias("__duplicate_feature_quality_flags"),
+            )
+        )
+
+    if not frames:
+        return _empty_hill_series_effect_frame()
+    return _aggregate_hill_series_effects(pl.concat(frames, how="vertical_relaxed"))
+
+
+def _build_hill_duplicate_report_extra(
+    duplicate_audit: pl.DataFrame,
+    duplicate_effects: pl.DataFrame,
+    turbine_ids: tuple[str, ...],
+) -> dict[str, object]:
+    true_conflicts = duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict")
+    duplicate_true_conflict_count_by_table = {
+        row["table_name"]: int(row["count"])
+        for row in true_conflicts.group_by("table_name", maintain_order=True)
+        .len(name="count")
+        .sort("table_name")
+        .iter_rows(named=True)
+    }
+
+    row_conflict_row_count = (
+        duplicate_effects.filter(pl.col("effect_scope") == _HILL_ROW_EFFECT_SCOPE)
+        .select(["dataset", "turbine_id", "timestamp"])
+        .unique()
+        .height
+    )
+
+    feature_conflict_parts: list[pl.DataFrame] = []
+    turbine_feature_rows = (
+        duplicate_effects.filter(pl.col("effect_scope") == _HILL_TURBINE_EFFECT_SCOPE)
+        .select(["dataset", "turbine_id", "timestamp"])
+        .unique()
+    )
+    if not turbine_feature_rows.is_empty():
+        feature_conflict_parts.append(turbine_feature_rows)
+
+    broadcast_rows = (
+        duplicate_effects.filter(pl.col("effect_scope") == _HILL_BROADCAST_EFFECT_SCOPE)
+        .select(["dataset", "timestamp"])
+        .unique()
+    )
+    if not broadcast_rows.is_empty():
+        feature_conflict_parts.append(
+            broadcast_rows.join(
+                pl.DataFrame({"turbine_id": list(turbine_ids)}),
+                how="cross",
+            ).select(["dataset", "turbine_id", "timestamp"])
+        )
+
+    feature_conflict_row_count = (
+        pl.concat(feature_conflict_parts, how="vertical_relaxed").unique().height
+        if feature_conflict_parts
+        else 0
+    )
+
+    duplicate_audit_count = duplicate_audit.height
+    duplicate_true_conflict_count = true_conflicts.height
+    return {
+        "duplicate_audit_count": duplicate_audit_count,
+        "duplicate_true_conflict_count": duplicate_true_conflict_count,
+        "duplicate_true_conflict_count_by_table": duplicate_true_conflict_count_by_table,
+        "row_conflict_row_count": row_conflict_row_count,
+        "feature_conflict_row_count": feature_conflict_row_count,
+        "duplicate_key_audit_count": duplicate_audit_count,
+        "duplicate_conflict_key_count": duplicate_true_conflict_count,
+    }
+
+
+def _hill_combined_frame(
     *,
     buffer: pl.DataFrame,
     current: pl.DataFrame,
     table_name: str,
+    key_columns: list[str],
+    effect_scope: str,
+    dataset_id: str,
+    station_to_turbine: dict[str, str],
+    excluded_payload_columns: set[str],
+    series_column_prefix: str | None = None,
+    feature_flag_token: str | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     combined = pl.concat([buffer, current], how="diagonal_relaxed") if not buffer.is_empty() else current
     duplicate_keys = (
-        combined.group_by(["timestamp", "StationId"])
+        combined.group_by(key_columns)
         .len()
         .filter(pl.col("len") > 1)
-        .select(["timestamp", "StationId"])
+        .select(key_columns)
     )
     if duplicate_keys.is_empty():
         return (
             combined.sort(["timestamp", "__source_file_idx", "__source_row_nr"]),
-            pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA),
-            _empty_hill_conflict_key_frame(),
+            _empty_hill_duplicate_audit_frame(),
+            _empty_hill_duplicate_effect_frame(),
         )
 
-    duplicate_rows = combined.join(duplicate_keys, on=["timestamp", "StationId"], how="inner")
-    deduped_duplicates, audit_frame, conflict_keys = _audit_hill_duplicate_rows(duplicate_rows, table_name)
-    nonduplicate_rows = combined.join(duplicate_keys, on=["timestamp", "StationId"], how="anti")
-    resolved = pl.concat([nonduplicate_rows, deduped_duplicates], how="diagonal_relaxed").sort(
+    duplicate_rows = combined.join(duplicate_keys, on=key_columns, how="inner")
+    resolved_duplicates, audit_frame, effects_frame = _resolve_hill_duplicate_groups(
+        duplicate_rows,
+        table_name=table_name,
+        effect_scope=effect_scope,
+        key_columns=key_columns,
+        dataset_id=dataset_id,
+        station_to_turbine=station_to_turbine,
+        series_column_prefix=series_column_prefix,
+        feature_flag_token=feature_flag_token,
+        excluded_payload_columns=excluded_payload_columns,
+    )
+    nonduplicate_rows = combined.join(duplicate_keys, on=key_columns, how="anti")
+    resolved = pl.concat([nonduplicate_rows, resolved_duplicates], how="diagonal_relaxed").sort(
         ["timestamp", "__source_file_idx", "__source_row_nr"]
     )
-    return resolved, audit_frame, conflict_keys
-
-
-def _hill_shared_combined_frame(
-    *,
-    buffer: pl.DataFrame,
-    current: pl.DataFrame,
-    dedupe_keys: list[str],
-) -> pl.DataFrame:
-    combined = pl.concat([buffer, current], how="diagonal_relaxed") if not buffer.is_empty() else current
-    duplicate_keys = (
-        combined.group_by(dedupe_keys)
-        .len()
-        .filter(pl.col("len") > 1)
-        .select(dedupe_keys)
-    )
-    if duplicate_keys.is_empty():
-        return combined.sort(["timestamp", "__source_file_idx", "__source_row_nr"])
-
-    duplicate_rows = combined.join(duplicate_keys, on=dedupe_keys, how="inner")
-    deduped_duplicates = _combine_hill_shared_duplicates(duplicate_rows, dedupe_keys)
-    nonduplicate_rows = combined.join(duplicate_keys, on=dedupe_keys, how="anti")
-    return pl.concat([nonduplicate_rows, deduped_duplicates], how="diagonal_relaxed").sort(
-        ["timestamp", "__source_file_idx", "__source_row_nr"]
-    )
+    return resolved, audit_frame, effects_frame
 
 
 def _write_hill_default_table(
@@ -472,6 +695,8 @@ def _write_hill_default_table(
     paths: list[Path],
     output_path: Path,
     table_name: str,
+    dataset_id: str,
+    station_to_turbine: dict[str, str],
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     ensure_directory(output_path.parent)
     output_path.unlink(missing_ok=True)
@@ -482,26 +707,31 @@ def _write_hill_default_table(
     )
     if not paths:
         writer.close()
-        return pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA), _empty_hill_conflict_key_frame()
+        return _empty_hill_duplicate_audit_frame(), _empty_hill_duplicate_effect_frame()
 
     buffer = pl.DataFrame()
     audit_frames: list[pl.DataFrame] = []
-    conflict_frames: list[pl.DataFrame] = []
+    effect_frames: list[pl.DataFrame] = []
     for source_file_idx, path in enumerate(paths):
         current = _read_hill_source_part(path, source_file_idx).with_columns(
             _hill_timestamp_parse_expr().alias("timestamp"),
             pl.col("StationId").cast(pl.String).alias("StationId"),
         )
         if buffer.is_empty():
-            buffer, audit_frame, conflict_keys = _hill_default_combined_frame(
+            buffer, audit_frame, effects_frame = _hill_combined_frame(
                 buffer=pl.DataFrame(),
                 current=current,
                 table_name=table_name,
+                key_columns=["timestamp", "StationId"],
+                effect_scope=_HILL_ROW_EFFECT_SCOPE,
+                dataset_id=dataset_id,
+                station_to_turbine=station_to_turbine,
+                excluded_payload_columns=_HILL_DEFAULT_DUPLICATE_EXCLUDED_COLUMNS,
             )
             if not audit_frame.is_empty():
                 audit_frames.append(audit_frame)
-            if not conflict_keys.is_empty():
-                conflict_frames.append(conflict_keys)
+            if not effects_frame.is_empty():
+                effect_frames.append(effects_frame)
             continue
 
         current_min = current["timestamp"].min()
@@ -510,15 +740,20 @@ def _write_hill_default_table(
         if not ready.is_empty():
             writer.write_frame(ready.drop(["TimeStamp", "__source_file_idx", "__source_row_nr"]).sort(["timestamp", "StationId"]))
 
-        buffer, audit_frame, conflict_keys = _hill_default_combined_frame(
+        buffer, audit_frame, effects_frame = _hill_combined_frame(
             buffer=overlap,
             current=current,
             table_name=table_name,
+            key_columns=["timestamp", "StationId"],
+            effect_scope=_HILL_ROW_EFFECT_SCOPE,
+            dataset_id=dataset_id,
+            station_to_turbine=station_to_turbine,
+            excluded_payload_columns=_HILL_DEFAULT_DUPLICATE_EXCLUDED_COLUMNS,
         )
         if not audit_frame.is_empty():
             audit_frames.append(audit_frame)
-        if not conflict_keys.is_empty():
-            conflict_frames.append(conflict_keys)
+        if not effects_frame.is_empty():
+            effect_frames.append(effects_frame)
 
     if not buffer.is_empty():
         writer.write_frame(buffer.drop(["TimeStamp", "__source_file_idx", "__source_row_nr"]).sort(["timestamp", "StationId"]))
@@ -526,25 +761,29 @@ def _write_hill_default_table(
     audit_frame = (
         pl.concat(audit_frames, how="vertical").sort(["timestamp", "station_id"])
         if audit_frames
-        else pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA)
+        else _empty_hill_duplicate_audit_frame()
     )
-    conflict_keys = (
-        pl.concat(conflict_frames, how="vertical").unique().sort(["timestamp", "StationId"])
-        if conflict_frames
-        else _empty_hill_conflict_key_frame()
+    effects_frame = (
+        _aggregate_hill_duplicate_effects(pl.concat(effect_frames, how="vertical"))
+        if effect_frames
+        else _empty_hill_duplicate_effect_frame()
     )
-    return audit_frame, conflict_keys
+    return audit_frame, effects_frame
 
 
 def _write_hill_shared_table(
     *,
     paths: list[Path],
     output_path: Path,
+    table_name: str,
     dataset_id: str,
+    group_name: str,
     metadata: pl.DataFrame,
+    station_to_turbine: dict[str, str],
     prefix: str,
     key_columns: tuple[str, ...],
-) -> None:
+    effect_scope: str,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
     ensure_directory(output_path.parent)
     output_path.unlink(missing_ok=True)
     writer = ParquetChunkWriter(
@@ -556,9 +795,11 @@ def _write_hill_shared_table(
     )
     if not paths:
         writer.close()
-        return
+        return _empty_hill_duplicate_audit_frame(), _empty_hill_duplicate_effect_frame()
 
     buffer = pl.DataFrame()
+    audit_frames: list[pl.DataFrame] = []
+    effect_frames: list[pl.DataFrame] = []
     dedupe_keys = ["timestamp"] if key_columns == ("TimeStamp",) else ["timestamp", "StationId"]
     for source_file_idx, path in enumerate(paths):
         current = _read_hill_source_part(path, source_file_idx).with_columns(
@@ -567,11 +808,22 @@ def _write_hill_shared_table(
         if key_columns != ("TimeStamp",):
             current = current.with_columns(pl.col("StationId").cast(pl.String).alias("StationId"))
         if buffer.is_empty():
-            buffer = _hill_shared_combined_frame(
+            buffer, audit_frame, effects_frame = _hill_combined_frame(
                 buffer=pl.DataFrame(),
                 current=current,
-                dedupe_keys=dedupe_keys,
+                table_name=table_name,
+                key_columns=dedupe_keys,
+                effect_scope=effect_scope,
+                dataset_id=dataset_id,
+                station_to_turbine=station_to_turbine,
+                excluded_payload_columns=_HILL_SHARED_DUPLICATE_EXCLUDED_COLUMNS,
+                series_column_prefix=prefix,
+                feature_flag_token=f"feature_source_conflict__{group_name}",
             )
+            if not audit_frame.is_empty():
+                audit_frames.append(audit_frame)
+            if not effects_frame.is_empty():
+                effect_frames.append(effects_frame)
             continue
 
         current_min = current["timestamp"].min()
@@ -588,11 +840,22 @@ def _write_hill_shared_table(
                 )
             )
 
-        buffer = _hill_shared_combined_frame(
+        buffer, audit_frame, effects_frame = _hill_combined_frame(
             buffer=overlap,
             current=current,
-            dedupe_keys=dedupe_keys,
+            table_name=table_name,
+            key_columns=dedupe_keys,
+            effect_scope=effect_scope,
+            dataset_id=dataset_id,
+            station_to_turbine=station_to_turbine,
+            excluded_payload_columns=_HILL_SHARED_DUPLICATE_EXCLUDED_COLUMNS,
+            series_column_prefix=prefix,
+            feature_flag_token=f"feature_source_conflict__{group_name}",
         )
+        if not audit_frame.is_empty():
+            audit_frames.append(audit_frame)
+        if not effects_frame.is_empty():
+            effect_frames.append(effects_frame)
 
     if not buffer.is_empty():
         writer.write_frame(
@@ -605,6 +868,17 @@ def _write_hill_shared_table(
             )
         )
     writer.close()
+    audit_frame = (
+        pl.concat(audit_frames, how="vertical").sort(["timestamp", "table_name", "station_id", "turbine_id"])
+        if audit_frames
+        else _empty_hill_duplicate_audit_frame()
+    )
+    effects_frame = (
+        _aggregate_hill_duplicate_effects(pl.concat(effect_frames, how="vertical"))
+        if effect_frames
+        else _empty_hill_duplicate_effect_frame()
+    )
+    return audit_frame, effects_frame
 
 
 def _max_hill_timestamp(paths: list[Path], timestamp_column: str = "TimeStamp") -> Any:
@@ -1133,6 +1407,7 @@ def _hill_base_output_schema(feature_columns: list[str]) -> dict[str, pl.DataTyp
         "target_kw": pl.Float64,
         "__row_present": pl.Boolean,
         "__base_quality_flags": pl.String,
+        "__feature_quality_flags": pl.String,
         **{column: pl.Float64 for column in feature_columns},
     }
 
@@ -1148,7 +1423,6 @@ def _build_hill_base_turbine_frame(
     cache_paths,
     spec,
     feature_columns: list[str],
-    conflict_keys: pl.DataFrame,
 ) -> pl.DataFrame:
     if station_id is None:
         return _empty_hill_base_frame(feature_columns)
@@ -1178,15 +1452,6 @@ def _build_hill_base_turbine_frame(
             how="left",
         )
 
-    if conflict_keys.is_empty():
-        joined = joined.with_columns(pl.lit(False).alias("__duplicate_conflict"))
-    else:
-        joined = joined.join(
-            conflict_keys.with_columns(pl.lit(True).alias("__duplicate_conflict")),
-            on=["timestamp", "StationId"],
-            how="left",
-        ).with_columns(pl.col("__duplicate_conflict").fill_null(False))
-
     required_payload_columns = [spec.target_column, *feature_columns]
     missing_payload_columns = [
         pl.lit(None).cast(pl.Float64).alias(column)
@@ -1198,10 +1463,8 @@ def _build_hill_base_turbine_frame(
 
     return joined.with_columns(
         pl.col(spec.target_column).cast(pl.Float64, strict=False).alias("target_kw"),
-        pl.when(pl.col("__duplicate_conflict"))
-        .then(pl.lit("duplicate_conflict_resolved"))
-        .otherwise(pl.lit(""))
-        .alias("__base_quality_flags"),
+        pl.lit("").alias("__base_quality_flags"),
+        pl.lit("").alias("__feature_quality_flags"),
         *[pl.col(column).cast(pl.Float64, strict=False).alias(column) for column in feature_columns],
     ).select(
         [
@@ -1211,6 +1474,7 @@ def _build_hill_base_turbine_frame(
             "target_kw",
             "__row_present",
             "__base_quality_flags",
+            "__feature_quality_flags",
             *feature_columns,
         ]
     )
@@ -1234,6 +1498,7 @@ def _reindex_hill_base_frame(
                 "target_kw": pl.Float64,
                 "is_observed": pl.Boolean,
                 "quality_flags": pl.String,
+                "feature_quality_flags": pl.String,
                 **{column: pl.Float64 for column in feature_columns},
             }
         )
@@ -1278,6 +1543,7 @@ def _reindex_hill_base_frame(
         )
         .fill_null("")
         .alias("quality_flags"),
+        pl.col("__feature_quality_flags").fill_null("").alias("feature_quality_flags"),
     ).select(
         [
             "dataset",
@@ -1286,6 +1552,7 @@ def _reindex_hill_base_frame(
             "target_kw",
             "is_observed",
             "quality_flags",
+            "feature_quality_flags",
             *feature_columns,
         ]
     )
@@ -1298,7 +1565,6 @@ def _iter_hill_base_chunks(
     layout: str,
     feature_columns: list[str],
     station_by_turbine: dict[str, str],
-    conflict_keys_by_station: dict[str, pl.DataFrame],
 ):
     global_start, global_end = _hill_default_time_bounds(cache_paths) if layout == "farm" else (None, None)
     turbine_ids = list(spec.turbine_ids)
@@ -1311,7 +1577,6 @@ def _iter_hill_base_chunks(
             cache_paths=cache_paths,
             spec=spec,
             feature_columns=feature_columns,
-            conflict_keys=conflict_keys_by_station.get(station_id, _empty_hill_conflict_key_frame()),
         )
         if layout == "turbine":
             if base_frame.is_empty():
@@ -1357,6 +1622,30 @@ def _augment_hill_batch(
     ]
     if missing_columns:
         joined = joined.with_columns(missing_columns)
+    for column in ("__duplicate_row_quality_flags", "__duplicate_feature_quality_flags"):
+        if column not in joined.columns:
+            joined = joined.with_columns(pl.lit("").alias(column))
+
+    joined = joined.with_columns(
+        pl.struct(["quality_flags", "__duplicate_row_quality_flags"])
+        .map_elements(
+            lambda value: join_flags(
+                value["quality_flags"],
+                value["__duplicate_row_quality_flags"],
+            ),
+            return_dtype=pl.String,
+        )
+        .alias("quality_flags"),
+        pl.struct(["feature_quality_flags", "__duplicate_feature_quality_flags"])
+        .map_elements(
+            lambda value: join_flags(
+                value["feature_quality_flags"],
+                value["__duplicate_feature_quality_flags"],
+            ),
+            return_dtype=pl.String,
+        )
+        .alias("feature_quality_flags"),
+    ).drop(["__duplicate_row_quality_flags", "__duplicate_feature_quality_flags"])
 
     boolean_columns = [column for column, dtype in joined.schema.items() if dtype == pl.Boolean]
     count_like_columns = [
@@ -1416,6 +1705,9 @@ def _load_hill_chunk_extra_frames(base_chunk: pl.DataFrame, cache_paths) -> dict
         )
         if not frame.is_empty():
             frames[group_name] = frame
+    duplicate_effects = _load_hill_duplicate_effects_slice(base_chunk, cache_paths)
+    if not duplicate_effects.is_empty():
+        frames["duplicate_effects"] = duplicate_effects
     return frames
 
 
@@ -1497,8 +1789,8 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
     def required_silver_paths(self) -> tuple[Path, ...]:
         return (
             self.cache_paths.silver_turbine_static_path,
-            self.cache_paths.hill_duplicate_audit_path,
-            self.cache_paths.hill_default_conflict_keys_path,
+            self.cache_paths.duplicate_audit_path,
+            self.cache_paths.duplicate_effects_path,
             self.cache_paths.hill_default_table_path("tblSCTurbine"),
             self.cache_paths.hill_default_table_path("tblSCTurGrid"),
             self.cache_paths.hill_default_table_path("tblSCTurFlag"),
@@ -1568,45 +1860,62 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             pl.col("Station ID").cast(pl.String).alias("StationId"),
             pl.col("Turbine Name").cast(pl.String).alias("turbine_id"),
         )
+        station_to_turbine = {
+            row["StationId"]: row["turbine_id"]
+            for row in metadata.iter_rows(named=True)
+            if row["StationId"] is not None and row["turbine_id"] is not None
+        }
         duplicate_audit_frames: list[pl.DataFrame] = []
-        duplicate_conflict_keys: list[pl.DataFrame] = []
+        duplicate_effect_frames: list[pl.DataFrame] = []
         for table_name in _DEFAULT_TABLES:
-            audit_frame, conflict_keys = _write_hill_default_table(
+            audit_frame, effects_frame = _write_hill_default_table(
                 paths=sorted(self.cache_paths.silver_dir.rglob(f"{table_name}_*.parquet")),
                 output_path=self.cache_paths.hill_default_table_path(table_name),
                 table_name=table_name,
+                dataset_id=self.spec.dataset_id,
+                station_to_turbine=station_to_turbine,
             )
             duplicate_audit_frames.append(audit_frame)
-            if not conflict_keys.is_empty():
-                duplicate_conflict_keys.append(conflict_keys)
+            if not effects_frame.is_empty():
+                duplicate_effect_frames.append(effects_frame)
 
         duplicate_audit = (
             pl.concat(duplicate_audit_frames, how="vertical")
             if duplicate_audit_frames
-            else pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA)
+            else _empty_hill_duplicate_audit_frame()
         )
-        duplicate_audit.write_parquet(self.cache_paths.hill_duplicate_audit_path)
-        conflict_keys = (
-            pl.concat(duplicate_conflict_keys, how="vertical")
-            .unique()
-            .sort(["timestamp", "StationId"])
-            if duplicate_conflict_keys
-            else _empty_hill_conflict_key_frame()
-        )
-        conflict_keys.write_parquet(self.cache_paths.hill_default_conflict_keys_path)
-
         dataset_end = _max_hill_timestamp(
             sorted(self.cache_paths.silver_dir.rglob("tblSCTurGrid_*.parquet"))
         )
-        for table_name, group_name, prefix, key_columns in _HILL_SHARED_TABLE_SPECS:
-            _write_hill_shared_table(
+        for table_name, group_name, prefix, key_columns, effect_scope in _HILL_SHARED_TABLE_SPECS:
+            audit_frame, effects_frame = _write_hill_shared_table(
                 paths=sorted(self.cache_paths.silver_dir.rglob(f"{table_name}_*.parquet")),
                 output_path=self.cache_paths.silver_shared_ts_path(group_name),
+                table_name=table_name,
                 dataset_id=self.spec.dataset_id,
+                group_name=group_name,
                 metadata=metadata,
+                station_to_turbine=station_to_turbine,
                 prefix=prefix,
                 key_columns=key_columns,
+                effect_scope=effect_scope,
             )
+            duplicate_audit_frames.append(audit_frame)
+            if not effects_frame.is_empty():
+                duplicate_effect_frames.append(effects_frame)
+
+        duplicate_audit = (
+            pl.concat(duplicate_audit_frames, how="vertical").sort(["timestamp", "table_name", "station_id", "turbine_id"])
+            if duplicate_audit_frames
+            else _empty_hill_duplicate_audit_frame()
+        )
+        duplicate_audit.write_parquet(self.cache_paths.duplicate_audit_path)
+        duplicate_effects = (
+            _aggregate_hill_duplicate_effects(pl.concat(duplicate_effect_frames, how="vertical_relaxed"))
+            if duplicate_effect_frames
+            else _empty_hill_duplicate_effect_frame()
+        )
+        duplicate_effects.write_parquet(self.cache_paths.duplicate_effects_path)
 
         shutdown_path = self.cache_paths.silver_dir / "ShutdownDuration.parquet"
         _standardize_shutdown_duration(
@@ -1679,18 +1988,27 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             feature_set=resolved_feature_set,
         )
         temp_series_path = series_path.with_suffix(".tmp.parquet") if resolved_layout == "farm" else None
-        duplicate_audit_path = self.cache_paths.hill_duplicate_audit_path
+        duplicate_audit_path = self.cache_paths.duplicate_audit_path
         existing_duplicate_audit = (
             pl.read_parquet(duplicate_audit_path)
             if duplicate_audit_path.exists()
-            else pl.DataFrame(schema=_DUPLICATE_AUDIT_SCHEMA)
+            else _empty_hill_duplicate_audit_frame()
+        )
+        duplicate_effects_path = self.cache_paths.duplicate_effects_path
+        existing_duplicate_effects = (
+            pl.read_parquet(duplicate_effects_path)
+            if duplicate_effects_path.exists()
+            else _empty_hill_duplicate_effect_frame()
         )
         existing_report_extra = {
             "quality_profile": resolved_quality_profile,
             "layout": resolved_layout,
             "feature_set": resolved_feature_set,
-            "duplicate_key_audit_count": existing_duplicate_audit.height,
-            "duplicate_conflict_key_count": existing_duplicate_audit.filter(pl.col("is_conflicting")).height,
+            **_build_hill_duplicate_report_extra(
+                existing_duplicate_audit,
+                existing_duplicate_effects,
+                self.spec.turbine_ids,
+            ),
         }
         if resolved_layout == "farm" and temp_series_path is not None and temp_series_path.exists() and not series_path.exists():
             coverage_summary = _finalize_hill_farm_temp(temp_series_path, series_path, self.spec)
@@ -1737,15 +2055,6 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             for row in turbine_static.iter_rows(named=True)
             if row["turbine_id"] is not None and row["StationId"] is not None
         }
-        conflict_keys = pl.read_parquet(self.cache_paths.hill_default_conflict_keys_path)
-        conflict_keys_by_station = (
-            {
-                group["StationId"][0]: group.select(["timestamp", "StationId"]).sort("timestamp")
-                for group in conflict_keys.partition_by("StationId", maintain_order=True)
-            }
-            if not conflict_keys.is_empty()
-            else {}
-        )
         feature_columns = _hill_default_feature_columns(self.cache_paths, self.spec.target_column)
         quality_accumulator, coverage_summary = _write_hill_gold_with_extras(
             _iter_hill_base_chunks(
@@ -1754,7 +2063,6 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
                 layout=resolved_layout,
                 feature_columns=feature_columns,
                 station_by_turbine=station_by_turbine,
-                conflict_keys_by_station=conflict_keys_by_station,
             ),
             self.cache_paths,
             series_path,

@@ -207,6 +207,7 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             .fill_null(False)
             .alias("sdwpf_is_masked"),
             base_quality_flags_expr.alias("__base_quality_flags"),
+            pl.lit("").alias("__feature_quality_flags"),
             *[pl.col(column).cast(pl.Float64, strict=False) for column in feature_columns],
         ).select(
             [
@@ -216,6 +217,7 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
                 "target_kw",
                 "__row_present",
                 "__base_quality_flags",
+                "__feature_quality_flags",
                 "sdwpf_is_unknown",
                 "sdwpf_is_abnormal",
                 "sdwpf_is_masked",

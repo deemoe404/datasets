@@ -20,7 +20,7 @@ from ..manifest import build_manifest
 from ..models import DatasetSpec, ResolvedTaskSpec, TaskSpec
 from ..paths import dataset_cache_paths
 from ..utils import ensure_directory, read_json, write_json
-from .common import build_window_index_from_series_path
+from .common import DUPLICATE_AUDIT_SCHEMA, build_window_index_from_series_path
 
 
 class BaseDatasetBuilder:
@@ -174,6 +174,15 @@ class BaseDatasetBuilder:
         self.ensure_silver_fresh()
         if not path.exists():
             self.build_silver()
+        return pl.read_parquet(path)
+
+    def load_duplicate_audit(self) -> pl.DataFrame:
+        path = self.cache_paths.duplicate_audit_path
+        self.ensure_silver_fresh()
+        if not path.exists():
+            self.build_silver()
+        if not path.exists():
+            return pl.DataFrame(schema=DUPLICATE_AUDIT_SCHEMA)
         return pl.read_parquet(path)
 
     def load_event_features(self, group_name: str) -> pl.DataFrame:

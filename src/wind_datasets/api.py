@@ -85,6 +85,15 @@ def load_shared_timeseries(
     return builder.load_shared_timeseries(group_name)
 
 
+def load_duplicate_audit(
+    dataset_id: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    return builder.load_duplicate_audit()
+
+
 def load_event_features(
     dataset_id: str,
     group_name: str,

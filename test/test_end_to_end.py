@@ -28,6 +28,7 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     report = builder.profile_dataset()
 
     assert "quality_flags" in series.columns
+    assert "feature_quality_flags" in series.columns
     assert "farm_turbines_observed" in series.columns
     assert "farm_is_fully_synchronous" in series.columns
     assert "farm_pmu__gms_power_kw" in series.columns
@@ -65,6 +66,8 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     assert window_index.height > 0
     assert "turbine_id" in window_index.columns
     assert "quality_flags" in window_index.columns
+    assert "feature_quality_flags" in window_index.columns
+    assert set(series["feature_quality_flags"].unique().to_list()) == {""}
     assert task_report["task"]["task_id"] == "short_task"
     assert task_report["window_count"] == window_index.height
 
@@ -101,10 +104,24 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "tuneup_post_effective" in series.columns
     assert "farm_turbines_observed" in series.columns
     assert "farm_turbines_with_target" in series.columns
+    assert "feature_quality_flags" in series.columns
     assert "farm_turbines_observed" not in turbine_series.columns
-    assert duplicate_audit.filter(pl.col("is_conflicting")).height == 1
-    assert duplicate_audit.filter(pl.col("is_conflicting"))["conflicting_columns"][0] == "wtc_PrWindSp_mean"
+    assert duplicate_audit.height == 6
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict").height == 3
     assert duplicate_audit.filter(pl.col("duplicate_kind") == "normalized_equal").height == 1
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "identical").height == 2
+    grid_conflict = duplicate_audit.filter(
+        (pl.col("table_name") == "tblGrid") & (pl.col("duplicate_kind") == "true_conflict")
+    )
+    assert grid_conflict["affected_series_columns"].to_list() == [["farm_grid__activepower"]]
+    temp_conflict = duplicate_audit.filter(
+        (pl.col("table_name") == "tblSCTurTemp") & (pl.col("duplicate_kind") == "true_conflict")
+    )
+    assert temp_conflict["affected_series_columns"].to_list() == [["tur_temp__wtc_ambietmp_mean"]]
+    default_conflict = duplicate_audit.filter(
+        (pl.col("table_name") == "tblSCTurbine") & (pl.col("duplicate_kind") == "true_conflict")
+    )
+    assert default_conflict["conflicting_source_columns"].to_list() == [["wtc_PrWindSp_mean"]]
     assert shutdown["timestamp"].null_count() == 0
     assert shutdown.height == 4
     assert shutdown.filter(
@@ -138,6 +155,10 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     t02_1750 = series.filter(
         (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:50:00")
+    )
+    t01_1810 = series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     )
     t02_1810 = series.filter(
         (pl.col("turbine_id") == "T02")
@@ -173,9 +194,28 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:30:00")
     )["target_kw"][0] is None
+    assert series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )["wtc_PrWindSp_mean"][0] is None
+    assert t01_1810["target_kw"][0] == 1060.0
+    assert t01_1810["farm_grid__activepower"][0] is None
+    assert t01_1810["farm_grid__frequency"][0] == 50.0
+    assert "feature_source_conflict__farm_grid" in t01_1810["feature_quality_flags"][0]
+    assert t02_1810["farm_grid__activepower"][0] is None
+    assert t02_1810["tur_temp__wtc_ambietmp_mean"][0] is None
+    assert "feature_source_conflict__farm_grid" in t02_1810["feature_quality_flags"][0]
+    assert "feature_source_conflict__turbine_temp" in t02_1810["feature_quality_flags"][0]
     assert report["target_missing_count"] >= 1
-    assert report["duplicate_key_audit_count"] == 4
-    assert report["duplicate_conflict_key_count"] == 1
+    assert report["duplicate_audit_count"] == 6
+    assert report["duplicate_true_conflict_count"] == 3
+    assert report["duplicate_true_conflict_count_by_table"] == {
+        "tblGrid": 1,
+        "tblSCTurTemp": 1,
+        "tblSCTurbine": 1,
+    }
+    assert report["row_conflict_row_count"] == 1
+    assert report["feature_conflict_row_count"] == 2
     assert report["layout"] == "farm"
     assert report["full_synchrony_ratio"] == 1.0
     assert report["full_target_ratio"] < 1.0
@@ -209,6 +249,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "turbine_id" not in farm_window_index.columns
     assert "input_turbines_observed_per_step" in farm_window_index.columns
     assert "output_turbines_with_target_per_step" in farm_window_index.columns
+    assert "feature_quality_flags" in farm_window_index.columns
     assert output_gap_window["output_turbines_with_target_min"][0] == 1
     assert output_gap_window["is_complete_output"][0] is False
     assert farm_task_static["turbine_index"].to_list() == [0, 1]
@@ -216,6 +257,13 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert farm_task_report["window_count"] > 0
     assert turbine_window_index.height > 0
     assert "turbine_id" in turbine_window_index.columns
+    assert "feature_quality_flags" in turbine_window_index.columns
+    feature_only_window = turbine_window_index.filter(
+        (pl.col("turbine_id") == "T02")
+        & (pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:00:00")
+    )
+    assert feature_only_window["quality_flags"][0] == ""
+    assert feature_only_window["feature_quality_flags"][0] == "feature_quality_issues_output"
     assert turbine_task_report["window_count"] == turbine_window_index.height
     assert turbine_task_report["window_count"] > 0
 
@@ -248,6 +296,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert manifest["time_semantics_check"]["calendar_anchor_date"] == "2020-05-01"
     assert default_negative["target_kw"][0] == -5
     assert default_negative["quality_flags"][0] == ""
+    assert default_negative["feature_quality_flags"][0] == ""
     assert "target_kw_raw" not in default_series.columns
     assert "sdwpf_has_negative_patv" not in default_series.columns
     assert report["quality_profile"] == "default"

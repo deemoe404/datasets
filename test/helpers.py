@@ -245,6 +245,14 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
         """,
     )
     _write_text(
+        root / "2024" / "tblGrid_2024_04.csv",
+        """
+        TimeStamp,Station,WPSStatus,TimestampStation,CurrentL1,CurrentL2,CurrentL3,VoltageL1,VoltageL2,VoltageL3,ActivePower,ReActivePower,ActivePowerExport,ReActivePowerExport,ActivePowerImport,ReActivePowerImport,DigitalInputBlock1,DigitalInputBlock2,DigitalInputBlock3,DigitalInputBlock4,GridTHD,PowerFactor,Frequency
+        2024-03-14 18:10:00,Hill,1,2024-03-14 18:10:00,16,16,16,406,407,408,2061,106,2060,106,0,0,1,0,0,0,2,0.98,50
+        2024-03-14 18:20:00,Hill,1,2024-03-14 18:20:00,17,17,17,407,408,409,2070,107,2070,107,0,0,1,0,0,0,2,0.98,50
+        """,
+    )
+    _write_text(
         root / "2024" / "tblGridScientific_2024_03.csv",
         """
         TimeStamp,Station,WPSStatus,DataOk,ActiveEnergy,ReActiveEnergy,ActivePowerMin,ActivePowerMax,ActivePowerMean,ActivePowerSD,ReActivePowerMin,ReActivePowerMax,ReActivePowerMean,ReActivePowerSD,VoltageMin,VoltageMax,VoltageMean,VoltageSD,CurrentMin,CurrentMax,CurrentMean,CurrentSD,Energy
@@ -285,6 +293,15 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
             2024-03-14 18:10:00,1002,{value_base + 13}
             """,
         )
+    _write_text(
+        root / "2024" / "tblSCTurTemp_2024_02.csv",
+        """
+        TimeStamp,StationId,wtc_AmbieTmp_mean
+        2024-03-14 18:10:00,1002,22
+        2024-03-14 18:20:00,1001,23
+        2024-03-14 18:20:00,1002,24
+        """,
+    )
     _write_text(
         root / "2024" / "tblAlarmLog_2024_03.csv",
         """

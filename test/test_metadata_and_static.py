@@ -11,13 +11,14 @@ from wind_datasets import api as api_module
 from wind_datasets.api import (
     build_task_cache,
     build_silver,
+    load_duplicate_audit,
     load_event_features,
     load_interventions,
     load_shared_timeseries,
     load_task_turbine_static,
     load_turbine_static,
 )
-from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
+from wind_datasets.datasets.common import DUPLICATE_AUDIT_SCHEMA, TURBINE_STATIC_SCHEMA
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
 from wind_datasets.datasets.hill_of_towie import (
     HillOfTowieDatasetBuilder,
@@ -68,6 +69,34 @@ def test_api_build_silver_then_load_turbine_static(tmp_path, monkeypatch, datase
 
     assert turbine_static.columns == list(TURBINE_STATIC_SCHEMA)
     assert turbine_static.height == len(spec.turbine_ids)
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "spec_factory"),
+    [
+        ("kelmarsh", lambda root: build_greenbyte_fixture(root, "Kelmarsh", "Kelmarsh 1")),
+        ("penmanshiel", lambda root: build_greenbyte_fixture(root, "Penmanshiel", "Penmanshiel 11")),
+        ("sdwpf_kddcup", build_sdwpf_kddcup_fixture),
+    ],
+)
+def test_non_hill_duplicate_audit_loader_returns_empty_canonical_schema(
+    tmp_path,
+    monkeypatch,
+    dataset_id,
+    spec_factory,
+) -> None:
+    spec = spec_factory(tmp_path / "raw" / dataset_id)
+
+    def _fake_get_dataset_spec(requested_dataset_id: str):
+        assert requested_dataset_id == dataset_id
+        return spec
+
+    monkeypatch.setattr(api_module, "get_dataset_spec", _fake_get_dataset_spec)
+
+    duplicate_audit = load_duplicate_audit(dataset_id, cache_root=tmp_path / "cache")
+
+    assert duplicate_audit.is_empty()
+    assert duplicate_audit.columns == list(DUPLICATE_AUDIT_SCHEMA)
 
 
 def test_greenbyte_manifest_release_check_distinguishes_latest_and_compatible(tmp_path) -> None:
@@ -199,7 +228,8 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     hill_aeroup = load_interventions("hill_of_towie", "aeroup", cache_root=tmp_path / "cache")
     hill_tuneup = load_interventions("hill_of_towie", "tuneup", cache_root=tmp_path / "cache")
     hill_tuneup_features = load_event_features("hill_of_towie", "tuneup", cache_root=tmp_path / "cache")
-    hill_conflict_keys = pl.read_parquet(hill_builder.cache_paths.hill_default_conflict_keys_path)
+    hill_duplicate_audit = load_duplicate_audit("hill_of_towie", cache_root=tmp_path / "cache")
+    hill_duplicate_effects = pl.read_parquet(hill_builder.cache_paths.duplicate_effects_path)
 
     assert "farm_pmu__gms_power_kw" in farm_pmu.columns
     assert "evt_status_code__710" in turbine_status.columns
@@ -208,12 +238,16 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     assert hill_builder.cache_paths.hill_default_table_path("tblSCTurGrid").exists()
     assert hill_builder.cache_paths.hill_default_table_path("tblSCTurFlag").exists()
     assert hill_builder.cache_paths.hill_duplicate_audit_path.exists()
-    assert hill_builder.cache_paths.hill_default_conflict_keys_path.exists()
-    assert hill_conflict_keys.height == 1
-    assert hill_conflict_keys.filter(
-        (pl.col("StationId") == "1001")
+    assert hill_builder.cache_paths.duplicate_effects_path.exists()
+    assert hill_duplicate_audit.height == 6
+    assert hill_duplicate_effects.height == 3
+    assert hill_duplicate_effects.filter(
+        (pl.col("effect_scope") == "row")
+        & (pl.col("turbine_id") == "T01")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     ).height == 1
+    assert hill_duplicate_effects.filter(pl.col("effect_scope") == "feature_broadcast").height == 1
+    assert hill_duplicate_effects.filter(pl.col("effect_scope") == "feature_turbine").height == 1
     assert hill_shutdown["timestamp"].null_count() == 0
     assert "alarm_code__42" in hill_alarm.columns
     assert hill_aeroup.columns == ["dataset", "turbine_id", "aeroup_start", "aeroup_end"]

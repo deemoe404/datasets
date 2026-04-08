@@ -24,6 +24,7 @@ Typical entry points:
 - `load_shared_timeseries(dataset_id, group_name)`
 - `load_event_features(dataset_id, group_name)`
 - `load_interventions(dataset_id, group_name)`
+- `load_duplicate_audit(dataset_id)`
 - `load_window_index(dataset_id, task_spec, quality_profile=None)`
 - `load_task_turbine_static(dataset_id, task_spec, quality_profile=None)`
 - `load_turbine_static(dataset_id)`
@@ -45,6 +46,8 @@ cache/<dataset>/
     event_features/
     interventions/
     meta/
+      duplicate_audit.parquet
+      duplicate_effects.parquet
       turbine_static.parquet
   gold_base/<quality_profile>/<layout>/<feature_set>/
   tasks/<quality_profile>/<granularity>/<task_id>/
@@ -59,6 +62,8 @@ Layer meanings:
 - `manifest`: source file inventory, official release metadata, source layout checks, release warnings
 - `silver`: dataset-specific normalized artifacts
 - `silver/meta/turbine_static.parquet`: unified turbine-level spatial/static sidecar
+- `silver/meta/duplicate_audit.parquet`: canonical duplicate-key audit for datasets that implement duplicate provenance
+- `silver/meta/duplicate_effects.parquet`: internal resolved duplicate effects keyed to series space
 - `silver/shared_ts/*`: standardized regular shared or turbine-level auxiliary time series
 - `silver/event_features/*`: regularized causal features derived from interval events
 - `silver/interventions/*`: normalized intervention timelines kept outside the default graph assumptions
@@ -107,7 +112,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Farm-synchronous rows expose `farm_turbines_expected`, `farm_turbines_observed`, `farm_turbines_with_target`, and synchronous-coverage flags.
 - Farm task caches write a task-local `turbine_static.parquet` with stable `turbine_index` ordering.
 - Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
-- `quality_flags` is an audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented rule flagged it.
+- `quality_flags` is the row-blocking audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented row-level rule flagged it.
+- `feature_quality_flags` is a non-blocking feature-source audit field. It records duplicate-resolution or auxiliary-source issues that should stay visible downstream without automatically invalidating the row.
 - `sdwpf_kddcup` defaults to `quality_profile="default"`.
 - `sdwpf_kddcup default` means “implemented SDWPF unknown/abnormal rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
 - `sdwpf_kddcup` gold/task builds are fail-closed when manifest time-semantics audit finds `Day + Tmstamp` values incompatible with the documented 245-day 10-minute grid.
@@ -250,10 +256,13 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - raw AeroUp timeline file
   - vendored TuneUp provenance metadata
 - Duplicate handling:
-  - default-table duplicate keys are audited in `silver/meta/default_table_duplicate_audit.parquet`
+  - duplicate-prone default and shared tables are audited in `silver/meta/duplicate_audit.parquet`
+  - resolved duplicate effects are materialized in `silver/meta/duplicate_effects.parquet`
   - duplicate audit distinguishes `identical`, `normalized_equal`, and `true_conflict`
-  - non-conflicting duplicates keep the first row
-  - `true_conflict` duplicates keep the first row and add `duplicate_conflict_resolved` to `quality_flags`
+  - `identical` and `normalized_equal` groups keep their canonical resolved values and remain audit-only
+  - `true_conflict` nulls only the affected output columns in `silver` and `gold_base`
+  - row-scoped default-table conflicts add `duplicate_conflict_resolved` to `quality_flags`
+  - shared and auxiliary feature-source conflicts surface in `feature_quality_flags` and do not, by themselves, make a row ineligible
 - Source layout expectation: official year archives must already be extracted before build
 - Spatial sidecar: yes, from `Hill_of_Towie_turbine_metadata.csv`
 

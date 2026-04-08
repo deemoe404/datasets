@@ -839,6 +839,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
                 .then(pl.lit("conflict_resolved"))
                 .otherwise(pl.lit(""))
                 .alias("__base_quality_flags"),
+                pl.lit("").alias("__feature_quality_flags"),
                 *missing_feature_columns,
             )
             duplicate_source_rows += int(frame.filter(pl.col("source_row_count") > 1).height)
@@ -852,6 +853,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
                         "target_kw",
                         "__row_present",
                         "__base_quality_flags",
+                        "__feature_quality_flags",
                         *selected_feature_columns,
                     ]
                 )

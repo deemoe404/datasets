@@ -45,6 +45,31 @@ FARM_SYNC_SCHEMA: dict[str, pl.DataType] = {
     "farm_has_all_targets": pl.Boolean,
 }
 
+DUPLICATE_AUDIT_SCHEMA: dict[str, pl.DataType] = {
+    "table_name": pl.String,
+    "effect_scope": pl.String,
+    "timestamp": pl.Datetime,
+    "station_id": pl.String,
+    "turbine_id": pl.String,
+    "duplicate_count": pl.Int64,
+    "duplicate_kind": pl.String,
+    "normalized_equal_columns": pl.List(pl.String),
+    "conflicting_source_columns": pl.List(pl.String),
+    "affected_series_columns": pl.List(pl.String),
+    "resolved_strategy": pl.String,
+}
+
+DUPLICATE_EFFECTS_SCHEMA: dict[str, pl.DataType] = {
+    "dataset": pl.String,
+    "turbine_id": pl.String,
+    "timestamp": pl.Datetime,
+    "effect_scope": pl.String,
+    "source_tables": pl.List(pl.String),
+    "row_quality_flags": pl.String,
+    "feature_quality_flags": pl.String,
+    "affected_series_columns": pl.List(pl.String),
+}
+
 _SANITIZE_PATTERN = re.compile(r"[^a-z0-9]+")
 
 
@@ -389,6 +414,7 @@ def _empty_regular_series(layout: str = "turbine") -> pl.DataFrame:
         "target_kw": pl.Float64,
         "is_observed": pl.Boolean,
         "quality_flags": pl.String,
+        "feature_quality_flags": pl.String,
     }
     if layout == "farm":
         schema.update(FARM_SYNC_SCHEMA)
@@ -420,6 +446,7 @@ def iter_reindexed_regular_series(
             "target_kw",
             "__row_present",
             "__base_quality_flags",
+            "__feature_quality_flags",
         }
     ]
     boolean_feature_columns = [
@@ -460,7 +487,14 @@ def iter_reindexed_regular_series(
         )
         missing_columns = [
             pl.lit(None).cast(df.schema[column]).alias(column)
-            for column in ("dataset", "target_kw", "__row_present", "__base_quality_flags", *feature_columns)
+            for column in (
+                "dataset",
+                "target_kw",
+                "__row_present",
+                "__base_quality_flags",
+                "__feature_quality_flags",
+                *feature_columns,
+            )
             if column not in joined.columns
         ]
         if missing_columns:
@@ -485,6 +519,7 @@ def iter_reindexed_regular_series(
             )
             .fill_null("")
             .alias("quality_flags"),
+            pl.col("__feature_quality_flags").fill_null("").alias("feature_quality_flags"),
         )
         if boolean_feature_columns:
             joined = joined.with_columns(
@@ -498,6 +533,7 @@ def iter_reindexed_regular_series(
                 "target_kw",
                 "is_observed",
                 "quality_flags",
+                "feature_quality_flags",
                 *feature_columns,
             ]
         )
@@ -820,6 +856,7 @@ def load_quality_report_frame(
         "target_kw",
         "is_observed",
         "quality_flags",
+        "feature_quality_flags",
         *FARM_SYNC_SCHEMA.keys(),
         *(extra_columns or []),
     ]:
@@ -848,6 +885,11 @@ def build_turbine_window_index(
             input_observed=[bool(value) for value in turbine_frame["is_observed"].to_list()],
             output_observed=[value is not None for value in turbine_frame["target_kw"].to_list()],
             row_quality_flags=[bool(value) for value in turbine_frame["quality_flags"].to_list()],
+            feature_quality_flags=(
+                turbine_frame["feature_quality_flags"].fill_null("").to_list()
+                if "feature_quality_flags" in turbine_frame.columns
+                else [""] * turbine_frame.height
+            ),
             masked_values=(
                 [bool(value) for value in turbine_frame["sdwpf_is_masked"].fill_null(False).to_list()]
                 if "sdwpf_is_masked" in turbine_frame.columns
@@ -901,6 +943,11 @@ def build_farm_window_index(
         if "sdwpf_is_abnormal" in df.columns
         else pl.lit(0).cast(pl.Int32)
     )
+    feature_quality_expr = (
+        pl.col("feature_quality_flags").fill_null("")
+        if "feature_quality_flags" in df.columns
+        else pl.lit("")
+    )
 
     timestamp_summary = (
         df.group_by(["dataset", "timestamp"], maintain_order=True)
@@ -911,7 +958,15 @@ def build_farm_window_index(
             unknown_expr.sum().alias("turbines_unknown"),
             abnormal_expr.sum().alias("turbines_abnormal"),
             (pl.col("quality_flags").fill_null("") != "").any().alias("has_row_quality_issues"),
+            feature_quality_expr.alias("feature_quality_flags"),
         )
+        .with_columns(join_flags_expr=pl.col("feature_quality_flags"))
+        .with_columns(
+            pl.col("join_flags_expr")
+            .map_elements(lambda values: join_flags(*values), return_dtype=pl.String)
+            .alias("feature_quality_flags")
+        )
+        .drop("join_flags_expr")
         .sort(["dataset", "timestamp"])
     )
 
@@ -931,6 +986,7 @@ def build_farm_window_index(
             unknown_counts=[int(value) for value in dataset_frame["turbines_unknown"].to_list()],
             abnormal_counts=[int(value) for value in dataset_frame["turbines_abnormal"].to_list()],
             quality_issue_steps=[bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()],
+            feature_quality_steps=dataset_frame["feature_quality_flags"].fill_null("").to_list(),
             expected_turbines=expected_turbines_by_dataset.get(dataset_frame["dataset"][0], 0),
             task=task,
             writer=writer,
@@ -971,6 +1027,7 @@ _TASK_WINDOW_REQUIRED_COLUMNS = [
     "target_kw",
     "is_observed",
     "quality_flags",
+    "feature_quality_flags",
 ]
 _TASK_WINDOW_OPTIONAL_COLUMNS = (
     "sdwpf_is_masked",
@@ -998,6 +1055,7 @@ _TURBINE_WINDOW_INDEX_SCHEMA = pa.schema(
         ("is_complete_input", pa.bool_()),
         ("is_complete_output", pa.bool_()),
         ("quality_flags", pa.string()),
+        ("feature_quality_flags", pa.string()),
     ]
 )
 _FARM_WINDOW_INDEX_SCHEMA = pa.schema(
@@ -1027,6 +1085,7 @@ _FARM_WINDOW_INDEX_SCHEMA = pa.schema(
         ("is_fully_synchronous_input", pa.bool_()),
         ("is_fully_synchronous_output", pa.bool_()),
         ("quality_flags", pa.string()),
+        ("feature_quality_flags", pa.string()),
     ]
 )
 
@@ -1052,6 +1111,7 @@ def _append_turbine_windows(
     input_observed: list[bool],
     output_observed: list[bool],
     row_quality_flags: list[bool],
+    feature_quality_flags: list[str],
     masked_values: list[bool],
     unknown_values: list[bool],
     abnormal_values: list[bool],
@@ -1089,6 +1149,8 @@ def _append_turbine_windows(
             flags.append("masked_output")
         if any(row_quality_flags[input_start_idx : output_end_idx + 1]):
             flags.append("row_quality_issues")
+        input_feature_quality_flags = join_flags(*feature_quality_flags[input_start_idx : anchor + 1])
+        output_feature_quality_flags = join_flags(*feature_quality_flags[anchor + 1 : output_end_idx + 1])
 
         buffer.append(
             {
@@ -1111,6 +1173,10 @@ def _append_turbine_windows(
                 "is_complete_input": complete_input,
                 "is_complete_output": complete_output,
                 "quality_flags": join_flags(*flags),
+                "feature_quality_flags": join_flags(
+                    "feature_quality_issues_input" if input_feature_quality_flags else None,
+                    "feature_quality_issues_output" if output_feature_quality_flags else None,
+                ),
             }
         )
         counts["window_count"] += 1
@@ -1148,6 +1214,7 @@ def _append_farm_windows(
     unknown_counts: list[int],
     abnormal_counts: list[int],
     quality_issue_steps: list[bool],
+    feature_quality_steps: list[str],
     expected_turbines: int,
     task: ResolvedTaskSpec,
     writer: ParquetChunkWriter,
@@ -1183,6 +1250,8 @@ def _append_farm_windows(
             flags.append("masked_output")
         if any(quality_issue_steps[input_start_idx : output_end_idx + 1]):
             flags.append("row_quality_issues")
+        input_feature_quality_flags = join_flags(*feature_quality_steps[input_start_idx : anchor + 1])
+        output_feature_quality_flags = join_flags(*feature_quality_steps[anchor + 1 : output_end_idx + 1])
 
         buffer.append(
             {
@@ -1211,6 +1280,10 @@ def _append_farm_windows(
                 "is_fully_synchronous_input": complete_input,
                 "is_fully_synchronous_output": complete_output,
                 "quality_flags": join_flags(*flags),
+                "feature_quality_flags": join_flags(
+                    "feature_quality_issues_input" if input_feature_quality_flags else None,
+                    "feature_quality_issues_output" if output_feature_quality_flags else None,
+                ),
             }
         )
         counts["window_count"] += 1
@@ -1261,6 +1334,7 @@ def build_turbine_window_index_from_series_path(
     input_observed: list[bool] = []
     output_observed: list[bool] = []
     row_quality_flags: list[bool] = []
+    feature_quality_flags: list[str] = []
     masked_values: list[bool] = []
     unknown_values: list[bool] = []
     abnormal_values: list[bool] = []
@@ -1282,6 +1356,7 @@ def build_turbine_window_index_from_series_path(
                         input_observed=input_observed,
                         output_observed=output_observed,
                         row_quality_flags=row_quality_flags,
+                        feature_quality_flags=feature_quality_flags,
                         masked_values=masked_values,
                         unknown_values=unknown_values,
                         abnormal_values=abnormal_values,
@@ -1296,6 +1371,7 @@ def build_turbine_window_index_from_series_path(
                 input_observed = []
                 output_observed = []
                 row_quality_flags = []
+                feature_quality_flags = []
                 masked_values = []
                 unknown_values = []
                 abnormal_values = []
@@ -1304,6 +1380,7 @@ def build_turbine_window_index_from_series_path(
             input_observed.append(bool(batch["is_observed"][index]))
             output_observed.append(batch["target_kw"][index] is not None)
             row_quality_flags.append(bool(batch["quality_flags"][index]))
+            feature_quality_flags.append(batch["feature_quality_flags"][index] or "")
             masked_values.append(bool(batch_masked[index]) if batch_masked is not None else False)
             unknown_values.append(bool(batch_unknown[index]) if batch_unknown is not None else False)
             abnormal_values.append(bool(batch_abnormal[index]) if batch_abnormal is not None else False)
@@ -1316,6 +1393,7 @@ def build_turbine_window_index_from_series_path(
             input_observed=input_observed,
             output_observed=output_observed,
             row_quality_flags=row_quality_flags,
+            feature_quality_flags=feature_quality_flags,
             masked_values=masked_values,
             unknown_values=unknown_values,
             abnormal_values=abnormal_values,
@@ -1365,6 +1443,7 @@ def build_farm_window_index_from_series_path(
     unknown_count = 0
     abnormal_count = 0
     has_row_quality_issues = False
+    current_feature_quality_flags = ""
 
     def flush_current_group() -> None:
         if current_dataset is None or current_timestamp is None:
@@ -1379,6 +1458,7 @@ def build_farm_window_index_from_series_path(
                 "unknown_counts": [],
                 "abnormal_counts": [],
                 "quality_issue_steps": [],
+                "feature_quality_steps": [],
             },
         )
         summary["timestamps"].append(current_timestamp)
@@ -1388,6 +1468,7 @@ def build_farm_window_index_from_series_path(
         summary["unknown_counts"].append(unknown_count)
         summary["abnormal_counts"].append(abnormal_count)
         summary["quality_issue_steps"].append(has_row_quality_issues)
+        summary["feature_quality_steps"].append(current_feature_quality_flags)
 
     for batch in _iter_series_row_batches(series_path, columns):
         batch_len = len(batch["timestamp"])
@@ -1407,6 +1488,7 @@ def build_farm_window_index_from_series_path(
                 unknown_count = 0
                 abnormal_count = 0
                 has_row_quality_issues = False
+                current_feature_quality_flags = ""
 
             observed_count += int(bool(batch["is_observed"][index]))
             target_count += int(batch["target_kw"][index] is not None)
@@ -1414,6 +1496,10 @@ def build_farm_window_index_from_series_path(
             unknown_count += int(bool(batch_unknown[index])) if batch_unknown is not None else 0
             abnormal_count += int(bool(batch_abnormal[index])) if batch_abnormal is not None else 0
             has_row_quality_issues = has_row_quality_issues or bool(batch["quality_flags"][index])
+            current_feature_quality_flags = join_flags(
+                current_feature_quality_flags,
+                batch["feature_quality_flags"][index] or "",
+            )
 
     flush_current_group()
 
@@ -1427,6 +1513,7 @@ def build_farm_window_index_from_series_path(
             unknown_counts=summary["unknown_counts"],
             abnormal_counts=summary["abnormal_counts"],
             quality_issue_steps=summary["quality_issue_steps"],
+            feature_quality_steps=summary["feature_quality_steps"],
             expected_turbines=expected_turbines_by_dataset.get(dataset_id, 0),
             task=task,
             writer=writer,
