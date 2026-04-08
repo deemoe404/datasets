@@ -16,10 +16,20 @@ It supports three evaluation layouts:
 - `univariate_power_stats`: univariate target forecasting with same-turbine historical power-stat covariates on the three supported datasets
 - `multivariate_knn6`: each target turbine is forecast with `self + 5 nearest turbines`,
   and only the target turbine forecast is scored
+- `multivariate_knn6_power_stats`: the same `self + 5 nearest turbines` layout, with
+  historical power-stat covariates for the three supported datasets
 
 For `multivariate_knn6`, each local 6-turbine neighborhood is reindexed onto its
 own full `10m` grid before Chronos-2 inference, so partially asynchronous turbine
 histories are aligned with `NaN` gaps instead of being rejected.
+
+For `multivariate_knn6_power_stats`, each local neighborhood is encoded as a
+6-target multivariate panel plus flattened per-neighbor historical power-stat
+covariates:
+
+- `kelmarsh`: `min/max/stddev`
+- `penmanshiel`: `min/max/stddev`
+- `hill_of_towie`: `min/max/stddev/endvalue`
 
 Invalid target points are defined as:
 
@@ -65,6 +75,10 @@ Run only one layout:
 ./.conda/bin/python run_power_only.py --dataset sdwpf_kddcup --mode multivariate_knn6 --batch-size 16
 ```
 
+For the three datasets with power-stats support, `--mode multivariate_knn6`
+emits both the plain `*_multivariate_knn6` rows and the added
+`*_multivariate_knn6_power_stats` rows.
+
 Run only the added power-stat covariate variant:
 
 ```bash
@@ -73,7 +87,7 @@ Run only the added power-stat covariate variant:
 
 `univariate_power_stats` is supported only for `kelmarsh`, `penmanshiel`, and `hill_of_towie`.
 
-To run the full 11-row benchmark safely, use the repo-tracked orchestrator instead
+To run the full 14-row benchmark safely, use the repo-tracked orchestrator instead
 of ad hoc shell loops. It runs serially, chunks the heavy datasets, falls back to
 CPU when an MPS chunk fails, can split heavy `multivariate_knn6` target groups
 into smaller chunks, and writes chunk logs under `./.work/`:

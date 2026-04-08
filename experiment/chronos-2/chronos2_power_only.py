@@ -22,27 +22,28 @@ DEFAULT_NEIGHBOR_COUNT = 6
 UNIVARIATE_SUFFIX = "_univariate"
 UNIVARIATE_POWER_STATS_SUFFIX = "_univariate_power_stats"
 MULTIVARIATE_KNN6_SUFFIX = "_multivariate_knn6"
+MULTIVARIATE_KNN6_POWER_STATS_SUFFIX = "_multivariate_knn6_power_stats"
 MODE_CHOICES = ("all", "univariate", "multivariate_knn6", "univariate_power_stats")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_ROOT = _REPO_ROOT / "cache"
 _OUTPUT_PATH = _REPO_ROOT / "experiment" / "chronos-2.csv"
 _POWER_ONLY_COLUMNS = ("dataset", "turbine_id", "timestamp", "target_kw", "quality_flags")
-_POWER_STATS_COVARIATE_COLUMNS = {
+_POWER_STATS_COVARIATE_SPECS = {
     "kelmarsh": (
-        "Power, Minimum (kW)",
-        "Power, Maximum (kW)",
-        "Power, Standard deviation (kW)",
+        ("Power, Minimum (kW)", "cov00_min"),
+        ("Power, Maximum (kW)", "cov01_max"),
+        ("Power, Standard deviation (kW)", "cov02_stddev"),
     ),
     "penmanshiel": (
-        "Power, Minimum (kW)",
-        "Power, Maximum (kW)",
-        "Power, Standard deviation (kW)",
+        ("Power, Minimum (kW)", "cov00_min"),
+        ("Power, Maximum (kW)", "cov01_max"),
+        ("Power, Standard deviation (kW)", "cov02_stddev"),
     ),
     "hill_of_towie": (
-        "wtc_ActPower_min",
-        "wtc_ActPower_max",
-        "wtc_ActPower_stddev",
-        "wtc_ActPower_endvalue",
+        ("wtc_ActPower_min", "cov00_min"),
+        ("wtc_ActPower_max", "cov01_max"),
+        ("wtc_ActPower_stddev", "cov02_stddev"),
+        ("wtc_ActPower_endvalue", "cov03_endvalue"),
     ),
 }
 _DATASET_RATED_POWER_KW = {
@@ -98,6 +99,14 @@ class FarmPanel:
 
 
 @dataclass(frozen=True)
+class FarmPowerStatsPanel:
+    turbine_ids: tuple[str, ...]
+    timestamps_us: np.ndarray
+    target_kw_masked: np.ndarray
+    past_covariates: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
 class MultivariateEpochConfig:
     name: str
     active_turbine_ids: tuple[str, ...]
@@ -115,9 +124,26 @@ class PreparedMultivariateEpoch:
 
 
 @dataclass(frozen=True)
+class PreparedMultivariatePowerStatsEpoch:
+    config: MultivariateEpochConfig
+    required_input_turbine_ids: tuple[str, ...]
+    neighbor_map: dict[str, tuple[str, ...]]
+    turbine_series_map: dict[str, TurbinePowerStatsSeries]
+
+
+@dataclass(frozen=True)
 class TargetPanelRun:
     name: str
     farm_panel: FarmPanel
+    scored_row_index: int
+    forecast_start_us_min: int | None = None
+    forecast_start_us_max: int | None = None
+
+
+@dataclass(frozen=True)
+class TargetPowerStatsPanelRun:
+    name: str
+    farm_panel: FarmPowerStatsPanel
     scored_row_index: int
     forecast_start_us_min: int | None = None
     forecast_start_us_max: int | None = None
@@ -231,17 +257,31 @@ def resolve_dataset_task(
     return spec, resolved_task_spec.resolve(spec.resolution_minutes)
 
 
+def supports_power_stats(dataset_id: str) -> bool:
+    return resolve_dataset_id(dataset_id) in _POWER_STATS_COVARIATE_SPECS
+
+
 def supports_univariate_power_stats(dataset_id: str) -> bool:
-    return resolve_dataset_id(dataset_id) in _POWER_STATS_COVARIATE_COLUMNS
+    return supports_power_stats(dataset_id)
 
 
 def resolve_power_stats_covariate_columns(dataset_id: str) -> tuple[str, ...]:
     resolved_dataset_id = resolve_dataset_id(dataset_id)
     try:
-        return _POWER_STATS_COVARIATE_COLUMNS[resolved_dataset_id]
+        return tuple(column for column, _ in _POWER_STATS_COVARIATE_SPECS[resolved_dataset_id])
     except KeyError as exc:
         raise ValueError(
-            f"Dataset {resolved_dataset_id!r} does not support univariate power_stats covariates."
+            f"Dataset {resolved_dataset_id!r} does not support power_stats covariates."
+        ) from exc
+
+
+def resolve_power_stats_covariate_specs(dataset_id: str) -> tuple[tuple[str, str], ...]:
+    resolved_dataset_id = resolve_dataset_id(dataset_id)
+    try:
+        return _POWER_STATS_COVARIATE_SPECS[resolved_dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"Dataset {resolved_dataset_id!r} does not support power_stats covariates."
         ) from exc
 
 
@@ -685,6 +725,76 @@ def build_local_panel(
     )
 
 
+def build_local_power_stats_panel(
+    turbine_series_map: dict[str, TurbinePowerStatsSeries],
+    *,
+    turbine_ids: Sequence[str],
+    resolution_minutes: int,
+    covariate_columns: Sequence[str],
+) -> FarmPowerStatsPanel:
+    ordered_turbine_ids = tuple(turbine_ids)
+    if not ordered_turbine_ids:
+        raise ValueError("Cannot build a local power_stats panel with no turbine ids.")
+    missing_turbines = [turbine_id for turbine_id in ordered_turbine_ids if turbine_id not in turbine_series_map]
+    if missing_turbines:
+        raise ValueError(f"Missing turbine power_stats series for: {missing_turbines!r}")
+
+    step_us = resolution_minutes * 60 * 1_000_000
+    if step_us <= 0:
+        raise ValueError("resolution_minutes must be positive.")
+
+    min_timestamp_us = min(int(turbine_series_map[turbine_id].timestamps_us.min()) for turbine_id in ordered_turbine_ids)
+    max_timestamp_us = max(int(turbine_series_map[turbine_id].timestamps_us.max()) for turbine_id in ordered_turbine_ids)
+    full_timestamps_us = np.arange(min_timestamp_us, max_timestamp_us + step_us, step_us, dtype=np.int64)
+
+    target_columns: list[np.ndarray] = []
+    covariate_panels: dict[str, list[np.ndarray]] = {column: [] for column in covariate_columns}
+    for turbine_id in ordered_turbine_ids:
+        turbine_series = turbine_series_map[turbine_id]
+        offsets = turbine_series.timestamps_us - min_timestamp_us
+        if np.any(offsets % step_us != 0):
+            raise ValueError(f"Turbine {turbine_id!r} has timestamps that do not align to a {resolution_minutes}-minute grid.")
+
+        positions = (offsets // step_us).astype(np.int64, copy=False)
+        aligned_target_values = np.full(full_timestamps_us.shape, np.nan, dtype=np.float32)
+        aligned_target_values[positions] = turbine_series.target_kw_masked
+        target_columns.append(aligned_target_values)
+
+        for column in covariate_columns:
+            aligned_covariate_values = np.full(full_timestamps_us.shape, np.nan, dtype=np.float32)
+            aligned_covariate_values[positions] = turbine_series.past_covariates[column]
+            covariate_panels[column].append(aligned_covariate_values)
+
+    return FarmPowerStatsPanel(
+        turbine_ids=ordered_turbine_ids,
+        timestamps_us=full_timestamps_us,
+        target_kw_masked=np.column_stack(target_columns).astype(np.float32, copy=False),
+        past_covariates={
+            column: np.column_stack(columns).astype(np.float32, copy=False)
+            for column, columns in covariate_panels.items()
+        },
+    )
+
+
+def build_flattened_power_stats_covariates(
+    farm_panel: FarmPowerStatsPanel,
+    *,
+    anchor_index: int,
+    history_steps: int,
+    covariate_specs: Sequence[tuple[str, str]],
+) -> dict[str, np.ndarray]:
+    start_index = anchor_index - history_steps + 1
+    end_index = anchor_index + 1
+    flattened_covariates: dict[str, np.ndarray] = {}
+    for turbine_index, _ in enumerate(farm_panel.turbine_ids):
+        for raw_column, canonical_key in covariate_specs:
+            flattened_covariates[f"neighbor_{turbine_index:02d}__{canonical_key}"] = farm_panel.past_covariates[raw_column][
+                start_index:end_index,
+                turbine_index,
+            ].astype(np.float32, copy=True)
+    return flattened_covariates
+
+
 def _timestamp_us_to_string(timestamp_us: int | None) -> str | None:
     if timestamp_us is None:
         return None
@@ -975,6 +1085,97 @@ def _iter_multivariate_batches_for_runs(
             emitted_windows += 1
 
             if len(context_batch) >= batch_size:
+                batch = flush_batch()
+                if batch is not None:
+                    yield batch
+
+            if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+                max_windows_reached = True
+                break
+
+        batch = flush_batch()
+        if batch is not None:
+            yield batch
+        if max_windows_reached:
+            break
+
+
+def _iter_multivariate_power_stats_batches_for_runs(
+    *,
+    panel_runs: Sequence[TargetPowerStatsPanelRun],
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    batch_size: int,
+    covariate_specs: Sequence[tuple[str, str]],
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> Iterable[tuple[list[dict[str, object]], np.ndarray, np.ndarray]]:
+    input_batch: list[dict[str, object]] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamps: list[np.ndarray] = []
+    emitted_windows = 0
+    skipped_windows = 0
+    max_windows_reached = False
+
+    def flush_batch() -> tuple[list[dict[str, object]], np.ndarray, np.ndarray] | None:
+        nonlocal input_batch, future_rows, future_timestamps
+        if not input_batch:
+            return None
+        batch = (
+            input_batch,
+            np.stack(future_rows),
+            np.stack(future_timestamps),
+        )
+        input_batch = []
+        future_rows = []
+        future_timestamps = []
+        return batch
+
+    for panel_run in panel_runs:
+        farm_panel = panel_run.farm_panel
+        max_anchor_index = farm_panel.timestamps_us.shape[0] - forecast_steps
+        for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+            forecast_start_us = int(farm_panel.timestamps_us[anchor_index + 1])
+            if panel_run.forecast_start_us_min is not None and forecast_start_us < panel_run.forecast_start_us_min:
+                continue
+            if panel_run.forecast_start_us_max is not None and forecast_start_us > panel_run.forecast_start_us_max:
+                continue
+
+            context = farm_panel.target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1].T
+            future = farm_panel.target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps].T
+            if context.shape != (len(farm_panel.turbine_ids), history_steps):
+                continue
+            if future.shape != (len(farm_panel.turbine_ids), forecast_steps):
+                continue
+            if (
+                np.isnan(context).all()
+                or np.isnan(future).all()
+                or np.isnan(future[panel_run.scored_row_index]).all()
+            ):
+                continue
+            if skipped_windows < window_offset:
+                skipped_windows += 1
+                continue
+
+            input_batch.append(
+                {
+                    "target": context.astype(np.float32, copy=True),
+                    "past_covariates": build_flattened_power_stats_covariates(
+                        farm_panel,
+                        anchor_index=anchor_index,
+                        history_steps=history_steps,
+                        covariate_specs=covariate_specs,
+                    ),
+                }
+            )
+            future_rows.append(future.astype(np.float64, copy=True))
+            future_timestamps.append(
+                farm_panel.timestamps_us[anchor_index + 1 : anchor_index + 1 + forecast_steps].astype(np.int64, copy=True)
+            )
+            emitted_windows += 1
+
+            if len(input_batch) >= batch_size:
                 batch = flush_batch()
                 if batch is not None:
                     yield batch
@@ -1480,6 +1681,192 @@ def evaluate_multivariate_knn6_dataset(
     )
 
 
+def evaluate_multivariate_knn6_power_stats_dataset(
+    dataset_id: str,
+    *,
+    pipeline: Any,
+    cache_root: str | Path = _CACHE_ROOT,
+    task_spec=None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+    device: str | None = None,
+    turbine_ids: Sequence[str] | None = None,
+) -> dict[str, object]:
+    dataset_start = time.monotonic()
+    spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
+    covariate_specs = resolve_power_stats_covariate_specs(spec.dataset_id)
+    covariate_columns = tuple(column for column, _ in covariate_specs)
+    target_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    epoch_configs = resolve_multivariate_epoch_configs(
+        spec,
+        target_turbine_ids=target_turbine_ids,
+    )
+    turbine_static = load_dataset_turbine_static(spec.dataset_id, cache_root=cache_root)
+    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
+    epoch_contexts: list[PreparedMultivariatePowerStatsEpoch] = []
+    all_required_input_turbine_ids: list[str] = []
+
+    for epoch_config in epoch_configs:
+        neighbor_map = build_epoch_knn_neighbor_map(
+            turbine_static,
+            active_turbine_ids=epoch_config.active_turbine_ids,
+        )
+        required_input_turbine_ids = build_epoch_required_input_turbine_ids(
+            epoch_config.target_turbine_ids,
+            neighbor_map,
+        )
+        all_required_input_turbine_ids.extend(required_input_turbine_ids)
+        _profile_log(
+            spec.dataset_id,
+            "multivariate_power_stats_epoch_scope",
+            epoch_name=epoch_config.name,
+            target_turbines=len(epoch_config.target_turbine_ids),
+            input_turbines=len(required_input_turbine_ids),
+            covariates=len(covariate_columns),
+            forecast_start_us_min=epoch_config.forecast_start_us_min,
+            forecast_start_us_max=epoch_config.forecast_start_us_max,
+        )
+        _, _, series = load_dataset_inputs(
+            dataset_id,
+            cache_root=cache_root,
+            task_spec=task_spec,
+            turbine_ids=required_input_turbine_ids,
+            include_power_stats=True,
+        )
+        prepare_started = time.monotonic()
+        prepared_series = prepare_power_stats_series(
+            series,
+            dataset_id=spec.dataset_id,
+            rated_power_kw=rated_power_kw,
+        )
+        _profile_log(
+            spec.dataset_id,
+            "prepare_multivariate_power_stats_series",
+            epoch_name=epoch_config.name,
+            rows=prepared_series.height,
+            columns=prepared_series.width,
+            target_turbines=len(epoch_config.target_turbine_ids),
+            input_turbines=len(required_input_turbine_ids),
+            covariates=len(covariate_columns),
+            duration_seconds=round(time.monotonic() - prepare_started, 6),
+        )
+        epoch_contexts.append(
+            PreparedMultivariatePowerStatsEpoch(
+                config=epoch_config,
+                required_input_turbine_ids=required_input_turbine_ids,
+                neighbor_map=neighbor_map,
+                turbine_series_map=build_turbine_power_stats_series_map(
+                    prepared_series,
+                    covariate_columns=covariate_columns,
+                ),
+            )
+        )
+
+    metrics = _initialize_metrics()
+
+    for target_turbine_id in target_turbine_ids:
+        panel_runs: list[TargetPowerStatsPanelRun] = []
+        for epoch_context in epoch_contexts:
+            if target_turbine_id not in epoch_context.config.target_turbine_ids:
+                continue
+            panel_started = time.monotonic()
+            local_panel = build_local_power_stats_panel(
+                epoch_context.turbine_series_map,
+                turbine_ids=epoch_context.neighbor_map[target_turbine_id],
+                resolution_minutes=spec.resolution_minutes,
+                covariate_columns=covariate_columns,
+            )
+            _profile_log(
+                spec.dataset_id,
+                "build_local_power_stats_panel",
+                epoch_name=epoch_context.config.name,
+                target_turbine_id=target_turbine_id,
+                input_turbines=len(epoch_context.neighbor_map[target_turbine_id]),
+                timestamps=len(local_panel.timestamps_us),
+                rows=int(local_panel.target_kw_masked.shape[0]),
+                columns=int(local_panel.target_kw_masked.shape[1]),
+                covariates=len(covariate_columns) * len(local_panel.turbine_ids),
+                duration_seconds=round(time.monotonic() - panel_started, 6),
+            )
+            panel_runs.append(
+                TargetPowerStatsPanelRun(
+                    name=epoch_context.config.name,
+                    farm_panel=local_panel,
+                    scored_row_index=0,
+                    forecast_start_us_min=epoch_context.config.forecast_start_us_min,
+                    forecast_start_us_max=epoch_context.config.forecast_start_us_max,
+                )
+            )
+
+        for input_batch, actual_batch, future_timestamps_batch in _iter_multivariate_power_stats_batches_for_runs(
+            panel_runs=panel_runs,
+            history_steps=resolved_task.history_steps,
+            forecast_steps=resolved_task.forecast_steps,
+            stride_steps=resolved_task.stride_steps,
+            batch_size=batch_size,
+            covariate_specs=covariate_specs,
+            window_offset=window_offset,
+            max_windows_per_dataset=max_windows_per_dataset,
+        ):
+            quantiles, _ = pipeline.predict_quantiles(
+                inputs=input_batch,
+                prediction_length=resolved_task.forecast_steps,
+                quantile_levels=[0.5],
+                batch_size=resolve_pipeline_batch_size(input_batch),
+                limit_prediction_length=False,
+                cross_learning=False,
+            )
+            prediction_batch = np.stack([_extract_median_forecast(prediction) for prediction in quantiles])
+            target_prediction_batch = prediction_batch[:, 0, :]
+            target_actual_batch = actual_batch[:, 0, :]
+            valid_mask = ~np.isnan(target_actual_batch)
+            if not valid_mask.any():
+                continue
+            valid_window_mask = ~np.isnan(target_actual_batch).all(axis=1)
+
+            errors = target_prediction_batch - target_actual_batch
+            valid_errors = errors[valid_mask]
+            normalized_valid_errors = valid_errors / rated_power_kw
+
+            metrics["window_count"] = int(metrics["window_count"]) + int(valid_window_mask.sum())
+            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
+            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
+            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
+            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(
+                np.abs(normalized_valid_errors).sum()
+            )
+            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
+                np.square(normalized_valid_errors).sum()
+            )
+            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(
+                future_timestamps_batch,
+                valid_mask,
+            )
+            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+
+    runtime_seconds = time.monotonic() - dataset_start
+    _profile_log(
+        spec.dataset_id,
+        "evaluate_multivariate_power_stats_complete",
+        target_turbines=len(target_turbine_ids),
+        input_turbines=len(_ordered_unique(all_required_input_turbine_ids)),
+        covariates=len(covariate_columns),
+        runtime_seconds=round(runtime_seconds, 6),
+        window_count=int(metrics["window_count"]),
+        prediction_count=int(metrics["prediction_count"]),
+    )
+    return _build_result_row(
+        dataset_id=spec.dataset_id,
+        suffix=MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
+        resolved_task=resolved_task,
+        rated_power_kw=rated_power_kw,
+        metrics=metrics,
+        runtime_seconds=runtime_seconds,
+        device=device or select_device(),
+    )
+
+
 def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
@@ -1497,7 +1884,7 @@ def run_experiment(
     if mode not in MODE_CHOICES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {MODE_CHOICES}.")
 
-    power_stats_dataset_ids = tuple(dataset_id for dataset_id in dataset_ids if supports_univariate_power_stats(dataset_id))
+    power_stats_dataset_ids = tuple(dataset_id for dataset_id in dataset_ids if supports_power_stats(dataset_id))
     if mode == "univariate_power_stats" and not power_stats_dataset_ids:
         raise ValueError(
             "Mode 'univariate_power_stats' requires at least one dataset with power_stats support."
@@ -1530,6 +1917,7 @@ def run_experiment(
         _run_evaluator(evaluate_univariate_power_stats_dataset, power_stats_dataset_ids)
     if mode in {"all", "multivariate_knn6"}:
         _run_evaluator(evaluate_multivariate_knn6_dataset, dataset_ids)
+        _run_evaluator(evaluate_multivariate_knn6_power_stats_dataset, power_stats_dataset_ids)
 
     results = pl.DataFrame(rows).select(_RESULT_COLUMNS).sort("dataset_id")
     output = Path(output_path)
@@ -1587,7 +1975,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=list(MODE_CHOICES),
         default="all",
-        help="Run all experiments, or only the univariate, multivariate_knn6, or univariate_power_stats subset.",
+        help=(
+            "Run all experiments, or only the univariate, multivariate_knn6 "
+            "(plain + supported power_stats variants), or univariate_power_stats subset."
+        ),
     )
     parser.add_argument(
         "--turbine-id",

@@ -661,6 +661,162 @@ def test_build_local_panel_reindexes_async_neighbors_and_preserves_order() -> No
     )
 
 
+def test_build_local_power_stats_panel_reindexes_async_neighbors_and_masks_covariates() -> None:
+    module = _load_module()
+    timestamps = pl.Series(
+        "timestamp",
+        [
+            datetime(2024, 1, 1, 0, 0, 0),
+            datetime(2024, 1, 1, 0, 10, 0),
+            datetime(2024, 1, 1, 0, 20, 0),
+            datetime(2024, 1, 1, 0, 30, 0),
+            datetime(2024, 1, 1, 0, 40, 0),
+            datetime(2024, 1, 1, 0, 50, 0),
+        ],
+    )
+    series = pl.DataFrame(
+        {
+            "dataset": ["kelmarsh"] * 6,
+            "turbine_id": ["T1", "T1", "T1", "T2", "T2", "T2"],
+            "timestamp": timestamps,
+            "target_kw": [1.0, 2.0, 4.0, 10.0, 12.0, 13.0],
+            "quality_flags": ["", "", "", "", "", "flagged"],
+            "Power, Minimum (kW)": [0.0, 1.0, 3.0, 9.0, 11.0, 12.0],
+            "Power, Maximum (kW)": [2.0, 3.0, 5.0, 11.0, 13.0, 14.0],
+            "Power, Standard deviation (kW)": [0.1, 0.2, 0.4, 1.0, 1.2, 1.3],
+        }
+    )
+
+    prepared = module.prepare_power_stats_series(
+        series,
+        dataset_id="kelmarsh",
+        rated_power_kw=2050.0,
+    )
+    turbine_series_map = module.build_turbine_power_stats_series_map(
+        prepared,
+        covariate_columns=module.resolve_power_stats_covariate_columns("kelmarsh"),
+    )
+
+    local_panel = module.build_local_power_stats_panel(
+        turbine_series_map,
+        turbine_ids=("T2", "T1"),
+        resolution_minutes=10,
+        covariate_columns=module.resolve_power_stats_covariate_columns("kelmarsh"),
+    )
+
+    assert local_panel.turbine_ids == ("T2", "T1")
+    assert local_panel.target_kw_masked.shape == (6, 2)
+    np.testing.assert_array_equal(
+        local_panel.timestamps_us,
+        timestamps.cast(pl.Int64).to_numpy(),
+    )
+    np.testing.assert_allclose(
+        local_panel.target_kw_masked[:, 0],
+        np.array([np.nan, np.nan, np.nan, 10.0, 12.0, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        local_panel.target_kw_masked[:, 1],
+        np.array([1.0, 2.0, 4.0, np.nan, np.nan, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        local_panel.past_covariates["Power, Minimum (kW)"][:, 0],
+        np.array([np.nan, np.nan, np.nan, 9.0, 11.0, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        local_panel.past_covariates["Power, Maximum (kW)"][:, 1],
+        np.array([2.0, 3.0, 5.0, np.nan, np.nan, np.nan], dtype=np.float32),
+        equal_nan=True,
+    )
+
+
+def test_iter_multivariate_power_stats_batches_for_runs_flattens_neighbor_covariates() -> None:
+    module = _load_module()
+    farm_panel = module.FarmPowerStatsPanel(
+        turbine_ids=("T01", "T02", "T03", "T04", "T05", "T06"),
+        timestamps_us=np.array([0, 600_000_000, 1_200_000_000, 1_800_000_000, 2_400_000_000], dtype=np.int64),
+        target_kw_masked=np.array(
+            [
+                [1.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+                [2.0, 11.0, 21.0, 31.0, 41.0, 51.0],
+                [3.0, 12.0, 22.0, 32.0, 42.0, 52.0],
+                [4.0, 13.0, 23.0, 33.0, 43.0, 53.0],
+                [5.0, 14.0, 24.0, 34.0, 44.0, 54.0],
+            ],
+            dtype=np.float32,
+        ),
+        past_covariates={
+            "Power, Minimum (kW)": np.array(
+                [
+                    [0.5, 9.5, 19.5, 29.5, 39.5, 49.5],
+                    [1.5, 10.5, 20.5, 30.5, 40.5, 50.5],
+                    [2.5, 11.5, 21.5, 31.5, 41.5, 51.5],
+                    [3.5, 12.5, 22.5, 32.5, 42.5, 52.5],
+                    [4.5, 13.5, 23.5, 33.5, 43.5, 53.5],
+                ],
+                dtype=np.float32,
+            ),
+            "Power, Maximum (kW)": np.array(
+                [
+                    [1.5, 10.5, 20.5, 30.5, 40.5, 50.5],
+                    [2.5, 11.5, 21.5, 31.5, 41.5, 51.5],
+                    [3.5, 12.5, 22.5, 32.5, 42.5, 52.5],
+                    [4.5, 13.5, 23.5, 33.5, 43.5, 53.5],
+                    [5.5, 14.5, 24.5, 34.5, 44.5, 54.5],
+                ],
+                dtype=np.float32,
+            ),
+            "Power, Standard deviation (kW)": np.array(
+                [
+                    [100.0, 110.0, 120.0, 130.0, 140.0, 150.0],
+                    [101.0, 111.0, 121.0, 131.0, 141.0, 151.0],
+                    [102.0, 112.0, 122.0, 132.0, 142.0, 152.0],
+                    [103.0, 113.0, 123.0, 133.0, 143.0, 153.0],
+                    [104.0, 114.0, 124.0, 134.0, 144.0, 154.0],
+                ],
+                dtype=np.float32,
+            ),
+        },
+    )
+
+    batches = list(
+        module._iter_multivariate_power_stats_batches_for_runs(
+            panel_runs=[module.TargetPowerStatsPanelRun(name="default", farm_panel=farm_panel, scored_row_index=0)],
+            history_steps=3,
+            forecast_steps=2,
+            stride_steps=2,
+            batch_size=4,
+            covariate_specs=module.resolve_power_stats_covariate_specs("kelmarsh"),
+        )
+    )
+
+    assert len(batches) == 1
+    input_batch, actual_batch, future_timestamps_batch = batches[0]
+    assert len(input_batch) == 1
+    assert input_batch[0]["target"].shape == (6, 3)
+    assert len(input_batch[0]["past_covariates"]) == 18
+    assert tuple(input_batch[0]["past_covariates"])[:3] == (
+        "neighbor_00__cov00_min",
+        "neighbor_00__cov01_max",
+        "neighbor_00__cov02_stddev",
+    )
+    np.testing.assert_allclose(
+        input_batch[0]["past_covariates"]["neighbor_00__cov00_min"],
+        np.array([0.5, 1.5, 2.5], dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        input_batch[0]["past_covariates"]["neighbor_05__cov02_stddev"],
+        np.array([150.0, 151.0, 152.0], dtype=np.float32),
+    )
+    assert actual_batch.shape == (1, 6, 2)
+    np.testing.assert_array_equal(
+        future_timestamps_batch,
+        np.array([[1_800_000_000, 2_400_000_000]], dtype=np.int64),
+    )
+
+
 def test_evaluate_multivariate_knn6_dataset_penmanshiel_switches_epoch_neighbors_at_2024_boundary(monkeypatch) -> None:
     module = _load_module()
     turbine_ids = _penmanshiel_turbine_ids()
@@ -1226,6 +1382,111 @@ def test_evaluate_multivariate_knn6_dataset_hill_single_target_smoke(monkeypatch
     assert result["rmse_kw"] == 0.0
 
 
+def test_evaluate_multivariate_knn6_power_stats_dataset_hill_single_target_smoke(monkeypatch) -> None:
+    module = _load_module()
+    spec = DatasetSpec(
+        dataset_id="hill_of_towie",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=("T01", "T02", "T03", "T04", "T05", "T06"),
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+    task_spec = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        stride_duration="20m",
+        task_id="synthetic_task",
+        granularity="turbine",
+    )
+    resolved_task = task_spec.resolve(spec.resolution_minutes)
+    timestamps = pl.datetime_range(
+        start=datetime(2024, 1, 1, 0, 0, 0),
+        end=datetime(2024, 1, 1, 0, 50, 0),
+        interval="10m",
+        eager=True,
+    )
+    turbine_ids = list(spec.turbine_ids)
+    rows: list[dict[str, object]] = []
+    for turbine_index, turbine_id in enumerate(turbine_ids, start=1):
+        for step_index, timestamp in enumerate(timestamps, start=1):
+            base = float(turbine_index * 10 + step_index)
+            rows.append(
+                {
+                    "dataset": "hill_of_towie",
+                    "turbine_id": turbine_id,
+                    "timestamp": timestamp,
+                    "target_kw": base,
+                    "quality_flags": "",
+                    "wtc_ActPower_min": base - 1.0,
+                    "wtc_ActPower_max": base + 1.0,
+                    "wtc_ActPower_stddev": base + 100.0,
+                    "wtc_ActPower_endvalue": base + 200.0,
+                }
+            )
+    series = pl.DataFrame(rows)
+    turbine_static = pl.DataFrame(
+        {
+            "turbine_id": turbine_ids,
+            "coord_x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+            "coord_y": [0.0] * 6,
+            "latitude": [None] * 6,
+            "longitude": [None] * 6,
+        }
+    )
+
+    def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None, include_power_stats=False):
+        assert dataset_id == "hill_of_towie"
+        assert turbine_ids == tuple(spec.turbine_ids)
+        assert include_power_stats is True
+        return spec, resolved_task, series
+
+    class _FakePipeline:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, object]]] = []
+            self.batch_sizes: list[int] = []
+
+        def predict_quantiles(self, *, inputs, prediction_length, quantile_levels, batch_size, limit_prediction_length, cross_learning):
+            assert prediction_length == resolved_task.forecast_steps
+            assert quantile_levels == [0.5]
+            assert cross_learning is False
+            self.calls.append(inputs)
+            self.batch_sizes.append(batch_size)
+            assert len(inputs) == 1
+            assert inputs[0]["target"].shape == (6, 3)
+            assert len(inputs[0]["past_covariates"]) == 24
+            forecast = np.zeros((6, 2), dtype=np.float32)
+            forecast[0] = np.array([14.0, 15.0], dtype=np.float32)
+            return [forecast[:, :, None]], [forecast]
+
+    pipeline = _FakePipeline()
+    monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
+    monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+
+    result = module.evaluate_multivariate_knn6_power_stats_dataset(
+        "hill_of_towie",
+        pipeline=pipeline,
+        task_spec=task_spec,
+        batch_size=1,
+        device="cpu",
+        turbine_ids=("T01",),
+        max_windows_per_dataset=1,
+    )
+
+    assert len(pipeline.calls) == 1
+    assert pipeline.batch_sizes == [30]
+    assert result["dataset_id"] == "hill_of_towie_multivariate_knn6_power_stats"
+    assert result["window_count"] == 1
+    assert result["prediction_count"] == 2
+    assert result["mae_kw"] == 0.0
+    assert result["rmse_kw"] == 0.0
+
+
 def test_resolve_pipeline_batch_size_counts_series_not_windows() -> None:
     module = _load_module()
 
@@ -1300,10 +1561,23 @@ def _install_run_experiment_fakes(monkeypatch, module):
             prediction_count=361,
         )
 
+    def _fake_evaluate_multivariate_knn6_power_stats_dataset(dataset_id, **kwargs):
+        return _build_row(
+            module.resolve_dataset_id(dataset_id),
+            module.MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
+            window_count=8,
+            prediction_count=288,
+        )
+
     monkeypatch.setattr(module, "load_pipeline", lambda **kwargs: _FakePipeline())
     monkeypatch.setattr(module, "evaluate_univariate_dataset", _fake_evaluate_univariate_dataset)
     monkeypatch.setattr(module, "evaluate_univariate_power_stats_dataset", _fake_evaluate_univariate_power_stats_dataset)
     monkeypatch.setattr(module, "evaluate_multivariate_knn6_dataset", _fake_evaluate_multivariate_knn6_dataset)
+    monkeypatch.setattr(
+        module,
+        "evaluate_multivariate_knn6_power_stats_dataset",
+        _fake_evaluate_multivariate_knn6_power_stats_dataset,
+    )
 
 
 def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> None:
@@ -1320,15 +1594,18 @@ def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> 
 
     assert output_path.exists()
     assert result.columns == module._RESULT_COLUMNS
-    assert result.height == 11
+    assert result.height == 14
     assert sorted(result["dataset_id"].to_list()) == [
         "hill_of_towie_multivariate_knn6",
+        "hill_of_towie_multivariate_knn6_power_stats",
         "hill_of_towie_univariate",
         "hill_of_towie_univariate_power_stats",
         "kelmarsh_multivariate_knn6",
+        "kelmarsh_multivariate_knn6_power_stats",
         "kelmarsh_univariate",
         "kelmarsh_univariate_power_stats",
         "penmanshiel_multivariate_knn6",
+        "penmanshiel_multivariate_knn6_power_stats",
         "penmanshiel_univariate",
         "penmanshiel_univariate_power_stats",
         "sdwpf_kddcup_multivariate_knn6",
@@ -1370,11 +1647,14 @@ def test_run_experiment_multivariate_mode_writes_expected_rows(monkeypatch, tmp_
         mode="multivariate_knn6",
     )
 
-    assert result.height == 4
+    assert result.height == 7
     assert sorted(result["dataset_id"].to_list()) == [
         "hill_of_towie_multivariate_knn6",
+        "hill_of_towie_multivariate_knn6_power_stats",
         "kelmarsh_multivariate_knn6",
+        "kelmarsh_multivariate_knn6_power_stats",
         "penmanshiel_multivariate_knn6",
+        "penmanshiel_multivariate_knn6_power_stats",
         "sdwpf_kddcup_multivariate_knn6",
     ]
 

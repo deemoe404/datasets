@@ -22,6 +22,7 @@ from chronos2_power_only import (
     DEFAULT_DATASETS,
     MODEL_ID,
     MULTIVARIATE_KNN6_SUFFIX,
+    MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
     _RESULT_COLUMNS,
     supports_univariate_power_stats,
     TARGET_POLICY,
@@ -58,6 +59,7 @@ def expected_dataset_ids() -> list[str]:
         rows.append(f"{dataset_id}{MULTIVARIATE_KNN6_SUFFIX}")
         rows.append(f"{dataset_id}{UNIVARIATE_SUFFIX}")
         if supports_univariate_power_stats(dataset_id):
+            rows.append(f"{dataset_id}{MULTIVARIATE_KNN6_POWER_STATS_SUFFIX}")
             rows.append(f"{dataset_id}{UNIVARIATE_POWER_STATS_SUFFIX}")
     return sorted(rows)
 
