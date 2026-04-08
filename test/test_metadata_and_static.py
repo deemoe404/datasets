@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+from datetime import datetime
 from textwrap import dedent
 
 import polars as pl
@@ -77,6 +79,59 @@ def test_greenbyte_manifest_release_check_distinguishes_latest_and_compatible(tm
     old_manifest = read_json(build_manifest_for_spec(old_spec, tmp_path / "cache_old"))
     assert old_manifest["source_release_check"]["status"] == "compatible_other_release"
     assert old_manifest["source_release_check"]["detected_release_id"] == "legacy_2022"
+
+
+def test_penmanshiel_manifest_reports_partial_2024_turbine_coverage_caveat(tmp_path) -> None:
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "pen_partial", "Penmanshiel", "Penmanshiel 11", file_end="2025-01-01")
+    root = spec.source_root
+    scada_dir = root / "Penmanshiel_SCADA_2024_0001"
+    (scada_dir / "Turbine_Data_Penmanshiel_01_2024-01-01_-_2024-01-01_0002.csv").write_text(
+        dedent(
+            """
+            # This file was exported by Greenbyte.
+            #
+            # Turbine: Penmanshiel 01
+            # Time zone: UTC
+            # Date and time,Power (kW)
+            2023-12-31 23:50:00,100
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    partial_spec = DatasetSpec(
+        dataset_id="penmanshiel",
+        source_root=spec.source_root,
+        resolution_minutes=spec.resolution_minutes,
+        turbine_ids=("Penmanshiel 01", "Penmanshiel 11"),
+        target_column=spec.target_column,
+        target_unit=spec.target_unit,
+        timezone_policy=spec.timezone_policy,
+        timestamp_convention=spec.timestamp_convention,
+        default_feature_groups=spec.default_feature_groups,
+        handler=spec.handler,
+        official_name=spec.official_name,
+        official_releases=spec.official_releases,
+        default_expected_release_id=spec.default_expected_release_id,
+        requires_pre_extracted_sources=spec.requires_pre_extracted_sources,
+        official_assets=spec.official_assets,
+        default_ingested_assets=spec.default_ingested_assets,
+        default_excluded_assets=spec.default_excluded_assets,
+    )
+
+    manifest = read_json(build_manifest_for_spec(partial_spec, tmp_path / "cache_partial"))
+    release_check = manifest["source_release_check"]
+
+    assert release_check["status"] == "match_expected"
+    assert release_check["detected_release_id"] == "extended_2025"
+    assert release_check["per_turbine_max_filename_end"] == {
+        "Penmanshiel 01": "2024-01-01",
+        "Penmanshiel 11": "2025-01-01",
+    }
+    assert release_check["turbines_reaching_expected_end"] == ["Penmanshiel 11"]
+    assert release_check["turbines_not_reaching_expected_end"] == ["Penmanshiel 01"]
+    assert "Only WT11-15 reach 2025-01-01 filename end" in release_check["coverage_caveat"]
+    assert any("full-farm coverage does not extend through 2024" in warning for warning in manifest["warnings"])
 
 
 def test_manifest_reports_layout_problem_for_zip_only_sources(tmp_path) -> None:

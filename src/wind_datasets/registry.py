@@ -85,7 +85,11 @@ _DATASET_SPECS: dict[str, DatasetSpec] = {
                 published_date="2025-08-13",
                 coverage_start="2016-06-02",
                 coverage_end="2024-12-31",
-                notes="Expanded release with SCADA/events through end-2024 and no WT03.",
+                notes=(
+                    "Expanded release with SCADA/events through end-2024 and no WT03. "
+                    "WT11-15 continue through 2024-12-31; "
+                    "WT01/02/04/05/06/07/08/09/10 have last observations on 2023-12-31."
+                ),
             ),
         ),
         default_expected_release_id="extended_2025",

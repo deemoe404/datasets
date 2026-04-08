@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 import re
@@ -17,6 +17,9 @@ _IGNORED_SUFFIXES = {".swp", ".webloc"}
 _BUILD_VERSION = "v2"
 _GREENBYTE_RANGE_PATTERN = re.compile(
     r"Turbine_Data_.*?_(?P<start>\d{4}-\d{2}-\d{2})_-_(?P<end>\d{4}-\d{2}-\d{2})(?:_|\.csv)"
+)
+_GREENBYTE_TURBINE_RANGE_PATTERN = re.compile(
+    r"^Turbine_Data_(?P<turbine_key>.+?)_(?P<start>\d{4}-\d{2}-\d{2})_-_(?P<end>\d{4}-\d{2}-\d{2})(?:_.*)?\.csv$"
 )
 _TEN_MINUTE_MINUTES = {0, 10, 20, 30, 40, 50}
 _KDDCUP_CALENDAR_ANCHOR_DATE = "2020-05-01"
@@ -119,12 +122,91 @@ def _detect_greenbyte_release(spec: DatasetSpec, relative_paths: list[str]) -> d
     else:
         status = "compatible_other_release"
         details = f"Observed maximum Turbine_Data filename end date {max_end}."
-    return {
+    check = {
         "status": status,
         "expected_release_id": spec.default_expected_release_id,
         "detected_release_id": detected,
         "details": details,
     }
+    _maybe_attach_greenbyte_coverage_caveat(spec, relative_paths, check)
+    return check
+
+
+def _normalize_greenbyte_turbine_id(spec: DatasetSpec, raw_turbine_key: str) -> str:
+    turbine_id = raw_turbine_key.replace("_", " ")
+    if turbine_id in spec.turbine_ids:
+        return turbine_id
+    return turbine_id
+
+
+def _build_greenbyte_per_turbine_max_filename_end(
+    spec: DatasetSpec,
+    relative_paths: list[str],
+) -> dict[str, str]:
+    per_turbine_max_end: dict[str, str] = {}
+    for relative_path in relative_paths:
+        match = _GREENBYTE_TURBINE_RANGE_PATTERN.match(Path(relative_path).name)
+        if not match:
+            continue
+        turbine_id = _normalize_greenbyte_turbine_id(spec, match.group("turbine_key"))
+        end_date = match.group("end")
+        current = per_turbine_max_end.get(turbine_id)
+        if current is None or end_date > current:
+            per_turbine_max_end[turbine_id] = end_date
+    return dict(sorted(per_turbine_max_end.items()))
+
+
+def _expected_greenbyte_filename_end(spec: DatasetSpec) -> str | None:
+    expected_release = next(
+        (release for release in spec.official_releases if release.release_id == spec.default_expected_release_id),
+        None,
+    )
+    if expected_release is None:
+        return None
+    try:
+        coverage_end = datetime.fromisoformat(expected_release.coverage_end).date()
+    except ValueError:
+        return None
+    return (coverage_end + timedelta(days=1)).isoformat()
+
+
+def _maybe_attach_greenbyte_coverage_caveat(
+    spec: DatasetSpec,
+    relative_paths: list[str],
+    check: dict[str, object],
+) -> None:
+    if spec.dataset_id != "penmanshiel":
+        return
+    if check["status"] != "match_expected":
+        return
+    if check["detected_release_id"] != spec.default_expected_release_id:
+        return
+
+    expected_end = _expected_greenbyte_filename_end(spec)
+    if expected_end is None:
+        return
+
+    per_turbine_max_end = _build_greenbyte_per_turbine_max_filename_end(spec, relative_paths)
+    if not per_turbine_max_end:
+        return
+
+    turbines_reaching_expected_end = sorted(
+        turbine_id for turbine_id, end_date in per_turbine_max_end.items() if end_date >= expected_end
+    )
+    turbines_not_reaching_expected_end = sorted(
+        turbine_id for turbine_id, end_date in per_turbine_max_end.items() if end_date < expected_end
+    )
+    if not turbines_reaching_expected_end or not turbines_not_reaching_expected_end:
+        return
+
+    check["per_turbine_max_filename_end"] = per_turbine_max_end
+    check["turbines_reaching_expected_end"] = turbines_reaching_expected_end
+    check["turbines_not_reaching_expected_end"] = turbines_not_reaching_expected_end
+    check["coverage_caveat"] = (
+        "Only WT11-15 reach 2025-01-01 filename end; "
+        "WT01/02/04/05/06/07/08/09/10 stop at 2024-01-01 filename end, "
+        "so full-farm coverage does not extend through 2024."
+    )
 
 
 def _build_source_release_check(
@@ -158,6 +240,8 @@ def _build_source_release_check(
         warnings.append("Unable to determine which official release the current source layout corresponds to.")
     elif check["status"] == "layout_problem":
         warnings.append("Source layout is incomplete for the current builder expectations.")
+    if "coverage_caveat" in check:
+        warnings.append(str(check["coverage_caveat"]))
     return check, warnings
 
 

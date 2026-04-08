@@ -163,7 +163,9 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Default expected release: `extended_2025`
 - Coverage:
   - legacy release: `2016-06-02` to `2021-06-30`
-  - extended release: `2016-06-02` to `2024-12-31`
+  - extended release package: `2016-06-02` to `2024-12-31`
+  - turbine-level caveat: `WT11-15` extend to `2024-12-31`; `WT01/02/04/05/06/07/08/09/10` have last observations on `2023-12-31`
+  - farm-synchronous caveat: do not treat `2024-12-31` as full-farm task-ready coverage; current `cache/penmanshiel/gold_base/default/farm/default/quality_report.json` reports `common_coverage_end = 2023-12-31T23:50:00` and `full_target_coverage_end = 2023-12-31T23:50:00`
 - Time semantics: UTC, source timestamps are treated as naive UTC values
 - Official assets:
   - KMZ layout
