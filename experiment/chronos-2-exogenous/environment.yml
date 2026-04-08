@@ -4,6 +4,7 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  - pytest
   - pip:
       - git+https://github.com/amazon-science/chronos-forecasting.git@6d68ed7c4ed2805d122d77b4660765b4089de5ca
       - torch
