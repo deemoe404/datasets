@@ -62,7 +62,7 @@ From this directory:
 This overwrites:
 
 ```text
-/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/chronos-2-exogenous.csv
+../chronos-2-exogenous.csv
 ```
 
 Useful smoke-test options:

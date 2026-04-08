@@ -12,7 +12,7 @@ official raw datasets.
 
 ## Public API
 
-The main import surface is [wind_datasets/__init__.py](/Users/sam/Developer/Code/Wind%20Power%20Forecasting/datasets/src/wind_datasets/__init__.py).
+The main import surface is [wind_datasets/__init__.py](./wind_datasets/__init__.py).
 
 Typical entry points:
 
@@ -30,7 +30,19 @@ Typical entry points:
 - `load_turbine_static(dataset_id)`
 - `profile_dataset(dataset_id, quality_profile=None, layout=None, feature_set=None)`
 
-`TaskSpec` lives in [wind_datasets/models.py](/Users/sam/Developer/Code/Wind%20Power%20Forecasting/datasets/src/wind_datasets/models.py). It is duration-based, not step-based. Runtime step counts are derived from each dataset's native resolution.
+`TaskSpec` lives in [wind_datasets/models.py](./wind_datasets/models.py). It is duration-based, not step-based. Runtime step counts are derived from each dataset's native resolution.
+
+## Local Source Configuration
+
+Runtime dataset source paths are configured through a repo-local TOML file at the repository root:
+
+```toml
+[paths]
+source_data_root = "/absolute/path/to/Wind Power Forecasting"
+```
+
+Use [wind_datasets.local.toml.example](../wind_datasets.local.toml.example) as the tracked template.
+The real [wind_datasets.local.toml](../wind_datasets.local.toml) is machine-local, ignored by git, and must point at the read-only dataset root.
 
 ## Cache Layout
 
@@ -378,6 +390,7 @@ Common variants:
 
 Notes:
 
+- Build the root environment first with `./create_env.sh`.
 - The script uses the repository's `./.conda/bin/python` by default.
 - The wrapper exports `PYTHONPATH=src`, so it works without requiring `pip install -e .`.
 - The underlying Python entrypoint is `python -m wind_datasets.rebuild_cache`.
@@ -461,9 +474,17 @@ PY
 
 ## Environment
 
-The package is configured in [pyproject.toml](/Users/sam/Developer/Code/Wind%20Power%20Forecasting/datasets/pyproject.toml) and is intended to run in the repository's `./.conda` environment.
+The package is configured in [pyproject.toml](../pyproject.toml) and is intended to run in the repository's `./.conda` environment.
 
-Editable install during development:
+Create or update that environment from the repository root:
+
+```bash
+./create_env.sh
+```
+
+The script creates `./.conda`, upgrades `pip`, and installs the repository in editable mode.
+
+Manual editable install during development:
 
 ```bash
 pip install -e .

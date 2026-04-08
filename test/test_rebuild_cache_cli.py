@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -7,6 +8,7 @@ import subprocess
 import pytest
 
 from wind_datasets import rebuild_cache as rebuild_module
+from wind_datasets.config import ProjectConfigError
 
 
 def _stage_name_for_task(task_id: str, granularity: str) -> str:
@@ -219,6 +221,27 @@ def test_rebuild_shell_wrapper_reports_missing_python_path(tmp_path) -> None:
     assert result.stderr.strip() == "--python requires a path"
 
 
+def test_rebuild_shell_wrapper_suggests_create_env_for_missing_default_python(tmp_path) -> None:
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "rebuild_cache.sh"
+    repo_root = tmp_path / "repo"
+    scripts_dir = repo_root / "scripts"
+    scripts_dir.mkdir(parents=True)
+    copied_script = scripts_dir / "rebuild_cache.sh"
+    copied_script.write_text(script_path.read_text(encoding="utf-8"), encoding="utf-8")
+    copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
+
+    result = subprocess.run(
+        ["bash", str(copied_script), "kelmarsh"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Run ./create_env.sh" in result.stderr
+
+
 def test_rebuild_shell_wrapper_passes_through_to_python_module(tmp_path) -> None:
     script_path = Path(__file__).resolve().parents[1] / "scripts" / "rebuild_cache.sh"
     repo_root = script_path.parents[1]
@@ -253,3 +276,110 @@ def test_rebuild_shell_wrapper_passes_through_to_python_module(tmp_path) -> None
     assert "args=-m wind_datasets.rebuild_cache --cache-root" in result.stdout
     assert "kelmarsh" in result.stdout
     assert f"pythonpath={repo_root / 'src'}" in result.stdout
+
+
+def test_root_create_env_script_bootstraps_conda_env_and_editable_install(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    script_path = Path(__file__).resolve().parents[1] / "create_env.sh"
+    env_file_path = Path(__file__).resolve().parents[1] / "environment.yml"
+    copied_script = repo_root / "create_env.sh"
+    copied_env_file = repo_root / "environment.yml"
+    copied_script.write_text(script_path.read_text(encoding="utf-8"), encoding="utf-8")
+    copied_env_file.write_text(env_file_path.read_text(encoding="utf-8"), encoding="utf-8")
+    copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
+
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    log_path = tmp_path / "create-env.log"
+    conda_stub = stub_bin / "conda"
+    conda_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf 'conda=%s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "prefix=''\n"
+        "while [[ $# -gt 0 ]]; do\n"
+        "  case \"$1\" in\n"
+        "    --prefix)\n"
+        "      prefix=\"$2\"\n"
+        "      shift 2\n"
+        "      ;;\n"
+        "    *)\n"
+        "      shift\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "mkdir -p \"$prefix/bin\"\n"
+        "cat > \"$prefix/bin/python\" <<'PYEOF'\n"
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "printf 'python=%s\\n' \"$*\" >> \"$LOG_PATH\"\n"
+        "PYEOF\n"
+        "chmod +x \"$prefix/bin/python\"\n",
+        encoding="utf-8",
+    )
+    conda_stub.chmod(conda_stub.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{stub_bin}:{env['PATH']}"
+    env["LOG_PATH"] = str(log_path)
+
+    result = subprocess.run(
+        ["/bin/bash", str(copied_script)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    log_text = log_path.read_text(encoding="utf-8")
+    assert f"conda=env create --prefix {repo_root / '.conda'} --file {repo_root / 'environment.yml'}" in log_text
+    assert "python=-m pip install --upgrade pip" in log_text
+    assert f"python=-m pip install --upgrade --editable {repo_root}" in log_text
+    assert "Dataset processing environment is ready" in result.stdout
+
+
+def test_root_create_env_script_requires_conda(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    script_path = Path(__file__).resolve().parents[1] / "create_env.sh"
+    env_file_path = Path(__file__).resolve().parents[1] / "environment.yml"
+    copied_script = repo_root / "create_env.sh"
+    copied_env_file = repo_root / "environment.yml"
+    copied_script.write_text(script_path.read_text(encoding="utf-8"), encoding="utf-8")
+    copied_env_file.write_text(env_file_path.read_text(encoding="utf-8"), encoding="utf-8")
+    copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
+
+    env = os.environ.copy()
+    env["PATH"] = str(tmp_path)
+
+    result = subprocess.run(
+        ["/bin/bash", str(copied_script)],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "conda executable not found" in result.stderr
+
+
+def test_rebuild_cli_check_reports_missing_project_config(monkeypatch, capsys) -> None:
+    def _raise_missing_config(dataset: str):
+        raise ProjectConfigError(
+            "Missing project config file /tmp/wind_datasets.local.toml. "
+            "Copy /tmp/wind_datasets.local.toml.example and set [paths].source_data_root."
+        )
+
+    monkeypatch.setattr(rebuild_module, "get_dataset_spec", _raise_missing_config)
+
+    code = rebuild_module.main(["--check", "kelmarsh"])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "wind_datasets.local.toml" in captured.err
+    assert "source_data_root" in captured.err

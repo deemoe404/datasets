@@ -60,7 +60,7 @@ From this directory:
 This overwrites:
 
 ```text
-/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/chronos-2.csv
+../chronos-2.csv
 ```
 
 Useful smoke-test options:
