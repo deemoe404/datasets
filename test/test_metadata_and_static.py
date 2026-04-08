@@ -21,6 +21,7 @@ from wind_datasets.datasets.common import TURBINE_STATIC_SCHEMA
 from wind_datasets.datasets.greenbyte import GreenbyteDatasetBuilder
 from wind_datasets.datasets.hill_of_towie import (
     HillOfTowieDatasetBuilder,
+    _featureize_tuneup_interventions,
     _load_packaged_hill_tuneup_metadata,
 )
 from wind_datasets.datasets.sdwpf_kddcup import SDWPFKDDCupDatasetBuilder
@@ -226,13 +227,13 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     assert hill_tuneup.height == 1
     assert hill_tuneup["turbine_id"].to_list() == ["T02"]
     assert hill_tuneup["tuneup_deployment_start"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
-        "2024-03-14 07:00:00"
+        "2024-03-14 09:20:00"
     ]
     assert hill_tuneup["tuneup_effective_start"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
-        "2024-03-14 17:00:00"
+        "2024-03-14 09:50:00"
     ]
     assert hill_tuneup["tuneup_deployment_end"].dt.strftime("%Y-%m-%d %H:%M:%S").to_list() == [
-        "2024-03-14 18:00:00"
+        "2024-03-14 09:40:00"
     ]
     assert "tuneup_in_deployment_window" in hill_tuneup_features.columns
     assert "tuneup_post_effective" in hill_tuneup_features.columns
@@ -240,16 +241,84 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
 
 def test_packaged_hill_tuneup_metadata_is_deduplicated_and_uses_official_times() -> None:
     tuneup = _load_packaged_hill_tuneup_metadata()
+    rows = tuneup.sort("turbine_id").select(
+        "turbine_id",
+        "tuneup_deployment_start",
+        "tuneup_effective_start",
+        "tuneup_deployment_end",
+    ).to_dicts()
+    expected = {
+        "T02": ("2024-03-14 09:20:00", "2024-03-14 09:50:00", "2024-03-14 09:40:00"),
+        "T03": ("2024-03-14 09:50:00", "2024-03-14 10:00:00", "2024-03-14 09:50:00"),
+        "T06": ("2024-03-14 09:00:00", "2024-03-14 09:40:00", "2024-03-14 09:30:00"),
+        "T08": ("2024-03-14 10:40:00", "2024-03-14 10:50:00", "2024-03-14 10:40:00"),
+        "T09": ("2024-03-14 10:00:00", "2024-03-14 10:10:00", "2024-03-14 10:00:00"),
+        "T13": ("2024-03-14 10:50:00", "2024-03-14 14:10:00", "2024-03-14 14:00:00"),
+        "T16": ("2024-03-14 12:30:00", "2024-03-14 12:40:00", "2024-03-14 12:30:00"),
+        "T20": ("2024-03-14 12:40:00", "2024-03-14 15:00:00", "2024-03-14 14:50:00"),
+        "T21": ("2024-05-02 08:50:00", "2024-05-02 09:50:00", "2024-05-02 09:40:00"),
+    }
 
     assert tuneup.height == 9
     assert tuneup["turbine_id"].n_unique() == 9
     assert tuneup.filter(pl.col("turbine_id") == "T08").height == 1
-    assert tuneup["tuneup_deployment_start"].unique().to_list() == ["2024-03-14 07:00:00"]
-    assert tuneup["tuneup_effective_start"].unique().to_list() == ["2024-03-14 17:00:00"]
-    assert tuneup["tuneup_deployment_end"].unique().to_list() == ["2024-03-14 18:00:00"]
+    for row in rows:
+        turbine_id = row["turbine_id"]
+        assert (
+            row["tuneup_deployment_start"],
+            row["tuneup_effective_start"],
+            row["tuneup_deployment_end"],
+        ) == expected[turbine_id]
     assert tuneup.filter(pl.col("turbine_id") == "T08")["source_configs"].to_list() == [
         "HoT_PitchTuneUp2024_north.yaml|HoT_PitchTuneUp2024_south.yaml"
     ]
+
+
+def test_penmanshiel_registry_notes_and_readme_document_partial_2024_coverage() -> None:
+    spec = get_dataset_spec("penmanshiel")
+    extended_release = next(
+        release for release in spec.official_releases if release.release_id == "extended_2025"
+    )
+    readme = Path("src/README.md").read_text(encoding="utf-8")
+
+    assert "WT11-15" in extended_release.notes
+    assert "WT01/02/04/05/06/07/08/09/10" in extended_release.notes
+    assert "2023-12-31" in extended_release.notes
+    assert "2024-12-31" in extended_release.notes
+    assert "turbine-level caveat: `WT11-15` extend to `2024-12-31`" in readme
+    assert "`WT01/02/04/05/06/07/08/09/10` have last observations on `2023-12-31`" in readme
+    assert "`common_coverage_end = 2023-12-31T23:50:00`" in readme
+    assert "`full_target_coverage_end = 2023-12-31T23:50:00`" in readme
+
+
+def test_featureize_tuneup_interventions_respects_interval_end_semantics() -> None:
+    frame = pl.DataFrame(
+        {
+            "dataset": ["hill_of_towie"],
+            "turbine_id": ["T21"],
+            "tuneup_deployment_start": [datetime(2024, 5, 2, 8, 50, 0)],
+            "tuneup_effective_start": [datetime(2024, 5, 2, 9, 50, 0)],
+            "tuneup_deployment_end": [datetime(2024, 5, 2, 9, 40, 0)],
+        }
+    )
+
+    features = _featureize_tuneup_interventions(
+        frame,
+        resolution_minutes=10,
+        dataset_end=datetime(2024, 5, 2, 10, 0, 0),
+    )
+
+    at_0940 = features.filter(pl.col("timestamp") == datetime(2024, 5, 2, 9, 40, 0))
+    at_0950 = features.filter(pl.col("timestamp") == datetime(2024, 5, 2, 9, 50, 0))
+
+    assert features.height == 8
+    assert at_0940["tuneup_in_deployment_window"][0] is True
+    assert at_0940["tuneup_post_effective"][0] is False
+    assert at_0940["days_since_tuneup_deployment_end"][0] is None
+    assert at_0950["tuneup_in_deployment_window"][0] is False
+    assert at_0950["tuneup_post_effective"][0] is True
+    assert at_0950["days_since_tuneup_effective_start"][0] == 0.0
+    assert at_0950["days_since_tuneup_deployment_end"][0] > 0.0
 
 
 def test_api_build_farm_task_cache_then_load_task_turbine_static(tmp_path, monkeypatch) -> None:

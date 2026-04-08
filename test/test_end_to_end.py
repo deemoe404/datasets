@@ -160,8 +160,10 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert t01_1730["farm_is_fully_synchronous"][0] is True
     assert t01_1720["aeroup_post_install"][0] is True
     assert t02_1720["aeroup_in_install_window"][0] is True
-    assert t02_1720["tuneup_in_deployment_window"][0] is True
+    assert t02_1720["tuneup_in_deployment_window"][0] is False
+    assert t02_1720["tuneup_post_effective"][0] is True
     assert t01_1720["tuneup_in_deployment_window"][0] is False
+    assert t01_1720["tuneup_post_effective"][0] is False
     assert t02_1810["tuneup_post_effective"][0] is True
     assert "duplicate_conflict_resolved" in series.filter(
         (pl.col("turbine_id") == "T01")
