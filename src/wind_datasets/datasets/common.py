@@ -924,88 +924,18 @@ def build_farm_window_index(
     report_path: Path,
     quality_profile: str,
 ) -> Path:
-    writer = ParquetChunkWriter(output_path, schema=_FARM_WINDOW_INDEX_SCHEMA)
-    counts = Counter()
-    buffer: list[dict[str, Any]] = []
-
-    masked_expr = (
-        pl.col("sdwpf_is_masked").fill_null(False).cast(pl.Int32)
-        if "sdwpf_is_masked" in df.columns
-        else pl.lit(0).cast(pl.Int32)
+    timestamp_summary, expected_turbines_by_dataset = _build_farm_timestamp_summary_from_lazyframe(
+        df.lazy(),
+        available_columns=set(df.columns),
     )
-    unknown_expr = (
-        pl.col("sdwpf_is_unknown").fill_null(False).cast(pl.Int32)
-        if "sdwpf_is_unknown" in df.columns
-        else pl.lit(0).cast(pl.Int32)
+    return _write_farm_window_index_from_summary(
+        timestamp_summary=timestamp_summary,
+        expected_turbines_by_dataset=expected_turbines_by_dataset,
+        task=task,
+        output_path=output_path,
+        report_path=report_path,
+        quality_profile=quality_profile,
     )
-    abnormal_expr = (
-        pl.col("sdwpf_is_abnormal").fill_null(False).cast(pl.Int32)
-        if "sdwpf_is_abnormal" in df.columns
-        else pl.lit(0).cast(pl.Int32)
-    )
-    feature_quality_expr = (
-        pl.col("feature_quality_flags").fill_null("")
-        if "feature_quality_flags" in df.columns
-        else pl.lit("")
-    )
-
-    timestamp_summary = (
-        df.group_by(["dataset", "timestamp"], maintain_order=True)
-        .agg(
-            pl.col("is_observed").cast(pl.Int32).sum().alias("turbines_observed"),
-            pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("turbines_with_target"),
-            masked_expr.sum().alias("turbines_masked"),
-            unknown_expr.sum().alias("turbines_unknown"),
-            abnormal_expr.sum().alias("turbines_abnormal"),
-            (pl.col("quality_flags").fill_null("") != "").any().alias("has_row_quality_issues"),
-            feature_quality_expr.alias("feature_quality_flags"),
-        )
-        .with_columns(join_flags_expr=pl.col("feature_quality_flags"))
-        .with_columns(
-            pl.col("join_flags_expr")
-            .map_elements(lambda values: join_flags(*values), return_dtype=pl.String)
-            .alias("feature_quality_flags")
-        )
-        .drop("join_flags_expr")
-        .sort(["dataset", "timestamp"])
-    )
-
-    expected_turbines_by_dataset = {
-        row["dataset"]: int(row["expected_turbines"])
-        for row in df.group_by("dataset", maintain_order=True)
-        .agg(pl.col("turbine_id").n_unique().alias("expected_turbines"))
-        .iter_rows(named=True)
-    }
-    for dataset_frame in timestamp_summary.partition_by("dataset", maintain_order=True):
-        _append_farm_windows(
-            dataset_id=dataset_frame["dataset"][0],
-            timestamps=dataset_frame["timestamp"].to_list(),
-            observed_counts=[int(value) for value in dataset_frame["turbines_observed"].to_list()],
-            target_counts=[int(value) for value in dataset_frame["turbines_with_target"].to_list()],
-            masked_counts=[int(value) for value in dataset_frame["turbines_masked"].to_list()],
-            unknown_counts=[int(value) for value in dataset_frame["turbines_unknown"].to_list()],
-            abnormal_counts=[int(value) for value in dataset_frame["turbines_abnormal"].to_list()],
-            quality_issue_steps=[bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()],
-            feature_quality_steps=dataset_frame["feature_quality_flags"].fill_null("").to_list(),
-            expected_turbines=expected_turbines_by_dataset.get(dataset_frame["dataset"][0], 0),
-            task=task,
-            writer=writer,
-            counts=counts,
-            buffer=buffer,
-        )
-
-    writer.write_rows(buffer)
-    writer.close()
-    write_json(
-        report_path,
-        {
-            "quality_profile": quality_profile,
-            "task": task.to_dict(),
-            "granularity": task.granularity,
-            **counts,
-        },
-    )
-    return output_path
 
 
 def build_window_index(
@@ -1101,6 +1031,136 @@ def _iter_series_row_batches(series_path: Path, columns: list[str], batch_size: 
     parquet_file = pq.ParquetFile(series_path)
     for batch in parquet_file.iter_batches(columns=columns, batch_size=batch_size):
         yield batch.to_pydict()
+
+
+def _join_flag_values(values: Any) -> str:
+    if values is None:
+        return ""
+    if isinstance(values, str):
+        return values
+    return join_flags(*values)
+
+
+def _expected_farm_turbines_by_dataset(
+    base_scan: pl.LazyFrame,
+    *,
+    available_columns: set[str],
+) -> dict[str, int]:
+    if "farm_turbines_expected" in available_columns:
+        expected_frame = (
+            base_scan.group_by("dataset")
+            .agg(pl.col("farm_turbines_expected").max().cast(pl.Int32).alias("expected_turbines"))
+            .collect()
+        )
+    else:
+        expected_frame = (
+            base_scan.select(["dataset", "turbine_id"])
+            .unique()
+            .group_by("dataset")
+            .agg(pl.len().cast(pl.Int32).alias("expected_turbines"))
+            .collect()
+        )
+    return {
+        row["dataset"]: int(row["expected_turbines"] or 0)
+        for row in expected_frame.iter_rows(named=True)
+    }
+
+
+def _build_farm_timestamp_summary_from_lazyframe(
+    base_scan: pl.LazyFrame,
+    *,
+    available_columns: set[str],
+) -> tuple[pl.DataFrame, dict[str, int]]:
+    masked_expr = (
+        pl.col("sdwpf_is_masked").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_masked" in available_columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+    unknown_expr = (
+        pl.col("sdwpf_is_unknown").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_unknown" in available_columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+    abnormal_expr = (
+        pl.col("sdwpf_is_abnormal").fill_null(False).cast(pl.Int32)
+        if "sdwpf_is_abnormal" in available_columns
+        else pl.lit(0).cast(pl.Int32)
+    )
+    feature_quality_expr = (
+        pl.col("feature_quality_flags").fill_null("")
+        if "feature_quality_flags" in available_columns
+        else pl.lit(None).cast(pl.String)
+    )
+    timestamp_summary = (
+        base_scan.group_by(["dataset", "timestamp"])
+        .agg(
+            pl.col("is_observed").fill_null(False).cast(pl.Int32).sum().alias("turbines_observed"),
+            pl.col("target_kw").is_not_null().cast(pl.Int32).sum().alias("turbines_with_target"),
+            masked_expr.sum().alias("turbines_masked"),
+            unknown_expr.sum().alias("turbines_unknown"),
+            abnormal_expr.sum().alias("turbines_abnormal"),
+            (pl.col("quality_flags").fill_null("") != "").any().alias("has_row_quality_issues"),
+            feature_quality_expr.alias("feature_quality_flags"),
+        )
+        .with_columns(
+            pl.col("feature_quality_flags")
+            .map_elements(_join_flag_values, return_dtype=pl.String)
+            .alias("feature_quality_flags")
+        )
+        .sort(["dataset", "timestamp"])
+        .collect()
+    )
+    expected_turbines_by_dataset = _expected_farm_turbines_by_dataset(
+        base_scan,
+        available_columns=available_columns,
+    )
+    return timestamp_summary, expected_turbines_by_dataset
+
+
+def _write_farm_window_index_from_summary(
+    *,
+    timestamp_summary: pl.DataFrame,
+    expected_turbines_by_dataset: dict[str, int],
+    task: ResolvedTaskSpec,
+    output_path: Path,
+    report_path: Path,
+    quality_profile: str,
+) -> Path:
+    writer = ParquetChunkWriter(output_path, schema=_FARM_WINDOW_INDEX_SCHEMA)
+    counts = Counter()
+    buffer: list[dict[str, Any]] = []
+
+    for dataset_frame in timestamp_summary.partition_by("dataset", maintain_order=True):
+        dataset_id = dataset_frame["dataset"][0]
+        _append_farm_windows(
+            dataset_id=dataset_id,
+            timestamps=dataset_frame["timestamp"].to_list(),
+            observed_counts=[int(value) for value in dataset_frame["turbines_observed"].to_list()],
+            target_counts=[int(value) for value in dataset_frame["turbines_with_target"].to_list()],
+            masked_counts=[int(value) for value in dataset_frame["turbines_masked"].to_list()],
+            unknown_counts=[int(value) for value in dataset_frame["turbines_unknown"].to_list()],
+            abnormal_counts=[int(value) for value in dataset_frame["turbines_abnormal"].to_list()],
+            quality_issue_steps=[bool(value) for value in dataset_frame["has_row_quality_issues"].to_list()],
+            feature_quality_steps=dataset_frame["feature_quality_flags"].fill_null("").to_list(),
+            expected_turbines=expected_turbines_by_dataset.get(dataset_id, 0),
+            task=task,
+            writer=writer,
+            counts=counts,
+            buffer=buffer,
+        )
+
+    writer.write_rows(buffer)
+    writer.close()
+    write_json(
+        report_path,
+        {
+            "quality_profile": quality_profile,
+            "task": task.to_dict(),
+            "granularity": task.granularity,
+            **counts,
+        },
+    )
+    return output_path
 
 
 def _append_turbine_windows(
@@ -1419,120 +1479,18 @@ def build_farm_window_index_from_series_path(
     available_columns: set[str],
 ) -> Path:
     output_path.unlink(missing_ok=True)
-    writer = ParquetChunkWriter(output_path, schema=_FARM_WINDOW_INDEX_SCHEMA)
-    counts = Counter()
-    buffer: list[dict[str, Any]] = []
-    columns = _task_window_columns(available_columns)
-    expected_turbines_by_dataset = {
-        row["dataset"]: int(row["expected_turbines"])
-        for row in pl.scan_parquet(series_path)
-        .select(["dataset", "turbine_id"])
-        .unique()
-        .group_by("dataset")
-        .agg(pl.len().alias("expected_turbines"))
-        .collect()
-        .iter_rows(named=True)
-    }
-
-    summary_by_dataset: dict[str, dict[str, list[Any]]] = {}
-    current_dataset: str | None = None
-    current_timestamp: Any | None = None
-    observed_count = 0
-    target_count = 0
-    masked_count = 0
-    unknown_count = 0
-    abnormal_count = 0
-    has_row_quality_issues = False
-    current_feature_quality_flags = ""
-
-    def flush_current_group() -> None:
-        if current_dataset is None or current_timestamp is None:
-            return
-        summary = summary_by_dataset.setdefault(
-            current_dataset,
-            {
-                "timestamps": [],
-                "observed_counts": [],
-                "target_counts": [],
-                "masked_counts": [],
-                "unknown_counts": [],
-                "abnormal_counts": [],
-                "quality_issue_steps": [],
-                "feature_quality_steps": [],
-            },
-        )
-        summary["timestamps"].append(current_timestamp)
-        summary["observed_counts"].append(observed_count)
-        summary["target_counts"].append(target_count)
-        summary["masked_counts"].append(masked_count)
-        summary["unknown_counts"].append(unknown_count)
-        summary["abnormal_counts"].append(abnormal_count)
-        summary["quality_issue_steps"].append(has_row_quality_issues)
-        summary["feature_quality_steps"].append(current_feature_quality_flags)
-
-    for batch in _iter_series_row_batches(series_path, columns):
-        batch_len = len(batch["timestamp"])
-        batch_masked = batch.get("sdwpf_is_masked")
-        batch_unknown = batch.get("sdwpf_is_unknown")
-        batch_abnormal = batch.get("sdwpf_is_abnormal")
-        for index in range(batch_len):
-            dataset_id = batch["dataset"][index]
-            timestamp = batch["timestamp"][index]
-            if current_dataset != dataset_id or current_timestamp != timestamp:
-                flush_current_group()
-                current_dataset = dataset_id
-                current_timestamp = timestamp
-                observed_count = 0
-                target_count = 0
-                masked_count = 0
-                unknown_count = 0
-                abnormal_count = 0
-                has_row_quality_issues = False
-                current_feature_quality_flags = ""
-
-            observed_count += int(bool(batch["is_observed"][index]))
-            target_count += int(batch["target_kw"][index] is not None)
-            masked_count += int(bool(batch_masked[index])) if batch_masked is not None else 0
-            unknown_count += int(bool(batch_unknown[index])) if batch_unknown is not None else 0
-            abnormal_count += int(bool(batch_abnormal[index])) if batch_abnormal is not None else 0
-            has_row_quality_issues = has_row_quality_issues or bool(batch["quality_flags"][index])
-            current_feature_quality_flags = join_flags(
-                current_feature_quality_flags,
-                batch["feature_quality_flags"][index] or "",
-            )
-
-    flush_current_group()
-
-    for dataset_id, summary in summary_by_dataset.items():
-        _append_farm_windows(
-            dataset_id=dataset_id,
-            timestamps=summary["timestamps"],
-            observed_counts=summary["observed_counts"],
-            target_counts=summary["target_counts"],
-            masked_counts=summary["masked_counts"],
-            unknown_counts=summary["unknown_counts"],
-            abnormal_counts=summary["abnormal_counts"],
-            quality_issue_steps=summary["quality_issue_steps"],
-            feature_quality_steps=summary["feature_quality_steps"],
-            expected_turbines=expected_turbines_by_dataset.get(dataset_id, 0),
-            task=task,
-            writer=writer,
-            counts=counts,
-            buffer=buffer,
-        )
-
-    writer.write_rows(buffer)
-    writer.close()
-    write_json(
-        report_path,
-        {
-            "quality_profile": quality_profile,
-            "task": task.to_dict(),
-            "granularity": task.granularity,
-            **counts,
-        },
+    timestamp_summary, expected_turbines_by_dataset = _build_farm_timestamp_summary_from_lazyframe(
+        pl.scan_parquet(series_path),
+        available_columns=available_columns,
     )
-    return output_path
+    return _write_farm_window_index_from_summary(
+        timestamp_summary=timestamp_summary,
+        expected_turbines_by_dataset=expected_turbines_by_dataset,
+        task=task,
+        output_path=output_path,
+        report_path=report_path,
+        quality_profile=quality_profile,
+    )
 
 
 def build_window_index_from_series_path(
