@@ -5,6 +5,6 @@ __pycache__/
 *.egg-info/
 cache/
 experiment/*/.conda/
-experiment/*/.work/
+experiment/*/.work*/
 .DS_Store
 wind_datasets.local.toml
