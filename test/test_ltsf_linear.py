@@ -333,6 +333,34 @@ def test_prepare_dataset_reads_existing_cache_and_expands_exogenous_inputs(tmp_p
     assert np.any(prepared.train.exogenous_inputs[:, :, 3:] == 1.0)
 
 
+def test_build_requested_packs_includes_stage3_regime_for_ltsf() -> None:
+    module = _load_module()
+
+    packs = module.build_requested_packs("kelmarsh", covariate_stages=("stage3_regime",))
+
+    assert [pack.pack_name for pack in packs] == ["power_only", "stage3_regime"]
+
+
+def test_select_device_prefers_cuda_then_mps_then_cpu() -> None:
+    module = _load_module()
+
+    class _Backend:
+        def __init__(self, available: bool) -> None:
+            self._available = available
+
+        def is_available(self) -> bool:
+            return self._available
+
+    class _Torch:
+        def __init__(self, *, cuda_available: bool, mps_available: bool) -> None:
+            self.cuda = _Backend(cuda_available)
+            self.backends = type("_Backends", (), {"mps": _Backend(mps_available)})()
+
+    assert module.select_device(torch_module=_Torch(cuda_available=True, mps_available=True)) == "cuda"
+    assert module.select_device(torch_module=_Torch(cuda_available=False, mps_available=True)) == "mps"
+    assert module.select_device(torch_module=_Torch(cuda_available=False, mps_available=False)) == "cpu"
+
+
 def test_run_experiment_writes_expected_rows_with_injected_runner(tmp_path) -> None:
     module = _load_module()
 

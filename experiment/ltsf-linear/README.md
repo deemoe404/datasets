@@ -76,6 +76,7 @@ Run the full 32-row benchmark grid:
 ./.conda/bin/python run_ltsf_linear_full.py
 ```
 
+The full-run orchestrator automatically selects `cuda -> mps -> cpu`.
 Pin the full run to a device:
 
 ```bash
