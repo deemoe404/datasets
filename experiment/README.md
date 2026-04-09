@@ -1,7 +1,16 @@
 # Experiment Overview
 
 This directory contains the repository-tracked experiment runners and result
-CSVs for the `24h look back -> 6h ahead -> 6h stride` task.
+CSVs for the repository forecasting tasks.
+
+- `chronos-2` and `chronos-2-exogenous` use `24h look back -> 6h ahead`, dense
+  sliding windows at the raw turbine timestep, and the shared raw-timestamp
+  chronological split `70/10/20` with strict-contained windows.
+- Chronos runners are zero-shot and score only `test`, reporting both
+  `rolling_origin_no_refit` and `non_overlap` views plus `overall` and
+  horizon-wise rows.
+- `ltsf-linear` uses the same split definition, but trains on `train` and reports
+  both `val` and `test`.
 
 ## Experiments
 
@@ -130,8 +139,15 @@ when present in the selected feature set.
 
 ## Notes
 
+- `chronos-2/run_power_only_full.py` uses a tuned CUDA chunk-batch profile:
+  `univariate=128`, `univariate_power_stats=32`, `multivariate_knn6=32`.
 - `chronos-2-exogenous` and `ltsf-linear` share the same staged covariate pack
   definitions.
+- `chronos-2.csv` and `chronos-2-exogenous.csv` are long result files with
+  `split_name=test`, `eval_protocol`, `metric_scope`, `lead_step`, and split
+  window-count metadata.
 - `ltsf-linear` currently reads the same staged packs but may react differently
   to sparse flags and near-constant covariates because it uses train-only
   z-score normalization on past covariates.
+- `ltsf-linear.csv` is also a long result file: each job emits `val/test`,
+  `rolling_origin_no_refit/non_overlap`, and `overall/horizon-wise` rows.
