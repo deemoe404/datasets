@@ -7,8 +7,17 @@ This experiment evaluates Chronos-2 zero-shot forecasting on:
 - `hill_of_towie`
 - `sdwpf_kddcup`
 
-The task is fixed to `24h look back -> 6h ahead` with a `6h` stride and uses
-only turbine power histories.
+The task is fixed to `24h look back -> 6h ahead` and uses only turbine power
+histories.
+
+Evaluation protocol:
+
+- dense sliding windows on the raw turbine timestep
+- raw unique timestamp chronological split `70/10/20`
+- strict-contained windows within each split
+- zero-shot scoring on `test` only
+- both `rolling_origin_no_refit` and `non_overlap`
+- long-form output with one `overall` row and `36` horizon rows per eval view
 
 It supports three evaluation layouts:
 
@@ -57,7 +66,7 @@ From this directory:
 ./.conda/bin/python run_power_only.py
 ```
 
-This overwrites:
+This writes:
 
 ```text
 ../chronos-2.csv
@@ -66,7 +75,7 @@ This overwrites:
 Useful smoke-test options:
 
 ```bash
-./.conda/bin/python run_power_only.py --dataset kelmarsh --mode all --max-windows-per-dataset 64 --batch-size 32
+./.conda/bin/python run_power_only.py --dataset kelmarsh --mode all --max-windows-per-split 64 --batch-size 32
 ```
 
 Run only one layout:
@@ -87,15 +96,21 @@ Run only the added power-stat covariate variant:
 
 `univariate_power_stats` is supported only for `kelmarsh`, `penmanshiel`, and `hill_of_towie`.
 
-To run the full 14-row benchmark safely, use the repo-tracked orchestrator instead
-of ad hoc shell loops. It runs serially, chunks the heavy datasets, automatically
-selects `cuda -> mps -> cpu`, falls back to CPU when a non-CPU chunk fails, can
-split heavy `multivariate_knn6` target groups into smaller chunks, and writes
-chunk logs under `./.work/`:
+To run the full aligned benchmark safely, use the repo-tracked orchestrator
+instead of ad hoc shell loops. It runs serially, chunks the heavy datasets,
+automatically selects `cuda -> mps -> cpu`, falls back to CPU when a non-CPU
+chunk fails, can split heavy `multivariate_knn6` target groups into smaller
+chunks, and writes chunk logs under `./.work/`:
 
 ```bash
 ./.conda/bin/python run_power_only_full.py
 ```
+
+The full-run output is a `1036`-row long CSV:
+
+- `14` dataset/layout jobs
+- `2` test eval views
+- `1 + 36` metric rows per eval view
 
 Pin the full run to a specific device when needed:
 
@@ -103,7 +118,26 @@ Pin the full run to a specific device when needed:
 ./.conda/bin/python run_power_only_full.py --device cuda
 ```
 
+CUDA full-run defaults are tuned per chunk family rather than using the
+runner-wide `--batch-size` default. On the `RTX 4090 D 24GB` mini-bench from
+`2026-04-09`, the best stable primary chunk sizes were:
+
+| full-run chunk family                            | datasets                                  | cuda batch size |
+| ----------------------------------------------- | ----------------------------------------- | --------------: |
+| `univariate`                                    | `kelmarsh`, `penmanshiel`                 |             128 |
+| `univariate`                                    | `hill_of_towie` 3-turbine chunks          |             128 |
+| `univariate`                                    | `sdwpf_kddcup` 16-turbine chunks          |             128 |
+| `univariate_power_stats`                        | `kelmarsh`, `penmanshiel`                 |              32 |
+| `univariate_power_stats`                        | `hill_of_towie` 3-turbine chunks          |              32 |
+| `multivariate_knn6` and added power-stats rows  | `kelmarsh`, `penmanshiel`                 |              32 |
+| `multivariate_knn6` and added power-stats rows  | `hill_of_towie` single-target groups      |              32 |
+| `multivariate_knn6`                             | `sdwpf_kddcup` 8-target groups            |              32 |
+
+`cpu` and `mps` still keep the older conservative chunk sizes because only the
+CUDA profile was re-tuned.
+
 Debug-only options:
 
 - `--turbine-id` limits `univariate` runs to a turbine subset
 - `--window-offset` skips retained windows before scoring
+- `--max-windows-per-split` limits retained `test` windows per eval slice for smoke tests

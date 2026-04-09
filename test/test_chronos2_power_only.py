@@ -4,6 +4,7 @@ from datetime import datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from typing import Sequence
 
 import numpy as np
 import polars as pl
@@ -29,6 +30,63 @@ def _load_module():
 
 def _penmanshiel_turbine_ids() -> tuple[str, ...]:
     return tuple(f"Penmanshiel {index:02d}" for index in (1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+
+
+def _timestamp_us(timestamps) -> list[int]:
+    return pl.Series("timestamp", list(timestamps), dtype=pl.Datetime).cast(pl.Int64).to_list()
+
+
+def _patch_split_windows(
+    monkeypatch,
+    module,
+    timestamps,
+    *,
+    target_indices: Sequence[int],
+    turbine_indices: Sequence[int] | None = None,
+    train_window_count: int = 10,
+    val_window_count: int = 5,
+):
+    timestamp_us = _timestamp_us(timestamps)
+    resolved_turbine_indices = tuple(turbine_indices or [0] * len(target_indices))
+    windows = module.WindowDescriptorIndex(
+        turbine_indices=np.asarray(resolved_turbine_indices, dtype=np.int32),
+        target_indices=np.asarray(list(target_indices), dtype=np.int32),
+        output_start_us=np.asarray([timestamp_us[index] for index in target_indices], dtype=np.int64),
+        output_end_us=np.asarray([timestamp_us[index + 1] for index in target_indices], dtype=np.int64),
+    )
+    split_windows = module.PreparedSplitWindowSet(
+        train_window_count=train_window_count,
+        val_window_count=val_window_count,
+        test_window_count=len(target_indices),
+        test_rolling_windows=windows,
+        test_non_overlap_windows=windows,
+    )
+    monkeypatch.setattr(
+        module,
+        "ensure_task_cache",
+        lambda dataset_id, *, cache_root=module._CACHE_ROOT: module.TaskCachePaths(
+            task_window_path=Path("task_windows.parquet"),
+            dataset_path=Path("dataset.parquet"),
+        ),
+    )
+    monkeypatch.setattr(module, "load_strict_window_index", lambda *args, **kwargs: pl.DataFrame())
+    monkeypatch.setattr(module, "prepare_split_window_set", lambda *args, **kwargs: split_windows)
+    return split_windows
+
+
+def _rows_frame(module, rows) -> pl.DataFrame:
+    if isinstance(rows, pl.DataFrame):
+        return rows
+    return module.sort_result_frame(pl.DataFrame(rows).select(module._RESULT_COLUMNS))
+
+
+def _overall_row(module, rows, *, eval_protocol: str | None = None) -> dict[str, object]:
+    frame = _rows_frame(module, rows)
+    selected_protocol = eval_protocol or module.ROLLING_EVAL_PROTOCOL
+    return frame.filter(
+        (pl.col("eval_protocol") == selected_protocol)
+        & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+    ).to_dicts()[0]
 
 
 def test_apply_target_policy_masks_invalid_and_clips_remaining_values() -> None:
@@ -391,6 +449,7 @@ def test_evaluate_univariate_dataset_masks_invalid_future_positions(monkeypatch)
     pipeline = _FakePipeline()
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_univariate_dataset(
         "kelmarsh",
@@ -398,7 +457,9 @@ def test_evaluate_univariate_dataset_masks_invalid_future_positions(monkeypatch)
         task_spec=task_spec,
         batch_size=8,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
     np.testing.assert_allclose(
@@ -407,13 +468,15 @@ def test_evaluate_univariate_dataset_masks_invalid_future_positions(monkeypatch)
         equal_nan=True,
     )
     assert pipeline.batch_sizes == [1]
-    assert result["dataset_id"] == "kelmarsh_univariate"
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 1
-    assert result["mae_kw"] == 5.0
-    assert result["rmse_kw"] == 5.0
-    assert result["start_timestamp"] == "2024-01-01 00:30:00"
-    assert result["end_timestamp"] == "2024-01-01 00:30:00"
+    assert _rows_frame(module, result).height == 3
+    assert overall["dataset_id"] == "kelmarsh_univariate"
+    assert overall["split_name"] == "test"
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 1
+    assert overall["mae_kw"] == 5.0
+    assert overall["rmse_kw"] == 5.0
+    assert overall["start_timestamp"] == "2024-01-01 00:30:00"
+    assert overall["end_timestamp"] == "2024-01-01 00:40:00"
 
 
 def test_evaluate_univariate_power_stats_dataset_uses_past_covariates_and_scores_target(monkeypatch) -> None:
@@ -478,6 +541,7 @@ def test_evaluate_univariate_power_stats_dataset_uses_past_covariates_and_scores
     pipeline = _FakePipeline()
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_univariate_power_stats_dataset(
         "kelmarsh",
@@ -485,7 +549,9 @@ def test_evaluate_univariate_power_stats_dataset_uses_past_covariates_and_scores
         task_spec=task_spec,
         batch_size=8,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
     assert len(pipeline.calls[0]) == 1
@@ -512,13 +578,14 @@ def test_evaluate_univariate_power_stats_dataset_uses_past_covariates_and_scores
         equal_nan=True,
     )
     assert pipeline.batch_sizes == [4]
-    assert result["dataset_id"] == "kelmarsh_univariate_power_stats"
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 1
-    assert result["mae_kw"] == 5.0
-    assert result["rmse_kw"] == 5.0
-    assert result["start_timestamp"] == "2024-01-01 00:30:00"
-    assert result["end_timestamp"] == "2024-01-01 00:30:00"
+    assert _rows_frame(module, result).height == 3
+    assert overall["dataset_id"] == "kelmarsh_univariate_power_stats"
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 1
+    assert overall["mae_kw"] == 5.0
+    assert overall["rmse_kw"] == 5.0
+    assert overall["start_timestamp"] == "2024-01-01 00:30:00"
+    assert overall["end_timestamp"] == "2024-01-01 00:40:00"
 
 
 def test_build_knn_neighbor_map_prefers_xy_and_keeps_target_first() -> None:
@@ -928,17 +995,21 @@ def test_evaluate_multivariate_knn6_dataset_penmanshiel_switches_epoch_neighbors
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3, 6])
 
     result = module.evaluate_multivariate_knn6_dataset(
         "penmanshiel",
         pipeline=pipeline,
         task_spec=task_spec,
-        batch_size=4,
+        batch_size=1,
         device="cpu",
         turbine_ids=("Penmanshiel 11",),
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert seen_loader_turbines == [
+        ("Penmanshiel 11",),
         (
             "Penmanshiel 11",
             "Penmanshiel 10",
@@ -986,13 +1057,13 @@ def test_evaluate_multivariate_knn6_dataset_penmanshiel_switches_epoch_neighbors
         ),
         equal_nan=True,
     )
-    assert result["dataset_id"] == "penmanshiel_multivariate_knn6"
-    assert result["window_count"] == 2
-    assert result["prediction_count"] == 4
-    assert result["mae_kw"] == 0.0
-    assert result["rmse_kw"] == 0.0
-    assert result["start_timestamp"] == "2023-12-31 23:30:00"
-    assert result["end_timestamp"] == "2024-01-01 00:10:00"
+    assert overall["dataset_id"] == "penmanshiel_multivariate_knn6"
+    assert overall["window_count"] == 2
+    assert overall["prediction_count"] == 4
+    assert overall["mae_kw"] == 0.0
+    assert overall["rmse_kw"] == 0.0
+    assert overall["start_timestamp"] == "2023-12-31 23:30:00"
+    assert overall["end_timestamp"] == "2024-01-01 00:10:00"
 
 
 def test_evaluate_multivariate_knn6_dataset_scores_only_target_turbine(monkeypatch) -> None:
@@ -1080,14 +1151,17 @@ def test_evaluate_multivariate_knn6_dataset_scores_only_target_turbine(monkeypat
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3, 3, 3], turbine_indices=[0, 1, 2])
 
     result = module.evaluate_multivariate_knn6_dataset(
         "kelmarsh",
         pipeline=pipeline,
         task_spec=task_spec,
-        batch_size=4,
+        batch_size=1,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 3
     np.testing.assert_allclose(
@@ -1103,13 +1177,13 @@ def test_evaluate_multivariate_knn6_dataset_scores_only_target_turbine(monkeypat
         equal_nan=True,
     )
     assert pipeline.batch_sizes == [3, 3, 3]
-    assert result["dataset_id"] == "kelmarsh_multivariate_knn6"
-    assert result["window_count"] == 3
-    assert result["prediction_count"] == 5
-    assert result["mae_kw"] == 0.0
-    assert result["rmse_kw"] == 0.0
-    assert result["start_timestamp"] == "2024-01-01 00:30:00"
-    assert result["end_timestamp"] == "2024-01-01 00:40:00"
+    assert overall["dataset_id"] == "kelmarsh_multivariate_knn6"
+    assert overall["window_count"] == 3
+    assert overall["prediction_count"] == 5
+    assert overall["mae_kw"] == 0.0
+    assert overall["rmse_kw"] == 0.0
+    assert overall["start_timestamp"] == "2024-01-01 00:30:00"
+    assert overall["end_timestamp"] == "2024-01-01 00:40:00"
 
 
 def test_evaluate_multivariate_knn6_dataset_accepts_target_turbine_subset(monkeypatch) -> None:
@@ -1163,10 +1237,16 @@ def test_evaluate_multivariate_knn6_dataset_accepts_target_turbine_subset(monkey
         }
     )
 
+    seen_loader_turbines: list[tuple[str, ...] | None] = []
+
     def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None):
         assert dataset_id == "kelmarsh"
-        assert turbine_ids == ("Kelmarsh 1", "Kelmarsh 2", "Kelmarsh 3")
-        return spec, resolved_task, series
+        resolved_turbine_ids = tuple(turbine_ids) if turbine_ids is not None else None
+        seen_loader_turbines.append(resolved_turbine_ids)
+        selected = series
+        if resolved_turbine_ids is not None:
+            selected = selected.filter(pl.col("turbine_id").is_in(list(resolved_turbine_ids)))
+        return spec, resolved_task, selected
 
     class _FakePipeline:
         def __init__(self) -> None:
@@ -1183,6 +1263,7 @@ def test_evaluate_multivariate_knn6_dataset_accepts_target_turbine_subset(monkey
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_multivariate_knn6_dataset(
         "kelmarsh",
@@ -1191,11 +1272,14 @@ def test_evaluate_multivariate_knn6_dataset_accepts_target_turbine_subset(monkey
         batch_size=4,
         device="cpu",
         turbine_ids=("Kelmarsh 1",),
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 2
+    assert seen_loader_turbines == [("Kelmarsh 1",), ("Kelmarsh 1", "Kelmarsh 2", "Kelmarsh 3")]
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 2
 
 
 def test_evaluate_multivariate_knn6_dataset_loads_only_required_neighbor_union(monkeypatch) -> None:
@@ -1266,6 +1350,7 @@ def test_evaluate_multivariate_knn6_dataset_loads_only_required_neighbor_union(m
             "T04": ("T04", "T01", "T02"),
         },
     )
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_multivariate_knn6_dataset(
         "hill_of_towie",
@@ -1274,12 +1359,14 @@ def test_evaluate_multivariate_knn6_dataset_loads_only_required_neighbor_union(m
         batch_size=4,
         device="cpu",
         turbine_ids=("T01",),
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
-    assert seen_loader_turbines == [("T01", "T02", "T03")]
-    assert result["dataset_id"] == "hill_of_towie_multivariate_knn6"
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 2
+    assert seen_loader_turbines == [("T01",), ("T01", "T02", "T03")]
+    assert overall["dataset_id"] == "hill_of_towie_multivariate_knn6"
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 2
 
 
 def test_evaluate_multivariate_knn6_dataset_hill_single_target_smoke(monkeypatch) -> None:
@@ -1342,10 +1429,16 @@ def test_evaluate_multivariate_knn6_dataset_hill_single_target_smoke(monkeypatch
         }
     )
 
+    seen_loader_turbines: list[tuple[str, ...] | None] = []
+
     def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None):
         assert dataset_id == "hill_of_towie"
-        assert turbine_ids == tuple(spec.turbine_ids)
-        return spec, resolved_task, series
+        resolved_turbine_ids = tuple(turbine_ids) if turbine_ids is not None else None
+        seen_loader_turbines.append(resolved_turbine_ids)
+        selected = series
+        if resolved_turbine_ids is not None:
+            selected = selected.filter(pl.col("turbine_id").is_in(list(resolved_turbine_ids)))
+        return spec, resolved_task, selected
 
     class _FakePipeline:
         def __init__(self) -> None:
@@ -1362,6 +1455,7 @@ def test_evaluate_multivariate_knn6_dataset_hill_single_target_smoke(monkeypatch
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_multivariate_knn6_dataset(
         "hill_of_towie",
@@ -1370,16 +1464,19 @@ def test_evaluate_multivariate_knn6_dataset_hill_single_target_smoke(monkeypatch
         batch_size=1,
         device="cpu",
         turbine_ids=("T01",),
-        max_windows_per_dataset=1,
+        max_windows_per_split=1,
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
+    assert seen_loader_turbines == [("T01",), tuple(spec.turbine_ids)]
     assert pipeline.calls[0].shape == (1, 6, 3)
-    assert result["dataset_id"] == "hill_of_towie_multivariate_knn6"
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 2
-    assert result["mae_kw"] == 0.0
-    assert result["rmse_kw"] == 0.0
+    assert overall["dataset_id"] == "hill_of_towie_multivariate_knn6"
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 2
+    assert overall["mae_kw"] == 0.0
+    assert overall["rmse_kw"] == 0.0
 
 
 def test_evaluate_multivariate_knn6_power_stats_dataset_hill_single_target_smoke(monkeypatch) -> None:
@@ -1439,11 +1536,18 @@ def test_evaluate_multivariate_knn6_power_stats_dataset_hill_single_target_smoke
         }
     )
 
+    seen_loader_turbines: list[tuple[str, ...] | None] = []
+    include_power_stats_calls: list[bool] = []
+
     def _fake_load_dataset_inputs(dataset_id, *, cache_root, task_spec, turbine_ids=None, include_power_stats=False):
         assert dataset_id == "hill_of_towie"
-        assert turbine_ids == tuple(spec.turbine_ids)
-        assert include_power_stats is True
-        return spec, resolved_task, series
+        resolved_turbine_ids = tuple(turbine_ids) if turbine_ids is not None else None
+        seen_loader_turbines.append(resolved_turbine_ids)
+        include_power_stats_calls.append(bool(include_power_stats))
+        selected = series
+        if resolved_turbine_ids is not None:
+            selected = selected.filter(pl.col("turbine_id").is_in(list(resolved_turbine_ids)))
+        return spec, resolved_task, selected
 
     class _FakePipeline:
         def __init__(self) -> None:
@@ -1467,6 +1571,7 @@ def test_evaluate_multivariate_knn6_power_stats_dataset_hill_single_target_smoke
     monkeypatch.setattr(module, "load_dataset_inputs", _fake_load_dataset_inputs)
     monkeypatch.setattr(module, "load_dataset_turbine_static", lambda dataset_id, *, cache_root: turbine_static)
     monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
 
     result = module.evaluate_multivariate_knn6_power_stats_dataset(
         "hill_of_towie",
@@ -1475,16 +1580,20 @@ def test_evaluate_multivariate_knn6_power_stats_dataset_hill_single_target_smoke
         batch_size=1,
         device="cpu",
         turbine_ids=("T01",),
-        max_windows_per_dataset=1,
+        max_windows_per_split=1,
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
+    assert include_power_stats_calls == [False, True]
+    assert seen_loader_turbines == [("T01",), tuple(spec.turbine_ids)]
     assert pipeline.batch_sizes == [30]
-    assert result["dataset_id"] == "hill_of_towie_multivariate_knn6_power_stats"
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 2
-    assert result["mae_kw"] == 0.0
-    assert result["rmse_kw"] == 0.0
+    assert overall["dataset_id"] == "hill_of_towie_multivariate_knn6_power_stats"
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 2
+    assert overall["mae_kw"] == 0.0
+    assert overall["rmse_kw"] == 0.0
 
 
 def test_resolve_pipeline_batch_size_counts_series_not_windows() -> None:
@@ -1516,29 +1625,69 @@ def _install_run_experiment_fakes(monkeypatch, module):
     class _FakePipeline:
         pass
 
-    def _build_row(resolved: str, suffix: str, *, window_count: int, prediction_count: int) -> dict[str, object]:
-        return {
+    def _build_rows(
+        resolved: str,
+        suffix: str,
+        window_count: int,
+        prediction_count: int,
+    ) -> list[dict[str, object]]:
+        resolved_task = module.build_task_spec(window_protocol=module.DEFAULT_WINDOW_PROTOCOL).resolve(10)
+        base_row = {
             "dataset_id": f"{resolved}{suffix}",
             "model_id": module.MODEL_ID,
-            "task_id": module.TASK_ID,
-            "history_steps": 144,
-            "forecast_steps": 36,
-            "stride_steps": 36,
+            "task_id": resolved_task.task_id,
+            "window_protocol": module.DEFAULT_WINDOW_PROTOCOL,
+            "history_steps": resolved_task.history_steps,
+            "forecast_steps": resolved_task.forecast_steps,
+            "stride_steps": resolved_task.stride_steps,
+            "split_protocol": module.SPLIT_PROTOCOL,
+            "split_name": "test",
             "target_policy": module.TARGET_POLICY,
-            "window_count": window_count,
-            "prediction_count": prediction_count,
             "start_timestamp": "2024-01-01 00:10:00",
             "end_timestamp": "2024-01-10 00:00:00",
-            "mae_kw": 1.0,
-            "rmse_kw": 2.0,
-            "mae_pu": 0.1,
-            "rmse_pu": 0.2,
             "device": "cpu",
             "runtime_seconds": 0.5,
+            "train_window_count": 100,
+            "val_window_count": 20,
+            "test_window_count": window_count,
         }
+        rows: list[dict[str, object]] = []
+        for eval_protocol in (module.ROLLING_EVAL_PROTOCOL, module.NON_OVERLAP_EVAL_PROTOCOL):
+            rows.append(
+                {
+                    **base_row,
+                    "eval_protocol": eval_protocol,
+                    "metric_scope": module.OVERALL_METRIC_SCOPE,
+                    "lead_step": None,
+                    "lead_minutes": None,
+                    "window_count": window_count,
+                    "prediction_count": prediction_count,
+                    "mae_kw": 1.0,
+                    "rmse_kw": 2.0,
+                    "mae_pu": 0.1,
+                    "rmse_pu": 0.2,
+                }
+            )
+            for lead_step in range(1, resolved_task.forecast_steps + 1):
+                rows.append(
+                    {
+                        **base_row,
+                        "eval_protocol": eval_protocol,
+                        "metric_scope": module.HORIZON_METRIC_SCOPE,
+                        "lead_step": lead_step,
+                        "lead_minutes": lead_step * 10,
+                        "window_count": window_count,
+                        "prediction_count": max(1, prediction_count // resolved_task.forecast_steps),
+                        "mae_kw": 1.0,
+                        "rmse_kw": 2.0,
+                        "mae_pu": 0.1,
+                        "rmse_pu": 0.2,
+                    }
+                )
+        return rows
 
     def _fake_evaluate_univariate_dataset(dataset_id, **kwargs):
-        return _build_row(
+        return _build_rows(
             module.resolve_dataset_id(dataset_id),
             module.UNIVARIATE_SUFFIX,
             window_count=10,
@@ -1546,7 +1695,7 @@ def _install_run_experiment_fakes(monkeypatch, module):
         )
 
     def _fake_evaluate_univariate_power_stats_dataset(dataset_id, **kwargs):
-        return _build_row(
+        return _build_rows(
             module.resolve_dataset_id(dataset_id),
             module.UNIVARIATE_POWER_STATS_SUFFIX,
             window_count=9,
@@ -1554,7 +1703,7 @@ def _install_run_experiment_fakes(monkeypatch, module):
         )
 
     def _fake_evaluate_multivariate_knn6_dataset(dataset_id, **kwargs):
-        return _build_row(
+        return _build_rows(
             module.resolve_dataset_id(dataset_id),
             module.MULTIVARIATE_KNN6_SUFFIX,
             window_count=11,
@@ -1562,7 +1711,7 @@ def _install_run_experiment_fakes(monkeypatch, module):
         )
 
     def _fake_evaluate_multivariate_knn6_power_stats_dataset(dataset_id, **kwargs):
-        return _build_row(
+        return _build_rows(
             module.resolve_dataset_id(dataset_id),
             module.MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
             window_count=8,
@@ -1594,8 +1743,10 @@ def test_run_experiment_all_mode_writes_expected_rows(monkeypatch, tmp_path) -> 
 
     assert output_path.exists()
     assert result.columns == module._RESULT_COLUMNS
-    assert result.height == 14
-    assert sorted(result["dataset_id"].to_list()) == [
+    assert result.height == 14 * 74
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert result["split_name"].unique().to_list() == ["test"]
+    assert sorted(result["dataset_id"].unique().to_list()) == [
         "hill_of_towie_multivariate_knn6",
         "hill_of_towie_multivariate_knn6_power_stats",
         "hill_of_towie_univariate",
@@ -1624,8 +1775,9 @@ def test_run_experiment_univariate_mode_includes_power_stats_rows(monkeypatch, t
         mode="univariate",
     )
 
-    assert result.height == 7
-    assert sorted(result["dataset_id"].to_list()) == [
+    assert result.height == 7 * 74
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert sorted(result["dataset_id"].unique().to_list()) == [
         "hill_of_towie_univariate",
         "hill_of_towie_univariate_power_stats",
         "kelmarsh_univariate",
@@ -1647,8 +1799,9 @@ def test_run_experiment_multivariate_mode_writes_expected_rows(monkeypatch, tmp_
         mode="multivariate_knn6",
     )
 
-    assert result.height == 7
-    assert sorted(result["dataset_id"].to_list()) == [
+    assert result.height == 7 * 74
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert sorted(result["dataset_id"].unique().to_list()) == [
         "hill_of_towie_multivariate_knn6",
         "hill_of_towie_multivariate_knn6_power_stats",
         "kelmarsh_multivariate_knn6",
@@ -1670,12 +1823,117 @@ def test_run_experiment_univariate_power_stats_mode_filters_supported_datasets(m
         mode="univariate_power_stats",
     )
 
-    assert result.height == 3
-    assert sorted(result["dataset_id"].to_list()) == [
+    assert result.height == 3 * 74
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert sorted(result["dataset_id"].unique().to_list()) == [
         "hill_of_towie_univariate_power_stats",
         "kelmarsh_univariate_power_stats",
         "penmanshiel_univariate_power_stats",
     ]
+
+
+def test_run_experiment_emits_univariate_progress_events(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    spec = DatasetSpec(
+        dataset_id="sdwpf_kddcup",
+        source_root=Path("."),
+        resolution_minutes=10,
+        turbine_ids=("1",),
+        target_column="target_kw",
+        target_unit="kW",
+        timezone_policy="naive",
+        timestamp_convention="naive",
+        default_feature_groups=("main",),
+        handler="synthetic",
+    )
+    task_spec = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        stride_duration="20m",
+        task_id="synthetic_task",
+        granularity="turbine",
+    )
+    resolved_task = task_spec.resolve(spec.resolution_minutes)
+    timestamps = pl.datetime_range(
+        start=datetime(2024, 1, 1, 0, 0, 0),
+        end=datetime(2024, 1, 1, 1, 10, 0),
+        interval="10m",
+        eager=True,
+    )
+    series = pl.DataFrame(
+        {
+            "dataset": ["sdwpf_kddcup"] * len(timestamps),
+            "turbine_id": ["1"] * len(timestamps),
+            "timestamp": timestamps,
+            "target_kw": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
+            "quality_flags": [""] * len(timestamps),
+        }
+    )
+    progress_events: list[dict[str, object]] = []
+
+    class _FakePipeline:
+        def predict_quantiles(self, *, inputs, prediction_length, quantile_levels, batch_size, limit_prediction_length):
+            del prediction_length, quantile_levels, batch_size, limit_prediction_length
+            forecasts = [np.array([[[40.0], [50.0]]], dtype=np.float32) for _ in range(len(inputs))]
+            return forecasts, [np.array([[40.0, 50.0]], dtype=np.float32)] * len(inputs)
+
+    monkeypatch.setattr(module, "resolve_dataset_task", lambda dataset_id, *, task_spec=None: (spec, resolved_task))
+    monkeypatch.setattr(
+        module,
+        "load_dataset_inputs",
+        lambda dataset_id, *, cache_root, task_spec, turbine_ids=None: (spec, resolved_task, series),
+    )
+    monkeypatch.setattr(
+        module,
+        "_profile_log",
+        lambda dataset_id, phase, **fields: progress_events.append({"dataset_id": dataset_id, "phase": phase, **fields}),
+    )
+    _patch_split_windows(monkeypatch, module, timestamps, target_indices=[3])
+
+    result = module.run_experiment(
+        dataset_ids=("sdwpf_kddcup",),
+        output_path=tmp_path / "chronos-2.csv",
+        device="cpu",
+        task_spec=task_spec,
+        pipeline=_FakePipeline(),
+        mode="univariate",
+        turbine_ids=("1",),
+        batch_size=1,
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
+        emit_progress_events=True,
+    )
+
+    progress_only = [event for event in progress_events if str(event["phase"]).startswith("progress_")]
+
+    assert result.height == 3
+    assert [event["phase"] for event in progress_only] == [
+        "progress_stage_start",
+        "progress_batch",
+        "progress_stage_complete",
+    ]
+    assert progress_only[0]["stage"] == "univariate"
+    assert progress_only[0]["stage_total_batches"] == 1
+    assert [event["completed_chunk_batches"] for event in progress_only if event["phase"] == "progress_batch"] == [1]
+    assert all(event["chunk_total_batches"] == 1 for event in progress_only)
+
+
+def test_run_experiment_emits_dense_test_only_metadata(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    _install_run_experiment_fakes(monkeypatch, module)
+    output_path = tmp_path / "chronos-2.csv"
+
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        output_path=output_path,
+        device="cpu",
+        mode="univariate",
+    )
+
+    assert output_path.exists()
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert result["task_id"].unique().to_list() == [module.TASK_ID]
+    assert result["split_protocol"].unique().to_list() == [module.SPLIT_PROTOCOL]
+    assert result["split_name"].unique().to_list() == ["test"]
 
 
 def test_run_experiment_univariate_power_stats_rejects_unsupported_only_dataset(monkeypatch, tmp_path) -> None:

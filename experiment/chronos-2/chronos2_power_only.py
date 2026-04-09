@@ -13,8 +13,32 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 import polars as pl
 
+COMMON_DIR = Path(__file__).resolve().parents[1] / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.insert(0, str(COMMON_DIR))
+
+from window_protocols import (  # noqa: E402
+    DEFAULT_WINDOW_PROTOCOL,
+    HORIZON_METRIC_SCOPE,
+    NON_OVERLAP_EVAL_PROTOCOL,
+    OVERALL_METRIC_SCOPE,
+    ROLLING_EVAL_PROTOCOL,
+    SPLIT_PROTOCOL,
+    WINDOW_PROTOCOL_CHOICES,
+    WindowDescriptorIndex,
+    build_chrono_split_lookup,
+    build_split_boundaries,
+    build_task_spec as build_window_protocol_task_spec,
+    build_window_descriptor_index as build_shared_window_descriptor_index,
+    default_output_path as resolve_default_output_path,
+    resolve_window_protocol,
+    split_window_index,
+    thin_non_overlap_window_index,
+)
+
 MODEL_ID = "amazon/chronos-2"
-TASK_ID = "next_6h_from_24h_stride_6h"
+EXPERIMENT_NAME = "chronos-2"
+TASK_ID = resolve_window_protocol(DEFAULT_WINDOW_PROTOCOL).task_id
 TARGET_POLICY = "invalid_to_nan_clip_0_rated"
 DEFAULT_DATASETS = ("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup")
 DEFAULT_BATCH_SIZE = 256
@@ -24,10 +48,24 @@ UNIVARIATE_POWER_STATS_SUFFIX = "_univariate_power_stats"
 MULTIVARIATE_KNN6_SUFFIX = "_multivariate_knn6"
 MULTIVARIATE_KNN6_POWER_STATS_SUFFIX = "_multivariate_knn6_power_stats"
 MODE_CHOICES = ("all", "univariate", "multivariate_knn6", "univariate_power_stats")
+EVAL_PROTOCOL_CHOICES = (ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CACHE_ROOT = _REPO_ROOT / "cache"
-_OUTPUT_PATH = _REPO_ROOT / "experiment" / "chronos-2.csv"
+_OUTPUT_PATH = resolve_default_output_path(
+    repo_root=_REPO_ROOT,
+    experiment_name=EXPERIMENT_NAME,
+    window_protocol=DEFAULT_WINDOW_PROTOCOL,
+)
 _POWER_ONLY_COLUMNS = ("dataset", "turbine_id", "timestamp", "target_kw", "quality_flags")
+_TASK_WINDOW_COLUMNS = (
+    "dataset",
+    "turbine_id",
+    "output_start_ts",
+    "output_end_ts",
+    "is_complete_input",
+    "is_complete_output",
+    "quality_flags",
+)
 _POWER_STATS_COVARIATE_SPECS = {
     "kelmarsh": (
         ("Power, Minimum (kW)", "cov00_min"),
@@ -61,9 +99,16 @@ _RESULT_COLUMNS = [
     "dataset_id",
     "model_id",
     "task_id",
+    "window_protocol",
     "history_steps",
     "forecast_steps",
     "stride_steps",
+    "split_protocol",
+    "split_name",
+    "eval_protocol",
+    "metric_scope",
+    "lead_step",
+    "lead_minutes",
     "target_policy",
     "window_count",
     "prediction_count",
@@ -75,13 +120,33 @@ _RESULT_COLUMNS = [
     "rmse_pu",
     "device",
     "runtime_seconds",
+    "train_window_count",
+    "val_window_count",
+    "test_window_count",
 ]
+PROFILE_LOG_PREFIX = "[chronos2_power_only] "
 
 
 @dataclass(frozen=True)
 class TurbineSeries:
     timestamps_us: np.ndarray
     target_kw_masked: np.ndarray
+
+
+@dataclass
+class ChunkProgressState:
+    chunk_total_batches: int = 0
+    completed_chunk_batches: int = 0
+
+
+@dataclass(frozen=True)
+class TaskCachePaths:
+    dataset_id: str
+    dataset_root: Path
+    task_dir: Path
+    window_index_path: Path
+    task_context_path: Path
+    turbine_static_path: Path
 
 
 @dataclass(frozen=True)
@@ -138,6 +203,7 @@ class TargetPanelRun:
     scored_row_index: int
     forecast_start_us_min: int | None = None
     forecast_start_us_max: int | None = None
+    timestamp_index_map: dict[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +213,32 @@ class TargetPowerStatsPanelRun:
     scored_row_index: int
     forecast_start_us_min: int | None = None
     forecast_start_us_max: int | None = None
+    timestamp_index_map: dict[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class PreparedSplitWindowSet:
+    train_window_count: int
+    val_window_count: int
+    test_window_count: int
+    test_rolling_windows: WindowDescriptorIndex
+    test_non_overlap_windows: WindowDescriptorIndex
+
+
+@dataclass(frozen=True)
+class EvaluationMetrics:
+    window_count: int
+    prediction_count: int
+    mae_kw: float | None
+    rmse_kw: float | None
+    mae_pu: float | None
+    rmse_pu: float | None
+    horizon_window_count: np.ndarray
+    horizon_prediction_count: np.ndarray
+    horizon_mae_kw: np.ndarray
+    horizon_rmse_kw: np.ndarray
+    horizon_mae_pu: np.ndarray
+    horizon_rmse_pu: np.ndarray
 
 
 def _ensure_repo_src_on_path() -> None:
@@ -155,17 +247,90 @@ def _ensure_repo_src_on_path() -> None:
         sys.path.insert(0, str(src_path))
 
 
-def build_task_spec():
-    _ensure_repo_src_on_path()
-    from wind_datasets import TaskSpec
+def build_task_spec(*, window_protocol: str = DEFAULT_WINDOW_PROTOCOL):
+    return build_window_protocol_task_spec(window_protocol, granularity="turbine")
 
-    return TaskSpec(
-        history_duration="24h",
-        forecast_duration="6h",
-        stride_duration="6h",
-        task_id=TASK_ID,
-        granularity="turbine",
+
+def default_output_path(*, window_protocol: str = DEFAULT_WINDOW_PROTOCOL) -> Path:
+    return resolve_default_output_path(
+        repo_root=_REPO_ROOT,
+        experiment_name=EXPERIMENT_NAME,
+        window_protocol=window_protocol,
     )
+
+
+def resolve_cache_paths(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> TaskCachePaths:
+    dataset_root = Path(cache_root) / dataset_id
+    task_dir = dataset_root / "tasks" / "default" / "turbine" / TASK_ID
+    return TaskCachePaths(
+        dataset_id=dataset_id,
+        dataset_root=dataset_root,
+        task_dir=task_dir,
+        window_index_path=task_dir / "window_index.parquet",
+        task_context_path=task_dir / "task_context.json",
+        turbine_static_path=dataset_root / "silver" / "meta" / "turbine_static.parquet",
+    )
+
+
+def ensure_task_cache(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> TaskCachePaths:
+    paths = resolve_cache_paths(dataset_id, cache_root=cache_root)
+    required_paths = (
+        paths.window_index_path,
+        paths.task_context_path,
+        paths.turbine_static_path,
+    )
+    if all(path.exists() for path in required_paths):
+        return paths
+
+    _ensure_repo_src_on_path()
+    try:
+        from wind_datasets import build_task_cache
+    except ImportError as exc:  # pragma: no cover - defensive
+        raise RuntimeError("Unable to import wind_datasets for task cache construction.") from exc
+
+    try:
+        build_task_cache(dataset_id, build_task_spec(), cache_root=cache_root)
+    except Exception as exc:  # pragma: no cover - exercised only when cache is missing
+        raise RuntimeError(
+            f"Task cache for dataset {dataset_id!r} is missing and could not be rebuilt. "
+            "Either prebuild the cache artifacts or configure wind_datasets.local.toml."
+        ) from exc
+
+    if not all(path.exists() for path in required_paths):
+        raise RuntimeError(f"Dataset cache for {dataset_id!r} is incomplete after rebuild.")
+    return paths
+
+
+def load_strict_window_index(
+    dataset_id: str,
+    *,
+    cache_root: str | Path = _CACHE_ROOT,
+    turbine_ids: Sequence[str] | None = None,
+) -> pl.DataFrame:
+    paths = ensure_task_cache(dataset_id, cache_root=cache_root)
+    load_started = time.monotonic()
+    window_index_scan = (
+        pl.scan_parquet(paths.window_index_path)
+        .select(list(_TASK_WINDOW_COLUMNS))
+        .filter(
+            pl.col("is_complete_input")
+            & pl.col("is_complete_output")
+            & (pl.col("quality_flags").fill_null("") == "")
+        )
+    )
+    if turbine_ids is not None:
+        window_index_scan = window_index_scan.filter(pl.col("turbine_id").is_in(list(turbine_ids)))
+    frame = window_index_scan.sort(["output_start_ts", "turbine_id"]).collect()
+    _profile_log(
+        dataset_id,
+        "load_window_index",
+        strict_windows=frame.height,
+        target_turbines=None if turbine_ids is None else len(tuple(dict.fromkeys(turbine_ids))),
+        duration_seconds=round(time.monotonic() - load_started, 6),
+    )
+    if frame.is_empty():
+        raise ValueError(f"Dataset {dataset_id!r} has no strict windows for {TASK_ID}.")
+    return frame
 
 
 def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
@@ -233,10 +398,22 @@ def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
         **fields,
     }
     print(
-        f"[chronos2_power_only] {json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}",
+        f"{PROFILE_LOG_PREFIX}{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}",
         file=sys.stderr,
         flush=True,
     )
+
+
+def _emit_progress_event(
+    dataset_id: str,
+    *,
+    enabled: bool,
+    phase: str,
+    **fields: object,
+) -> None:
+    if not enabled:
+        return
+    _profile_log(dataset_id, phase, **fields)
 
 
 def resolve_dataset_id(dataset_id: str) -> str:
@@ -795,6 +972,554 @@ def build_flattened_power_stats_covariates(
     return flattened_covariates
 
 
+def build_timestamps_by_turbine(
+    turbine_series_map: Mapping[str, TurbineSeries | TurbinePowerStatsSeries],
+) -> dict[str, np.ndarray]:
+    return {
+        turbine_id: np.asarray(turbine_series.timestamps_us, dtype=np.int64)
+        for turbine_id, turbine_series in turbine_series_map.items()
+    }
+
+
+def slice_window_descriptor(
+    windows: WindowDescriptorIndex,
+    *,
+    window_offset: int = 0,
+    max_windows_per_split: int | None = None,
+) -> WindowDescriptorIndex:
+    start = max(0, int(window_offset))
+    if start >= len(windows):
+        return WindowDescriptorIndex.empty()
+    stop = len(windows) if max_windows_per_split is None else min(len(windows), start + int(max_windows_per_split))
+    if stop <= start:
+        return WindowDescriptorIndex.empty()
+    return WindowDescriptorIndex(
+        turbine_indices=windows.turbine_indices[start:stop].copy(),
+        target_indices=windows.target_indices[start:stop].copy(),
+        output_start_us=windows.output_start_us[start:stop].copy(),
+        output_end_us=windows.output_end_us[start:stop].copy(),
+    )
+
+
+def resolve_selected_eval_protocols(
+    eval_protocols: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if eval_protocols is None:
+        return EVAL_PROTOCOL_CHOICES
+    resolved = tuple(dict.fromkeys(eval_protocols))
+    unsupported = [eval_protocol for eval_protocol in resolved if eval_protocol not in EVAL_PROTOCOL_CHOICES]
+    if unsupported:
+        raise ValueError(f"Unsupported eval protocols: {unsupported!r}")
+    return resolved
+
+
+def prepare_split_window_set(
+    dataset_id: str,
+    *,
+    cache_root: str | Path,
+    raw_timestamps: Sequence[datetime],
+    resolution_minutes: int,
+    history_steps: int,
+    forecast_steps: int,
+    turbine_ids: Sequence[str],
+    timestamps_by_turbine: Mapping[str, Sequence[int] | np.ndarray],
+) -> PreparedSplitWindowSet:
+    strict_window_index = load_strict_window_index(
+        dataset_id,
+        cache_root=cache_root,
+        turbine_ids=turbine_ids,
+    )
+    split_frames = split_window_index(
+        strict_window_index,
+        raw_timestamps=raw_timestamps,
+        resolution_minutes=resolution_minutes,
+        history_steps=history_steps,
+    )
+    test_rolling_windows = build_shared_window_descriptor_index(
+        split_frames["test"],
+        turbine_ids=turbine_ids,
+        timestamps_by_turbine=timestamps_by_turbine,
+    )
+    test_non_overlap_windows = thin_non_overlap_window_index(
+        test_rolling_windows,
+        turbine_ids=turbine_ids,
+        forecast_steps=forecast_steps,
+    )
+    return PreparedSplitWindowSet(
+        train_window_count=split_frames["train"].height,
+        val_window_count=split_frames["val"].height,
+        test_window_count=split_frames["test"].height,
+        test_rolling_windows=test_rolling_windows,
+        test_non_overlap_windows=test_non_overlap_windows,
+    )
+
+
+def iter_evaluation_windows(
+    split_windows: PreparedSplitWindowSet,
+    *,
+    eval_protocols: Sequence[str],
+    window_offset: int = 0,
+    max_windows_per_split: int | None = None,
+) -> tuple[tuple[str, WindowDescriptorIndex], ...]:
+    specs: list[tuple[str, WindowDescriptorIndex]] = []
+    for eval_protocol in eval_protocols:
+        base_windows = (
+            split_windows.test_rolling_windows
+            if eval_protocol == ROLLING_EVAL_PROTOCOL
+            else split_windows.test_non_overlap_windows
+        )
+        specs.append(
+            (
+                eval_protocol,
+                slice_window_descriptor(
+                    base_windows,
+                    window_offset=window_offset,
+                    max_windows_per_split=max_windows_per_split,
+                ),
+            )
+        )
+    return tuple(specs)
+
+
+def _window_bounds(windows: WindowDescriptorIndex) -> tuple[str | None, str | None]:
+    if len(windows) == 0:
+        return None, None
+    return (
+        _timestamp_us_to_string(int(windows.output_start_us.min())),
+        _timestamp_us_to_string(int(windows.output_end_us.max())),
+    )
+
+
+def _count_batches_from_windows(windows: WindowDescriptorIndex, batch_size: int) -> int:
+    if len(windows) == 0:
+        return 0
+    return (len(windows) + batch_size - 1) // batch_size
+
+
+def _iter_univariate_descriptor_batches(
+    *,
+    turbine_series: Sequence[TurbineSeries],
+    windows: WindowDescriptorIndex,
+    history_steps: int,
+    forecast_steps: int,
+    batch_size: int,
+) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    context_batch: list[np.ndarray] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamp_rows: list[np.ndarray] = []
+
+    for window_index_position in range(len(windows)):
+        turbine_index = int(windows.turbine_indices[window_index_position])
+        target_index = int(windows.target_indices[window_index_position])
+        series = turbine_series[turbine_index]
+        context = series.target_kw_masked[target_index - history_steps : target_index]
+        future = series.target_kw_masked[target_index : target_index + forecast_steps]
+        future_timestamp_values = series.timestamps_us[target_index : target_index + forecast_steps]
+        if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
+            continue
+        if np.isnan(context).all() or np.isnan(future).all():
+            continue
+        context_batch.append(context.astype(np.float32, copy=True))
+        future_rows.append(future.astype(np.float64, copy=True))
+        future_timestamp_rows.append(future_timestamp_values.astype(np.int64, copy=True))
+        if len(context_batch) >= batch_size:
+            yield (
+                np.stack(context_batch)[:, None, :],
+                np.stack(future_rows),
+                np.stack(future_timestamp_rows),
+            )
+            context_batch = []
+            future_rows = []
+            future_timestamp_rows = []
+
+    if context_batch:
+        yield (
+            np.stack(context_batch)[:, None, :],
+            np.stack(future_rows),
+            np.stack(future_timestamp_rows),
+        )
+
+
+def _iter_univariate_power_stats_descriptor_batches(
+    *,
+    turbine_series: Sequence[TurbinePowerStatsSeries],
+    windows: WindowDescriptorIndex,
+    history_steps: int,
+    forecast_steps: int,
+    batch_size: int,
+) -> Iterable[tuple[list[dict[str, object]], np.ndarray, np.ndarray]]:
+    input_batch: list[dict[str, object]] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamp_rows: list[np.ndarray] = []
+
+    for window_index_position in range(len(windows)):
+        turbine_index = int(windows.turbine_indices[window_index_position])
+        target_index = int(windows.target_indices[window_index_position])
+        series = turbine_series[turbine_index]
+        context = series.target_kw_masked[target_index - history_steps : target_index]
+        future = series.target_kw_masked[target_index : target_index + forecast_steps]
+        future_timestamp_values = series.timestamps_us[target_index : target_index + forecast_steps]
+        if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
+            continue
+        if np.isnan(context).all() or np.isnan(future).all():
+            continue
+        input_batch.append(
+            {
+                "target": context.astype(np.float32, copy=True),
+                "past_covariates": {
+                    column: values[target_index - history_steps : target_index].astype(np.float32, copy=True)
+                    for column, values in series.past_covariates.items()
+                },
+            }
+        )
+        future_rows.append(future.astype(np.float64, copy=True))
+        future_timestamp_rows.append(future_timestamp_values.astype(np.int64, copy=True))
+        if len(input_batch) >= batch_size:
+            yield (
+                input_batch,
+                np.stack(future_rows),
+                np.stack(future_timestamp_rows),
+            )
+            input_batch = []
+            future_rows = []
+            future_timestamp_rows = []
+
+    if input_batch:
+        yield (
+            input_batch,
+            np.stack(future_rows),
+            np.stack(future_timestamp_rows),
+        )
+
+
+def _select_panel_run_for_timestamp(
+    panel_runs: Sequence[TargetPanelRun | TargetPowerStatsPanelRun],
+    forecast_start_us: int,
+) -> TargetPanelRun | TargetPowerStatsPanelRun | None:
+    for panel_run in panel_runs:
+        if panel_run.forecast_start_us_min is not None and forecast_start_us < panel_run.forecast_start_us_min:
+            continue
+        if panel_run.forecast_start_us_max is not None and forecast_start_us > panel_run.forecast_start_us_max:
+            continue
+        timestamp_index_map = panel_run.timestamp_index_map or {}
+        if forecast_start_us in timestamp_index_map:
+            return panel_run
+    return None
+
+
+def _iter_selected_multivariate_batches(
+    *,
+    panel_runs_by_target: Mapping[str, Sequence[TargetPanelRun]],
+    target_turbine_ids: Sequence[str],
+    windows: WindowDescriptorIndex,
+    history_steps: int,
+    forecast_steps: int,
+    batch_size: int,
+) -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    context_batch: list[np.ndarray] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamps: list[np.ndarray] = []
+
+    for window_index_position in range(len(windows)):
+        target_turbine_id = target_turbine_ids[int(windows.turbine_indices[window_index_position])]
+        forecast_start_us = int(windows.output_start_us[window_index_position])
+        panel_run = _select_panel_run_for_timestamp(panel_runs_by_target[target_turbine_id], forecast_start_us)
+        if panel_run is None or panel_run.timestamp_index_map is None:
+            continue
+        target_index = panel_run.timestamp_index_map[forecast_start_us]
+        farm_panel = panel_run.farm_panel
+        context = farm_panel.target_kw_masked[target_index - history_steps : target_index].T
+        future = farm_panel.target_kw_masked[target_index : target_index + forecast_steps].T
+        future_timestamp_values = farm_panel.timestamps_us[target_index : target_index + forecast_steps]
+        if context.shape != (len(farm_panel.turbine_ids), history_steps):
+            continue
+        if future.shape != (len(farm_panel.turbine_ids), forecast_steps):
+            continue
+        if np.isnan(context).all() or np.isnan(future).all() or np.isnan(future[panel_run.scored_row_index]).all():
+            continue
+        context_batch.append(context.astype(np.float32, copy=True))
+        future_rows.append(future.astype(np.float64, copy=True))
+        future_timestamps.append(future_timestamp_values.astype(np.int64, copy=True))
+        if len(context_batch) >= batch_size:
+            yield (
+                np.stack(context_batch),
+                np.stack(future_rows),
+                np.stack(future_timestamps),
+            )
+            context_batch = []
+            future_rows = []
+            future_timestamps = []
+
+    if context_batch:
+        yield (
+            np.stack(context_batch),
+            np.stack(future_rows),
+            np.stack(future_timestamps),
+        )
+
+
+def _iter_selected_multivariate_power_stats_batches(
+    *,
+    panel_runs_by_target: Mapping[str, Sequence[TargetPowerStatsPanelRun]],
+    target_turbine_ids: Sequence[str],
+    windows: WindowDescriptorIndex,
+    history_steps: int,
+    forecast_steps: int,
+    batch_size: int,
+    covariate_specs: Sequence[tuple[str, str]],
+) -> Iterable[tuple[list[dict[str, object]], np.ndarray, np.ndarray]]:
+    input_batch: list[dict[str, object]] = []
+    future_rows: list[np.ndarray] = []
+    future_timestamps: list[np.ndarray] = []
+
+    for window_index_position in range(len(windows)):
+        target_turbine_id = target_turbine_ids[int(windows.turbine_indices[window_index_position])]
+        forecast_start_us = int(windows.output_start_us[window_index_position])
+        panel_run = _select_panel_run_for_timestamp(panel_runs_by_target[target_turbine_id], forecast_start_us)
+        if panel_run is None or panel_run.timestamp_index_map is None:
+            continue
+        target_index = panel_run.timestamp_index_map[forecast_start_us]
+        farm_panel = panel_run.farm_panel
+        context = farm_panel.target_kw_masked[target_index - history_steps : target_index].T
+        future = farm_panel.target_kw_masked[target_index : target_index + forecast_steps].T
+        future_timestamp_values = farm_panel.timestamps_us[target_index : target_index + forecast_steps]
+        if context.shape != (len(farm_panel.turbine_ids), history_steps):
+            continue
+        if future.shape != (len(farm_panel.turbine_ids), forecast_steps):
+            continue
+        if np.isnan(context).all() or np.isnan(future).all() or np.isnan(future[panel_run.scored_row_index]).all():
+            continue
+        input_batch.append(
+            {
+                "target": context.astype(np.float32, copy=True),
+                "past_covariates": build_flattened_power_stats_covariates(
+                    farm_panel,
+                    anchor_index=target_index - 1,
+                    history_steps=history_steps,
+                    covariate_specs=covariate_specs,
+                ),
+            }
+        )
+        future_rows.append(future.astype(np.float64, copy=True))
+        future_timestamps.append(future_timestamp_values.astype(np.int64, copy=True))
+        if len(input_batch) >= batch_size:
+            yield (
+                input_batch,
+                np.stack(future_rows),
+                np.stack(future_timestamps),
+            )
+            input_batch = []
+            future_rows = []
+            future_timestamps = []
+
+    if input_batch:
+        yield (
+            input_batch,
+            np.stack(future_rows),
+            np.stack(future_timestamps),
+        )
+
+
+def _initialize_metric_state(forecast_steps: int) -> dict[str, object]:
+    return {
+        "window_count": 0,
+        "prediction_count": 0,
+        "abs_error_sum": 0.0,
+        "squared_error_sum": 0.0,
+        "normalized_abs_error_sum": 0.0,
+        "normalized_squared_error_sum": 0.0,
+        "horizon_window_count": np.zeros((forecast_steps,), dtype=np.int64),
+        "horizon_prediction_count": np.zeros((forecast_steps,), dtype=np.int64),
+        "horizon_abs_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_squared_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_normalized_abs_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_normalized_squared_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+    }
+
+
+def _update_metric_state(
+    metrics: dict[str, object],
+    *,
+    prediction_batch: np.ndarray,
+    actual_batch: np.ndarray,
+    rated_power_kw: float,
+) -> None:
+    valid_mask = ~np.isnan(actual_batch)
+    if not valid_mask.any():
+        return
+    valid_window_mask = valid_mask.any(axis=1)
+    errors = prediction_batch - actual_batch
+    absolute_errors = np.where(valid_mask, np.abs(errors), 0.0)
+    squared_errors = np.where(valid_mask, np.square(errors), 0.0)
+    normalized_errors = errors / rated_power_kw
+    normalized_absolute_errors = np.where(valid_mask, np.abs(normalized_errors), 0.0)
+    normalized_squared_errors = np.where(valid_mask, np.square(normalized_errors), 0.0)
+    horizon_counts = valid_mask.sum(axis=0).astype(np.int64, copy=False)
+
+    metrics["window_count"] = int(metrics["window_count"]) + int(valid_window_mask.sum())
+    metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
+    metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(absolute_errors.sum())
+    metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(squared_errors.sum())
+    metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(normalized_absolute_errors.sum())
+    metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
+        normalized_squared_errors.sum()
+    )
+    metrics["horizon_window_count"] = np.asarray(metrics["horizon_window_count"], dtype=np.int64) + horizon_counts
+    metrics["horizon_prediction_count"] = np.asarray(metrics["horizon_prediction_count"], dtype=np.int64) + horizon_counts
+    metrics["horizon_abs_error_sum"] = np.asarray(metrics["horizon_abs_error_sum"], dtype=np.float64) + absolute_errors.sum(axis=0)
+    metrics["horizon_squared_error_sum"] = np.asarray(metrics["horizon_squared_error_sum"], dtype=np.float64) + squared_errors.sum(axis=0)
+    metrics["horizon_normalized_abs_error_sum"] = np.asarray(
+        metrics["horizon_normalized_abs_error_sum"],
+        dtype=np.float64,
+    ) + normalized_absolute_errors.sum(axis=0)
+    metrics["horizon_normalized_squared_error_sum"] = np.asarray(
+        metrics["horizon_normalized_squared_error_sum"],
+        dtype=np.float64,
+    ) + normalized_squared_errors.sum(axis=0)
+
+
+def _safe_array_divide(numerators: np.ndarray, denominators: np.ndarray) -> np.ndarray:
+    result = np.full(numerators.shape, np.nan, dtype=np.float64)
+    valid = denominators > 0
+    result[valid] = numerators[valid] / denominators[valid]
+    return result
+
+
+def _safe_array_rmse(squared_error_sum: np.ndarray, denominators: np.ndarray) -> np.ndarray:
+    result = np.full(squared_error_sum.shape, np.nan, dtype=np.float64)
+    valid = denominators > 0
+    result[valid] = np.sqrt(squared_error_sum[valid] / denominators[valid])
+    return result
+
+
+def finalize_metric_state(metrics: dict[str, object]) -> EvaluationMetrics:
+    prediction_count = int(metrics["prediction_count"])
+    horizon_prediction_count = np.asarray(metrics["horizon_prediction_count"], dtype=np.int64)
+    horizon_window_count = np.asarray(metrics["horizon_window_count"], dtype=np.int64)
+    horizon_mae_kw = _safe_array_divide(
+        np.asarray(metrics["horizon_abs_error_sum"], dtype=np.float64),
+        horizon_prediction_count,
+    )
+    horizon_rmse_kw = _safe_array_rmse(
+        np.asarray(metrics["horizon_squared_error_sum"], dtype=np.float64),
+        horizon_prediction_count,
+    )
+    horizon_mae_pu = _safe_array_divide(
+        np.asarray(metrics["horizon_normalized_abs_error_sum"], dtype=np.float64),
+        horizon_prediction_count,
+    )
+    horizon_rmse_pu = _safe_array_rmse(
+        np.asarray(metrics["horizon_normalized_squared_error_sum"], dtype=np.float64),
+        horizon_prediction_count,
+    )
+    return EvaluationMetrics(
+        window_count=int(metrics["window_count"]),
+        prediction_count=prediction_count,
+        mae_kw=_safe_divide(float(metrics["abs_error_sum"]), prediction_count),
+        rmse_kw=_safe_rmse(float(metrics["squared_error_sum"]), prediction_count),
+        mae_pu=_safe_divide(float(metrics["normalized_abs_error_sum"]), prediction_count),
+        rmse_pu=_safe_rmse(float(metrics["normalized_squared_error_sum"]), prediction_count),
+        horizon_window_count=horizon_window_count,
+        horizon_prediction_count=horizon_prediction_count,
+        horizon_mae_kw=horizon_mae_kw,
+        horizon_rmse_kw=horizon_rmse_kw,
+        horizon_mae_pu=horizon_mae_pu,
+        horizon_rmse_pu=horizon_rmse_pu,
+    )
+
+
+def _metric_value(value: float | np.floating[Any] | None) -> float | None:
+    if value is None:
+        return None
+    if np.isnan(value):
+        return None
+    return float(value)
+
+
+def build_result_rows(
+    *,
+    dataset_id: str,
+    suffix: str,
+    resolved_task: Any,
+    resolution_minutes: int,
+    split_windows: PreparedSplitWindowSet,
+    runtime_seconds: float,
+    device: str,
+    evaluation_results: Sequence[tuple[str, WindowDescriptorIndex, EvaluationMetrics]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    base_row = {
+        "dataset_id": f"{dataset_id}{suffix}",
+        "model_id": MODEL_ID,
+        "task_id": resolved_task.task_id,
+        "window_protocol": DEFAULT_WINDOW_PROTOCOL,
+        "history_steps": resolved_task.history_steps,
+        "forecast_steps": resolved_task.forecast_steps,
+        "stride_steps": resolved_task.stride_steps,
+        "split_protocol": SPLIT_PROTOCOL,
+        "split_name": "test",
+        "target_policy": TARGET_POLICY,
+        "device": device,
+        "runtime_seconds": round(runtime_seconds, 6),
+        "train_window_count": split_windows.train_window_count,
+        "val_window_count": split_windows.val_window_count,
+        "test_window_count": split_windows.test_window_count,
+    }
+    for eval_protocol, windows, metrics in evaluation_results:
+        start_timestamp, end_timestamp = _window_bounds(windows)
+        rows.append(
+            {
+                **base_row,
+                "eval_protocol": eval_protocol,
+                "metric_scope": OVERALL_METRIC_SCOPE,
+                "lead_step": None,
+                "lead_minutes": None,
+                "window_count": int(metrics.window_count),
+                "prediction_count": int(metrics.prediction_count),
+                "start_timestamp": start_timestamp,
+                "end_timestamp": end_timestamp,
+                "mae_kw": _metric_value(metrics.mae_kw),
+                "rmse_kw": _metric_value(metrics.rmse_kw),
+                "mae_pu": _metric_value(metrics.mae_pu),
+                "rmse_pu": _metric_value(metrics.rmse_pu),
+            }
+        )
+        for lead_index in range(resolved_task.forecast_steps):
+            lead_step = lead_index + 1
+            rows.append(
+                {
+                    **base_row,
+                    "eval_protocol": eval_protocol,
+                    "metric_scope": HORIZON_METRIC_SCOPE,
+                    "lead_step": lead_step,
+                    "lead_minutes": lead_step * resolution_minutes,
+                    "window_count": int(metrics.horizon_window_count[lead_index]),
+                    "prediction_count": int(metrics.horizon_prediction_count[lead_index]),
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp,
+                    "mae_kw": _metric_value(metrics.horizon_mae_kw[lead_index]),
+                    "rmse_kw": _metric_value(metrics.horizon_rmse_kw[lead_index]),
+                    "mae_pu": _metric_value(metrics.horizon_mae_pu[lead_index]),
+                    "rmse_pu": _metric_value(metrics.horizon_rmse_pu[lead_index]),
+                }
+            )
+    return rows
+
+
+def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    eval_order = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
+    metric_scope_order = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
+    return (
+        frame.with_columns(
+            pl.col("eval_protocol").replace_strict(eval_order, default=len(eval_order)).alias("__eval_order"),
+            pl.col("metric_scope").replace_strict(metric_scope_order, default=len(metric_scope_order)).alias("__metric_scope_order"),
+            pl.col("lead_step").fill_null(0).alias("__lead_order"),
+        )
+        .sort(["dataset_id", "__eval_order", "__metric_scope_order", "__lead_order"])
+        .drop(["__eval_order", "__metric_scope_order", "__lead_order"])
+    )
+
+
 def _timestamp_us_to_string(timestamp_us: int | None) -> str | None:
     if timestamp_us is None:
         return None
@@ -1191,6 +1916,128 @@ def _iter_multivariate_power_stats_batches_for_runs(
             break
 
 
+def _count_retained_univariate_windows(
+    *,
+    timestamps_us: np.ndarray,
+    target_kw_masked: np.ndarray,
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> int:
+    retained_windows = 0
+    skipped_windows = 0
+    emitted_windows = 0
+    max_anchor_index = timestamps_us.shape[0] - forecast_steps
+
+    for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+        context = target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1]
+        future = target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps]
+        if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
+            continue
+        if np.isnan(context).all() or np.isnan(future).all():
+            continue
+        if skipped_windows < window_offset:
+            skipped_windows += 1
+            continue
+
+        retained_windows += 1
+        emitted_windows += 1
+        if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+            break
+
+    return retained_windows
+
+
+def _count_univariate_batches_for_turbine(
+    *,
+    turbine_series: TurbineSeries | TurbinePowerStatsSeries,
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    batch_size: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> int:
+    retained_windows = _count_retained_univariate_windows(
+        timestamps_us=turbine_series.timestamps_us,
+        target_kw_masked=turbine_series.target_kw_masked,
+        history_steps=history_steps,
+        forecast_steps=forecast_steps,
+        stride_steps=stride_steps,
+        window_offset=window_offset,
+        max_windows_per_dataset=max_windows_per_dataset,
+    )
+    if retained_windows == 0:
+        return 0
+    return (retained_windows + batch_size - 1) // batch_size
+
+
+def _count_multivariate_batches_for_runs(
+    *,
+    panel_runs: Sequence[TargetPanelRun | TargetPowerStatsPanelRun],
+    history_steps: int,
+    forecast_steps: int,
+    stride_steps: int,
+    batch_size: int,
+    window_offset: int = 0,
+    max_windows_per_dataset: int | None = None,
+) -> int:
+    batch_count = 0
+    buffered_windows = 0
+    emitted_windows = 0
+    skipped_windows = 0
+    max_windows_reached = False
+
+    def flush_batch() -> None:
+        nonlocal batch_count, buffered_windows
+        if buffered_windows > 0:
+            batch_count += 1
+            buffered_windows = 0
+
+    for panel_run in panel_runs:
+        farm_panel = panel_run.farm_panel
+        max_anchor_index = farm_panel.timestamps_us.shape[0] - forecast_steps
+        for anchor_index in range(history_steps - 1, max_anchor_index, stride_steps):
+            forecast_start_us = int(farm_panel.timestamps_us[anchor_index + 1])
+            if panel_run.forecast_start_us_min is not None and forecast_start_us < panel_run.forecast_start_us_min:
+                continue
+            if panel_run.forecast_start_us_max is not None and forecast_start_us > panel_run.forecast_start_us_max:
+                continue
+
+            context = farm_panel.target_kw_masked[anchor_index - history_steps + 1 : anchor_index + 1].T
+            future = farm_panel.target_kw_masked[anchor_index + 1 : anchor_index + 1 + forecast_steps].T
+            if context.shape != (len(farm_panel.turbine_ids), history_steps):
+                continue
+            if future.shape != (len(farm_panel.turbine_ids), forecast_steps):
+                continue
+            if (
+                np.isnan(context).all()
+                or np.isnan(future).all()
+                or np.isnan(future[panel_run.scored_row_index]).all()
+            ):
+                continue
+            if skipped_windows < window_offset:
+                skipped_windows += 1
+                continue
+
+            buffered_windows += 1
+            emitted_windows += 1
+            if buffered_windows >= batch_size:
+                batch_count += 1
+                buffered_windows = 0
+            if max_windows_per_dataset is not None and emitted_windows >= max_windows_per_dataset:
+                max_windows_reached = True
+                break
+
+        flush_batch()
+        if max_windows_reached:
+            break
+
+    return batch_count
+
+
 def _count_variates(value: Any) -> int:
     array = _coerce_array(value)
     if array.ndim == 1:
@@ -1283,12 +2130,14 @@ def _build_result_row(
     metrics: dict[str, float | int | None],
     runtime_seconds: float,
     device: str,
+    window_protocol: str,
 ) -> dict[str, object]:
     prediction_count = int(metrics["prediction_count"])
     return {
         "dataset_id": f"{dataset_id}{suffix}",
         "model_id": MODEL_ID,
-        "task_id": TASK_ID,
+        "task_id": resolved_task.task_id,
+        "window_protocol": window_protocol,
         "history_steps": resolved_task.history_steps,
         "forecast_steps": resolved_task.forecast_steps,
         "stride_steps": resolved_task.stride_steps,
@@ -1314,13 +2163,17 @@ def evaluate_univariate_dataset(
     task_spec=None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     window_offset: int = 0,
-    max_windows_per_dataset: int | None = None,
+    max_windows_per_split: int | None = None,
     device: str | None = None,
     turbine_ids: Sequence[str] | None = None,
-) -> dict[str, object]:
+    eval_protocols: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
+    progress_state: ChunkProgressState | None = None,
+) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
     selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    selected_eval_protocols = resolve_selected_eval_protocols(eval_protocols)
 
     spec, resolved_task, series = load_dataset_inputs(
         dataset_id,
@@ -1344,18 +2197,52 @@ def evaluate_univariate_dataset(
         duration_seconds=round(time.monotonic() - prepare_started, 6),
     )
     turbine_series_map = build_turbine_series_map(prepared_series)
-    metrics = _initialize_metrics()
+    split_windows = prepare_split_window_set(
+        spec.dataset_id,
+        cache_root=cache_root,
+        raw_timestamps=prepared_series["timestamp"].to_list(),
+        resolution_minutes=spec.resolution_minutes,
+        history_steps=resolved_task.history_steps,
+        forecast_steps=resolved_task.forecast_steps,
+        turbine_ids=selected_turbine_ids,
+        timestamps_by_turbine=build_timestamps_by_turbine(turbine_series_map),
+    )
+    evaluation_window_specs = iter_evaluation_windows(
+        split_windows,
+        eval_protocols=selected_eval_protocols,
+        window_offset=window_offset,
+        max_windows_per_split=max_windows_per_split,
+    )
+    ordered_turbine_series = tuple(turbine_series_map[turbine_id] for turbine_id in selected_turbine_ids)
+    stage_total_batches = sum(
+        _count_batches_from_windows(windows, batch_size)
+        for _, windows in evaluation_window_specs
+    )
+    evaluation_results: list[tuple[str, WindowDescriptorIndex, EvaluationMetrics]] = []
+    if emit_progress_events:
+        if progress_state is None:
+            raise ValueError("emit_progress_events requires progress_state.")
+        progress_state.chunk_total_batches += stage_total_batches
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_start",
+            stage="univariate",
+            stage_total_batches=stage_total_batches,
+            completed_stage_batches=0,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
+    stage_completed_batches = 0
 
-    for turbine_id in selected_turbine_ids:
-        turbine_series = turbine_series_map[turbine_id]
-        for context_batch, actual_batch, future_timestamps_batch in _iter_univariate_batches(
-            turbine_series=turbine_series,
+    for eval_protocol, windows in evaluation_window_specs:
+        metrics = _initialize_metric_state(resolved_task.forecast_steps)
+        for context_batch, actual_batch, _future_timestamps_batch in _iter_univariate_descriptor_batches(
+            turbine_series=ordered_turbine_series,
+            windows=windows,
             history_steps=resolved_task.history_steps,
             forecast_steps=resolved_task.forecast_steps,
-            stride_steps=resolved_task.stride_steps,
             batch_size=batch_size,
-            window_offset=window_offset,
-            max_windows_per_dataset=max_windows_per_dataset,
         ):
             quantiles, _ = pipeline.predict_quantiles(
                 inputs=context_batch,
@@ -1364,25 +2251,40 @@ def evaluate_univariate_dataset(
                 batch_size=resolve_pipeline_batch_size(context_batch),
                 limit_prediction_length=False,
             )
+            if emit_progress_events:
+                stage_completed_batches += 1
+                progress_state.completed_chunk_batches += 1
+                _emit_progress_event(
+                    spec.dataset_id,
+                    enabled=True,
+                    phase="progress_batch",
+                    stage="univariate",
+                    eval_protocol=eval_protocol,
+                    completed_stage_batches=stage_completed_batches,
+                    stage_total_batches=stage_total_batches,
+                    completed_chunk_batches=progress_state.completed_chunk_batches,
+                    chunk_total_batches=progress_state.chunk_total_batches,
+                )
             prediction_batch = np.stack([_extract_median_forecast(prediction)[0] for prediction in quantiles])
-            valid_mask = ~np.isnan(actual_batch)
-            if not valid_mask.any():
-                continue
-
-            errors = prediction_batch - actual_batch
-            valid_errors = errors[valid_mask]
-            normalized_valid_errors = valid_errors / rated_power_kw
-
-            metrics["window_count"] = int(metrics["window_count"]) + prediction_batch.shape[0]
-            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
-            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
-            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
-            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(np.abs(normalized_valid_errors).sum())
-            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
-                np.square(normalized_valid_errors).sum()
+            _update_metric_state(
+                metrics,
+                prediction_batch=prediction_batch,
+                actual_batch=actual_batch,
+                rated_power_kw=rated_power_kw,
             )
-            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(future_timestamps_batch, valid_mask)
-            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+        evaluation_results.append((eval_protocol, windows, finalize_metric_state(metrics)))
+
+    if emit_progress_events:
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_complete",
+            stage="univariate",
+            completed_stage_batches=stage_completed_batches,
+            stage_total_batches=stage_total_batches,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
 
     runtime_seconds = time.monotonic() - dataset_start
     _profile_log(
@@ -1391,17 +2293,17 @@ def evaluate_univariate_dataset(
         target_turbines=len(selected_turbine_ids),
         input_turbines=len(selected_turbine_ids),
         runtime_seconds=round(runtime_seconds, 6),
-        window_count=int(metrics["window_count"]),
-        prediction_count=int(metrics["prediction_count"]),
+        test_window_count=split_windows.test_window_count,
     )
-    return _build_result_row(
+    return build_result_rows(
         dataset_id=spec.dataset_id,
         suffix=UNIVARIATE_SUFFIX,
         resolved_task=resolved_task,
-        rated_power_kw=rated_power_kw,
-        metrics=metrics,
+        resolution_minutes=spec.resolution_minutes,
+        split_windows=split_windows,
         runtime_seconds=runtime_seconds,
         device=device or select_device(),
+        evaluation_results=evaluation_results,
     )
 
 
@@ -1413,14 +2315,18 @@ def evaluate_univariate_power_stats_dataset(
     task_spec=None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     window_offset: int = 0,
-    max_windows_per_dataset: int | None = None,
+    max_windows_per_split: int | None = None,
     device: str | None = None,
     turbine_ids: Sequence[str] | None = None,
-) -> dict[str, object]:
+    eval_protocols: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
+    progress_state: ChunkProgressState | None = None,
+) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
     covariate_columns = resolve_power_stats_covariate_columns(spec.dataset_id)
     selected_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    selected_eval_protocols = resolve_selected_eval_protocols(eval_protocols)
 
     spec, resolved_task, series = load_dataset_inputs(
         dataset_id,
@@ -1450,18 +2356,53 @@ def evaluate_univariate_power_stats_dataset(
         prepared_series,
         covariate_columns=covariate_columns,
     )
-    metrics = _initialize_metrics()
+    split_windows = prepare_split_window_set(
+        spec.dataset_id,
+        cache_root=cache_root,
+        raw_timestamps=prepared_series["timestamp"].to_list(),
+        resolution_minutes=spec.resolution_minutes,
+        history_steps=resolved_task.history_steps,
+        forecast_steps=resolved_task.forecast_steps,
+        turbine_ids=selected_turbine_ids,
+        timestamps_by_turbine=build_timestamps_by_turbine(turbine_series_map),
+    )
+    evaluation_window_specs = iter_evaluation_windows(
+        split_windows,
+        eval_protocols=selected_eval_protocols,
+        window_offset=window_offset,
+        max_windows_per_split=max_windows_per_split,
+    )
+    ordered_turbine_series = tuple(turbine_series_map[turbine_id] for turbine_id in selected_turbine_ids)
+    stage_total_batches = sum(
+        _count_batches_from_windows(windows, batch_size)
+        for _, windows in evaluation_window_specs
+    )
+    evaluation_results: list[tuple[str, WindowDescriptorIndex, EvaluationMetrics]] = []
+    if emit_progress_events:
+        if progress_state is None:
+            raise ValueError("emit_progress_events requires progress_state.")
+        progress_state.chunk_total_batches += stage_total_batches
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_start",
+            stage="univariate_power_stats",
+            covariates=len(covariate_columns),
+            stage_total_batches=stage_total_batches,
+            completed_stage_batches=0,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
+    stage_completed_batches = 0
 
-    for turbine_id in selected_turbine_ids:
-        turbine_series = turbine_series_map[turbine_id]
-        for input_batch, actual_batch, future_timestamps_batch in _iter_univariate_power_stats_batches(
-            turbine_series=turbine_series,
+    for eval_protocol, windows in evaluation_window_specs:
+        metrics = _initialize_metric_state(resolved_task.forecast_steps)
+        for input_batch, actual_batch, _future_timestamps_batch in _iter_univariate_power_stats_descriptor_batches(
+            turbine_series=ordered_turbine_series,
+            windows=windows,
             history_steps=resolved_task.history_steps,
             forecast_steps=resolved_task.forecast_steps,
-            stride_steps=resolved_task.stride_steps,
             batch_size=batch_size,
-            window_offset=window_offset,
-            max_windows_per_dataset=max_windows_per_dataset,
         ):
             quantiles, _ = pipeline.predict_quantiles(
                 inputs=input_batch,
@@ -1470,25 +2411,42 @@ def evaluate_univariate_power_stats_dataset(
                 batch_size=resolve_pipeline_batch_size(input_batch),
                 limit_prediction_length=False,
             )
+            if emit_progress_events:
+                stage_completed_batches += 1
+                progress_state.completed_chunk_batches += 1
+                _emit_progress_event(
+                    spec.dataset_id,
+                    enabled=True,
+                    phase="progress_batch",
+                    stage="univariate_power_stats",
+                    eval_protocol=eval_protocol,
+                    covariates=len(covariate_columns),
+                    completed_stage_batches=stage_completed_batches,
+                    stage_total_batches=stage_total_batches,
+                    completed_chunk_batches=progress_state.completed_chunk_batches,
+                    chunk_total_batches=progress_state.chunk_total_batches,
+                )
             prediction_batch = np.stack([_extract_median_forecast(prediction)[0] for prediction in quantiles])
-            valid_mask = ~np.isnan(actual_batch)
-            if not valid_mask.any():
-                continue
-
-            errors = prediction_batch - actual_batch
-            valid_errors = errors[valid_mask]
-            normalized_valid_errors = valid_errors / rated_power_kw
-
-            metrics["window_count"] = int(metrics["window_count"]) + prediction_batch.shape[0]
-            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
-            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
-            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
-            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(np.abs(normalized_valid_errors).sum())
-            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
-                np.square(normalized_valid_errors).sum()
+            _update_metric_state(
+                metrics,
+                prediction_batch=prediction_batch,
+                actual_batch=actual_batch,
+                rated_power_kw=rated_power_kw,
             )
-            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(future_timestamps_batch, valid_mask)
-            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+        evaluation_results.append((eval_protocol, windows, finalize_metric_state(metrics)))
+
+    if emit_progress_events:
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_complete",
+            stage="univariate_power_stats",
+            covariates=len(covariate_columns),
+            completed_stage_batches=stage_completed_batches,
+            stage_total_batches=stage_total_batches,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
 
     runtime_seconds = time.monotonic() - dataset_start
     _profile_log(
@@ -1497,17 +2455,17 @@ def evaluate_univariate_power_stats_dataset(
         target_turbines=len(selected_turbine_ids),
         input_turbines=len(selected_turbine_ids),
         runtime_seconds=round(runtime_seconds, 6),
-        window_count=int(metrics["window_count"]),
-        prediction_count=int(metrics["prediction_count"]),
+        test_window_count=split_windows.test_window_count,
     )
-    return _build_result_row(
+    return build_result_rows(
         dataset_id=spec.dataset_id,
         suffix=UNIVARIATE_POWER_STATS_SUFFIX,
         resolved_task=resolved_task,
-        rated_power_kw=rated_power_kw,
-        metrics=metrics,
+        resolution_minutes=spec.resolution_minutes,
+        split_windows=split_windows,
         runtime_seconds=runtime_seconds,
         device=device or select_device(),
+        evaluation_results=evaluation_results,
     )
 
 
@@ -1519,19 +2477,41 @@ def evaluate_multivariate_knn6_dataset(
     task_spec=None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     window_offset: int = 0,
-    max_windows_per_dataset: int | None = None,
+    max_windows_per_split: int | None = None,
     device: str | None = None,
     turbine_ids: Sequence[str] | None = None,
-) -> dict[str, object]:
+    eval_protocols: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
+    progress_state: ChunkProgressState | None = None,
+) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
     target_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    selected_eval_protocols = resolve_selected_eval_protocols(eval_protocols)
+    _, _, target_series = load_dataset_inputs(
+        dataset_id,
+        cache_root=cache_root,
+        task_spec=task_spec,
+        turbine_ids=target_turbine_ids,
+    )
+    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
+    prepared_target_series = prepare_power_only_series(target_series, rated_power_kw=rated_power_kw)
+    target_turbine_series_map = build_turbine_series_map(prepared_target_series)
+    split_windows = prepare_split_window_set(
+        spec.dataset_id,
+        cache_root=cache_root,
+        raw_timestamps=prepared_target_series["timestamp"].to_list(),
+        resolution_minutes=spec.resolution_minutes,
+        history_steps=resolved_task.history_steps,
+        forecast_steps=resolved_task.forecast_steps,
+        turbine_ids=target_turbine_ids,
+        timestamps_by_turbine=build_timestamps_by_turbine(target_turbine_series_map),
+    )
     epoch_configs = resolve_multivariate_epoch_configs(
         spec,
         target_turbine_ids=target_turbine_ids,
     )
     turbine_static = load_dataset_turbine_static(spec.dataset_id, cache_root=cache_root)
-    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
     epoch_contexts: list[PreparedMultivariateEpoch] = []
     all_required_input_turbine_ids: list[str] = []
 
@@ -1581,8 +2561,7 @@ def evaluate_multivariate_knn6_dataset(
             )
         )
 
-    metrics = _initialize_metrics()
-
+    panel_runs_by_target: dict[str, list[TargetPanelRun]] = {}
     for target_turbine_id in target_turbine_ids:
         panel_runs: list[TargetPanelRun] = []
         for epoch_context in epoch_contexts:
@@ -1612,17 +2591,50 @@ def evaluate_multivariate_knn6_dataset(
                     scored_row_index=0,
                     forecast_start_us_min=epoch_context.config.forecast_start_us_min,
                     forecast_start_us_max=epoch_context.config.forecast_start_us_max,
+                    timestamp_index_map={
+                        int(timestamp): index
+                        for index, timestamp in enumerate(local_panel.timestamps_us.tolist())
+                    },
                 )
             )
+        panel_runs_by_target[target_turbine_id] = panel_runs
 
-        for context_batch, actual_batch, future_timestamps_batch in _iter_multivariate_batches_for_runs(
-            panel_runs=panel_runs,
+    evaluation_window_specs = iter_evaluation_windows(
+        split_windows,
+        eval_protocols=selected_eval_protocols,
+        window_offset=window_offset,
+        max_windows_per_split=max_windows_per_split,
+    )
+    stage_total_batches = sum(
+        _count_batches_from_windows(windows, batch_size)
+        for _, windows in evaluation_window_specs
+    )
+    evaluation_results: list[tuple[str, WindowDescriptorIndex, EvaluationMetrics]] = []
+    if emit_progress_events:
+        if progress_state is None:
+            raise ValueError("emit_progress_events requires progress_state.")
+        progress_state.chunk_total_batches += stage_total_batches
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_start",
+            stage="multivariate_knn6",
+            stage_total_batches=stage_total_batches,
+            completed_stage_batches=0,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
+    stage_completed_batches = 0
+
+    for eval_protocol, windows in evaluation_window_specs:
+        metrics = _initialize_metric_state(resolved_task.forecast_steps)
+        for context_batch, actual_batch, _future_timestamps_batch in _iter_selected_multivariate_batches(
+            panel_runs_by_target=panel_runs_by_target,
+            target_turbine_ids=target_turbine_ids,
+            windows=windows,
             history_steps=resolved_task.history_steps,
             forecast_steps=resolved_task.forecast_steps,
-            stride_steps=resolved_task.stride_steps,
             batch_size=batch_size,
-            window_offset=window_offset,
-            max_windows_per_dataset=max_windows_per_dataset,
         ):
             quantiles, _ = pipeline.predict_quantiles(
                 inputs=context_batch,
@@ -1632,33 +2644,42 @@ def evaluate_multivariate_knn6_dataset(
                 limit_prediction_length=False,
                 cross_learning=False,
             )
+            if emit_progress_events:
+                stage_completed_batches += 1
+                progress_state.completed_chunk_batches += 1
+                _emit_progress_event(
+                    spec.dataset_id,
+                    enabled=True,
+                    phase="progress_batch",
+                    stage="multivariate_knn6",
+                    eval_protocol=eval_protocol,
+                    completed_stage_batches=stage_completed_batches,
+                    stage_total_batches=stage_total_batches,
+                    completed_chunk_batches=progress_state.completed_chunk_batches,
+                    chunk_total_batches=progress_state.chunk_total_batches,
+                )
             prediction_batch = np.stack([_extract_median_forecast(prediction) for prediction in quantiles])
             target_prediction_batch = prediction_batch[:, 0, :]
             target_actual_batch = actual_batch[:, 0, :]
-            valid_mask = ~np.isnan(target_actual_batch)
-            if not valid_mask.any():
-                continue
-            valid_window_mask = ~np.isnan(target_actual_batch).all(axis=1)
+            _update_metric_state(
+                metrics,
+                prediction_batch=target_prediction_batch,
+                actual_batch=target_actual_batch,
+                rated_power_kw=rated_power_kw,
+            )
+        evaluation_results.append((eval_protocol, windows, finalize_metric_state(metrics)))
 
-            errors = target_prediction_batch - target_actual_batch
-            valid_errors = errors[valid_mask]
-            normalized_valid_errors = valid_errors / rated_power_kw
-
-            metrics["window_count"] = int(metrics["window_count"]) + int(valid_window_mask.sum())
-            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
-            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
-            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
-            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(
-                np.abs(normalized_valid_errors).sum()
-            )
-            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
-                np.square(normalized_valid_errors).sum()
-            )
-            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(
-                future_timestamps_batch,
-                valid_mask,
-            )
-            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+    if emit_progress_events:
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_complete",
+            stage="multivariate_knn6",
+            completed_stage_batches=stage_completed_batches,
+            stage_total_batches=stage_total_batches,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
 
     runtime_seconds = time.monotonic() - dataset_start
     _profile_log(
@@ -1667,17 +2688,17 @@ def evaluate_multivariate_knn6_dataset(
         target_turbines=len(target_turbine_ids),
         input_turbines=len(_ordered_unique(all_required_input_turbine_ids)),
         runtime_seconds=round(runtime_seconds, 6),
-        window_count=int(metrics["window_count"]),
-        prediction_count=int(metrics["prediction_count"]),
+        test_window_count=split_windows.test_window_count,
     )
-    return _build_result_row(
+    return build_result_rows(
         dataset_id=spec.dataset_id,
         suffix=MULTIVARIATE_KNN6_SUFFIX,
         resolved_task=resolved_task,
-        rated_power_kw=rated_power_kw,
-        metrics=metrics,
+        resolution_minutes=spec.resolution_minutes,
+        split_windows=split_windows,
         runtime_seconds=runtime_seconds,
         device=device or select_device(),
+        evaluation_results=evaluation_results,
     )
 
 
@@ -1689,21 +2710,43 @@ def evaluate_multivariate_knn6_power_stats_dataset(
     task_spec=None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     window_offset: int = 0,
-    max_windows_per_dataset: int | None = None,
+    max_windows_per_split: int | None = None,
     device: str | None = None,
     turbine_ids: Sequence[str] | None = None,
-) -> dict[str, object]:
+    eval_protocols: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
+    progress_state: ChunkProgressState | None = None,
+) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     spec, resolved_task = resolve_dataset_task(dataset_id, task_spec=task_spec)
     covariate_specs = resolve_power_stats_covariate_specs(spec.dataset_id)
     covariate_columns = tuple(column for column, _ in covariate_specs)
     target_turbine_ids = resolve_selected_turbine_ids(spec, turbine_ids)
+    selected_eval_protocols = resolve_selected_eval_protocols(eval_protocols)
+    _, _, target_series = load_dataset_inputs(
+        dataset_id,
+        cache_root=cache_root,
+        task_spec=task_spec,
+        turbine_ids=target_turbine_ids,
+    )
+    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
+    prepared_target_series = prepare_power_only_series(target_series, rated_power_kw=rated_power_kw)
+    target_turbine_series_map = build_turbine_series_map(prepared_target_series)
+    split_windows = prepare_split_window_set(
+        spec.dataset_id,
+        cache_root=cache_root,
+        raw_timestamps=prepared_target_series["timestamp"].to_list(),
+        resolution_minutes=spec.resolution_minutes,
+        history_steps=resolved_task.history_steps,
+        forecast_steps=resolved_task.forecast_steps,
+        turbine_ids=target_turbine_ids,
+        timestamps_by_turbine=build_timestamps_by_turbine(target_turbine_series_map),
+    )
     epoch_configs = resolve_multivariate_epoch_configs(
         spec,
         target_turbine_ids=target_turbine_ids,
     )
     turbine_static = load_dataset_turbine_static(spec.dataset_id, cache_root=cache_root)
-    rated_power_kw = resolve_rated_power_kw(spec.dataset_id)
     epoch_contexts: list[PreparedMultivariatePowerStatsEpoch] = []
     all_required_input_turbine_ids: list[str] = []
 
@@ -1763,8 +2806,7 @@ def evaluate_multivariate_knn6_power_stats_dataset(
             )
         )
 
-    metrics = _initialize_metrics()
-
+    panel_runs_by_target: dict[str, list[TargetPowerStatsPanelRun]] = {}
     for target_turbine_id in target_turbine_ids:
         panel_runs: list[TargetPowerStatsPanelRun] = []
         for epoch_context in epoch_contexts:
@@ -1796,18 +2838,52 @@ def evaluate_multivariate_knn6_power_stats_dataset(
                     scored_row_index=0,
                     forecast_start_us_min=epoch_context.config.forecast_start_us_min,
                     forecast_start_us_max=epoch_context.config.forecast_start_us_max,
+                    timestamp_index_map={
+                        int(timestamp): index
+                        for index, timestamp in enumerate(local_panel.timestamps_us.tolist())
+                    },
                 )
             )
+        panel_runs_by_target[target_turbine_id] = panel_runs
 
-        for input_batch, actual_batch, future_timestamps_batch in _iter_multivariate_power_stats_batches_for_runs(
-            panel_runs=panel_runs,
+    evaluation_window_specs = iter_evaluation_windows(
+        split_windows,
+        eval_protocols=selected_eval_protocols,
+        window_offset=window_offset,
+        max_windows_per_split=max_windows_per_split,
+    )
+    stage_total_batches = sum(
+        _count_batches_from_windows(windows, batch_size)
+        for _, windows in evaluation_window_specs
+    )
+    evaluation_results: list[tuple[str, WindowDescriptorIndex, EvaluationMetrics]] = []
+    if emit_progress_events:
+        if progress_state is None:
+            raise ValueError("emit_progress_events requires progress_state.")
+        progress_state.chunk_total_batches += stage_total_batches
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_start",
+            stage="multivariate_knn6_power_stats",
+            covariates=len(covariate_columns),
+            stage_total_batches=stage_total_batches,
+            completed_stage_batches=0,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
+    stage_completed_batches = 0
+
+    for eval_protocol, windows in evaluation_window_specs:
+        metrics = _initialize_metric_state(resolved_task.forecast_steps)
+        for input_batch, actual_batch, _future_timestamps_batch in _iter_selected_multivariate_power_stats_batches(
+            panel_runs_by_target=panel_runs_by_target,
+            target_turbine_ids=target_turbine_ids,
+            windows=windows,
             history_steps=resolved_task.history_steps,
             forecast_steps=resolved_task.forecast_steps,
-            stride_steps=resolved_task.stride_steps,
             batch_size=batch_size,
             covariate_specs=covariate_specs,
-            window_offset=window_offset,
-            max_windows_per_dataset=max_windows_per_dataset,
         ):
             quantiles, _ = pipeline.predict_quantiles(
                 inputs=input_batch,
@@ -1817,33 +2893,44 @@ def evaluate_multivariate_knn6_power_stats_dataset(
                 limit_prediction_length=False,
                 cross_learning=False,
             )
+            if emit_progress_events:
+                stage_completed_batches += 1
+                progress_state.completed_chunk_batches += 1
+                _emit_progress_event(
+                    spec.dataset_id,
+                    enabled=True,
+                    phase="progress_batch",
+                    stage="multivariate_knn6_power_stats",
+                    eval_protocol=eval_protocol,
+                    covariates=len(covariate_columns),
+                    completed_stage_batches=stage_completed_batches,
+                    stage_total_batches=stage_total_batches,
+                    completed_chunk_batches=progress_state.completed_chunk_batches,
+                    chunk_total_batches=progress_state.chunk_total_batches,
+                )
             prediction_batch = np.stack([_extract_median_forecast(prediction) for prediction in quantiles])
             target_prediction_batch = prediction_batch[:, 0, :]
             target_actual_batch = actual_batch[:, 0, :]
-            valid_mask = ~np.isnan(target_actual_batch)
-            if not valid_mask.any():
-                continue
-            valid_window_mask = ~np.isnan(target_actual_batch).all(axis=1)
+            _update_metric_state(
+                metrics,
+                prediction_batch=target_prediction_batch,
+                actual_batch=target_actual_batch,
+                rated_power_kw=rated_power_kw,
+            )
+        evaluation_results.append((eval_protocol, windows, finalize_metric_state(metrics)))
 
-            errors = target_prediction_batch - target_actual_batch
-            valid_errors = errors[valid_mask]
-            normalized_valid_errors = valid_errors / rated_power_kw
-
-            metrics["window_count"] = int(metrics["window_count"]) + int(valid_window_mask.sum())
-            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(valid_mask.sum())
-            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(np.abs(valid_errors).sum())
-            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(np.square(valid_errors).sum())
-            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(
-                np.abs(normalized_valid_errors).sum()
-            )
-            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
-                np.square(normalized_valid_errors).sum()
-            )
-            batch_start_us, batch_end_us = _valid_timestamp_span_from_univariate(
-                future_timestamps_batch,
-                valid_mask,
-            )
-            _update_timestamp_bounds(metrics, batch_start_us, batch_end_us)
+    if emit_progress_events:
+        _emit_progress_event(
+            spec.dataset_id,
+            enabled=True,
+            phase="progress_stage_complete",
+            stage="multivariate_knn6_power_stats",
+            covariates=len(covariate_columns),
+            completed_stage_batches=stage_completed_batches,
+            stage_total_batches=stage_total_batches,
+            completed_chunk_batches=progress_state.completed_chunk_batches,
+            chunk_total_batches=progress_state.chunk_total_batches,
+        )
 
     runtime_seconds = time.monotonic() - dataset_start
     _profile_log(
@@ -1853,17 +2940,17 @@ def evaluate_multivariate_knn6_power_stats_dataset(
         input_turbines=len(_ordered_unique(all_required_input_turbine_ids)),
         covariates=len(covariate_columns),
         runtime_seconds=round(runtime_seconds, 6),
-        window_count=int(metrics["window_count"]),
-        prediction_count=int(metrics["prediction_count"]),
+        test_window_count=split_windows.test_window_count,
     )
-    return _build_result_row(
+    return build_result_rows(
         dataset_id=spec.dataset_id,
         suffix=MULTIVARIATE_KNN6_POWER_STATS_SUFFIX,
         resolved_task=resolved_task,
-        rated_power_kw=rated_power_kw,
-        metrics=metrics,
+        resolution_minutes=spec.resolution_minutes,
+        split_windows=split_windows,
         runtime_seconds=runtime_seconds,
         device=device or select_device(),
+        evaluation_results=evaluation_results,
     )
 
 
@@ -1871,15 +2958,17 @@ def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
     cache_root: str | Path = _CACHE_ROOT,
-    output_path: str | Path = _OUTPUT_PATH,
+    output_path: str | Path | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     window_offset: int = 0,
-    max_windows_per_dataset: int | None = None,
+    max_windows_per_split: int | None = None,
     device: str | None = None,
     task_spec=None,
     pipeline: Any | None = None,
     mode: str = "all",
     turbine_ids: Sequence[str] | None = None,
+    eval_protocols: Sequence[str] | None = None,
+    emit_progress_events: bool = False,
 ) -> pl.DataFrame:
     if mode not in MODE_CHOICES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {MODE_CHOICES}.")
@@ -1890,26 +2979,31 @@ def run_experiment(
             "Mode 'univariate_power_stats' requires at least one dataset with power_stats support."
         )
 
-    resolved_task_spec = task_spec or build_task_spec()
+    selected_eval_protocols = resolve_selected_eval_protocols(eval_protocols)
+    resolved_task_spec = task_spec or build_task_spec(window_protocol=DEFAULT_WINDOW_PROTOCOL)
     resolved_device = device or select_device()
     resolved_pipeline = pipeline or load_pipeline(device=resolved_device)
     rows: list[dict[str, object]] = []
+    progress_state = ChunkProgressState() if emit_progress_events else None
 
     def _run_evaluator(evaluator, active_dataset_ids: Sequence[str]) -> None:
-        rows.extend(
-            evaluator(
+        for dataset_id in active_dataset_ids:
+            rows.extend(
+                evaluator(
                 dataset_id,
                 pipeline=resolved_pipeline,
                 cache_root=cache_root,
                 task_spec=resolved_task_spec,
                 batch_size=batch_size,
                 window_offset=window_offset,
-                max_windows_per_dataset=max_windows_per_dataset,
+                max_windows_per_split=max_windows_per_split,
                 device=resolved_device,
                 turbine_ids=turbine_ids,
+                eval_protocols=selected_eval_protocols,
+                emit_progress_events=emit_progress_events,
+                progress_state=progress_state,
             )
-            for dataset_id in active_dataset_ids
-        )
+            )
 
     if mode in {"all", "univariate"}:
         _run_evaluator(evaluate_univariate_dataset, dataset_ids)
@@ -1919,8 +3013,8 @@ def run_experiment(
         _run_evaluator(evaluate_multivariate_knn6_dataset, dataset_ids)
         _run_evaluator(evaluate_multivariate_knn6_power_stats_dataset, power_stats_dataset_ids)
 
-    results = pl.DataFrame(rows).select(_RESULT_COLUMNS).sort("dataset_id")
-    output = Path(output_path)
+    results = sort_result_frame(pl.DataFrame(rows).select(_RESULT_COLUMNS))
+    output = Path(output_path) if output_path is not None else default_output_path(window_protocol=DEFAULT_WINDOW_PROTOCOL)
     output.parent.mkdir(parents=True, exist_ok=True)
     results.write_csv(output)
     return results
@@ -1944,8 +3038,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=_OUTPUT_PATH,
-        help="Output CSV path. Defaults to experiment/chronos-2.csv in the repo root.",
+        default=None,
+        help="Output CSV path. Defaults to a protocol-specific path under experiment/.",
     )
     parser.add_argument(
         "--batch-size",
@@ -1960,10 +3054,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip this many retained evaluation windows before scoring.",
     )
     parser.add_argument(
-        "--max-windows-per-dataset",
+        "--max-windows-per-split",
         type=int,
         default=None,
-        help="Optional smoke-test limit on the number of retained windows evaluated per dataset.",
+        help="Optional smoke-test limit on the number of retained test windows evaluated per protocol slice.",
     )
     parser.add_argument(
         "--device",
@@ -1986,6 +3080,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="turbine_ids",
         help="Optional turbine subset for univariate runs. May be passed multiple times.",
     )
+    parser.add_argument(
+        "--emit-progress-events",
+        action="store_true",
+        help="Emit structured progress events on stderr for full-run orchestration progress bars.",
+    )
+    parser.add_argument(
+        "--eval-protocol",
+        action="append",
+        choices=list(EVAL_PROTOCOL_CHOICES),
+        dest="eval_protocols",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -1998,10 +3104,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path=args.output_path,
         batch_size=args.batch_size,
         window_offset=args.window_offset,
-        max_windows_per_dataset=args.max_windows_per_dataset,
+        max_windows_per_split=args.max_windows_per_split,
         device=args.device,
         mode=args.mode,
         turbine_ids=tuple(args.turbine_ids) if args.turbine_ids else None,
+        eval_protocols=tuple(args.eval_protocols) if args.eval_protocols else None,
+        emit_progress_events=bool(args.emit_progress_events),
     )
     print(results)
     return 0
