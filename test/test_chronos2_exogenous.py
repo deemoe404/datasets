@@ -379,7 +379,7 @@ def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) ->
 
     assert len(pipeline.calls) == 1
     assert len(pipeline.calls[0][0]["past_covariates"]) == len(pack.required_columns)
-    assert pipeline.batch_sizes == [14]
+    assert pipeline.batch_sizes == [13]
     assert result["dataset_id"] == "kelmarsh"
     assert result["covariate_stage"] == "stage1_core"
     assert result["covariate_pack"] == "stage1_core"
@@ -426,7 +426,7 @@ def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) 
         device="cpu",
     )
 
-    assert pipeline.batch_sizes == [22]
+    assert pipeline.batch_sizes == [18]
     assert result["covariate_stage"] == "stage2_ops"
     assert result["covariate_count"] == len(pack.required_columns)
 
@@ -437,7 +437,7 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
     pack = manifest.resolve_covariate_pack("hill_of_towie", "stage3_regime")
     spec = _synthetic_spec("hill_of_towie", ("T01",))
     task_spec, resolved_task = _synthetic_task()
-    bool_columns = {"aeroup_in_install_window", "aeroup_post_install", "tuneup_in_deployment_window", "tuneup_post_effective"}
+    bool_columns = {"aeroup_in_install_window", "aeroup_post_install"}
     series = _single_turbine_series(
         dataset_id="hill_of_towie",
         turbine_id="T01",
@@ -476,7 +476,7 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
         pipeline.first_call["past_covariates"]["aeroup_in_install_window"],
         np.array([0.0, 1.0, 0.0], dtype=np.float32),
     )
-    assert pipeline.batch_sizes == [31]
+    assert pipeline.batch_sizes == [24]
     assert result["covariate_stage"] == "stage3_regime"
     assert result["covariate_count"] == len(pack.required_columns)
 

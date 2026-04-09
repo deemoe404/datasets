@@ -37,11 +37,23 @@ def test_reference_pack_and_stage_feature_sets_are_expected() -> None:
 
     kelmarsh_reference = shared.reference_pack_for("kelmarsh")
     hill_stage3 = shared.resolve_covariate_pack("hill_of_towie", "stage3_regime")
+    kelmarsh_stage1 = shared.resolve_covariate_pack("kelmarsh", "stage1_core")
+    penmanshiel_stage2 = shared.resolve_covariate_pack("penmanshiel", "stage2_ops")
     sdwpf_stage2 = shared.resolve_covariate_pack("sdwpf_kddcup", "stage2_ops")
 
     assert kelmarsh_reference.stage == "reference"
     assert kelmarsh_reference.pack_name == "power_only"
     assert kelmarsh_reference.feature_set == "lightweight"
+    assert len(kelmarsh_stage1.required_columns) == 12
+    assert "Grid frequency (Hz)" not in kelmarsh_stage1.required_columns
+    assert len(penmanshiel_stage2.required_columns) == 17
+    assert "farm_pmu__gms_power_setpoint_kw" not in penmanshiel_stage2.required_columns
+    assert "farm_pmu__gms_voltage_v" not in penmanshiel_stage2.required_columns
+    assert "farm_pmu__gms_grid_frequency_hz" not in penmanshiel_stage2.required_columns
     assert hill_stage3.feature_set == "default"
-    assert "tuneup_post_effective" in hill_stage3.required_columns
+    assert len(hill_stage3.required_columns) == 23
+    assert "wtc_ActualWindDirection_mean" not in hill_stage3.required_columns
+    assert "wtc_GridFreq_mean" not in hill_stage3.required_columns
+    assert "farm_grid__frequency" not in hill_stage3.required_columns
+    assert "tuneup_post_effective" not in hill_stage3.required_columns
     assert sdwpf_stage2.required_columns[-1] == "Prtv"

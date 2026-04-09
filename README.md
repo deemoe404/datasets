@@ -22,11 +22,19 @@
 | Hill of Towie | `wtc_ActPower_*` 的 min/max/stddev/endvalue/mean over 10 min |            机组/场级 SCADA 多表 + 告警事件 + AeroUp/TuneUp |
 | sdwpf_kddcup  |                                      `Patv` mean over 10 min | `Wspd/Wdir/Etmp/Itmp/Ndir/Pab1/Pab2/Pab3/Prtv` + 质量 flag |
 
-Kelmarsh/Penmanshiel 的 Greenbyte 连续 CSV 不是天然一条时间戳一行，同一时间戳会出现很多条记录，必须先聚合整理
-Hill of Towie 的月表在月边界有重复行，需要先审计再去重
-默认模型就绪层是 farm-synchronous 长表和 farm-granularity 窗口；单机 `turbine` 语义只作为显式兼容模式保留
-`sdwpf_kddcup` 的源文件只提供 `Day + Tmstamp`；仓库统一按 `Day 1 = 2020-05-01` 恢复工程用 `timestamp`
-`sdwpf_kddcup` 如果 manifest 时间语义审计不通过，则只允许保留 `manifest/silver`，禁止继续构建 `gold/task`
+切分 train/val/test 时的注意事项（时间顺序按照 70/10/20 比例）：
+
+- Hill of Towie 中，`wtc_ActualWindDirection_mean`/`days_since_tuneup_effective_start`/`days_since_tuneup_deployment_end` 在 train/val/test 上大量缺失。
+- Hill of Towie 中，`tuneup_post_effective`/`tuneup_in_deployment_window` 在 train/val/test 上大量为 0。
+- Hill of Towie 中，`farm_grid__frequency` 在 train 上波动很小，且会出现 0 值（可能是缺失哨兵）。
+- Hill of Towie 中，`wtc_GridFreq_mean` 在时间轴上会出现 0 值（可能是缺失哨兵）。
+
+- Kelmarsh 中，`farm_pmu__gms_power_setpoint_kw`/`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上几乎为常数，test 上会出现 0 值。
+- Kelmarsh 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
+
+- Penmanshiel 中，`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上波动很小，test 上会出现 0 值。
+- Penmanshiel 中，`farm_pmu__gms_power_setpoint_kw` 在 train 上接近常数。
+- Penmanshiel 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
 
 ## 滑窗式构建 `24H->6H` 窗口
 
@@ -51,6 +59,8 @@ Hill of Towie 的月表在月边界有重复行，需要先审计再去重
 | sdwpf_kddcup   | 1,131,661 / 4,727,520 = 23.94% |   269,772 / 4,703,534 |      5.74% |    0 / 134 |
 
 *Hill of Towie 数据集除了 `quality_flags` 外还有代表 sidecar 文件导致的质量问题的 `feature_quality_flags`。
+
+---
 
 ## 环境准备
 

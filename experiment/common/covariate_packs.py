@@ -15,7 +15,6 @@ _GREENBYTE_LIGHTWEIGHT_COLUMNS = (
     "Nacelle temperature (°C)",
     "Power factor (cosphi)",
     "Reactive power (kvar)",
-    "Grid frequency (Hz)",
     "Blade angle (pitch position) A (°)",
     "Blade angle (pitch position) B (°)",
     "Blade angle (pitch position) C (°)",
@@ -23,11 +22,8 @@ _GREENBYTE_LIGHTWEIGHT_COLUMNS = (
 
 _GREENBYTE_STAGE2_EXTRA_COLUMNS = (
     "farm_pmu__gms_power_kw",
-    "farm_pmu__gms_power_setpoint_kw",
     "farm_pmu__gms_reactive_power_kvar",
-    "farm_pmu__gms_voltage_v",
     "farm_pmu__gms_current_a",
-    "farm_pmu__gms_grid_frequency_hz",
     "farm_pmu__production_meter_data_availability",
     "farm_grid_meter__grid_meter_data_availability",
 )
@@ -50,14 +46,12 @@ _GREENBYTE_STAGE3_OPTIONAL_COLUMNS = (
 _HILL_STAGE1_COLUMNS = (
     "wtc_SecAnemo_mean",
     "wtc_PriAnemo_mean",
-    "wtc_ActualWindDirection_mean",
     "wtc_YawPos_mean",
     "wtc_GenRpm_mean",
     "wtc_MainSRpm_mean",
     "wtc_PitchRef_BladeA_mean",
     "wtc_PitchRef_BladeB_mean",
     "wtc_PitchRef_BladeC_mean",
-    "wtc_GridFreq_mean",
     "wtc_TwrHumid_mean",
 )
 
@@ -66,7 +60,6 @@ _HILL_STAGE2_EXTRA_COLUMNS = (
     "tur_temp__wtc_naceltmp_mean",
     "tur_temp__wtc_geoiltmp_mean",
     "tur_press__wtc_hydpress_mean",
-    "farm_grid__frequency",
     "farm_grid__activepower",
     "farm_grid__reactivepower",
     "farm_grid__powerfactor",
@@ -80,10 +73,6 @@ _HILL_STAGE3_EXTRA_COLUMNS = (
     "aeroup_post_install",
     "days_since_aeroup_start",
     "days_since_aeroup_end",
-    "tuneup_in_deployment_window",
-    "tuneup_post_effective",
-    "days_since_tuneup_effective_start",
-    "days_since_tuneup_deployment_end",
 )
 
 _SDWPF_STAGE1_COLUMNS = (
