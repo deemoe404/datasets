@@ -422,7 +422,7 @@ Each sidecar records the layer fingerprint, the parent-layer fingerprint, the la
 Fingerprint inputs are layer-specific:
 
 - `manifest`: dataset id, handler, dataset-spec fingerprint, manifest-layer code fingerprint, and a source snapshot fingerprint derived from source file `relative_path + size_bytes + mtime_ns`
-- `silver`: dataset id, handler, dataset-spec fingerprint, silver-layer code fingerprint, and the resolved `manifest` fingerprint
+- `silver`: dataset id, handler, dataset-spec fingerprint, silver-layer code fingerprint, the resolved `manifest` fingerprint, and any declared repo-packaged preprocessing dependency fingerprints
 - `gold_base`: dataset id, handler, dataset-spec fingerprint, gold-layer code fingerprint, the resolved `silver` fingerprint, plus `quality_profile`, `layout`, and `feature_set`
 - `task`: dataset id, handler, dataset-spec fingerprint, task-layer code fingerprint, the resolved `gold_base` fingerprint, plus the resolved `TaskSpec`
 
@@ -430,6 +430,7 @@ This gives the usual layered invalidation behavior:
 
 - source data changes invalidate `manifest`, which in turn invalidates `silver`, `gold_base`, and `task`
 - preprocessing code changes invalidate the layer whose code fingerprint changed, then all descendants
+- repo-packaged preprocessing dependency changes invalidate the layer that declares them, then all descendants
 - parameter changes such as `layout`, `feature_set`, `quality_profile`, or `TaskSpec` invalidate only the affected layer and its descendants
 - caches created before `_build_meta.json` existed are treated as stale and are rebuilt on first read or explicit rebuild
 

@@ -21,6 +21,9 @@ _HANDLER_FILES = {
     "hill_of_towie": "datasets/hill_of_towie.py",
     "sdwpf_kddcup": "datasets/sdwpf_kddcup.py",
 }
+_PACKAGED_LAYER_DEPENDENCIES = {
+    ("silver", "hill_of_towie"): ("data/hill_of_towie_tuneup_2024.csv",),
+}
 _COMMON_FILES = (
     "datasets/base.py",
     "datasets/common.py",
@@ -105,6 +108,14 @@ def code_fingerprint_for(layer: str, handler: str) -> str:
         files = [_PACKAGE_ROOT / relative for relative in _COMMON_FILES]
     else:
         raise ValueError(f"Unsupported cache layer {layer!r}.")
+    return hash_files(files)
+
+
+def packaged_dependency_fingerprint_for(layer: str, handler: str) -> str | None:
+    relative_paths = _PACKAGED_LAYER_DEPENDENCIES.get((layer, handler), ())
+    if not relative_paths:
+        return None
+    files = [_PACKAGE_ROOT / relative for relative in relative_paths]
     return hash_files(files)
 
 
@@ -260,13 +271,17 @@ def manifest_meta_from_payload(spec: DatasetSpec, payload: dict[str, Any]) -> La
 
 def expected_silver_meta(spec: DatasetSpec) -> LayerBuildMeta:
     manifest_meta = expected_manifest_meta(spec)
+    params: dict[str, Any] = {}
+    packaged_dependency_fingerprint = packaged_dependency_fingerprint_for("silver", spec.handler)
+    if packaged_dependency_fingerprint is not None:
+        params["packaged_dependency_fingerprint"] = packaged_dependency_fingerprint
     return _make_meta(
         layer="silver",
         dataset_id=spec.dataset_id,
         code_fingerprint=code_fingerprint_for("silver", spec.handler),
         parent_fingerprint=manifest_meta.fingerprint,
         spec_fingerprint=spec_fingerprint_for(spec),
-        params={},
+        params=params,
     )
 
 
