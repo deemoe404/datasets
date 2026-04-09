@@ -14,16 +14,39 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
+try:
+    from tqdm.auto import tqdm
+
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs) -> None:
+            del args
+            self.total = kwargs.get("total")
+            self.desc = kwargs.get("desc")
+            self.disable = kwargs.get("disable", False)
+            self.n = 0
+
+        def update(self, value=1) -> None:
+            self.n += int(value)
+
+        def set_postfix_str(self, value: str, refresh: bool = True) -> None:
+            del value, refresh
+
+        def close(self) -> None:
+            return None
 
 try:
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset
+    from torch.utils.data import DataLoader, Dataset
 except ImportError:  # pragma: no cover - exercised in the root env where torch is absent
     torch = None
     nn = None
     DataLoader = None
-    TensorDataset = None
+    Dataset = None
 
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
@@ -37,16 +60,32 @@ from covariate_packs import (  # noqa: E402
     iter_covariate_packs,
     reference_pack_for,
 )
+from window_protocols import (  # noqa: E402
+    DEFAULT_WINDOW_PROTOCOL,
+    HORIZON_METRIC_SCOPE,
+    NON_OVERLAP_EVAL_PROTOCOL,
+    OVERALL_METRIC_SCOPE,
+    ROLLING_EVAL_PROTOCOL,
+    SPLIT_PROTOCOL,
+    SplitBoundary,
+    WindowDescriptorIndex,
+    build_chrono_split_lookup as shared_build_chrono_split_lookup,
+    build_split_boundaries as shared_build_split_boundaries,
+    build_window_descriptor_index as shared_build_window_descriptor_index,
+    resolve_window_protocol,
+    split_window_index as shared_split_window_index,
+    thin_non_overlap_window_index as shared_thin_non_overlap_window_index,
+)
 
 
 MODEL_ID = "LTSF-Linear"
-TASK_ID = "next_6h_from_24h_stride_6h"
-SPLIT_PROTOCOL = "chrono_70_10_20"
+WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
+TASK_ID = resolve_window_protocol(WINDOW_PROTOCOL).task_id
 DEFAULT_DATASETS = ("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup")
 MODEL_VARIANTS = ("nlinear", "dlinear")
 HISTORY_STEPS = 144
 FORECAST_STEPS = 36
-STRIDE_STEPS = 36
+STRIDE_STEPS = 1
 DEFAULT_BATCH_SIZE = 1024
 DEFAULT_LEARNING_RATE = 1e-3
 DEFAULT_MAX_EPOCHS = 50
@@ -86,10 +125,16 @@ _RESULT_COLUMNS = [
     "model_id",
     "model_variant",
     "task_id",
+    "window_protocol",
     "history_steps",
     "forecast_steps",
     "stride_steps",
     "split_protocol",
+    "split_name",
+    "eval_protocol",
+    "metric_scope",
+    "lead_step",
+    "lead_minutes",
     "covariate_stage",
     "covariate_pack",
     "feature_set",
@@ -118,6 +163,9 @@ _RESULT_COLUMNS = [
 _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_DATASETS)}
 _STAGE_ORDER = {REFERENCE_STAGE: 0, **{stage: index + 1 for index, stage in enumerate(DEFAULT_COVARIATE_STAGES)}}
 _MODEL_ORDER = {model_variant: index for index, model_variant in enumerate(MODEL_VARIANTS)}
+_SPLIT_ORDER = {"val": 0, "test": 1}
+_EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
+_METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
 
 
 @dataclass(frozen=True)
@@ -146,26 +194,9 @@ class TurbineSeries:
 
 
 @dataclass(frozen=True)
-class RawSplitData:
-    target_inputs: np.ndarray
-    raw_exogenous_inputs: np.ndarray
-    targets: np.ndarray
-    output_start_us: np.ndarray
-    output_end_us: np.ndarray
-
-
-@dataclass(frozen=True)
-class SplitData:
-    target_inputs: np.ndarray
-    exogenous_inputs: np.ndarray
-    targets: np.ndarray
-    output_start_us: np.ndarray
-    output_end_us: np.ndarray
-
-
-@dataclass(frozen=True)
 class PreparedDataset:
     dataset_id: str
+    resolution_minutes: int
     rated_power_kw: float
     history_steps: int
     forecast_steps: int
@@ -173,11 +204,18 @@ class PreparedDataset:
     covariate_stage: str
     covariate_pack: str
     feature_set: str
+    covariate_columns: tuple[str, ...]
     covariate_count: int
     covariate_policy: str
-    train: SplitData
-    val: SplitData
-    test: SplitData
+    turbine_ids: tuple[str, ...]
+    turbine_series: tuple[TurbineSeries, ...]
+    train_windows: WindowDescriptorIndex
+    val_rolling_windows: WindowDescriptorIndex
+    val_non_overlap_windows: WindowDescriptorIndex
+    test_rolling_windows: WindowDescriptorIndex
+    test_non_overlap_windows: WindowDescriptorIndex
+    covariate_means: np.ndarray
+    covariate_stds: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -186,7 +224,23 @@ class TrainingOutcome:
     epochs_ran: int
     best_val_rmse_pu: float
     device: str
-    metrics: dict[str, float | int]
+    model: Any
+
+
+@dataclass(frozen=True)
+class EvaluationMetrics:
+    window_count: int
+    prediction_count: int
+    mae_kw: float
+    rmse_kw: float
+    mae_pu: float
+    rmse_pu: float
+    horizon_window_count: np.ndarray
+    horizon_prediction_count: np.ndarray
+    horizon_mae_kw: np.ndarray
+    horizon_rmse_kw: np.ndarray
+    horizon_mae_pu: np.ndarray
+    horizon_rmse_pu: np.ndarray
 
 
 def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
@@ -196,6 +250,40 @@ def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def progress_is_enabled() -> bool:
+    return HAS_TQDM and sys.stderr.isatty()
+
+
+def _create_progress_bar(
+    *,
+    total: int | None,
+    desc: str,
+    leave: bool = False,
+    enabled: bool | None = None,
+):
+    return tqdm(
+        total=total,
+        desc=desc,
+        leave=leave,
+        disable=not (progress_is_enabled() if enabled is None else enabled),
+        dynamic_ncols=True,
+    )
+
+
+def _loader_batch_total(loader: object) -> int | None:
+    try:
+        return int(len(loader))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _job_progress_label(dataset_id: str, covariate_pack: str, model_variant: str | None = None) -> str:
+    parts = [dataset_id, covariate_pack]
+    if model_variant is not None:
+        parts.append(model_variant)
+    return "/".join(parts)
 
 
 def _ensure_repo_src_on_path() -> None:
@@ -211,7 +299,6 @@ def build_task_spec():
     return TaskSpec(
         history_duration="24h",
         forecast_duration="6h",
-        stride_duration="6h",
         task_id=TASK_ID,
         granularity="turbine",
     )
@@ -234,12 +321,12 @@ def build_requested_packs(
 
 
 def require_torch() -> tuple[Any, Any, Any, Any]:
-    if torch is None or nn is None or DataLoader is None or TensorDataset is None:
+    if torch is None or nn is None or DataLoader is None or Dataset is None:
         raise ImportError(
             "PyTorch is unavailable in the current environment. "
             "Create experiment/ltsf-linear/.conda with ./create_env.sh."
         )
-    return torch, nn, DataLoader, TensorDataset
+    return torch, nn, DataLoader, Dataset
 
 
 def select_device(torch_module: Any | None = None) -> str:
@@ -453,48 +540,28 @@ def load_strict_window_index(dataset_id: str, *, cache_root: str | Path = _CACHE
     return frame
 
 
-def build_chrono_split_lookup(output_start_timestamps: Sequence[datetime]) -> pl.DataFrame:
-    unique_sorted = sorted(dict.fromkeys(output_start_timestamps))
-    total = len(unique_sorted)
-    train_count = math.floor(total * 0.7)
-    val_count = math.floor(total * 0.1)
-    test_count = total - train_count - val_count
-    if min(train_count, val_count, test_count) <= 0:
-        raise ValueError(
-            f"Chronological split {SPLIT_PROTOCOL!r} requires non-empty train/val/test, found "
-            f"{train_count}/{val_count}/{test_count}."
-        )
-    return pl.DataFrame(
-        {
-            "output_start_ts": unique_sorted,
-            "split": (
-                ["train"] * train_count
-                + ["val"] * val_count
-                + ["test"] * test_count
-            ),
-        }
-    )
+def build_chrono_split_lookup(raw_timestamps: Sequence[datetime]) -> pl.DataFrame:
+    return shared_build_chrono_split_lookup(raw_timestamps)
+
+
+def build_split_boundaries(raw_timestamps: Sequence[datetime]) -> dict[str, SplitBoundary]:
+    return shared_build_split_boundaries(raw_timestamps)
 
 
 def split_window_index(
     window_index: pl.DataFrame,
     *,
+    raw_timestamps: Sequence[datetime],
+    resolution_minutes: int,
     max_windows_per_split: int | None = None,
 ) -> dict[str, pl.DataFrame]:
-    split_lookup = build_chrono_split_lookup(window_index["output_start_ts"].to_list())
-    frames = (
-        window_index.join(split_lookup, on="output_start_ts", how="inner")
-        .sort(["output_start_ts", "turbine_id"])
+    return shared_split_window_index(
+        window_index,
+        raw_timestamps=raw_timestamps,
+        resolution_minutes=resolution_minutes,
+        history_steps=HISTORY_STEPS,
+        max_windows_per_split=max_windows_per_split,
     )
-    split_frames: dict[str, pl.DataFrame] = {}
-    for split_name in ("train", "val", "test"):
-        split_frame = frames.filter(pl.col("split") == split_name)
-        if max_windows_per_split is not None:
-            split_frame = split_frame.head(max_windows_per_split)
-        if split_frame.is_empty():
-            raise ValueError(f"Split {split_name!r} is empty after window selection.")
-        split_frames[split_name] = split_frame
-    return split_frames
 
 
 def prepare_series_frame(series: pl.DataFrame, *, covariate_columns: Sequence[str]) -> pl.DataFrame:
@@ -536,74 +603,213 @@ def build_turbine_series_map(
     return turbines
 
 
-def build_raw_split_samples(
-    window_index: pl.DataFrame,
+def resolve_resolution_minutes(series: pl.DataFrame) -> int:
+    timestamps = (
+        series.select("timestamp")
+        .unique()
+        .sort("timestamp")
+        .head(2)["timestamp"]
+        .cast(pl.Int64)
+        .to_list()
+    )
+    if len(timestamps) < 2:
+        raise ValueError("Series must include at least two timestamps to infer resolution.")
+    step_us = int(timestamps[1]) - int(timestamps[0])
+    if step_us <= 0 or step_us % (60 * 1_000_000) != 0:
+        raise ValueError(f"Unsupported resolution step {step_us!r}us.")
+    return step_us // (60 * 1_000_000)
+
+
+def build_turbine_series_tuple(
+    metadata: DatasetMetadata,
     turbine_series_map: Mapping[str, TurbineSeries],
+) -> tuple[TurbineSeries, ...]:
+    return tuple(turbine_series_map[turbine_id] for turbine_id in metadata.turbine_ids)
+
+
+def build_window_descriptor_index(
+    window_index: pl.DataFrame,
+    *,
+    turbine_ids: Sequence[str],
+    turbine_series_map: Mapping[str, TurbineSeries],
+) -> WindowDescriptorIndex:
+    return shared_build_window_descriptor_index(
+        window_index,
+        turbine_ids=turbine_ids,
+        timestamps_by_turbine={
+            turbine_id: turbine_series_map[turbine_id].timestamps_us
+            for turbine_id in turbine_ids
+        },
+    )
+
+
+def thin_non_overlap_window_index(
+    windows: WindowDescriptorIndex,
+    *,
+    turbine_ids: Sequence[str],
+    forecast_steps: int,
+) -> WindowDescriptorIndex:
+    return shared_thin_non_overlap_window_index(
+        windows,
+        turbine_ids=turbine_ids,
+        forecast_steps=forecast_steps,
+    )
+
+
+def _empty_raw_exogenous_batch(batch_size: int, history_steps: int) -> np.ndarray:
+    return np.empty((batch_size, history_steps, 0), dtype=np.float32)
+
+
+def build_raw_exogenous_batch(
+    turbine_series: Sequence[TurbineSeries],
+    windows: WindowDescriptorIndex,
     *,
     history_steps: int,
-    forecast_steps: int,
     covariate_columns: Sequence[str],
-) -> RawSplitData:
-    sample_target_inputs: list[np.ndarray] = []
-    sample_covariates: list[np.ndarray] = []
-    sample_targets: list[np.ndarray] = []
-    output_start_values: list[int] = []
-    output_end_values: list[int] = []
+    start: int = 0,
+    stop: int | None = None,
+) -> np.ndarray:
+    stop = len(windows) if stop is None else min(stop, len(windows))
+    batch_size = max(0, stop - start)
+    covariate_count = len(covariate_columns)
+    if batch_size == 0:
+        return _empty_raw_exogenous_batch(0, history_steps)
+    if covariate_count == 0:
+        return _empty_raw_exogenous_batch(batch_size, history_steps)
+    batch = np.empty((batch_size, history_steps, covariate_count), dtype=np.float32)
+    for batch_index, window_index_position in enumerate(range(start, stop)):
+        turbine_index = int(windows.turbine_indices[window_index_position])
+        target_index = int(windows.target_indices[window_index_position])
+        series = turbine_series[turbine_index]
+        for covariate_index, column in enumerate(covariate_columns):
+            batch[batch_index, :, covariate_index] = series.past_covariates[column][
+                target_index - history_steps : target_index
+            ]
+    return batch
 
-    working = window_index.with_columns(
-        pl.col("output_start_ts").cast(pl.Int64).alias("output_start_us"),
-        pl.col("output_end_ts").cast(pl.Int64).alias("output_end_us"),
+
+def fit_covariate_statistics_from_windows(
+    turbine_series: Sequence[TurbineSeries],
+    windows: WindowDescriptorIndex,
+    *,
+    history_steps: int,
+    covariate_columns: Sequence[str],
+    chunk_size: int = 2048,
+    progress_label: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    covariate_count = len(covariate_columns)
+    if covariate_count == 0:
+        return (
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    sums = np.zeros((covariate_count,), dtype=np.float64)
+    squared_sums = np.zeros((covariate_count,), dtype=np.float64)
+    counts = np.zeros((covariate_count,), dtype=np.int64)
+    chunk_starts = range(0, len(windows), chunk_size)
+    progress = _create_progress_bar(
+        total=math.ceil(len(windows) / chunk_size) if len(windows) else 0,
+        desc=f"{progress_label or 'covariates'} stats",
     )
+    try:
+        for start in chunk_starts:
+            raw_batch = build_raw_exogenous_batch(
+                turbine_series,
+                windows,
+                history_steps=history_steps,
+                covariate_columns=covariate_columns,
+                start=start,
+                stop=start + chunk_size,
+            )
+            flat = raw_batch.reshape(-1, covariate_count).astype(np.float64, copy=False)
+            valid = ~np.isnan(flat)
+            filled = np.where(valid, flat, 0.0)
+            counts += valid.sum(axis=0)
+            sums += filled.sum(axis=0)
+            squared_sums += np.square(filled).sum(axis=0)
+            progress.update(1)
+    finally:
+        progress.close()
+    means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+    variances = np.divide(squared_sums, counts, out=np.ones_like(sums), where=counts > 0) - np.square(means)
+    variances = np.maximum(variances, 0.0)
+    stds = np.sqrt(variances)
+    stds[stds < 1e-6] = 1.0
+    stds[counts == 0] = 1.0
+    return means.astype(np.float32), stds.astype(np.float32)
 
-    for turbine_frame in working.partition_by("turbine_id", maintain_order=True):
-        turbine_id = turbine_frame["turbine_id"][0]
-        series = turbine_series_map[turbine_id]
-        timestamp_index = {int(timestamp): index for index, timestamp in enumerate(series.timestamps_us.tolist())}
-        for output_start_us, output_end_us in zip(
-            turbine_frame["output_start_us"].to_list(),
-            turbine_frame["output_end_us"].to_list(),
-            strict=True,
-        ):
-            target_index = timestamp_index.get(int(output_start_us))
-            if target_index is None:
-                raise KeyError(
-                    f"Output start timestamp {output_start_us!r} is missing for turbine {turbine_id!r}."
-                )
-            context = series.target_pu[target_index - history_steps : target_index]
-            future = series.target_pu[target_index : target_index + forecast_steps]
-            if context.shape[0] != history_steps or future.shape[0] != forecast_steps:
-                raise ValueError(
-                    f"Window for turbine {turbine_id!r} does not match expected history/forecast sizes."
-                )
-            if np.isnan(context).any() or np.isnan(future).any():
-                continue
-            sample_target_inputs.append(context.astype(np.float32, copy=True))
-            if covariate_columns:
-                covariate_history = np.column_stack(
+
+def normalize_exogenous_window(
+    raw_exogenous_inputs: np.ndarray,
+    *,
+    means: np.ndarray,
+    stds: np.ndarray,
+) -> np.ndarray:
+    covariate_count = raw_exogenous_inputs.shape[1]
+    if covariate_count == 0:
+        return np.empty((raw_exogenous_inputs.shape[0], 0), dtype=np.float32)
+    reshaped_means = means.reshape(1, covariate_count)
+    reshaped_stds = stds.reshape(1, covariate_count)
+    valid = ~np.isnan(raw_exogenous_inputs)
+    centered = np.where(valid, raw_exogenous_inputs, reshaped_means) - reshaped_means
+    normalized = (centered / reshaped_stds).astype(np.float32, copy=False)
+    normalized[~valid] = 0.0
+    missing_mask = (~valid).astype(np.float32)
+    return np.concatenate([normalized, missing_mask], axis=1)
+
+
+if Dataset is not None:
+
+    class WindowTensorDataset(Dataset):
+        def __init__(
+            self,
+            turbine_series: Sequence[TurbineSeries],
+            windows: WindowDescriptorIndex,
+            *,
+            history_steps: int,
+            forecast_steps: int,
+            covariate_columns: Sequence[str],
+            covariate_means: np.ndarray,
+            covariate_stds: np.ndarray,
+        ) -> None:
+            self.turbine_series = tuple(turbine_series)
+            self.windows = windows
+            self.history_steps = history_steps
+            self.forecast_steps = forecast_steps
+            self.covariate_columns = tuple(covariate_columns)
+            self.covariate_means = covariate_means
+            self.covariate_stds = covariate_stds
+
+        def __len__(self) -> int:
+            return len(self.windows)
+
+        def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            turbine_index = int(self.windows.turbine_indices[index])
+            target_index = int(self.windows.target_indices[index])
+            series = self.turbine_series[turbine_index]
+            target_inputs = series.target_pu[target_index - self.history_steps : target_index].astype(np.float32, copy=True)
+            targets = series.target_pu[target_index : target_index + self.forecast_steps].astype(np.float32, copy=True)
+            if self.covariate_columns:
+                raw_exogenous = np.column_stack(
                     [
-                        series.past_covariates[column][target_index - history_steps : target_index]
-                        for column in covariate_columns
+                        series.past_covariates[column][target_index - self.history_steps : target_index]
+                        for column in self.covariate_columns
                     ]
-                ).astype(np.float32, copy=True)
+                ).astype(np.float32, copy=False)
+                exogenous_inputs = normalize_exogenous_window(
+                    raw_exogenous,
+                    means=self.covariate_means,
+                    stds=self.covariate_stds,
+                )
             else:
-                covariate_history = np.empty((history_steps, 0), dtype=np.float32)
-            sample_covariates.append(covariate_history)
-            sample_targets.append(future.astype(np.float32, copy=True))
-            output_start_values.append(int(output_start_us))
-            output_end_values.append(int(output_end_us))
+                exogenous_inputs = np.empty((self.history_steps, 0), dtype=np.float32)
+            return target_inputs, exogenous_inputs, targets
 
-    if not sample_target_inputs:
-        raise ValueError("No valid samples remain after filtering NaN target windows.")
+else:
 
-    return RawSplitData(
-        target_inputs=np.stack(sample_target_inputs),
-        raw_exogenous_inputs=np.stack(sample_covariates)
-        if sample_covariates
-        else np.empty((0, history_steps, 0), dtype=np.float32),
-        targets=np.stack(sample_targets),
-        output_start_us=np.asarray(output_start_values, dtype=np.int64),
-        output_end_us=np.asarray(output_end_values, dtype=np.int64),
-    )
+    class WindowTensorDataset:  # pragma: no cover - exercised only when torch is missing
+        def __init__(self, *_args, **_kwargs) -> None:
+            require_torch()
 
 
 def fit_covariate_statistics(raw_exogenous_inputs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -653,21 +859,6 @@ def transform_exogenous_inputs(
     return np.concatenate([normalized, missing_mask], axis=2)
 
 
-def finalize_split_data(
-    raw_split: RawSplitData,
-    *,
-    means: np.ndarray,
-    stds: np.ndarray,
-) -> SplitData:
-    return SplitData(
-        target_inputs=raw_split.target_inputs,
-        exogenous_inputs=transform_exogenous_inputs(raw_split.raw_exogenous_inputs, means=means, stds=stds),
-        targets=raw_split.targets,
-        output_start_us=raw_split.output_start_us,
-        output_end_us=raw_split.output_end_us,
-    )
-
-
 def prepare_dataset(
     dataset_id: str,
     *,
@@ -677,29 +868,53 @@ def prepare_dataset(
 ) -> PreparedDataset:
     metadata = load_dataset_metadata(dataset_id, cache_root=cache_root)
     strict_window_index = load_strict_window_index(dataset_id, cache_root=cache_root)
-    split_frames = split_window_index(strict_window_index, max_windows_per_split=max_windows_per_split)
     resolved_feature_set, covariate_columns, series = load_series_frame(dataset_id, pack=pack, cache_root=cache_root)
     prepared_series = prepare_series_frame(series, covariate_columns=covariate_columns)
+    resolution_minutes = resolve_resolution_minutes(prepared_series)
+    split_frames = split_window_index(
+        strict_window_index,
+        raw_timestamps=prepared_series["timestamp"].to_list(),
+        resolution_minutes=resolution_minutes,
+        max_windows_per_split=max_windows_per_split,
+    )
     turbine_series_map = build_turbine_series_map(
         prepared_series,
         rated_power_kw=metadata.rated_power_kw,
         covariate_columns=covariate_columns,
     )
-    raw_split_data = {
-        split_name: build_raw_split_samples(
-            split_frame,
-            turbine_series_map,
-            history_steps=HISTORY_STEPS,
-            forecast_steps=FORECAST_STEPS,
-            covariate_columns=covariate_columns,
-        )
-        for split_name, split_frame in split_frames.items()
-    }
-    means, stds = fit_covariate_statistics(raw_split_data["train"].raw_exogenous_inputs)
-    split_data = {
-        split_name: finalize_split_data(raw_split, means=means, stds=stds)
-        for split_name, raw_split in raw_split_data.items()
-    }
+    turbine_series = build_turbine_series_tuple(metadata, turbine_series_map)
+    train_windows = build_window_descriptor_index(
+        split_frames["train"],
+        turbine_ids=metadata.turbine_ids,
+        turbine_series_map=turbine_series_map,
+    )
+    val_rolling_windows = build_window_descriptor_index(
+        split_frames["val"],
+        turbine_ids=metadata.turbine_ids,
+        turbine_series_map=turbine_series_map,
+    )
+    test_rolling_windows = build_window_descriptor_index(
+        split_frames["test"],
+        turbine_ids=metadata.turbine_ids,
+        turbine_series_map=turbine_series_map,
+    )
+    val_non_overlap_windows = thin_non_overlap_window_index(
+        val_rolling_windows,
+        turbine_ids=metadata.turbine_ids,
+        forecast_steps=FORECAST_STEPS,
+    )
+    test_non_overlap_windows = thin_non_overlap_window_index(
+        test_rolling_windows,
+        turbine_ids=metadata.turbine_ids,
+        forecast_steps=FORECAST_STEPS,
+    )
+    means, stds = fit_covariate_statistics_from_windows(
+        turbine_series,
+        train_windows,
+        history_steps=HISTORY_STEPS,
+        covariate_columns=covariate_columns,
+        progress_label=_job_progress_label(dataset_id, pack.pack_name),
+    )
     covariate_policy = COVARIATE_POLICY if covariate_columns else REFERENCE_COVARIATE_POLICY
     _profile_log(
         dataset_id,
@@ -708,13 +923,17 @@ def prepare_dataset(
         covariate_pack=pack.pack_name,
         feature_set=resolved_feature_set,
         covariate_count=len(covariate_columns),
-        train_windows=split_data["train"].target_inputs.shape[0],
-        val_windows=split_data["val"].target_inputs.shape[0],
-        test_windows=split_data["test"].target_inputs.shape[0],
+        train_windows=len(train_windows),
+        val_rolling_windows=len(val_rolling_windows),
+        val_non_overlap_windows=len(val_non_overlap_windows),
+        test_rolling_windows=len(test_rolling_windows),
+        test_non_overlap_windows=len(test_non_overlap_windows),
         rated_power_kw=metadata.rated_power_kw,
+        resolution_minutes=resolution_minutes,
     )
     return PreparedDataset(
         dataset_id=dataset_id,
+        resolution_minutes=resolution_minutes,
         rated_power_kw=metadata.rated_power_kw,
         history_steps=HISTORY_STEPS,
         forecast_steps=FORECAST_STEPS,
@@ -722,11 +941,18 @@ def prepare_dataset(
         covariate_stage=pack.stage,
         covariate_pack=pack.pack_name,
         feature_set=resolved_feature_set,
+        covariate_columns=tuple(covariate_columns),
         covariate_count=len(covariate_columns),
         covariate_policy=covariate_policy,
-        train=split_data["train"],
-        val=split_data["val"],
-        test=split_data["test"],
+        turbine_ids=metadata.turbine_ids,
+        turbine_series=turbine_series,
+        train_windows=train_windows,
+        val_rolling_windows=val_rolling_windows,
+        val_non_overlap_windows=val_non_overlap_windows,
+        test_rolling_windows=test_rolling_windows,
+        test_non_overlap_windows=test_non_overlap_windows,
+        covariate_means=means,
+        covariate_stds=stds,
     )
 
 
@@ -906,17 +1132,22 @@ def build_model(
 
 
 def _build_dataloader(
-    split_data: SplitData,
+    prepared_dataset: PreparedDataset,
     *,
+    windows: WindowDescriptorIndex,
     batch_size: int,
     shuffle: bool,
     seed: int,
 ):
-    resolved_torch, _, resolved_loader, resolved_dataset = require_torch()
-    dataset = resolved_dataset(
-        resolved_torch.from_numpy(split_data.target_inputs),
-        resolved_torch.from_numpy(split_data.exogenous_inputs),
-        resolved_torch.from_numpy(split_data.targets),
+    resolved_torch, _, resolved_loader, _ = require_torch()
+    dataset = WindowTensorDataset(
+        prepared_dataset.turbine_series,
+        windows,
+        history_steps=prepared_dataset.history_steps,
+        forecast_steps=prepared_dataset.forecast_steps,
+        covariate_columns=prepared_dataset.covariate_columns,
+        covariate_means=prepared_dataset.covariate_means,
+        covariate_stds=prepared_dataset.covariate_stds,
     )
     generator = resolved_torch.Generator()
     generator.manual_seed(seed)
@@ -928,45 +1159,96 @@ def _build_dataloader(
     )
 
 
-def evaluate_model(model, loader, *, device: str, rated_power_kw: float) -> dict[str, float | int]:
+def evaluate_model(
+    model,
+    loader,
+    *,
+    device: str,
+    rated_power_kw: float,
+    forecast_steps: int,
+    progress_label: str | None = None,
+) -> EvaluationMetrics:
     resolved_torch, _, _, _ = require_torch()
-    metrics = {
-        "window_count": 0,
-        "prediction_count": 0,
-        "abs_error_sum": 0.0,
-        "squared_error_sum": 0.0,
-        "normalized_abs_error_sum": 0.0,
-        "normalized_squared_error_sum": 0.0,
-    }
+    window_count = 0
+    prediction_count = 0
+    abs_error_sum_kw = 0.0
+    squared_error_sum_kw = 0.0
+    abs_error_sum_pu = 0.0
+    squared_error_sum_pu = 0.0
+    horizon_window_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_prediction_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_abs_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_squared_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
     model.eval()
-    with resolved_torch.no_grad():
-        for batch_target_inputs, batch_exogenous_inputs, batch_targets in loader:
-            batch_target_inputs = batch_target_inputs.to(device=device, dtype=resolved_torch.float32)
-            batch_exogenous_inputs = batch_exogenous_inputs.to(device=device, dtype=resolved_torch.float32)
-            batch_targets = batch_targets.to(device=device, dtype=resolved_torch.float32)
-            predictions = model(batch_target_inputs, batch_exogenous_inputs)
-            errors_pu = predictions - batch_targets
-            errors_kw = errors_pu * rated_power_kw
-            metrics["window_count"] = int(metrics["window_count"]) + int(batch_target_inputs.shape[0])
-            metrics["prediction_count"] = int(metrics["prediction_count"]) + int(batch_targets.numel())
-            metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(resolved_torch.abs(errors_kw).sum().item())
-            metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(
-                resolved_torch.square(errors_kw).sum().item()
-            )
-            metrics["normalized_abs_error_sum"] = float(metrics["normalized_abs_error_sum"]) + float(
-                resolved_torch.abs(errors_pu).sum().item()
-            )
-            metrics["normalized_squared_error_sum"] = float(metrics["normalized_squared_error_sum"]) + float(
-                resolved_torch.square(errors_pu).sum().item()
-            )
-    prediction_count = int(metrics["prediction_count"])
-    return {
-        **metrics,
-        "mae_kw": _safe_divide(float(metrics["abs_error_sum"]), prediction_count),
-        "rmse_kw": _safe_rmse(float(metrics["squared_error_sum"]), prediction_count),
-        "mae_pu": _safe_divide(float(metrics["normalized_abs_error_sum"]), prediction_count),
-        "rmse_pu": _safe_rmse(float(metrics["normalized_squared_error_sum"]), prediction_count),
-    }
+    progress = _create_progress_bar(
+        total=_loader_batch_total(loader),
+        desc=progress_label or "evaluate",
+    )
+    try:
+        with resolved_torch.no_grad():
+            for batch_target_inputs, batch_exogenous_inputs, batch_targets in loader:
+                batch_target_inputs = batch_target_inputs.to(device=device, dtype=resolved_torch.float32)
+                batch_exogenous_inputs = batch_exogenous_inputs.to(device=device, dtype=resolved_torch.float32)
+                batch_targets = batch_targets.to(device=device, dtype=resolved_torch.float32)
+                predictions = model(batch_target_inputs, batch_exogenous_inputs)
+                errors_pu = predictions - batch_targets
+                errors_kw = errors_pu * rated_power_kw
+                batch_window_count = int(batch_target_inputs.shape[0])
+                window_count += batch_window_count
+                prediction_count += int(batch_targets.numel())
+
+                abs_errors_kw = resolved_torch.abs(errors_kw)
+                squared_errors_kw = resolved_torch.square(errors_kw)
+                abs_errors_pu = resolved_torch.abs(errors_pu)
+                squared_errors_pu = resolved_torch.square(errors_pu)
+
+                abs_error_sum_kw += float(abs_errors_kw.sum().item())
+                squared_error_sum_kw += float(squared_errors_kw.sum().item())
+                abs_error_sum_pu += float(abs_errors_pu.sum().item())
+                squared_error_sum_pu += float(squared_errors_pu.sum().item())
+
+                horizon_window_count += batch_window_count
+                horizon_prediction_count += batch_window_count
+                horizon_abs_error_sum_kw += abs_errors_kw.sum(dim=0).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_squared_error_sum_kw += (
+                    squared_errors_kw.sum(dim=0).detach().cpu().numpy().astype(np.float64, copy=False)
+                )
+                horizon_abs_error_sum_pu += abs_errors_pu.sum(dim=0).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_squared_error_sum_pu += (
+                    squared_errors_pu.sum(dim=0).detach().cpu().numpy().astype(np.float64, copy=False)
+                )
+                progress.update(1)
+                progress.set_postfix_str(f"windows={window_count}")
+    finally:
+        progress.close()
+    return EvaluationMetrics(
+        window_count=window_count,
+        prediction_count=prediction_count,
+        mae_kw=_safe_divide(abs_error_sum_kw, prediction_count),
+        rmse_kw=_safe_rmse(squared_error_sum_kw, prediction_count),
+        mae_pu=_safe_divide(abs_error_sum_pu, prediction_count),
+        rmse_pu=_safe_rmse(squared_error_sum_pu, prediction_count),
+        horizon_window_count=horizon_window_count,
+        horizon_prediction_count=horizon_prediction_count,
+        horizon_mae_kw=np.asarray(
+            [_safe_divide(horizon_abs_error_sum_kw[index], int(horizon_prediction_count[index])) for index in range(forecast_steps)],
+            dtype=np.float64,
+        ),
+        horizon_rmse_kw=np.asarray(
+            [_safe_rmse(horizon_squared_error_sum_kw[index], int(horizon_prediction_count[index])) for index in range(forecast_steps)],
+            dtype=np.float64,
+        ),
+        horizon_mae_pu=np.asarray(
+            [_safe_divide(horizon_abs_error_sum_pu[index], int(horizon_prediction_count[index])) for index in range(forecast_steps)],
+            dtype=np.float64,
+        ),
+        horizon_rmse_pu=np.asarray(
+            [_safe_rmse(horizon_squared_error_sum_pu[index], int(horizon_prediction_count[index])) for index in range(forecast_steps)],
+            dtype=np.float64,
+        ),
+    )
 
 
 def train_model(
@@ -979,6 +1261,7 @@ def train_model(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     max_epochs: int = DEFAULT_MAX_EPOCHS,
     early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
+    progress_label: str | None = None,
 ) -> TrainingOutcome:
     resolved_torch, _, _, _ = require_torch()
     _set_random_seed(seed)
@@ -987,66 +1270,97 @@ def train_model(
         model_variant,
         history_steps=prepared_dataset.history_steps,
         forecast_steps=prepared_dataset.forecast_steps,
-        exogenous_channels=prepared_dataset.train.exogenous_inputs.shape[2],
+        exogenous_channels=prepared_dataset.covariate_count * 2,
     ).to(device=resolved_device)
     optimizer = resolved_torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = resolved_torch.nn.MSELoss()
-    train_loader = _build_dataloader(prepared_dataset.train, batch_size=batch_size, shuffle=True, seed=seed)
-    val_loader = _build_dataloader(prepared_dataset.val, batch_size=batch_size, shuffle=False, seed=seed)
-    test_loader = _build_dataloader(prepared_dataset.test, batch_size=batch_size, shuffle=False, seed=seed)
+    train_loader = _build_dataloader(
+        prepared_dataset,
+        windows=prepared_dataset.train_windows,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=seed,
+    )
+    val_loader = _build_dataloader(
+        prepared_dataset,
+        windows=prepared_dataset.val_rolling_windows,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=seed,
+    )
 
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_rmse_pu = float("inf")
     epochs_without_improvement = 0
     epochs_ran = 0
+    epoch_progress = _create_progress_bar(
+        total=max_epochs,
+        desc=f"{progress_label or prepared_dataset.dataset_id} epochs",
+        leave=True,
+    )
+    try:
+        for epoch_index in range(1, max_epochs + 1):
+            model.train()
+            batch_progress = _create_progress_bar(
+                total=_loader_batch_total(train_loader),
+                desc=f"{progress_label or prepared_dataset.dataset_id} train e{epoch_index}",
+            )
+            last_loss_value: float | None = None
+            try:
+                for batch_target_inputs, batch_exogenous_inputs, batch_targets in train_loader:
+                    batch_target_inputs = batch_target_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
+                    batch_exogenous_inputs = batch_exogenous_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
+                    batch_targets = batch_targets.to(device=resolved_device, dtype=resolved_torch.float32)
+                    optimizer.zero_grad(set_to_none=True)
+                    predictions = model(batch_target_inputs, batch_exogenous_inputs)
+                    loss = criterion(predictions, batch_targets)
+                    loss.backward()
+                    optimizer.step()
+                    if hasattr(loss, "item"):
+                        last_loss_value = float(loss.item())
+                        batch_progress.set_postfix_str(f"loss={last_loss_value:.4f}")
+                    batch_progress.update(1)
+            finally:
+                batch_progress.close()
 
-    for epoch_index in range(1, max_epochs + 1):
-        model.train()
-        for batch_target_inputs, batch_exogenous_inputs, batch_targets in train_loader:
-            batch_target_inputs = batch_target_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
-            batch_exogenous_inputs = batch_exogenous_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
-            batch_targets = batch_targets.to(device=resolved_device, dtype=resolved_torch.float32)
-            optimizer.zero_grad(set_to_none=True)
-            predictions = model(batch_target_inputs, batch_exogenous_inputs)
-            loss = criterion(predictions, batch_targets)
-            loss.backward()
-            optimizer.step()
-
-        epochs_ran = epoch_index
-        val_metrics = evaluate_model(
-            model,
-            val_loader,
-            device=resolved_device,
-            rated_power_kw=prepared_dataset.rated_power_kw,
-        )
-        val_rmse_pu = float(val_metrics["rmse_pu"])
-        if val_rmse_pu < best_val_rmse_pu - 1e-12:
-            best_val_rmse_pu = val_rmse_pu
-            best_epoch = epoch_index
-            best_state = copy.deepcopy(model.state_dict())
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+            epochs_ran = epoch_index
+            val_metrics = evaluate_model(
+                model,
+                val_loader,
+                device=resolved_device,
+                rated_power_kw=prepared_dataset.rated_power_kw,
+                forecast_steps=prepared_dataset.forecast_steps,
+                progress_label=f"{progress_label or prepared_dataset.dataset_id} val e{epoch_index}",
+            )
+            val_rmse_pu = float(val_metrics.rmse_pu)
+            if val_rmse_pu < best_val_rmse_pu - 1e-12:
+                best_val_rmse_pu = val_rmse_pu
+                best_epoch = epoch_index
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            epoch_progress.update(1)
+            postfix_parts = [f"val_rmse={val_rmse_pu:.4f}", f"best={best_val_rmse_pu:.4f}"]
+            if last_loss_value is not None:
+                postfix_parts.insert(0, f"loss={last_loss_value:.4f}")
+            epoch_progress.set_postfix_str(" ".join(postfix_parts))
             if epochs_without_improvement >= early_stopping_patience:
                 break
+    finally:
+        epoch_progress.close()
 
     if best_state is None:  # pragma: no cover - defensive
         raise RuntimeError("Training completed without a best checkpoint.")
 
     model.load_state_dict(best_state)
-    test_metrics = evaluate_model(
-        model,
-        test_loader,
-        device=resolved_device,
-        rated_power_kw=prepared_dataset.rated_power_kw,
-    )
     return TrainingOutcome(
         best_epoch=best_epoch,
         epochs_ran=epochs_ran,
         best_val_rmse_pu=best_val_rmse_pu,
         device=resolved_device,
-        metrics=test_metrics,
+        model=model,
     )
 
 
@@ -1072,7 +1386,27 @@ def _timestamp_us_to_string(value: int | None) -> str | None:
     )
 
 
-def build_result_row(
+def _window_bounds(windows: WindowDescriptorIndex) -> tuple[str | None, str | None]:
+    if len(windows) == 0:
+        return None, None
+    return (
+        _timestamp_us_to_string(int(windows.output_start_us.min())),
+        _timestamp_us_to_string(int(windows.output_end_us.max())),
+    )
+
+
+def iter_evaluation_specs(
+    prepared_dataset: PreparedDataset,
+) -> tuple[tuple[str, str, WindowDescriptorIndex], ...]:
+    return (
+        ("val", ROLLING_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows),
+        ("val", NON_OVERLAP_EVAL_PROTOCOL, prepared_dataset.val_non_overlap_windows),
+        ("test", ROLLING_EVAL_PROTOCOL, prepared_dataset.test_rolling_windows),
+        ("test", NON_OVERLAP_EVAL_PROTOCOL, prepared_dataset.test_non_overlap_windows),
+    )
+
+
+def build_result_rows(
     prepared_dataset: PreparedDataset,
     *,
     model_variant: str,
@@ -1081,14 +1415,15 @@ def build_result_row(
     seed: int,
     batch_size: int,
     learning_rate: float,
-) -> dict[str, object]:
-    test_split = prepared_dataset.test
-    metrics = training_outcome.metrics
-    return {
+    evaluation_results: Sequence[tuple[str, str, WindowDescriptorIndex, EvaluationMetrics]],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    base_row = {
         "dataset_id": prepared_dataset.dataset_id,
         "model_id": MODEL_ID,
         "model_variant": model_variant,
         "task_id": TASK_ID,
+        "window_protocol": WINDOW_PROTOCOL,
         "history_steps": prepared_dataset.history_steps,
         "forecast_steps": prepared_dataset.forecast_steps,
         "stride_steps": prepared_dataset.stride_steps,
@@ -1098,19 +1433,11 @@ def build_result_row(
         "feature_set": prepared_dataset.feature_set,
         "covariate_count": prepared_dataset.covariate_count,
         "covariate_policy": prepared_dataset.covariate_policy,
-        "window_count": int(metrics["window_count"]),
-        "prediction_count": int(metrics["prediction_count"]),
-        "start_timestamp": _timestamp_us_to_string(int(test_split.output_start_us.min())),
-        "end_timestamp": _timestamp_us_to_string(int(test_split.output_end_us.max())),
-        "mae_kw": float(metrics["mae_kw"]),
-        "rmse_kw": float(metrics["rmse_kw"]),
-        "mae_pu": float(metrics["mae_pu"]),
-        "rmse_pu": float(metrics["rmse_pu"]),
         "device": training_outcome.device,
         "runtime_seconds": round(runtime_seconds, 6),
-        "train_window_count": int(prepared_dataset.train.target_inputs.shape[0]),
-        "val_window_count": int(prepared_dataset.val.target_inputs.shape[0]),
-        "test_window_count": int(prepared_dataset.test.target_inputs.shape[0]),
+        "train_window_count": len(prepared_dataset.train_windows),
+        "val_window_count": len(prepared_dataset.val_rolling_windows),
+        "test_window_count": len(prepared_dataset.test_rolling_windows),
         "best_epoch": training_outcome.best_epoch,
         "epochs_ran": training_outcome.epochs_ran,
         "best_val_rmse_pu": training_outcome.best_val_rmse_pu,
@@ -1118,6 +1445,47 @@ def build_result_row(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
     }
+    for split_name, eval_protocol, windows, metrics in evaluation_results:
+        start_timestamp, end_timestamp = _window_bounds(windows)
+        rows.append(
+            {
+                **base_row,
+                "split_name": split_name,
+                "eval_protocol": eval_protocol,
+                "metric_scope": OVERALL_METRIC_SCOPE,
+                "lead_step": None,
+                "lead_minutes": None,
+                "window_count": int(metrics.window_count),
+                "prediction_count": int(metrics.prediction_count),
+                "start_timestamp": start_timestamp,
+                "end_timestamp": end_timestamp,
+                "mae_kw": float(metrics.mae_kw),
+                "rmse_kw": float(metrics.rmse_kw),
+                "mae_pu": float(metrics.mae_pu),
+                "rmse_pu": float(metrics.rmse_pu),
+            }
+        )
+        for lead_index in range(prepared_dataset.forecast_steps):
+            lead_step = lead_index + 1
+            rows.append(
+                {
+                    **base_row,
+                    "split_name": split_name,
+                    "eval_protocol": eval_protocol,
+                    "metric_scope": HORIZON_METRIC_SCOPE,
+                    "lead_step": lead_step,
+                    "lead_minutes": lead_step * prepared_dataset.resolution_minutes,
+                    "window_count": int(metrics.horizon_window_count[lead_index]),
+                    "prediction_count": int(metrics.horizon_prediction_count[lead_index]),
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp,
+                    "mae_kw": float(metrics.horizon_mae_kw[lead_index]),
+                    "rmse_kw": float(metrics.horizon_rmse_kw[lead_index]),
+                    "mae_pu": float(metrics.horizon_mae_pu[lead_index]),
+                    "rmse_pu": float(metrics.horizon_rmse_pu[lead_index]),
+                }
+            )
+    return rows
 
 
 def execute_training_job(
@@ -1130,8 +1498,13 @@ def execute_training_job(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     max_epochs: int = DEFAULT_MAX_EPOCHS,
     early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
-) -> dict[str, object]:
+) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
+    progress_label = _job_progress_label(
+        prepared_dataset.dataset_id,
+        prepared_dataset.covariate_pack,
+        model_variant,
+    )
     training_outcome = train_model(
         model_variant,
         prepared_dataset,
@@ -1141,8 +1514,39 @@ def execute_training_job(
         learning_rate=learning_rate,
         max_epochs=max_epochs,
         early_stopping_patience=early_stopping_patience,
+        progress_label=progress_label,
     )
+    evaluation_results: list[tuple[str, str, WindowDescriptorIndex, EvaluationMetrics]] = []
+    eval_specs = iter_evaluation_specs(prepared_dataset)
+    eval_progress = _create_progress_bar(total=len(eval_specs), desc=f"{progress_label} eval")
+    try:
+        for split_name, eval_protocol, windows in eval_specs:
+            loader = _build_dataloader(
+                prepared_dataset,
+                windows=windows,
+                batch_size=batch_size,
+                shuffle=False,
+                seed=seed,
+            )
+            metrics = evaluate_model(
+                training_outcome.model,
+                loader,
+                device=training_outcome.device,
+                rated_power_kw=prepared_dataset.rated_power_kw,
+                forecast_steps=prepared_dataset.forecast_steps,
+                progress_label=f"{progress_label} {split_name}/{eval_protocol}",
+            )
+            evaluation_results.append((split_name, eval_protocol, windows, metrics))
+            eval_progress.update(1)
+            eval_progress.set_postfix_str(f"{split_name}/{eval_protocol}")
+    finally:
+        eval_progress.close()
     runtime_seconds = time.monotonic() - dataset_start
+    test_rolling_metrics = next(
+        metrics
+        for split_name, eval_protocol, _windows, metrics in evaluation_results
+        if split_name == "test" and eval_protocol == ROLLING_EVAL_PROTOCOL
+    )
     _profile_log(
         prepared_dataset.dataset_id,
         "training_complete",
@@ -1152,10 +1556,10 @@ def execute_training_job(
         best_epoch=training_outcome.best_epoch,
         epochs_ran=training_outcome.epochs_ran,
         best_val_rmse_pu=training_outcome.best_val_rmse_pu,
-        test_rmse_pu=training_outcome.metrics["rmse_pu"],
+        test_rolling_rmse_pu=test_rolling_metrics.rmse_pu,
         runtime_seconds=round(runtime_seconds, 6),
     )
-    return build_result_row(
+    return build_result_rows(
         prepared_dataset,
         model_variant=model_variant,
         training_outcome=training_outcome,
@@ -1163,6 +1567,7 @@ def execute_training_job(
         seed=seed,
         batch_size=batch_size,
         learning_rate=learning_rate,
+        evaluation_results=evaluation_results,
     )
 
 
@@ -1178,9 +1583,40 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("model_variant")
             .replace_strict(_MODEL_ORDER, default=len(_MODEL_ORDER))
             .alias("__model_order"),
+            pl.col("split_name")
+            .replace_strict(_SPLIT_ORDER, default=len(_SPLIT_ORDER))
+            .alias("__split_order"),
+            pl.col("eval_protocol")
+            .replace_strict(_EVAL_PROTOCOL_ORDER, default=len(_EVAL_PROTOCOL_ORDER))
+            .alias("__eval_protocol_order"),
+            pl.col("metric_scope")
+            .replace_strict(_METRIC_SCOPE_ORDER, default=len(_METRIC_SCOPE_ORDER))
+            .alias("__metric_scope_order"),
+            pl.col("lead_step").fill_null(0).alias("__lead_order"),
         )
-        .sort(["__dataset_order", "__stage_order", "__model_order"])
-        .drop(["__dataset_order", "__stage_order", "__model_order"])
+        .sort(
+            [
+                "__dataset_order",
+                "__stage_order",
+                "covariate_pack",
+                "__model_order",
+                "__split_order",
+                "__eval_protocol_order",
+                "__metric_scope_order",
+                "__lead_order",
+            ]
+        )
+        .drop(
+            [
+                "__dataset_order",
+                "__stage_order",
+                "__model_order",
+                "__split_order",
+                "__eval_protocol_order",
+                "__metric_scope_order",
+                "__lead_order",
+            ]
+        )
     )
 
 
@@ -1200,7 +1636,7 @@ def run_experiment(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
     dataset_loader: Callable[..., PreparedDataset] | None = None,
-    job_runner: Callable[..., dict[str, object]] | None = None,
+    job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
     unknown_variants = [variant for variant in model_variants if variant not in MODEL_VARIANTS]
     if unknown_variants:
@@ -1208,32 +1644,50 @@ def run_experiment(
     loader = dataset_loader or prepare_dataset
     runner = job_runner or execute_training_job
     rows: list[dict[str, object]] = []
-
-    for dataset_id in dataset_ids:
-        for pack in build_requested_packs(
-            dataset_id,
-            covariate_stages=covariate_stages,
-            include_power_only_reference=include_power_only_reference,
-        ):
-            prepared = loader(
+    total_jobs = sum(
+        len(
+            build_requested_packs(
                 dataset_id,
-                pack=pack,
-                cache_root=cache_root,
-                max_windows_per_split=max_windows_per_split,
+                covariate_stages=covariate_stages,
+                include_power_only_reference=include_power_only_reference,
             )
-            for model_variant in model_variants:
-                rows.append(
-                    runner(
-                        prepared,
-                        model_variant=model_variant,
-                        device=device,
-                        seed=seed,
-                        batch_size=batch_size,
-                        learning_rate=learning_rate,
-                        max_epochs=max_epochs,
-                        early_stopping_patience=early_stopping_patience,
-                    )
+        )
+        * len(model_variants)
+        for dataset_id in dataset_ids
+    )
+    job_progress = _create_progress_bar(total=total_jobs, desc="ltsf-linear jobs", leave=True)
+
+    try:
+        for dataset_id in dataset_ids:
+            for pack in build_requested_packs(
+                dataset_id,
+                covariate_stages=covariate_stages,
+                include_power_only_reference=include_power_only_reference,
+            ):
+                job_progress.set_postfix_str(f"{dataset_id}/{pack.pack_name}")
+                prepared = loader(
+                    dataset_id,
+                    pack=pack,
+                    cache_root=cache_root,
+                    max_windows_per_split=max_windows_per_split,
                 )
+                for model_variant in model_variants:
+                    job_progress.set_postfix_str(f"{dataset_id}/{pack.pack_name}/{model_variant}")
+                    rows.extend(
+                        runner(
+                            prepared,
+                            model_variant=model_variant,
+                            device=device,
+                            seed=seed,
+                            batch_size=batch_size,
+                            learning_rate=learning_rate,
+                            max_epochs=max_epochs,
+                            early_stopping_patience=early_stopping_patience,
+                        )
+                    )
+                    job_progress.update(1)
+    finally:
+        job_progress.close()
 
     results = sort_result_frame(pl.DataFrame(rows).select(_RESULT_COLUMNS))
     output = Path(output_path)
@@ -1243,7 +1697,9 @@ def run_experiment(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run local LTSF-Linear training benchmarks.")
+    parser = argparse.ArgumentParser(
+        description="Run local LTSF-Linear dense-window training with rolling and non-overlap evaluation."
+    )
     parser.add_argument(
         "--dataset",
         action="append",
@@ -1300,7 +1756,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-windows-per-split",
         type=int,
         default=None,
-        help="Optional smoke-test limit applied independently to train/val/test after split assignment.",
+        help=(
+            "Optional smoke-test limit applied to the dense base windows in each split "
+            "before non-overlap thinning."
+        ),
     )
     parser.add_argument(
         "--reference-only",

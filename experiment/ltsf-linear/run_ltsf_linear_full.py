@@ -10,6 +10,33 @@ import sys
 from typing import Sequence
 
 import polars as pl
+try:
+    from tqdm.auto import tqdm
+
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs) -> None:
+            del args
+            self.total = kwargs.get("total")
+            self.desc = kwargs.get("desc")
+            self.disable = kwargs.get("disable", False)
+            self.n = 0
+
+        def update(self, value=1) -> None:
+            self.n += int(value)
+
+        def set_postfix_str(self, value: str) -> None:
+            del value
+
+        def close(self) -> None:
+            return None
+
+        @staticmethod
+        def write(message: str) -> None:
+            print(message, flush=True)
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 if str(EXPERIMENT_DIR) not in sys.path:
@@ -18,11 +45,17 @@ if str(EXPERIMENT_DIR) not in sys.path:
 from ltsf_linear import (  # noqa: E402
     DEFAULT_COVARIATE_STAGES,
     DEFAULT_DATASETS,
+    FORECAST_STEPS,
+    HORIZON_METRIC_SCOPE,
     MODEL_ID,
     MODEL_VARIANTS,
+    NON_OVERLAP_EVAL_PROTOCOL,
+    OVERALL_METRIC_SCOPE,
     REFERENCE_STAGE,
+    ROLLING_EVAL_PROTOCOL,
     SPLIT_PROTOCOL,
     TASK_ID,
+    WINDOW_PROTOCOL,
     _RESULT_COLUMNS,
     build_requested_packs,
     resolve_device,
@@ -52,7 +85,21 @@ class JobSpec:
 
 
 def print_status(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+    tqdm.write(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+
+def progress_is_enabled() -> bool:
+    return HAS_TQDM and sys.stderr.isatty()
+
+
+def _create_progress_bar(*, total: int | None, desc: str, leave: bool = False):
+    return tqdm(
+        total=total,
+        desc=desc,
+        leave=leave,
+        disable=not progress_is_enabled(),
+        dynamic_ncols=True,
+    )
 
 
 def build_job_specs() -> tuple[JobSpec, ...]:
@@ -81,6 +128,39 @@ def expected_job_keys() -> list[tuple[str, str, str, str]]:
     ]
 
 
+def expected_result_keys() -> list[tuple[str, str, str, str, str, str, str, int | None]]:
+    keys: list[tuple[str, str, str, str, str, str, str, int | None]] = []
+    for job in build_job_specs():
+        for split_name in ("val", "test"):
+            for eval_protocol in (ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL):
+                keys.append(
+                    (
+                        job.dataset_id,
+                        job.covariate_stage,
+                        job.covariate_pack,
+                        job.model_variant,
+                        split_name,
+                        eval_protocol,
+                        OVERALL_METRIC_SCOPE,
+                        None,
+                    )
+                )
+                for lead_step in range(1, FORECAST_STEPS + 1):
+                    keys.append(
+                        (
+                            job.dataset_id,
+                            job.covariate_stage,
+                            job.covariate_pack,
+                            job.model_variant,
+                            split_name,
+                            eval_protocol,
+                            HORIZON_METRIC_SCOPE,
+                            lead_step,
+                        )
+                    )
+    return keys
+
+
 def resolve_attempts(device: str | None = None) -> tuple[Attempt, ...]:
     resolved_device = resolve_device(device)
     primary = Attempt(device=resolved_device)
@@ -92,6 +172,23 @@ def resolve_attempts(device: str | None = None) -> tuple[Attempt, ...]:
 def write_log(log_path: Path, payload: dict[str, object]) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def chunk_is_reusable(csv_path: Path) -> bool:
+    if not csv_path.exists():
+        return False
+    try:
+        frame = pl.read_csv(
+            csv_path,
+            n_rows=1,
+            schema_overrides={
+                "lead_step": pl.Int64,
+                "lead_minutes": pl.Int64,
+            },
+        )
+    except Exception:
+        return False
+    return set(_RESULT_COLUMNS).issubset(frame.columns)
 
 
 def build_cli_command(
@@ -134,15 +231,20 @@ def execute_job(
     attempts: Sequence[Attempt],
     epochs: int | None = None,
     max_windows_per_split: int | None = None,
+    reuse_existing_chunks: bool = False,
 ) -> Path:
     chunk_dir = work_dir / "chunks"
     log_dir = work_dir / "logs"
     chunk_dir.mkdir(parents=True, exist_ok=True)
     output_path = chunk_dir / f"{job.label}.csv"
 
-    if output_path.exists():
+    if reuse_existing_chunks and chunk_is_reusable(output_path):
         print_status(f"REUSE {job.label}: {output_path}")
         return output_path
+    if output_path.exists():
+        status = "STALE" if reuse_existing_chunks else "OVERWRITE"
+        print_status(f"{status} {job.label}: {output_path}")
+        output_path.unlink()
 
     for attempt_index, attempt in enumerate(attempts):
         suffix = "" if attempt_index == 0 else f"__retry_{attempt.device}"
@@ -155,6 +257,8 @@ def execute_job(
             epochs=epochs,
             max_windows_per_split=max_windows_per_split,
         )
+        if output_path.exists():
+            output_path.unlink()
         print_status(f"RUN {job.label}{suffix}: {' '.join(command)}")
         started_at = datetime.now().isoformat(timespec="seconds")
         result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
@@ -182,7 +286,13 @@ def execute_job(
 
 
 def load_chunk_frame(csv_path: Path) -> pl.DataFrame:
-    return pl.read_csv(csv_path).select(_RESULT_COLUMNS)
+    return pl.read_csv(
+        csv_path,
+        schema_overrides={
+            "lead_step": pl.Int64,
+            "lead_minutes": pl.Int64,
+        },
+    ).select(_RESULT_COLUMNS)
 
 
 def merge_chunk_results(chunk_paths: Sequence[Path]) -> pl.DataFrame:
@@ -191,7 +301,7 @@ def merge_chunk_results(chunk_paths: Sequence[Path]) -> pl.DataFrame:
 
 
 def validate_final_results(frame: pl.DataFrame) -> None:
-    expected = expected_job_keys()
+    expected = expected_result_keys()
     if frame.height != len(expected):
         raise RuntimeError(f"Expected {len(expected)} result rows, found {frame.height}.")
     actual = list(
@@ -200,15 +310,43 @@ def validate_final_results(frame: pl.DataFrame) -> None:
             frame["covariate_stage"].to_list(),
             frame["covariate_pack"].to_list(),
             frame["model_variant"].to_list(),
+            frame["split_name"].to_list(),
+            frame["eval_protocol"].to_list(),
+            frame["metric_scope"].to_list(),
+            frame["lead_step"].to_list(),
             strict=True,
         )
     )
-    if actual != expected:
-        raise RuntimeError(f"Unexpected dataset/stage/pack/model rows: {actual!r}")
+    normalized_actual = [
+        (
+            dataset_id,
+            covariate_stage,
+            covariate_pack,
+            model_variant,
+            split_name,
+            eval_protocol,
+            metric_scope,
+            None if lead_step is None else int(lead_step),
+        )
+        for (
+            dataset_id,
+            covariate_stage,
+            covariate_pack,
+            model_variant,
+            split_name,
+            eval_protocol,
+            metric_scope,
+            lead_step,
+        ) in actual
+    ]
+    if normalized_actual != expected:
+        raise RuntimeError(f"Unexpected result key rows: {normalized_actual!r}")
     if frame["model_id"].n_unique() != 1 or frame["model_id"][0] != MODEL_ID:
         raise RuntimeError("Final results contain an unexpected model_id.")
     if frame["task_id"].n_unique() != 1 or frame["task_id"][0] != TASK_ID:
         raise RuntimeError("Final results contain an unexpected task_id.")
+    if frame["window_protocol"].n_unique() != 1 or frame["window_protocol"][0] != WINDOW_PROTOCOL:
+        raise RuntimeError("Final results contain an unexpected window_protocol.")
     if frame["split_protocol"].n_unique() != 1 or frame["split_protocol"][0] != SPLIT_PROTOCOL:
         raise RuntimeError("Final results contain an unexpected split_protocol.")
     for column in (
@@ -236,19 +374,29 @@ def run_full_experiment(
     work_dir: str | Path = DEFAULT_WORK_ROOT,
     epochs: int | None = None,
     max_windows_per_split: int | None = None,
+    reuse_existing_chunks: bool = False,
 ) -> pl.DataFrame:
     work_dir_path = Path(work_dir)
     attempts = resolve_attempts(device)
-    chunk_paths = [
-        execute_job(
-            job=job,
-            work_dir=work_dir_path,
-            attempts=attempts,
-            epochs=epochs,
-            max_windows_per_split=max_windows_per_split,
-        )
-        for job in build_job_specs()
-    ]
+    job_specs = build_job_specs()
+    progress = _create_progress_bar(total=len(job_specs), desc="ltsf-linear full jobs", leave=True)
+    chunk_paths: list[Path] = []
+    try:
+        for job in job_specs:
+            progress.set_postfix_str(job.label)
+            chunk_paths.append(
+                execute_job(
+                    job=job,
+                    work_dir=work_dir_path,
+                    attempts=attempts,
+                    epochs=epochs,
+                    max_windows_per_split=max_windows_per_split,
+                    reuse_existing_chunks=reuse_existing_chunks,
+                )
+            )
+            progress.update(1)
+    finally:
+        progress.close()
     results = merge_chunk_results(chunk_paths)
     validate_final_results(results)
     output = Path(output_path)
@@ -289,6 +437,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional smoke-test limit passed through to each job.",
     )
+    parser.add_argument(
+        "--reuse-existing-chunks",
+        action="store_true",
+        help="Resume from compatible existing chunk CSVs under the work directory instead of rerunning them.",
+    )
     return parser
 
 
@@ -301,6 +454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         work_dir=args.work_dir,
         epochs=args.epochs,
         max_windows_per_split=args.max_windows_per_split,
+        reuse_existing_chunks=bool(args.reuse_existing_chunks),
     )
     return 0
 
