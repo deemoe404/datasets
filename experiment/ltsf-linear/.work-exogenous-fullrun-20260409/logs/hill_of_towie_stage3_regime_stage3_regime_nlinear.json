@@ -1,0 +1,27 @@
+{
+  "label": "hill_of_towie_stage3_regime_stage3_regime_nlinear",
+  "dataset_id": "hill_of_towie",
+  "covariate_stage": "stage3_regime",
+  "covariate_pack": "stage3_regime",
+  "model_variant": "nlinear",
+  "command": [
+    "/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/ltsf-linear/.conda/bin/python",
+    "/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/ltsf-linear/run_ltsf_linear.py",
+    "--dataset",
+    "hill_of_towie",
+    "--model",
+    "nlinear",
+    "--device",
+    "mps",
+    "--output-path",
+    "experiment/ltsf-linear/.work-exogenous-fullrun-20260409/chunks/hill_of_towie_stage3_regime_stage3_regime_nlinear.csv",
+    "--covariate-stage",
+    "stage3_regime",
+    "--no-power-only-reference"
+  ],
+  "returncode": 0,
+  "started_at": "2026-04-09T09:39:22",
+  "finished_at": "2026-04-09T09:40:29",
+  "stdout": "",
+  "stderr": "[ltsf_linear] {\"dataset_id\": \"hill_of_towie\", \"duration_seconds\": 0.006331, \"phase\": \"load_window_index\", \"strict_windows\": 253159}\n[ltsf_linear] {\"columns\": 35, \"covariate_pack\": \"stage3_regime\", \"covariate_stage\": \"stage3_regime\", \"covariates\": 30, \"dataset_id\": \"hill_of_towie\", \"duration_seconds\": 1.304581, \"feature_set\": \"default\", \"phase\": \"load_series\", \"rows\": 9574005}\n[ltsf_linear] {\"covariate_count\": 30, \"covariate_pack\": \"stage3_regime\", \"covariate_stage\": \"stage3_regime\", \"dataset_id\": \"hill_of_towie\", \"feature_set\": \"default\", \"phase\": \"prepare_dataset_complete\", \"rated_power_kw\": 2300.0, \"test_windows\": 51008, \"train_windows\": 178140, \"val_windows\": 24011}\n[ltsf_linear] {\"best_epoch\": 2, \"best_val_rmse_pu\": 0.8379718378045495, \"covariate_pack\": \"stage3_regime\", \"covariate_stage\": \"stage3_regime\", \"dataset_id\": \"hill_of_towie\", \"epochs_ran\": 7, \"model_variant\": \"nlinear\", \"phase\": \"training_complete\", \"runtime_seconds\": 15.746369, \"test_rmse_pu\": 1.5604391667204662}\n"
+}

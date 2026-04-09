@@ -37,3 +37,11 @@ cd experiment/chronos-2-exogenous
 ./create_env.sh
 ./.conda/bin/python run_exogenous_full.py
 ```
+
+## 全量运行 ltsf-linear 实验
+
+```shell
+cd experiment/ltsf-linear
+./create_env.sh
+./.conda/bin/python run_ltsf_linear_full.py
+```

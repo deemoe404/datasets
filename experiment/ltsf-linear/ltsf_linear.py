@@ -26,6 +26,19 @@ except ImportError:  # pragma: no cover - exercised in the root env where torch 
     TensorDataset = None
 
 
+EXPERIMENT_DIR = Path(__file__).resolve().parent
+COMMON_DIR = EXPERIMENT_DIR.parent / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.insert(0, str(COMMON_DIR))
+
+from covariate_packs import (  # noqa: E402
+    DEFAULT_COVARIATE_STAGES,
+    CovariatePackSpec,
+    iter_covariate_packs,
+    reference_pack_for,
+)
+
+
 MODEL_ID = "LTSF-Linear"
 TASK_ID = "next_6h_from_24h_stride_6h"
 SPLIT_PROTOCOL = "chrono_70_10_20"
@@ -42,7 +55,10 @@ DEFAULT_SEED = 42
 DLINEAR_KERNEL_SIZE = 25
 QUALITY_PROFILE = "default"
 SERIES_LAYOUT = "turbine"
-FEATURE_SET = "default"
+REFERENCE_STAGE = "reference"
+REFERENCE_PACK = "power_only"
+COVARIATE_POLICY = "past_only_train_zscore_fill0_mask"
+REFERENCE_COVARIATE_POLICY = "none"
 PROFILE_LOG_PREFIX = "[ltsf_linear] "
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,12 +74,11 @@ _TASK_WINDOW_COLUMNS = (
     "is_complete_output",
     "quality_flags",
 )
-_SERIES_COLUMNS = (
+_SERIES_BASE_COLUMNS = (
     "dataset",
     "turbine_id",
     "timestamp",
     "target_kw",
-    "is_observed",
     "quality_flags",
 )
 _RESULT_COLUMNS = [
@@ -75,6 +90,11 @@ _RESULT_COLUMNS = [
     "forecast_steps",
     "stride_steps",
     "split_protocol",
+    "covariate_stage",
+    "covariate_pack",
+    "feature_set",
+    "covariate_count",
+    "covariate_policy",
     "window_count",
     "prediction_count",
     "start_timestamp",
@@ -96,16 +116,17 @@ _RESULT_COLUMNS = [
     "learning_rate",
 ]
 _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_DATASETS)}
+_STAGE_ORDER = {REFERENCE_STAGE: 0, **{stage: index + 1 for index, stage in enumerate(DEFAULT_COVARIATE_STAGES)}}
 _MODEL_ORDER = {model_variant: index for index, model_variant in enumerate(MODEL_VARIANTS)}
 
 
 @dataclass(frozen=True)
 class TaskCachePaths:
     dataset_id: str
+    dataset_root: Path
     task_dir: Path
     window_index_path: Path
     task_context_path: Path
-    series_path: Path
     turbine_static_path: Path
 
 
@@ -118,14 +139,25 @@ class DatasetMetadata:
 
 
 @dataclass(frozen=True)
-class TurbineTargetSeries:
+class TurbineSeries:
     timestamps_us: np.ndarray
     target_pu: np.ndarray
+    past_covariates: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class RawSplitData:
+    target_inputs: np.ndarray
+    raw_exogenous_inputs: np.ndarray
+    targets: np.ndarray
+    output_start_us: np.ndarray
+    output_end_us: np.ndarray
 
 
 @dataclass(frozen=True)
 class SplitData:
-    inputs: np.ndarray
+    target_inputs: np.ndarray
+    exogenous_inputs: np.ndarray
     targets: np.ndarray
     output_start_us: np.ndarray
     output_end_us: np.ndarray
@@ -138,6 +170,11 @@ class PreparedDataset:
     history_steps: int
     forecast_steps: int
     stride_steps: int
+    covariate_stage: str
+    covariate_pack: str
+    feature_set: str
+    covariate_count: int
+    covariate_policy: str
     train: SplitData
     val: SplitData
     test: SplitData
@@ -178,6 +215,22 @@ def build_task_spec():
         task_id=TASK_ID,
         granularity="turbine",
     )
+
+
+def build_requested_packs(
+    dataset_id: str,
+    *,
+    covariate_stages: Sequence[str] = DEFAULT_COVARIATE_STAGES,
+    include_power_only_reference: bool = True,
+) -> tuple[CovariatePackSpec, ...]:
+    packs: list[CovariatePackSpec] = []
+    if include_power_only_reference:
+        packs.append(reference_pack_for(dataset_id))
+    if covariate_stages:
+        packs.extend(iter_covariate_packs((dataset_id,), tuple(covariate_stages)))
+    if not packs:
+        raise ValueError("At least one covariate pack must be selected.")
+    return tuple(packs)
 
 
 def require_torch() -> tuple[Any, Any, Any, Any]:
@@ -227,10 +280,10 @@ def resolve_cache_paths(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT
     task_dir = dataset_root / "tasks" / QUALITY_PROFILE / SERIES_LAYOUT / _TASK_DIR_NAME
     return TaskCachePaths(
         dataset_id=dataset_id,
+        dataset_root=dataset_root,
         task_dir=task_dir,
         window_index_path=task_dir / "window_index.parquet",
         task_context_path=task_dir / "task_context.json",
-        series_path=dataset_root / "gold_base" / QUALITY_PROFILE / SERIES_LAYOUT / FEATURE_SET / "series.parquet",
         turbine_static_path=dataset_root / "silver" / "meta" / "turbine_static.parquet",
     )
 
@@ -240,7 +293,6 @@ def ensure_task_cache(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) 
     required_paths = (
         paths.window_index_path,
         paths.task_context_path,
-        paths.series_path,
         paths.turbine_static_path,
     )
     if all(path.exists() for path in required_paths):
@@ -263,6 +315,46 @@ def ensure_task_cache(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) 
     if not all(path.exists() for path in required_paths):
         raise RuntimeError(f"Dataset cache for {dataset_id!r} is incomplete after rebuild.")
     return paths
+
+
+def resolve_turbine_series_path(
+    dataset_id: str,
+    *,
+    feature_set: str,
+    cache_root: str | Path = _CACHE_ROOT,
+) -> tuple[str, Path]:
+    cache_root_path = Path(cache_root)
+    direct_path = (
+        cache_root_path
+        / dataset_id
+        / "gold_base"
+        / QUALITY_PROFILE
+        / SERIES_LAYOUT
+        / feature_set
+        / "series.parquet"
+    )
+    if direct_path.exists():
+        return feature_set, direct_path
+
+    _ensure_repo_src_on_path()
+    from wind_datasets import get_dataset_spec
+    from wind_datasets.datasets import get_builder
+
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, cache_root_path)
+    resolved_feature_set = builder.resolve_feature_set(feature_set)
+    series_path = builder.cache_paths.gold_base_series_path_for(
+        spec.default_quality_profile,
+        layout=SERIES_LAYOUT,
+        feature_set=resolved_feature_set,
+    )
+    if not series_path.exists():
+        builder.build_gold_base(
+            quality_profile=spec.default_quality_profile,
+            layout=SERIES_LAYOUT,
+            feature_set=resolved_feature_set,
+        )
+    return resolved_feature_set, series_path
 
 
 def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> DatasetMetadata:
@@ -296,23 +388,44 @@ def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_RO
     )
 
 
-def load_target_series_frame(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> pl.DataFrame:
-    paths = ensure_task_cache(dataset_id, cache_root=cache_root)
+def load_series_frame(
+    dataset_id: str,
+    *,
+    pack: CovariatePackSpec,
+    cache_root: str | Path = _CACHE_ROOT,
+) -> tuple[str, tuple[str, ...], pl.DataFrame]:
+    resolved_feature_set, series_path = resolve_turbine_series_path(
+        dataset_id,
+        feature_set=pack.feature_set,
+        cache_root=cache_root,
+    )
+    available_columns = set(pl.read_parquet_schema(series_path))
+    missing_base = [column for column in _SERIES_BASE_COLUMNS if column not in available_columns]
+    if missing_base:
+        raise ValueError(
+            f"Series {series_path} for dataset {dataset_id!r} is missing required base columns {missing_base!r}."
+        )
+    covariate_columns = pack.selected_covariate_columns(available_columns)
+    selected_columns = tuple(_SERIES_BASE_COLUMNS) + covariate_columns
     load_started = time.monotonic()
     frame = (
-        pl.scan_parquet(paths.series_path)
-        .select(list(_SERIES_COLUMNS))
+        pl.scan_parquet(series_path)
+        .select(list(selected_columns))
         .sort(["turbine_id", "timestamp"])
         .collect()
     )
     _profile_log(
         dataset_id,
-        "load_target_series",
+        "load_series",
+        covariate_stage=pack.stage,
+        covariate_pack=pack.pack_name,
+        feature_set=resolved_feature_set,
         rows=frame.height,
         columns=len(frame.columns),
+        covariates=len(covariate_columns),
         duration_seconds=round(time.monotonic() - load_started, 6),
     )
-    return frame
+    return resolved_feature_set, covariate_columns, frame
 
 
 def load_strict_window_index(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> pl.DataFrame:
@@ -384,29 +497,55 @@ def split_window_index(
     return split_frames
 
 
+def prepare_series_frame(series: pl.DataFrame, *, covariate_columns: Sequence[str]) -> pl.DataFrame:
+    covariate_expressions: list[pl.Expr] = []
+    for column in covariate_columns:
+        dtype = series.schema[column]
+        if dtype == pl.Boolean:
+            covariate_expressions.append(
+                pl.when(pl.col(column).is_null())
+                .then(pl.lit(None, dtype=pl.Float64))
+                .otherwise(pl.col(column).cast(pl.UInt8))
+                .cast(pl.Float64)
+                .alias(column)
+            )
+        else:
+            covariate_expressions.append(
+                pl.col(column).cast(pl.Float64, strict=False).alias(column)
+            )
+    return series.with_columns(*covariate_expressions).select([*_SERIES_BASE_COLUMNS, *covariate_columns])
+
+
 def build_turbine_series_map(
     series: pl.DataFrame,
     *,
     rated_power_kw: float,
-) -> dict[str, TurbineTargetSeries]:
-    turbines: dict[str, TurbineTargetSeries] = {}
+    covariate_columns: Sequence[str],
+) -> dict[str, TurbineSeries]:
+    turbines: dict[str, TurbineSeries] = {}
     for turbine_frame in series.partition_by("turbine_id", maintain_order=True):
         turbine_id = turbine_frame["turbine_id"][0]
-        turbines[turbine_id] = TurbineTargetSeries(
+        turbines[turbine_id] = TurbineSeries(
             timestamps_us=turbine_frame["timestamp"].cast(pl.Int64).to_numpy(),
             target_pu=_normalize_target_values(turbine_frame["target_kw"].to_list(), rated_power_kw),
+            past_covariates={
+                column: turbine_frame[column].cast(pl.Float32).to_numpy()
+                for column in covariate_columns
+            },
         )
     return turbines
 
 
-def build_split_samples(
+def build_raw_split_samples(
     window_index: pl.DataFrame,
-    turbine_series_map: Mapping[str, TurbineTargetSeries],
+    turbine_series_map: Mapping[str, TurbineSeries],
     *,
     history_steps: int,
     forecast_steps: int,
-) -> SplitData:
-    sample_inputs: list[np.ndarray] = []
+    covariate_columns: Sequence[str],
+) -> RawSplitData:
+    sample_target_inputs: list[np.ndarray] = []
+    sample_covariates: list[np.ndarray] = []
     sample_targets: list[np.ndarray] = []
     output_start_values: list[int] = []
     output_end_values: list[int] = []
@@ -415,7 +554,6 @@ def build_split_samples(
         pl.col("output_start_ts").cast(pl.Int64).alias("output_start_us"),
         pl.col("output_end_ts").cast(pl.Int64).alias("output_end_us"),
     )
-    skipped_nan_windows = 0
 
     for turbine_frame in working.partition_by("turbine_id", maintain_order=True):
         turbine_id = turbine_frame["turbine_id"][0]
@@ -438,50 +576,141 @@ def build_split_samples(
                     f"Window for turbine {turbine_id!r} does not match expected history/forecast sizes."
                 )
             if np.isnan(context).any() or np.isnan(future).any():
-                skipped_nan_windows += 1
                 continue
-            sample_inputs.append(context.astype(np.float32, copy=True))
+            sample_target_inputs.append(context.astype(np.float32, copy=True))
+            if covariate_columns:
+                covariate_history = np.column_stack(
+                    [
+                        series.past_covariates[column][target_index - history_steps : target_index]
+                        for column in covariate_columns
+                    ]
+                ).astype(np.float32, copy=True)
+            else:
+                covariate_history = np.empty((history_steps, 0), dtype=np.float32)
+            sample_covariates.append(covariate_history)
             sample_targets.append(future.astype(np.float32, copy=True))
             output_start_values.append(int(output_start_us))
             output_end_values.append(int(output_end_us))
 
-    if not sample_inputs:
+    if not sample_target_inputs:
         raise ValueError("No valid samples remain after filtering NaN target windows.")
 
-    return SplitData(
-        inputs=np.stack(sample_inputs),
+    return RawSplitData(
+        target_inputs=np.stack(sample_target_inputs),
+        raw_exogenous_inputs=np.stack(sample_covariates)
+        if sample_covariates
+        else np.empty((0, history_steps, 0), dtype=np.float32),
         targets=np.stack(sample_targets),
         output_start_us=np.asarray(output_start_values, dtype=np.int64),
         output_end_us=np.asarray(output_end_values, dtype=np.int64),
     )
 
 
+def fit_covariate_statistics(raw_exogenous_inputs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if raw_exogenous_inputs.ndim != 3:
+        raise ValueError("raw_exogenous_inputs must have shape [batch, history, covariates].")
+    covariate_count = raw_exogenous_inputs.shape[2]
+    if covariate_count == 0:
+        return (
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+        )
+    flat = raw_exogenous_inputs.reshape(-1, covariate_count).astype(np.float64, copy=False)
+    valid = ~np.isnan(flat)
+    counts = valid.sum(axis=0)
+    sums = np.where(valid, flat, 0.0).sum(axis=0)
+    means = np.divide(sums, counts, out=np.zeros_like(sums), where=counts > 0)
+    centered = np.where(valid, flat - means, 0.0)
+    variances = np.divide(
+        np.square(centered).sum(axis=0),
+        counts,
+        out=np.ones_like(sums),
+        where=counts > 0,
+    )
+    stds = np.sqrt(variances)
+    stds[stds < 1e-6] = 1.0
+    return means.astype(np.float32), stds.astype(np.float32)
+
+
+def transform_exogenous_inputs(
+    raw_exogenous_inputs: np.ndarray,
+    *,
+    means: np.ndarray,
+    stds: np.ndarray,
+) -> np.ndarray:
+    if raw_exogenous_inputs.ndim != 3:
+        raise ValueError("raw_exogenous_inputs must have shape [batch, history, covariates].")
+    covariate_count = raw_exogenous_inputs.shape[2]
+    if covariate_count == 0:
+        return np.empty((raw_exogenous_inputs.shape[0], raw_exogenous_inputs.shape[1], 0), dtype=np.float32)
+    reshaped_means = means.reshape(1, 1, covariate_count)
+    reshaped_stds = stds.reshape(1, 1, covariate_count)
+    valid = ~np.isnan(raw_exogenous_inputs)
+    centered = np.where(valid, raw_exogenous_inputs, reshaped_means) - reshaped_means
+    normalized = (centered / reshaped_stds).astype(np.float32, copy=False)
+    normalized[~valid] = 0.0
+    missing_mask = (~valid).astype(np.float32)
+    return np.concatenate([normalized, missing_mask], axis=2)
+
+
+def finalize_split_data(
+    raw_split: RawSplitData,
+    *,
+    means: np.ndarray,
+    stds: np.ndarray,
+) -> SplitData:
+    return SplitData(
+        target_inputs=raw_split.target_inputs,
+        exogenous_inputs=transform_exogenous_inputs(raw_split.raw_exogenous_inputs, means=means, stds=stds),
+        targets=raw_split.targets,
+        output_start_us=raw_split.output_start_us,
+        output_end_us=raw_split.output_end_us,
+    )
+
+
 def prepare_dataset(
     dataset_id: str,
     *,
+    pack: CovariatePackSpec,
     cache_root: str | Path = _CACHE_ROOT,
     max_windows_per_split: int | None = None,
 ) -> PreparedDataset:
     metadata = load_dataset_metadata(dataset_id, cache_root=cache_root)
     strict_window_index = load_strict_window_index(dataset_id, cache_root=cache_root)
     split_frames = split_window_index(strict_window_index, max_windows_per_split=max_windows_per_split)
-    series = load_target_series_frame(dataset_id, cache_root=cache_root)
-    turbine_series_map = build_turbine_series_map(series, rated_power_kw=metadata.rated_power_kw)
-    split_data = {
-        split_name: build_split_samples(
+    resolved_feature_set, covariate_columns, series = load_series_frame(dataset_id, pack=pack, cache_root=cache_root)
+    prepared_series = prepare_series_frame(series, covariate_columns=covariate_columns)
+    turbine_series_map = build_turbine_series_map(
+        prepared_series,
+        rated_power_kw=metadata.rated_power_kw,
+        covariate_columns=covariate_columns,
+    )
+    raw_split_data = {
+        split_name: build_raw_split_samples(
             split_frame,
             turbine_series_map,
             history_steps=HISTORY_STEPS,
             forecast_steps=FORECAST_STEPS,
+            covariate_columns=covariate_columns,
         )
         for split_name, split_frame in split_frames.items()
     }
+    means, stds = fit_covariate_statistics(raw_split_data["train"].raw_exogenous_inputs)
+    split_data = {
+        split_name: finalize_split_data(raw_split, means=means, stds=stds)
+        for split_name, raw_split in raw_split_data.items()
+    }
+    covariate_policy = COVARIATE_POLICY if covariate_columns else REFERENCE_COVARIATE_POLICY
     _profile_log(
         dataset_id,
         "prepare_dataset_complete",
-        train_windows=split_data["train"].inputs.shape[0],
-        val_windows=split_data["val"].inputs.shape[0],
-        test_windows=split_data["test"].inputs.shape[0],
+        covariate_stage=pack.stage,
+        covariate_pack=pack.pack_name,
+        feature_set=resolved_feature_set,
+        covariate_count=len(covariate_columns),
+        train_windows=split_data["train"].target_inputs.shape[0],
+        val_windows=split_data["val"].target_inputs.shape[0],
+        test_windows=split_data["test"].target_inputs.shape[0],
         rated_power_kw=metadata.rated_power_kw,
     )
     return PreparedDataset(
@@ -490,6 +719,11 @@ def prepare_dataset(
         history_steps=HISTORY_STEPS,
         forecast_steps=FORECAST_STEPS,
         stride_steps=STRIDE_STEPS,
+        covariate_stage=pack.stage,
+        covariate_pack=pack.pack_name,
+        feature_set=resolved_feature_set,
+        covariate_count=len(covariate_columns),
+        covariate_policy=covariate_policy,
         train=split_data["train"],
         val=split_data["val"],
         test=split_data["test"],
@@ -515,6 +749,15 @@ def _initialize_linear(layer: Any) -> None:
         return
     with torch.no_grad():
         layer.weight.fill_(1.0 / layer.in_features)
+        if layer.bias is not None:
+            layer.bias.zero_()
+
+
+def _initialize_zero_linear(layer: Any) -> None:
+    if layer is None:  # pragma: no cover - defensive
+        return
+    with torch.no_grad():
+        layer.weight.zero_()
         if layer.bias is not None:
             layer.bias.zero_()
 
@@ -571,6 +814,45 @@ if nn is not None:
             seasonal, trend = self.decomposition(x)
             return self.linear_seasonal(seasonal) + self.linear_trend(trend)
 
+
+    class ExogenousResidualHead(nn.Module):
+        def __init__(self, history_steps: int, exogenous_channels: int, forecast_steps: int) -> None:
+            super().__init__()
+            self.exogenous_channels = exogenous_channels
+            if exogenous_channels > 0:
+                self.linear = nn.Linear(history_steps * exogenous_channels, forecast_steps)
+                _initialize_zero_linear(self.linear)
+            else:
+                self.linear = None
+
+        def forward(self, exogenous_inputs, *, target_like):
+            if self.linear is None or exogenous_inputs.shape[-1] == 0:
+                return torch.zeros_like(target_like)
+            flattened = exogenous_inputs.reshape(exogenous_inputs.shape[0], -1)
+            return self.linear(flattened)
+
+
+    class NLinearX(nn.Module):
+        def __init__(self, history_steps: int, forecast_steps: int, exogenous_channels: int) -> None:
+            super().__init__()
+            self.target_backbone = NLinear(history_steps, forecast_steps)
+            self.exogenous_head = ExogenousResidualHead(history_steps, exogenous_channels, forecast_steps)
+
+        def forward(self, target_inputs, exogenous_inputs):
+            base = self.target_backbone(target_inputs)
+            return base + self.exogenous_head(exogenous_inputs, target_like=base)
+
+
+    class DLinearX(nn.Module):
+        def __init__(self, history_steps: int, forecast_steps: int, exogenous_channels: int) -> None:
+            super().__init__()
+            self.target_backbone = DLinear(history_steps, forecast_steps, kernel_size=DLINEAR_KERNEL_SIZE)
+            self.exogenous_head = ExogenousResidualHead(history_steps, exogenous_channels, forecast_steps)
+
+        def forward(self, target_inputs, exogenous_inputs):
+            base = self.target_backbone(target_inputs)
+            return base + self.exogenous_head(exogenous_inputs, target_like=base)
+
 else:
 
     class MovingAverage:  # pragma: no cover - exercised only when torch is missing
@@ -593,12 +875,33 @@ else:
             require_torch()
 
 
-def build_model(model_variant: str, *, history_steps: int, forecast_steps: int):
+    class ExogenousResidualHead:  # pragma: no cover - exercised only when torch is missing
+        def __init__(self, *_args, **_kwargs) -> None:
+            require_torch()
+
+
+    class NLinearX:  # pragma: no cover - exercised only when torch is missing
+        def __init__(self, *_args, **_kwargs) -> None:
+            require_torch()
+
+
+    class DLinearX:  # pragma: no cover - exercised only when torch is missing
+        def __init__(self, *_args, **_kwargs) -> None:
+            require_torch()
+
+
+def build_model(
+    model_variant: str,
+    *,
+    history_steps: int,
+    forecast_steps: int,
+    exogenous_channels: int,
+):
     require_torch()
     if model_variant == "nlinear":
-        return NLinear(history_steps, forecast_steps)
+        return NLinearX(history_steps, forecast_steps, exogenous_channels)
     if model_variant == "dlinear":
-        return DLinear(history_steps, forecast_steps, kernel_size=DLINEAR_KERNEL_SIZE)
+        return DLinearX(history_steps, forecast_steps, exogenous_channels)
     raise ValueError(f"Unsupported model_variant {model_variant!r}.")
 
 
@@ -611,7 +914,8 @@ def _build_dataloader(
 ):
     resolved_torch, _, resolved_loader, resolved_dataset = require_torch()
     dataset = resolved_dataset(
-        resolved_torch.from_numpy(split_data.inputs),
+        resolved_torch.from_numpy(split_data.target_inputs),
+        resolved_torch.from_numpy(split_data.exogenous_inputs),
         resolved_torch.from_numpy(split_data.targets),
     )
     generator = resolved_torch.Generator()
@@ -636,13 +940,14 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float) -> dict
     }
     model.eval()
     with resolved_torch.no_grad():
-        for batch_inputs, batch_targets in loader:
-            batch_inputs = batch_inputs.to(device=device, dtype=resolved_torch.float32)
+        for batch_target_inputs, batch_exogenous_inputs, batch_targets in loader:
+            batch_target_inputs = batch_target_inputs.to(device=device, dtype=resolved_torch.float32)
+            batch_exogenous_inputs = batch_exogenous_inputs.to(device=device, dtype=resolved_torch.float32)
             batch_targets = batch_targets.to(device=device, dtype=resolved_torch.float32)
-            predictions = model(batch_inputs)
+            predictions = model(batch_target_inputs, batch_exogenous_inputs)
             errors_pu = predictions - batch_targets
             errors_kw = errors_pu * rated_power_kw
-            metrics["window_count"] = int(metrics["window_count"]) + int(batch_inputs.shape[0])
+            metrics["window_count"] = int(metrics["window_count"]) + int(batch_target_inputs.shape[0])
             metrics["prediction_count"] = int(metrics["prediction_count"]) + int(batch_targets.numel())
             metrics["abs_error_sum"] = float(metrics["abs_error_sum"]) + float(resolved_torch.abs(errors_kw).sum().item())
             metrics["squared_error_sum"] = float(metrics["squared_error_sum"]) + float(
@@ -682,6 +987,7 @@ def train_model(
         model_variant,
         history_steps=prepared_dataset.history_steps,
         forecast_steps=prepared_dataset.forecast_steps,
+        exogenous_channels=prepared_dataset.train.exogenous_inputs.shape[2],
     ).to(device=resolved_device)
     optimizer = resolved_torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = resolved_torch.nn.MSELoss()
@@ -697,11 +1003,12 @@ def train_model(
 
     for epoch_index in range(1, max_epochs + 1):
         model.train()
-        for batch_inputs, batch_targets in train_loader:
-            batch_inputs = batch_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
+        for batch_target_inputs, batch_exogenous_inputs, batch_targets in train_loader:
+            batch_target_inputs = batch_target_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
+            batch_exogenous_inputs = batch_exogenous_inputs.to(device=resolved_device, dtype=resolved_torch.float32)
             batch_targets = batch_targets.to(device=resolved_device, dtype=resolved_torch.float32)
             optimizer.zero_grad(set_to_none=True)
-            predictions = model(batch_inputs)
+            predictions = model(batch_target_inputs, batch_exogenous_inputs)
             loss = criterion(predictions, batch_targets)
             loss.backward()
             optimizer.step()
@@ -786,6 +1093,11 @@ def build_result_row(
         "forecast_steps": prepared_dataset.forecast_steps,
         "stride_steps": prepared_dataset.stride_steps,
         "split_protocol": SPLIT_PROTOCOL,
+        "covariate_stage": prepared_dataset.covariate_stage,
+        "covariate_pack": prepared_dataset.covariate_pack,
+        "feature_set": prepared_dataset.feature_set,
+        "covariate_count": prepared_dataset.covariate_count,
+        "covariate_policy": prepared_dataset.covariate_policy,
         "window_count": int(metrics["window_count"]),
         "prediction_count": int(metrics["prediction_count"]),
         "start_timestamp": _timestamp_us_to_string(int(test_split.output_start_us.min())),
@@ -796,9 +1108,9 @@ def build_result_row(
         "rmse_pu": float(metrics["rmse_pu"]),
         "device": training_outcome.device,
         "runtime_seconds": round(runtime_seconds, 6),
-        "train_window_count": int(prepared_dataset.train.inputs.shape[0]),
-        "val_window_count": int(prepared_dataset.val.inputs.shape[0]),
-        "test_window_count": int(prepared_dataset.test.inputs.shape[0]),
+        "train_window_count": int(prepared_dataset.train.target_inputs.shape[0]),
+        "val_window_count": int(prepared_dataset.val.target_inputs.shape[0]),
+        "test_window_count": int(prepared_dataset.test.target_inputs.shape[0]),
         "best_epoch": training_outcome.best_epoch,
         "epochs_ran": training_outcome.epochs_ran,
         "best_val_rmse_pu": training_outcome.best_val_rmse_pu,
@@ -834,6 +1146,8 @@ def execute_training_job(
     _profile_log(
         prepared_dataset.dataset_id,
         "training_complete",
+        covariate_stage=prepared_dataset.covariate_stage,
+        covariate_pack=prepared_dataset.covariate_pack,
         model_variant=model_variant,
         best_epoch=training_outcome.best_epoch,
         epochs_ran=training_outcome.epochs_ran,
@@ -858,12 +1172,15 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("dataset_id")
             .replace_strict(_DATASET_ORDER, default=len(_DATASET_ORDER))
             .alias("__dataset_order"),
+            pl.col("covariate_stage")
+            .replace_strict(_STAGE_ORDER, default=len(_STAGE_ORDER))
+            .alias("__stage_order"),
             pl.col("model_variant")
             .replace_strict(_MODEL_ORDER, default=len(_MODEL_ORDER))
             .alias("__model_order"),
         )
-        .sort(["__dataset_order", "__model_order"])
-        .drop(["__dataset_order", "__model_order"])
+        .sort(["__dataset_order", "__stage_order", "__model_order"])
+        .drop(["__dataset_order", "__stage_order", "__model_order"])
     )
 
 
@@ -871,6 +1188,8 @@ def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
     model_variants: Sequence[str] = MODEL_VARIANTS,
+    covariate_stages: Sequence[str] = DEFAULT_COVARIATE_STAGES,
+    include_power_only_reference: bool = True,
     cache_root: str | Path = _CACHE_ROOT,
     output_path: str | Path = _OUTPUT_PATH,
     device: str | None = None,
@@ -888,29 +1207,33 @@ def run_experiment(
         raise ValueError(f"Unsupported model variants: {unknown_variants!r}")
     loader = dataset_loader or prepare_dataset
     runner = job_runner or execute_training_job
-    prepared_datasets: dict[str, PreparedDataset] = {}
     rows: list[dict[str, object]] = []
 
     for dataset_id in dataset_ids:
-        prepared = loader(
+        for pack in build_requested_packs(
             dataset_id,
-            cache_root=cache_root,
-            max_windows_per_split=max_windows_per_split,
-        )
-        prepared_datasets[dataset_id] = prepared
-        for model_variant in model_variants:
-            rows.append(
-                runner(
-                    prepared,
-                    model_variant=model_variant,
-                    device=device,
-                    seed=seed,
-                    batch_size=batch_size,
-                    learning_rate=learning_rate,
-                    max_epochs=max_epochs,
-                    early_stopping_patience=early_stopping_patience,
-                )
+            covariate_stages=covariate_stages,
+            include_power_only_reference=include_power_only_reference,
+        ):
+            prepared = loader(
+                dataset_id,
+                pack=pack,
+                cache_root=cache_root,
+                max_windows_per_split=max_windows_per_split,
             )
+            for model_variant in model_variants:
+                rows.append(
+                    runner(
+                        prepared,
+                        model_variant=model_variant,
+                        device=device,
+                        seed=seed,
+                        batch_size=batch_size,
+                        learning_rate=learning_rate,
+                        max_epochs=max_epochs,
+                        early_stopping_patience=early_stopping_patience,
+                    )
+                )
 
     results = sort_result_frame(pl.DataFrame(rows).select(_RESULT_COLUMNS))
     output = Path(output_path)
@@ -936,6 +1259,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Limit execution to one or more model variants. Defaults to both nlinear and dlinear.",
     )
     parser.add_argument(
+        "--covariate-stage",
+        action="append",
+        choices=list(DEFAULT_COVARIATE_STAGES),
+        dest="covariate_stages",
+        help="Limit execution to one or more exogenous covariate stages. Defaults to all stages.",
+    )
+    parser.set_defaults(include_power_only_reference=True)
+    parser.add_argument(
+        "--include-power-only-reference",
+        action="store_true",
+        dest="include_power_only_reference",
+        help="Also emit one power-only reference row per dataset in the same output file.",
+    )
+    parser.add_argument(
+        "--no-power-only-reference",
+        action="store_false",
+        dest="include_power_only_reference",
+        help="Skip the power-only reference row.",
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cuda", "mps", "cpu"),
         default="auto",
@@ -959,15 +1302,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional smoke-test limit applied independently to train/val/test after split assignment.",
     )
+    parser.add_argument(
+        "--reference-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.reference_only:
+        covariate_stages: tuple[str, ...] = ()
+        include_power_only_reference = True
+    else:
+        covariate_stages = tuple(args.covariate_stages) if args.covariate_stages else DEFAULT_COVARIATE_STAGES
+        include_power_only_reference = bool(args.include_power_only_reference)
     run_experiment(
         dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
         model_variants=tuple(args.models) if args.models else MODEL_VARIANTS,
+        covariate_stages=covariate_stages,
+        include_power_only_reference=include_power_only_reference,
         device=args.device,
         max_epochs=args.epochs,
         output_path=args.output_path,

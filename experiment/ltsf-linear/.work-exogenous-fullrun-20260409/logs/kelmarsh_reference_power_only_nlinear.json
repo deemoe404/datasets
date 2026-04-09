@@ -1,0 +1,25 @@
+{
+  "label": "kelmarsh_reference_power_only_nlinear",
+  "dataset_id": "kelmarsh",
+  "covariate_stage": "reference",
+  "covariate_pack": "power_only",
+  "model_variant": "nlinear",
+  "command": [
+    "/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/ltsf-linear/.conda/bin/python",
+    "/Users/sam/Developer/Code/Wind Power Forecasting/datasets/experiment/ltsf-linear/run_ltsf_linear.py",
+    "--dataset",
+    "kelmarsh",
+    "--model",
+    "nlinear",
+    "--device",
+    "mps",
+    "--output-path",
+    "experiment/ltsf-linear/.work-exogenous-fullrun-20260409/chunks/kelmarsh_reference_power_only_nlinear.csv",
+    "--reference-only"
+  ],
+  "returncode": 0,
+  "started_at": "2026-04-09T09:33:18",
+  "finished_at": "2026-04-09T09:33:23",
+  "stdout": "",
+  "stderr": "[ltsf_linear] {\"dataset_id\": \"kelmarsh\", \"duration_seconds\": 0.004336, \"phase\": \"load_window_index\", \"strict_windows\": 73399}\n[ltsf_linear] {\"columns\": 5, \"covariate_pack\": \"power_only\", \"covariate_stage\": \"reference\", \"covariates\": 0, \"dataset_id\": \"kelmarsh\", \"duration_seconds\": 0.045658, \"feature_set\": \"lightweight\", \"phase\": \"load_series\", \"rows\": 2839104}\n[ltsf_linear] {\"covariate_count\": 0, \"covariate_pack\": \"power_only\", \"covariate_stage\": \"reference\", \"dataset_id\": \"kelmarsh\", \"feature_set\": \"lightweight\", \"phase\": \"prepare_dataset_complete\", \"rated_power_kw\": 2050.0, \"test_windows\": 14728, \"train_windows\": 51291, \"val_windows\": 7380}\n[ltsf_linear] {\"best_epoch\": 2, \"best_val_rmse_pu\": 0.1685208219457132, \"covariate_pack\": \"power_only\", \"covariate_stage\": \"reference\", \"dataset_id\": \"kelmarsh\", \"epochs_ran\": 7, \"model_variant\": \"nlinear\", \"phase\": \"training_complete\", \"runtime_seconds\": 2.672091, \"test_rmse_pu\": 0.17484543537482933}\n"
+}

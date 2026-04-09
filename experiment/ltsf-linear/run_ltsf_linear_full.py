@@ -15,15 +15,18 @@ EXPERIMENT_DIR = Path(__file__).resolve().parent
 if str(EXPERIMENT_DIR) not in sys.path:
     sys.path.insert(0, str(EXPERIMENT_DIR))
 
-from ltsf_linear import (
+from ltsf_linear import (  # noqa: E402
+    DEFAULT_COVARIATE_STAGES,
     DEFAULT_DATASETS,
     MODEL_ID,
     MODEL_VARIANTS,
-    _RESULT_COLUMNS,
-    resolve_device,
-    sort_result_frame,
+    REFERENCE_STAGE,
     SPLIT_PROTOCOL,
     TASK_ID,
+    _RESULT_COLUMNS,
+    build_requested_packs,
+    resolve_device,
+    sort_result_frame,
 )
 
 
@@ -43,6 +46,8 @@ class Attempt:
 class JobSpec:
     label: str
     dataset_id: str
+    covariate_stage: str
+    covariate_pack: str
     model_variant: str
 
 
@@ -53,17 +58,27 @@ def print_status(message: str) -> None:
 def build_job_specs() -> tuple[JobSpec, ...]:
     return tuple(
         JobSpec(
-            label=f"{dataset_id}_{model_variant}",
+            label=f"{dataset_id}_{pack.stage}_{pack.pack_name}_{model_variant}",
             dataset_id=dataset_id,
+            covariate_stage=pack.stage,
+            covariate_pack=pack.pack_name,
             model_variant=model_variant,
         )
         for dataset_id in DEFAULT_DATASETS
+        for pack in build_requested_packs(
+            dataset_id,
+            covariate_stages=DEFAULT_COVARIATE_STAGES,
+            include_power_only_reference=True,
+        )
         for model_variant in MODEL_VARIANTS
     )
 
 
-def expected_job_keys() -> list[tuple[str, str]]:
-    return [(job.dataset_id, job.model_variant) for job in build_job_specs()]
+def expected_job_keys() -> list[tuple[str, str, str, str]]:
+    return [
+        (job.dataset_id, job.covariate_stage, job.covariate_pack, job.model_variant)
+        for job in build_job_specs()
+    ]
 
 
 def resolve_attempts(device: str | None = None) -> tuple[Attempt, ...]:
@@ -82,6 +97,7 @@ def write_log(log_path: Path, payload: dict[str, object]) -> None:
 def build_cli_command(
     *,
     dataset_id: str,
+    covariate_stage: str,
     model_variant: str,
     output_path: Path,
     attempt: Attempt,
@@ -100,6 +116,10 @@ def build_cli_command(
         "--output-path",
         str(output_path),
     ]
+    if covariate_stage == REFERENCE_STAGE:
+        command.append("--reference-only")
+    else:
+        command.extend(["--covariate-stage", covariate_stage, "--no-power-only-reference"])
     if epochs is not None:
         command.extend(["--epochs", str(epochs)])
     if max_windows_per_split is not None:
@@ -128,6 +148,7 @@ def execute_job(
         suffix = "" if attempt_index == 0 else f"__retry_{attempt.device}"
         command = build_cli_command(
             dataset_id=job.dataset_id,
+            covariate_stage=job.covariate_stage,
             model_variant=job.model_variant,
             output_path=output_path,
             attempt=attempt,
@@ -143,6 +164,8 @@ def execute_job(
             {
                 "label": f"{job.label}{suffix}",
                 "dataset_id": job.dataset_id,
+                "covariate_stage": job.covariate_stage,
+                "covariate_pack": job.covariate_pack,
                 "model_variant": job.model_variant,
                 "command": command,
                 "returncode": result.returncode,
@@ -171,9 +194,17 @@ def validate_final_results(frame: pl.DataFrame) -> None:
     expected = expected_job_keys()
     if frame.height != len(expected):
         raise RuntimeError(f"Expected {len(expected)} result rows, found {frame.height}.")
-    actual = list(zip(frame["dataset_id"].to_list(), frame["model_variant"].to_list(), strict=True))
+    actual = list(
+        zip(
+            frame["dataset_id"].to_list(),
+            frame["covariate_stage"].to_list(),
+            frame["covariate_pack"].to_list(),
+            frame["model_variant"].to_list(),
+            strict=True,
+        )
+    )
     if actual != expected:
-        raise RuntimeError(f"Unexpected dataset/model rows: {actual!r}")
+        raise RuntimeError(f"Unexpected dataset/stage/pack/model rows: {actual!r}")
     if frame["model_id"].n_unique() != 1 or frame["model_id"][0] != MODEL_ID:
         raise RuntimeError("Final results contain an unexpected model_id.")
     if frame["task_id"].n_unique() != 1 or frame["task_id"][0] != TASK_ID:
@@ -181,6 +212,9 @@ def validate_final_results(frame: pl.DataFrame) -> None:
     if frame["split_protocol"].n_unique() != 1 or frame["split_protocol"][0] != SPLIT_PROTOCOL:
         raise RuntimeError("Final results contain an unexpected split_protocol.")
     for column in (
+        "feature_set",
+        "covariate_count",
+        "covariate_policy",
         "window_count",
         "prediction_count",
         "mae_kw",
