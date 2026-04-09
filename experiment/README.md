@@ -14,9 +14,9 @@ CSVs for the repository forecasting tasks.
 
 ## Experiments
 
-- [chronos-2](/home/sam/datasets/experiment/chronos-2/README.md): Chronos-2 `power_only` baselines
-- [chronos-2-exogenous](/home/sam/datasets/experiment/chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
-- [ltsf-linear](/home/sam/datasets/experiment/ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
+- [chronos-2](./chronos-2/README.md): Chronos-2 `power_only` baselines
+- [chronos-2-exogenous](./chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
+- [ltsf-linear](./ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
 
 Tracked result files:
 
@@ -27,7 +27,7 @@ Tracked result files:
 ## Covariate Stages
 
 The staged exogenous packs are defined in
-[`experiment/common/covariate_packs.py`](/home/sam/datasets/experiment/common/covariate_packs.py).
+[`experiment/common/covariate_packs.py`](./common/covariate_packs.py).
 `kelmarsh` and `penmanshiel` use `feature_set="lightweight"`. `hill_of_towie`
 and `sdwpf_kddcup` use `feature_set="default"`.
 

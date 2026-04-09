@@ -68,7 +68,7 @@
 
 ```toml
 [paths]
-source_data_root = "/home/sam/Documents/datasets/Wind Power Forecasting"
+source_data_root = "/path/to/Wind Power Forecasting"
 ```
 
 建立项目根环境：
