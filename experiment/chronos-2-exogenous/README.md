@@ -7,8 +7,17 @@ This experiment evaluates Chronos-2 zero-shot forecasting on:
 - `hill_of_towie`
 - `sdwpf_kddcup`
 
-The task is fixed to `24h look back -> 6h ahead` with a `6h` stride and uses
-only univariate turbine targets.
+The task is fixed to `24h look back -> 6h ahead` and uses only univariate
+turbine targets.
+
+Evaluation protocol:
+
+- dense sliding windows on the raw turbine timestep
+- raw unique timestamp chronological split `70/10/20`
+- strict-contained windows within each split
+- zero-shot scoring on `test` only
+- both `rolling_origin_no_refit` and `non_overlap`
+- long-form output with one `overall` row and `36` horizon rows per eval view
 
 Compared with `experiment/chronos-2`, this runner:
 
@@ -59,7 +68,7 @@ From this directory:
 ./.conda/bin/python run_exogenous.py
 ```
 
-This overwrites:
+This writes:
 
 ```text
 ../chronos-2-exogenous.csv
@@ -68,17 +77,17 @@ This overwrites:
 Useful smoke-test options:
 
 ```bash
-./.conda/bin/python run_exogenous.py --dataset kelmarsh --covariate-stage stage1_core --max-windows-per-dataset 64
+./.conda/bin/python run_exogenous.py --dataset kelmarsh --covariate-stage stage1_core --max-windows-per-split 64
 ```
 
 ```bash
-./.conda/bin/python run_exogenous.py --dataset hill_of_towie --covariate-stage stage3_regime --series-budget 256 --max-windows-per-dataset 32
+./.conda/bin/python run_exogenous.py --dataset hill_of_towie --covariate-stage stage3_regime --series-budget 256 --max-windows-per-split 32
 ```
 
 Include a local power-only reference row:
 
 ```bash
-./.conda/bin/python run_exogenous.py --dataset sdwpf_kddcup --include-power-only-reference --max-windows-per-dataset 32
+./.conda/bin/python run_exogenous.py --dataset sdwpf_kddcup --include-power-only-reference --max-windows-per-split 32
 ```
 
 Run the full staged benchmark serially:
@@ -86,6 +95,14 @@ Run the full staged benchmark serially:
 ```bash
 ./.conda/bin/python run_exogenous_full.py
 ```
+
+The default full-run output is an `888`-row long CSV:
+
+- `12` dataset/stage-pack jobs
+- `2` test eval views
+- `1 + 36` metric rows per eval view
+
+With `--include-power-only-reference`, it expands to `1184` rows.
 
 The full-run orchestrator automatically selects `cuda -> mps -> cpu`. When a
 non-CPU chunk fails, it retries the same chunk with fixed series budgets
@@ -95,6 +112,11 @@ non-CPU chunk fails, it retries the same chunk with fixed series budgets
 ```bash
 ./.conda/bin/python run_exogenous_full.py --device cuda
 ```
+
+Mini-bench note: on the `RTX 4090 D 24GB` check from `2026-04-09`, increasing
+the non-CPU `series_budget` above `1024` made both light and heavy packs slower,
+and `stage3_regime` started to hit CUDA OOM at higher budgets. The repo keeps
+the fixed retry ladder `1024 -> 768 -> 512 -> cpu 1024` intentionally.
 
 `--series-budget` remains available for backward compatibility, but it is only
 honored when the full run resolves to `cpu`. Non-CPU full runs always use the

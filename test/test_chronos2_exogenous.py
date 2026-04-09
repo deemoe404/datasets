@@ -70,6 +70,63 @@ def _synthetic_task(resolution_minutes: int = 10):
     return task_spec, task_spec.resolve(resolution_minutes)
 
 
+def _timestamp_us(timestamps) -> list[int]:
+    return pl.Series("timestamp", list(timestamps), dtype=pl.Datetime).cast(pl.Int64).to_list()
+
+
+def _patch_split_windows(
+    monkeypatch,
+    module,
+    timestamps,
+    *,
+    target_indices: Sequence[int],
+    turbine_indices: Sequence[int] | None = None,
+    train_window_count: int = 10,
+    val_window_count: int = 5,
+):
+    timestamp_us = _timestamp_us(timestamps)
+    resolved_turbine_indices = tuple(turbine_indices or [0] * len(target_indices))
+    windows = module.WindowDescriptorIndex(
+        turbine_indices=np.asarray(resolved_turbine_indices, dtype=np.int32),
+        target_indices=np.asarray(list(target_indices), dtype=np.int32),
+        output_start_us=np.asarray([timestamp_us[index] for index in target_indices], dtype=np.int64),
+        output_end_us=np.asarray([timestamp_us[index + 1] for index in target_indices], dtype=np.int64),
+    )
+    split_windows = module.PreparedSplitWindowSet(
+        train_window_count=train_window_count,
+        val_window_count=val_window_count,
+        test_window_count=len(target_indices),
+        test_rolling_windows=windows,
+        test_non_overlap_windows=windows,
+    )
+    monkeypatch.setattr(
+        module,
+        "ensure_task_cache",
+        lambda dataset_id, *, cache_root=module._CACHE_ROOT: module.TaskCachePaths(
+            task_window_path=Path("task_windows.parquet"),
+            dataset_path=Path("dataset.parquet"),
+        ),
+    )
+    monkeypatch.setattr(module, "load_strict_window_index", lambda *args, **kwargs: pl.DataFrame())
+    monkeypatch.setattr(module, "prepare_split_window_set", lambda *args, **kwargs: split_windows)
+    return split_windows
+
+
+def _rows_frame(module, rows) -> pl.DataFrame:
+    if isinstance(rows, pl.DataFrame):
+        return rows
+    return module.sort_result_frame(pl.DataFrame(rows).select(module._RESULT_COLUMNS))
+
+
+def _overall_row(module, rows, *, eval_protocol: str | None = None) -> dict[str, object]:
+    frame = _rows_frame(module, rows)
+    selected_protocol = eval_protocol or module.ROLLING_EVAL_PROTOCOL
+    return frame.filter(
+        (pl.col("eval_protocol") == selected_protocol)
+        & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+    ).to_dicts()[0]
+
+
 def _single_turbine_series(
     *,
     dataset_id: str,
@@ -367,6 +424,7 @@ def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) ->
         "load_covariate_series_frame",
         lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
     )
+    _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
     result = module.evaluate_univariate_covariate_pack(
         "kelmarsh",
@@ -375,19 +433,22 @@ def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) ->
         task_spec=task_spec,
         series_budget=1024,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert len(pipeline.calls) == 1
     assert len(pipeline.calls[0][0]["past_covariates"]) == len(pack.required_columns)
     assert pipeline.batch_sizes == [13]
-    assert result["dataset_id"] == "kelmarsh"
-    assert result["covariate_stage"] == "stage1_core"
-    assert result["covariate_pack"] == "stage1_core"
-    assert result["feature_set"] == "lightweight"
-    assert result["covariate_count"] == len(pack.required_columns)
-    assert result["window_count"] == 1
-    assert result["prediction_count"] == 1
-    assert result["mae_kw"] == 0.0
+    assert _rows_frame(module, result).height == 3
+    assert overall["dataset_id"] == "kelmarsh"
+    assert overall["covariate_stage"] == "stage1_core"
+    assert overall["covariate_pack"] == "stage1_core"
+    assert overall["feature_set"] == "lightweight"
+    assert overall["covariate_count"] == len(pack.required_columns)
+    assert overall["window_count"] == 1
+    assert overall["prediction_count"] == 1
+    assert overall["mae_kw"] == 0.0
 
 
 def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) -> None:
@@ -417,6 +478,7 @@ def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) 
         "load_covariate_series_frame",
         lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
     )
+    _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
     result = module.evaluate_univariate_covariate_pack(
         "penmanshiel",
@@ -424,11 +486,13 @@ def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) 
         pipeline=pipeline,
         task_spec=task_spec,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert pipeline.batch_sizes == [18]
-    assert result["covariate_stage"] == "stage2_ops"
-    assert result["covariate_count"] == len(pack.required_columns)
+    assert overall["covariate_stage"] == "stage2_ops"
+    assert overall["covariate_count"] == len(pack.required_columns)
 
 
 def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> None:
@@ -462,6 +526,7 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
         "load_covariate_series_frame",
         lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
     )
+    _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
     result = module.evaluate_univariate_covariate_pack(
         "hill_of_towie",
@@ -469,7 +534,9 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
         pipeline=pipeline,
         task_spec=task_spec,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert pipeline.first_call is not None
     np.testing.assert_allclose(
@@ -477,8 +544,8 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
         np.array([0.0, 1.0, 0.0], dtype=np.float32),
     )
     assert pipeline.batch_sizes == [24]
-    assert result["covariate_stage"] == "stage3_regime"
-    assert result["covariate_count"] == len(pack.required_columns)
+    assert overall["covariate_stage"] == "stage3_regime"
+    assert overall["covariate_count"] == len(pack.required_columns)
 
 
 def test_evaluate_univariate_covariate_pack_sdwpf_stage3_regime(monkeypatch) -> None:
@@ -510,6 +577,7 @@ def test_evaluate_univariate_covariate_pack_sdwpf_stage3_regime(monkeypatch) -> 
         "load_covariate_series_frame",
         lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
     )
+    _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
     result = module.evaluate_univariate_covariate_pack(
         "sdwpf_kddcup",
@@ -517,11 +585,13 @@ def test_evaluate_univariate_covariate_pack_sdwpf_stage3_regime(monkeypatch) -> 
         pipeline=pipeline,
         task_spec=task_spec,
         device="cpu",
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
     )
+    overall = _overall_row(module, result)
 
     assert pipeline.batch_sizes == [13]
-    assert result["covariate_stage"] == "stage3_regime"
-    assert result["covariate_count"] == len(pack.required_columns)
+    assert overall["covariate_stage"] == "stage3_regime"
+    assert overall["covariate_count"] == len(pack.required_columns)
 
 
 def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> None:
@@ -572,6 +642,7 @@ def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> No
         "_profile_log",
         lambda dataset_id, phase, **fields: progress_events.append({"dataset_id": dataset_id, "phase": phase, **fields}),
     )
+    _patch_split_windows(monkeypatch, module, stage2_series["timestamp"], target_indices=[3])
 
     output_path = tmp_path / "chronos-2-exogenous.csv"
     result = module.run_experiment(
@@ -583,28 +654,26 @@ def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> No
         pipeline=_FakePipeline(),
         turbine_ids=("Kelmarsh 1",),
         series_budget=14,
+        eval_protocols=(module.ROLLING_EVAL_PROTOCOL,),
         emit_progress_events=True,
     )
 
     progress_only = [event for event in progress_events if str(event["phase"]).startswith("progress_")]
 
     assert output_path.exists()
-    assert result.height == 2
+    assert result.height == 6
     assert [event["phase"] for event in progress_only] == [
-        "progress_chunk_plan",
         "progress_stage_start",
-        "progress_batch",
         "progress_batch",
         "progress_stage_complete",
         "progress_stage_start",
-        "progress_batch",
         "progress_batch",
         "progress_stage_complete",
     ]
-    assert progress_only[0]["chunk_total_batches"] == 4
-    assert [event["completed_chunk_batches"] for event in progress_only if event["phase"] == "progress_batch"] == [1, 2, 3, 4]
-    assert [event["stage_total_batches"] for event in progress_only if event["phase"] == "progress_stage_start"] == [2, 2]
-    assert [event["completed_stage_batches"] for event in progress_only if event["phase"] == "progress_stage_complete"] == [2, 2]
+    assert progress_only[0]["chunk_total_batches"] == 1
+    assert [event["completed_chunk_batches"] for event in progress_only if event["phase"] == "progress_batch"] == [1, 2]
+    assert [event["stage_total_batches"] for event in progress_only if event["phase"] == "progress_stage_start"] == [1, 1]
+    assert [event["completed_stage_batches"] for event in progress_only if event["phase"] == "progress_stage_complete"] == [1, 1]
     assert all(event["dataset_id"] == "kelmarsh" for event in progress_only)
 
 
@@ -615,22 +684,20 @@ def test_run_experiment_includes_reference_and_stage_rows(monkeypatch, tmp_path)
         pass
 
     def _fake_evaluate(dataset_id, *, pack, **kwargs):
-        return {
+        resolved_task = module.build_task_spec(window_protocol=module.DEFAULT_WINDOW_PROTOCOL).resolve(10)
+        base_row = {
             "dataset_id": dataset_id,
             "model_id": module.MODEL_ID,
-            "task_id": module.TASK_ID,
-            "history_steps": 144,
-            "forecast_steps": 36,
-            "stride_steps": 36,
+            "task_id": resolved_task.task_id,
+            "window_protocol": module.DEFAULT_WINDOW_PROTOCOL,
+            "history_steps": resolved_task.history_steps,
+            "forecast_steps": resolved_task.forecast_steps,
+            "stride_steps": resolved_task.stride_steps,
+            "split_protocol": module.SPLIT_PROTOCOL,
+            "split_name": "test",
             "target_policy": module.TARGET_POLICY,
-            "window_count": 1,
-            "prediction_count": 1,
             "start_timestamp": "2024-01-01 00:10:00",
             "end_timestamp": "2024-01-01 00:10:00",
-            "mae_kw": 1.0,
-            "rmse_kw": 1.0,
-            "mae_pu": 0.1,
-            "rmse_pu": 0.1,
             "device": "cpu",
             "runtime_seconds": 0.1,
             "layout": module.LAYOUT,
@@ -639,7 +706,44 @@ def test_run_experiment_includes_reference_and_stage_rows(monkeypatch, tmp_path)
             "feature_set": pack.feature_set,
             "covariate_count": len(pack.required_columns),
             "covariate_policy": module.COVARIATE_POLICY,
+            "train_window_count": 100,
+            "val_window_count": 20,
+            "test_window_count": 1,
         }
+        rows: list[dict[str, object]] = []
+        for eval_protocol in (module.ROLLING_EVAL_PROTOCOL, module.NON_OVERLAP_EVAL_PROTOCOL):
+            rows.append(
+                {
+                    **base_row,
+                    "eval_protocol": eval_protocol,
+                    "metric_scope": module.OVERALL_METRIC_SCOPE,
+                    "lead_step": None,
+                    "lead_minutes": None,
+                    "window_count": 1,
+                    "prediction_count": 1,
+                    "mae_kw": 1.0,
+                    "rmse_kw": 1.0,
+                    "mae_pu": 0.1,
+                    "rmse_pu": 0.1,
+                }
+            )
+            for lead_step in range(1, resolved_task.forecast_steps + 1):
+                rows.append(
+                    {
+                        **base_row,
+                        "eval_protocol": eval_protocol,
+                        "metric_scope": module.HORIZON_METRIC_SCOPE,
+                        "lead_step": lead_step,
+                        "lead_minutes": lead_step * 10,
+                        "window_count": 1,
+                        "prediction_count": 1,
+                        "mae_kw": 1.0,
+                        "rmse_kw": 1.0,
+                        "mae_pu": 0.1,
+                        "rmse_pu": 0.1,
+                    }
+                )
+        return rows
 
     monkeypatch.setattr(module, "load_pipeline", lambda **kwargs: _FakePipeline())
     monkeypatch.setattr(module, "evaluate_univariate_covariate_pack", _fake_evaluate)
@@ -654,14 +758,76 @@ def test_run_experiment_includes_reference_and_stage_rows(monkeypatch, tmp_path)
 
     assert output_path.exists()
     assert result.columns == module._RESULT_COLUMNS
-    assert result.height == 8
-    assert sorted(result["covariate_stage"].to_list()) == [
-        "reference",
+    assert result.height == 8 * 74
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert sorted(result["covariate_stage"].unique().to_list()) == [
         "reference",
         "stage1_core",
-        "stage1_core",
         "stage2_ops",
-        "stage2_ops",
-        "stage3_regime",
         "stage3_regime",
     ]
+
+
+def test_run_experiment_emits_dense_test_only_metadata(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+
+    class _FakePipeline:
+        pass
+
+    def _fake_evaluate(dataset_id, *, pack, **kwargs):
+        del dataset_id, pack, kwargs
+        resolved_task = module.build_task_spec(window_protocol=module.DEFAULT_WINDOW_PROTOCOL).resolve(10)
+        return [
+            {
+                "dataset_id": "kelmarsh",
+                "model_id": module.MODEL_ID,
+                "task_id": resolved_task.task_id,
+                "window_protocol": module.DEFAULT_WINDOW_PROTOCOL,
+                "history_steps": resolved_task.history_steps,
+                "forecast_steps": resolved_task.forecast_steps,
+                "stride_steps": resolved_task.stride_steps,
+                "split_protocol": module.SPLIT_PROTOCOL,
+                "split_name": "test",
+                "eval_protocol": module.ROLLING_EVAL_PROTOCOL,
+                "metric_scope": module.OVERALL_METRIC_SCOPE,
+                "lead_step": None,
+                "lead_minutes": None,
+                "target_policy": module.TARGET_POLICY,
+                "window_count": 1,
+                "prediction_count": 1,
+                "start_timestamp": "2024-01-01 00:10:00",
+                "end_timestamp": "2024-01-01 00:10:00",
+                "mae_kw": 1.0,
+                "rmse_kw": 1.0,
+                "mae_pu": 0.1,
+                "rmse_pu": 0.1,
+                "device": "cpu",
+                "runtime_seconds": 0.1,
+                "layout": module.LAYOUT,
+                "covariate_stage": "stage1_core",
+                "covariate_pack": "stage1_core",
+                "feature_set": "lightweight",
+                "covariate_count": 1,
+                "covariate_policy": module.COVARIATE_POLICY,
+                "train_window_count": 100,
+                "val_window_count": 20,
+                "test_window_count": 1,
+            }
+        ]
+
+    monkeypatch.setattr(module, "load_pipeline", lambda **kwargs: _FakePipeline())
+    monkeypatch.setattr(module, "evaluate_univariate_covariate_pack", _fake_evaluate)
+
+    output_path = tmp_path / "chronos-2-exogenous.csv"
+    result = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        covariate_stages=("stage1_core",),
+        output_path=output_path,
+        device="cpu",
+    )
+
+    assert output_path.exists()
+    assert result["window_protocol"].unique().to_list() == [module.DEFAULT_WINDOW_PROTOCOL]
+    assert result["task_id"].unique().to_list() == [module.TASK_ID]
+    assert result["split_protocol"].unique().to_list() == [module.SPLIT_PROTOCOL]
+    assert result["split_name"].unique().to_list() == ["test"]
