@@ -109,3 +109,11 @@ cd experiment/ltsf-linear
 ./create_env.sh
 ./.conda/bin/python run_ltsf_linear_full.py
 ```
+
+tft pilot 实验：
+
+```shell
+cd experiment/tft
+./create_env.sh
+./.conda/bin/python run_tft.py
+```

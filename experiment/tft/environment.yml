@@ -1,0 +1,15 @@
+name: tft-pilot
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch
+      - lightning
+      - pytorch-forecasting==1.7.0
+      - pandas[pyarrow]
+      - numpy
+      - pyarrow
+      - polars
+      - tqdm

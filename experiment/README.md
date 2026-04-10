@@ -11,18 +11,22 @@ CSVs for the repository forecasting tasks.
   horizon-wise rows.
 - `ltsf-linear` uses the same split definition, but trains on `train` and reports
   both `val` and `test`.
+- `tft` is a first-phase Kelmarsh pilot: train origins are downsampled for
+  efficiency, but `val/test` keep the same split definition and both eval views.
 
 ## Experiments
 
 - [chronos-2](./chronos-2/README.md): Chronos-2 `power_only` baselines
 - [chronos-2-exogenous](./chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
 - [ltsf-linear](./ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
+- [tft](./tft/README.md): Kelmarsh TFT pilot with static, deterministic known-future, and staged historical inputs
 
 Tracked result files:
 
 - `./chronos-2.csv`
 - `./chronos-2-exogenous.csv`
 - `./ltsf-linear.csv`
+- `./tft-pilot.csv`
 
 ## Covariate Stages
 
