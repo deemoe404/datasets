@@ -117,3 +117,11 @@ cd experiment/tft
 ./create_env.sh
 ./.conda/bin/python run_tft.py
 ```
+
+AGCRN pilot 实验：
+
+```shell
+cd experiment/agcrn
+./create_env.sh
+./.conda/bin/python run_agcrn.py
+```

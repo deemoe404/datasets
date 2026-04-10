@@ -9,6 +9,8 @@ CSVs for the repository forecasting tasks.
 - Chronos runners are zero-shot and score only `test`, reporting both
   `rolling_origin_no_refit` and `non_overlap` views plus `overall` and
   horizon-wise rows.
+- `agcrn` is a first-phase graph baseline pilot on the farm-synchronous
+  Kelmarsh turbine panel, trains on `train`, and reports both `val` and `test`.
 - `ltsf-linear` uses the same split definition, but trains on `train` and reports
   both `val` and `test`.
 - `tft` is a first-phase Kelmarsh pilot: train origins are downsampled for
@@ -18,6 +20,7 @@ CSVs for the repository forecasting tasks.
 
 - [chronos-2](./chronos-2/README.md): Chronos-2 `power_only` baselines
 - [chronos-2-exogenous](./chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
+- [agcrn](./agcrn/README.md): Kelmarsh farm-synchronous AGCRN `power_only` pilot
 - [ltsf-linear](./ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
 - [tft](./tft/README.md): Kelmarsh TFT pilot with static, deterministic known-future, and staged historical inputs
 
@@ -25,6 +28,7 @@ Tracked result files:
 
 - `./chronos-2.csv`
 - `./chronos-2-exogenous.csv`
+- `./agcrn-pilot.csv`
 - `./ltsf-linear.csv`
 - `./tft-pilot.csv`
 
@@ -145,6 +149,8 @@ when present in the selected feature set.
 
 - `chronos-2/run_power_only_full.py` uses a tuned CUDA chunk-batch profile:
   `univariate=128`, `univariate_power_stats=32`, `multivariate_knn6=32`.
+- `agcrn` intentionally starts narrower than the other trainable baselines:
+  Kelmarsh only, `power_only` only, and full-synchronous farm windows only.
 - `chronos-2-exogenous` and `ltsf-linear` share the same staged covariate pack
   definitions.
 - `chronos-2.csv` and `chronos-2-exogenous.csv` are long result files with
