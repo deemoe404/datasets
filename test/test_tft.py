@@ -449,8 +449,25 @@ def test_run_experiment_all_input_packs_emits_expected_888_row_grid(tmp_path) ->
         del dataset_id, cache_root, max_train_origins
         return _small_prepared_dataset(module, input_pack_spec=input_pack_spec)
 
-    def _fake_runner(prepared_dataset, *, device, seed, batch_size, learning_rate, max_epochs, early_stopping_patience):
-        del device, max_epochs, early_stopping_patience
+    def _fake_runner(
+        prepared_dataset,
+        *,
+        device,
+        seed,
+        batch_size,
+        learning_rate,
+        max_epochs,
+        early_stopping_patience,
+        hidden_size,
+        attention_head_size,
+        hidden_continuous_size,
+        dropout,
+        gradient_clip_val,
+        num_workers,
+        trainer_precision,
+        matmul_precision,
+    ):
+        del device, max_epochs, early_stopping_patience, num_workers, trainer_precision, matmul_precision
         evaluation_results = [
             ("val", module.ROLLING_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows, _evaluation_metrics(module, window_count=1, forecast_steps=36, base=0.10)),
             ("val", module.NON_OVERLAP_EVAL_PROTOCOL, prepared_dataset.val_non_overlap_windows, _evaluation_metrics(module, window_count=1, forecast_steps=36, base=0.11)),
@@ -470,6 +487,14 @@ def test_run_experiment_all_input_packs_emits_expected_888_row_grid(tmp_path) ->
             seed=seed,
             batch_size=batch_size or 128,
             learning_rate=learning_rate,
+            hidden_size=hidden_size,
+            attention_head_size=attention_head_size,
+            hidden_continuous_size=hidden_continuous_size,
+            dropout=dropout,
+            gradient_clip_val=gradient_clip_val,
+            num_workers=0,
+            trainer_precision="32-true",
+            matmul_precision=None,
             evaluation_results=evaluation_results,
         )
 
@@ -498,7 +523,19 @@ def test_resolve_batch_size_uses_cpu_default_for_mps() -> None:
 
     assert module.resolve_batch_size("cpu") == 128
     assert module.resolve_batch_size("mps") == 128
-    assert module.resolve_batch_size("cuda") == 256
+    assert module.resolve_batch_size("cuda") == 512
+
+
+def test_runtime_auto_resolution_prefers_cuda_fast_path() -> None:
+    module = _load_module()
+
+    assert module.resolve_num_workers("cpu") == 0
+    assert module.resolve_num_workers("mps") == 0
+    assert module.resolve_num_workers("cuda") >= 4
+    assert module.resolve_trainer_precision("cpu") == "32-true"
+    assert module.resolve_trainer_precision("cuda") == "bf16-mixed"
+    assert module.resolve_matmul_precision("cpu") is None
+    assert module.resolve_matmul_precision("cuda") == "high"
 
 
 def test_evaluate_model_disables_return_index(monkeypatch) -> None:
@@ -515,11 +552,13 @@ def test_evaluate_model_disables_return_index(monkeypatch) -> None:
             captured["kwargs"] = kwargs
             return FakePrediction()
 
-    def _fake_loader(dataset, *, batch_size, train):
+    def _fake_loader(dataset, *, batch_size, train, device, num_workers):
         captured["loader_args"] = {
             "dataset": dataset,
             "batch_size": batch_size,
             "train": train,
+            "device": device,
+            "num_workers": num_workers,
         }
         return "loader"
 
@@ -547,6 +586,8 @@ def test_evaluate_model_disables_return_index(monkeypatch) -> None:
         "dataset": "dataset",
         "batch_size": 64,
         "train": False,
+        "device": "mps",
+        "num_workers": None,
     }
     assert captured["kwargs"]["return_index"] is False
     assert captured["kwargs"]["return_y"] is True
@@ -578,6 +619,9 @@ def test_execute_training_job_reuses_built_datasets(monkeypatch) -> None:
                 "built_datasets": kwargs["built_datasets"],
                 "batch_size": kwargs["batch_size"],
                 "device": kwargs["device"],
+                "num_workers": kwargs["num_workers"],
+                "trainer_precision": kwargs["trainer_precision"],
+                "matmul_precision": kwargs["matmul_precision"],
             }
         )
         return module.TrainingOutcome(
@@ -599,7 +643,15 @@ def test_execute_training_job_reuses_built_datasets(monkeypatch) -> None:
         )
 
     def _fake_evaluate(model, dataset, **kwargs):
-        evaluate_calls.append((model, dataset, kwargs["batch_size"], kwargs["device"]))
+        evaluate_calls.append(
+            (
+                model,
+                dataset,
+                kwargs["batch_size"],
+                kwargs["device"],
+                kwargs["num_workers"],
+            )
+        )
         return _evaluation_metrics(module, window_count=1, forecast_steps=36, base=0.12)
 
     class _Progress:
@@ -627,10 +679,16 @@ def test_execute_training_job_reuses_built_datasets(monkeypatch) -> None:
             "built_datasets": fake_built,
             "batch_size": 128,
             "device": "mps",
+            "num_workers": 0,
+            "trainer_precision": "32-true",
+            "matmul_precision": None,
         }
     ]
     assert len(evaluate_calls) == 4
     assert rows[0]["batch_size"] == 128
+    assert rows[0]["num_workers"] == 0
+    assert rows[0]["trainer_precision"] == "32-true"
+    assert rows[0]["matmul_precision"] is None
 
 
 def test_normalize_cli_input_packs_expands_all_once() -> None:
@@ -639,3 +697,31 @@ def test_normalize_cli_input_packs_expands_all_once() -> None:
     normalized = module._normalize_cli_input_packs(["all", "reference", "mixed_stage1"])
 
     assert normalized == module.DEFAULT_INPUT_PACKS
+
+
+def test_build_dataloader_enables_cuda_prefetching() -> None:
+    module = _load_module()
+    captured: dict[str, object] = {}
+
+    class FakeDataset:
+        def to_dataloader(self, **kwargs):
+            captured.update(kwargs)
+            return "loader"
+
+    loader = module._build_dataloader(
+        FakeDataset(),
+        batch_size=512,
+        train=True,
+        device="cuda",
+        num_workers=6,
+    )
+
+    assert loader == "loader"
+    assert captured == {
+        "train": True,
+        "batch_size": 512,
+        "num_workers": 6,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": module.DEFAULT_PREFETCH_FACTOR,
+    }

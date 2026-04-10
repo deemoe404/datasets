@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import gc
 import json
 import math
+import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -59,6 +63,41 @@ except ImportError:  # pragma: no cover - exercised in the root env where pytorc
     TemporalFusionTransformer = None
     TimeSeriesDataSet = None
     RMSE = None
+
+
+def _configure_warning_filters() -> None:
+    warning_specs = (
+        (
+            "ignore",
+            r"The given NumPy array is not writable, and PyTorch does not support non-writable tensors\..*",
+            UserWarning,
+        ),
+        (
+            "ignore",
+            r"Attribute 'loss' is an instance of `nn\.Module` and is already saved during checkpointing\..*",
+            UserWarning,
+        ),
+        (
+            "ignore",
+            r"Attribute 'logging_metrics' is an instance of `nn\.Module` and is already saved during checkpointing\..*",
+            UserWarning,
+        ),
+        (
+            "ignore",
+            r"`isinstance\(treespec, LeafSpec\)` is deprecated, use `isinstance\(treespec, TreeSpec\) and treespec\.is_leaf\(\)` instead\..*",
+            Warning,
+        ),
+        (
+            "ignore",
+            r"upsample_linear1d_backward_out_cuda does not have a deterministic implementation, but you set 'torch\.use_deterministic_algorithms\(True, warn_only=True\)'\..*",
+            UserWarning,
+        ),
+    )
+    for action, message, category in warning_specs:
+        warnings.filterwarnings(action, message=message, category=category)
+
+
+_configure_warning_filters()
 
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
@@ -117,16 +156,21 @@ DEFAULT_DROPOUT = 0.1
 DEFAULT_GRADIENT_CLIP_VAL = 0.1
 DEFAULT_CPU_BATCH_SIZE = 128
 DEFAULT_ACCELERATOR_BATCH_SIZE = 256
+DEFAULT_PREFETCH_FACTOR = 4
 KNOWN_FUTURE_COLUMNS = ("tod_sin", "tod_cos", "dow_sin", "dow_cos")
 STATIC_COORD_COLUMNS = ("static_coord_1", "static_coord_2")
 TARGET_MISSING_COLUMN = "target_missing"
 REFERENCE_COVARIATE_POLICY = "none"
 COVARIATE_POLICY = "historical_train_zscore_fill0_mask + static_dataset_zscore + known_calendar"
 PROFILE_LOG_PREFIX = "[tft] "
+TRAINER_PRECISION_CHOICES = ("auto", "32-true", "16-mixed", "bf16-mixed")
+MATMUL_PRECISION_CHOICES = ("auto", "highest", "high", "medium")
 
 _REPO_ROOT = EXPERIMENT_DIR.parents[1]
 _CACHE_ROOT = _REPO_ROOT / "cache"
 _OUTPUT_PATH = _REPO_ROOT / "experiment" / "tft-pilot.csv"
+_WORK_DIR = EXPERIMENT_DIR / ".work"
+_JOB_ARTIFACTS_ROOT = _WORK_DIR / "jobs"
 _TASK_WINDOW_COLUMNS = (
     "dataset",
     "turbine_id",
@@ -185,6 +229,14 @@ _RESULT_COLUMNS = [
     "seed",
     "batch_size",
     "learning_rate",
+    "hidden_size",
+    "attention_head_size",
+    "hidden_continuous_size",
+    "dropout",
+    "gradient_clip_val",
+    "num_workers",
+    "trainer_precision",
+    "matmul_precision",
 ]
 _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_DATASETS)}
 _INPUT_PACK_ORDER = {name: index for index, name in enumerate(DEFAULT_INPUT_PACKS)}
@@ -209,6 +261,15 @@ class DatasetMetadata:
     turbine_ids: tuple[str, ...]
     rated_power_kw: float
     task_paths: TaskCachePaths
+
+
+@dataclass(frozen=True)
+class JobArtifactPaths:
+    dataset_id: str
+    input_pack: str
+    job_dir: Path
+    checkpoint_dir: Path
+    training_state_path: Path
 
 
 @dataclass(frozen=True)
@@ -319,6 +380,114 @@ def _create_progress_bar(*, total: int | None, desc: str, leave: bool = False):
     )
 
 
+def _sanitize_path_component(value: str) -> str:
+    return "".join(character if character.isalnum() or character in "-_." else "_" for character in value)
+
+
+def build_job_artifact_paths(dataset_id: str, input_pack: str) -> JobArtifactPaths:
+    job_dir = _JOB_ARTIFACTS_ROOT / _sanitize_path_component(dataset_id) / _sanitize_path_component(input_pack)
+    return JobArtifactPaths(
+        dataset_id=dataset_id,
+        input_pack=input_pack,
+        job_dir=job_dir,
+        checkpoint_dir=job_dir / "checkpoints",
+        training_state_path=job_dir / "training_state.json",
+    )
+
+
+def _job_result_filter(dataset_id: str, input_pack: str) -> pl.Expr:
+    return (pl.col("dataset_id") == dataset_id) & (pl.col("input_pack") == input_pack)
+
+
+def _expected_job_result_row_count(*, forecast_steps: int = FORECAST_STEPS) -> int:
+    return 4 * (forecast_steps + 1)
+
+
+def _has_complete_job_results(
+    results: pl.DataFrame | None,
+    *,
+    dataset_id: str,
+    input_pack: str,
+    forecast_steps: int = FORECAST_STEPS,
+) -> bool:
+    if results is None or results.height == 0:
+        return False
+    return (
+        results.filter(_job_result_filter(dataset_id, input_pack)).height
+        == _expected_job_result_row_count(forecast_steps=forecast_steps)
+    )
+
+
+def _read_results_frame(path: Path) -> pl.DataFrame | None:
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    return pl.read_csv(path, infer_schema_length=None, try_parse_dates=True)
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _read_training_state(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def _write_result_frame(results: pl.DataFrame, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+        results.write_csv(temp_path)
+        temp_path.replace(output_path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+
+
+def _merge_job_results(
+    existing_results: pl.DataFrame | None,
+    *,
+    dataset_id: str,
+    input_pack: str,
+    job_rows: Sequence[dict[str, object]],
+) -> pl.DataFrame:
+    job_frame = pl.DataFrame(job_rows, infer_schema_length=None).select(_RESULT_COLUMNS)
+    if existing_results is None or existing_results.height == 0:
+        return sort_result_frame(job_frame)
+    retained = existing_results.filter(~_job_result_filter(dataset_id, input_pack)).select(_RESULT_COLUMNS)
+    return sort_result_frame(pl.concat([retained, job_frame], how="vertical_relaxed"))
+
+
 def _loader_batch_total(loader: object) -> int | None:
     try:
         return int(len(loader))  # type: ignore[arg-type]
@@ -368,6 +537,12 @@ def require_forecasting() -> tuple[Any, Any, Any, Any, Any, Any]:
     return resolved_torch, lightning, EarlyStopping, ModelCheckpoint, TimeSeriesDataSet, TemporalFusionTransformer
 
 
+def release_process_memory() -> None:
+    gc.collect()
+    if torch is not None and bool(torch.cuda.is_available()):
+        torch.cuda.empty_cache()
+
+
 def select_device(torch_module: Any | None = None) -> str:
     resolved_torch = torch_module or torch
     if resolved_torch is None:
@@ -390,12 +565,65 @@ def resolve_batch_size(device: str) -> int:
     return DEFAULT_ACCELERATOR_BATCH_SIZE if device == "cuda" else DEFAULT_CPU_BATCH_SIZE
 
 
+def resolve_num_workers(device: str) -> int:
+    # The TFT pipeline materializes large in-memory pandas/TimeSeriesDataset
+    # objects, so multi-worker DataLoaders add memory pressure faster than they
+    # improve throughput on this repo's Kelmarsh pilot.
+    del device
+    return 0
+
+
 def _resolve_lightning_accelerator(device: str) -> str:
     if device == "cuda":
         return "gpu"
     if device == "mps":
         return "mps"
     return "cpu"
+
+
+def _resolve_trainer_deterministic(device: str) -> bool | str:
+    # TFT currently hits a CUDA backward op without a deterministic kernel in
+    # PyTorch, so strict deterministic mode fails on GPU-backed servers.
+    return True if device == "cpu" else "warn"
+
+
+def resolve_trainer_precision(device: str, precision: str | None = None) -> str:
+    if precision is None or precision == "auto":
+        return "bf16-mixed" if device == "cuda" else "32-true"
+    return precision
+
+
+def resolve_matmul_precision(device: str, precision: str | None = None) -> str | None:
+    if precision is None or precision == "auto":
+        return "high" if device == "cuda" else None
+    return precision
+
+
+def configure_torch_runtime(
+    torch_module: Any,
+    *,
+    device: str,
+    matmul_precision: str | None = None,
+) -> str | None:
+    resolved_matmul_precision = resolve_matmul_precision(device, matmul_precision)
+    if resolved_matmul_precision is not None and hasattr(torch_module, "set_float32_matmul_precision"):
+        torch_module.set_float32_matmul_precision(resolved_matmul_precision)
+
+    if device != "cuda":
+        return resolved_matmul_precision
+
+    backends = getattr(torch_module, "backends", None)
+    cuda_backend = getattr(backends, "cuda", None)
+    matmul_backend = getattr(cuda_backend, "matmul", None)
+    allow_tf32 = resolved_matmul_precision in {"high", "medium"}
+    if matmul_backend is not None and hasattr(matmul_backend, "allow_tf32"):
+        matmul_backend.allow_tf32 = allow_tf32
+    cudnn_backend = getattr(backends, "cudnn", None)
+    if cudnn_backend is not None and hasattr(cudnn_backend, "allow_tf32"):
+        cudnn_backend.allow_tf32 = allow_tf32
+    if cudnn_backend is not None and hasattr(cudnn_backend, "benchmark"):
+        cudnn_backend.benchmark = True
+    return resolved_matmul_precision
 
 
 def clip_target_values(values: Sequence[float | None], rated_power_kw: float) -> np.ndarray:
@@ -1172,11 +1400,27 @@ def build_timeseries_datasets(prepared_dataset: PreparedDataset) -> BuiltTimeSer
     )
 
 
-def _build_dataloader(dataset: Any, *, batch_size: int, train: bool) -> Any:
+def _build_dataloader(
+    dataset: Any,
+    *,
+    batch_size: int,
+    train: bool,
+    device: str,
+    num_workers: int | None = None,
+) -> Any:
+    resolved_num_workers = resolve_num_workers(device) if num_workers is None else int(num_workers)
+    dataloader_kwargs: dict[str, object] = {
+        "train": train,
+        "batch_size": batch_size,
+        "num_workers": resolved_num_workers,
+    }
+    if device == "cuda":
+        dataloader_kwargs["pin_memory"] = True
+    if resolved_num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = DEFAULT_PREFETCH_FACTOR
     return dataset.to_dataloader(
-        train=train,
-        batch_size=batch_size,
-        num_workers=0,
+        **dataloader_kwargs,
     )
 
 
@@ -1225,6 +1469,81 @@ def _resolve_best_epoch(best_model_path: str, torch_module: Any) -> int:
     return int(epoch) + 1
 
 
+def _build_training_config(
+    *,
+    seed: int,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    early_stopping_patience: int,
+    hidden_size: int,
+    attention_head_size: int,
+    hidden_continuous_size: int,
+    dropout: float,
+    gradient_clip_val: float,
+    num_workers: int,
+    trainer_precision: str,
+    matmul_precision: str | None,
+) -> dict[str, object]:
+    return {
+        "seed": int(seed),
+        "batch_size": int(batch_size),
+        "learning_rate": float(learning_rate),
+        "max_epochs": int(max_epochs),
+        "early_stopping_patience": int(early_stopping_patience),
+        "hidden_size": int(hidden_size),
+        "attention_head_size": int(attention_head_size),
+        "hidden_continuous_size": int(hidden_continuous_size),
+        "dropout": float(dropout),
+        "gradient_clip_val": float(gradient_clip_val),
+        "num_workers": int(num_workers),
+        "trainer_precision": trainer_precision,
+        "matmul_precision": matmul_precision,
+    }
+
+
+def _reset_job_artifacts(paths: JobArtifactPaths) -> None:
+    if paths.job_dir.exists():
+        shutil.rmtree(paths.job_dir)
+
+
+def _load_completed_training_outcome(
+    *,
+    paths: JobArtifactPaths,
+    training_config: Mapping[str, object],
+    model_loader: Any,
+) -> TrainingOutcome | None:
+    state = _read_training_state(paths.training_state_path)
+    if state is None or state.get("status") != "training_complete":
+        return None
+    if state.get("training_config") != dict(training_config):
+        return None
+    best_model_path = state.get("best_model_path")
+    if not isinstance(best_model_path, str) or not Path(best_model_path).exists():
+        return None
+    return TrainingOutcome(
+        best_epoch=int(state.get("best_epoch", 0)),
+        epochs_ran=int(state.get("epochs_ran", 0)),
+        best_val_rmse_pu=float(state.get("best_val_rmse_pu", float("nan"))),
+        device=str(state.get("device", "cpu")),
+        model=model_loader.load_from_checkpoint(best_model_path),
+    )
+
+
+def _resolve_resume_checkpoint(
+    *,
+    paths: JobArtifactPaths,
+    training_config: Mapping[str, object],
+) -> str | None:
+    state = _read_training_state(paths.training_state_path)
+    if state is not None and state.get("training_config") != dict(training_config):
+        return None
+    last_checkpoint = paths.checkpoint_dir / "last.ckpt"
+    if last_checkpoint.exists():
+        return str(last_checkpoint)
+    return None
+
+
 def train_model(
     prepared_dataset: PreparedDataset,
     *,
@@ -1240,14 +1559,96 @@ def train_model(
     hidden_continuous_size: int = DEFAULT_HIDDEN_CONTINUOUS_SIZE,
     dropout: float = DEFAULT_DROPOUT,
     gradient_clip_val: float = DEFAULT_GRADIENT_CLIP_VAL,
+    num_workers: int | None = None,
+    trainer_precision: str | None = None,
+    matmul_precision: str | None = None,
+    job_artifacts: JobArtifactPaths | None = None,
+    resume: bool = False,
 ) -> TrainingOutcome:
     resolved_torch, resolved_lightning, ResolvedEarlyStopping, ResolvedModelCheckpoint, _ResolvedTimeSeriesDataSet, ResolvedTemporalFusionTransformer = require_forecasting()
     resolved_device = resolve_device(device)
     resolved_batch_size = batch_size or resolve_batch_size(resolved_device)
+    resolved_num_workers = resolve_num_workers(resolved_device) if num_workers is None else int(num_workers)
+    resolved_trainer_precision = resolve_trainer_precision(resolved_device, trainer_precision)
+    resolved_matmul_precision = configure_torch_runtime(
+        resolved_torch,
+        device=resolved_device,
+        matmul_precision=matmul_precision,
+    )
+    training_config = _build_training_config(
+        seed=seed,
+        batch_size=resolved_batch_size,
+        learning_rate=learning_rate,
+        max_epochs=max_epochs,
+        early_stopping_patience=early_stopping_patience,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
+        gradient_clip_val=gradient_clip_val,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
+    )
+    resume_checkpoint_path: str | None = None
+    if job_artifacts is not None:
+        if resume:
+            cached_outcome = _load_completed_training_outcome(
+                paths=job_artifacts,
+                training_config=training_config,
+                model_loader=ResolvedTemporalFusionTransformer,
+            )
+            if cached_outcome is not None:
+                _profile_log(
+                    prepared_dataset.dataset_id,
+                    "fit_reuse",
+                    input_pack=prepared_dataset.input_pack,
+                    checkpoint_path=str(job_artifacts.training_state_path),
+                )
+                return cached_outcome
+            resume_checkpoint_path = _resolve_resume_checkpoint(
+                paths=job_artifacts,
+                training_config=training_config,
+            )
+            if resume_checkpoint_path is None:
+                state = _read_training_state(job_artifacts.training_state_path)
+                if state is not None and state.get("training_config") != training_config:
+                    _profile_log(
+                        prepared_dataset.dataset_id,
+                        "fit_resume_reset",
+                        input_pack=prepared_dataset.input_pack,
+                        reason="config_changed",
+                    )
+                    _reset_job_artifacts(job_artifacts)
+        else:
+            _reset_job_artifacts(job_artifacts)
+        job_artifacts.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(
+            job_artifacts.training_state_path,
+            {
+                "dataset_id": prepared_dataset.dataset_id,
+                "device": resolved_device,
+                "input_pack": prepared_dataset.input_pack,
+                "status": "fit_in_progress",
+                "training_config": training_config,
+            },
+        )
     resolved_torch.manual_seed(seed)
     resolved_built_datasets = built_datasets or build_timeseries_datasets(prepared_dataset)
-    train_loader = _build_dataloader(resolved_built_datasets.train_dataset, batch_size=resolved_batch_size, train=True)
-    val_loader = _build_dataloader(resolved_built_datasets.val_rolling_dataset, batch_size=resolved_batch_size, train=False)
+    train_loader = _build_dataloader(
+        resolved_built_datasets.train_dataset,
+        batch_size=resolved_batch_size,
+        train=True,
+        device=resolved_device,
+        num_workers=resolved_num_workers,
+    )
+    val_loader = _build_dataloader(
+        resolved_built_datasets.val_rolling_dataset,
+        batch_size=resolved_batch_size,
+        train=False,
+        device=resolved_device,
+        num_workers=resolved_num_workers,
+    )
     model = _build_model(
         resolved_built_datasets.train_dataset,
         learning_rate=learning_rate,
@@ -1265,9 +1666,31 @@ def train_model(
         monitor="val_loss",
         mode="min",
         save_top_k=1,
+        save_last=True,
         save_weights_only=False,
+        dirpath=str(job_artifacts.checkpoint_dir) if job_artifacts is not None else None,
+        filename="{epoch:02d}-{val_loss:.6f}",
     )
-    with tempfile.TemporaryDirectory(prefix="tft-pilot-") as temp_dir:
+    _profile_log(
+        prepared_dataset.dataset_id,
+        "fit_start",
+        input_pack=prepared_dataset.input_pack,
+        batch_size=resolved_batch_size,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
+        gradient_clip_val=gradient_clip_val,
+    )
+    fit_started = time.monotonic()
+    temp_dir_manager = tempfile.TemporaryDirectory(prefix="tft-pilot-") if job_artifacts is None else None
+    try:
+        trainer_root_dir = Path(temp_dir_manager.name) if temp_dir_manager is not None else job_artifacts.job_dir
+        if job_artifacts is not None:
+            trainer_root_dir.mkdir(parents=True, exist_ok=True)
         trainer = resolved_lightning.Trainer(
             max_epochs=max_epochs,
             accelerator=_resolve_lightning_accelerator(resolved_device),
@@ -1276,17 +1699,63 @@ def train_model(
             enable_model_summary=False,
             enable_progress_bar=progress_is_enabled(),
             gradient_clip_val=gradient_clip_val,
-            deterministic=True,
+            deterministic=_resolve_trainer_deterministic(resolved_device),
+            precision=resolved_trainer_precision,
             callbacks=[early_stopping, checkpoint],
-            default_root_dir=temp_dir,
+            default_root_dir=str(trainer_root_dir),
         )
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        if resume_checkpoint_path is not None:
+            _profile_log(
+                prepared_dataset.dataset_id,
+                "fit_resume",
+                input_pack=prepared_dataset.input_pack,
+                checkpoint_path=resume_checkpoint_path,
+            )
+            trainer.fit(
+                model,
+                train_dataloaders=train_loader,
+                val_dataloaders=val_loader,
+                ckpt_path=resume_checkpoint_path,
+            )
+        else:
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
         best_model_path = checkpoint.best_model_path
         best_val_rmse_pu = float(checkpoint.best_model_score.cpu().item()) if checkpoint.best_model_score is not None else float("nan")
         best_epoch = _resolve_best_epoch(best_model_path, resolved_torch)
         epochs_ran = max(int(getattr(trainer, "current_epoch", -1)) + 1, best_epoch, 1)
         if best_model_path:
             model = ResolvedTemporalFusionTransformer.load_from_checkpoint(best_model_path)
+    finally:
+        if temp_dir_manager is not None:
+            temp_dir_manager.cleanup()
+    if job_artifacts is not None and best_model_path:
+        _write_json_atomic(
+            job_artifacts.training_state_path,
+            {
+                "best_epoch": best_epoch,
+                "best_model_path": str(Path(best_model_path).resolve()),
+                "best_val_rmse_pu": best_val_rmse_pu,
+                "dataset_id": prepared_dataset.dataset_id,
+                "device": resolved_device,
+                "epochs_ran": epochs_ran,
+                "input_pack": prepared_dataset.input_pack,
+                "status": "training_complete",
+                "training_config": training_config,
+            },
+        )
+    _profile_log(
+        prepared_dataset.dataset_id,
+        "fit_complete",
+        input_pack=prepared_dataset.input_pack,
+        batch_size=resolved_batch_size,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
+        best_epoch=best_epoch,
+        epochs_ran=epochs_ran,
+        best_val_rmse_pu=best_val_rmse_pu,
+        duration_seconds=round(time.monotonic() - fit_started, 6),
+    )
     return TrainingOutcome(
         best_epoch=best_epoch,
         epochs_ran=epochs_ran,
@@ -1402,10 +1871,17 @@ def evaluate_model(
     *,
     device: str,
     batch_size: int,
+    num_workers: int | None = None,
     rated_power_kw: float,
 ) -> EvaluationMetrics:
     resolved_device = resolve_device(device)
-    loader = _build_dataloader(dataset, batch_size=batch_size, train=False)
+    loader = _build_dataloader(
+        dataset,
+        batch_size=batch_size,
+        train=False,
+        device=resolved_device,
+        num_workers=num_workers,
+    )
     trainer_kwargs = {
         "accelerator": _resolve_lightning_accelerator(resolved_device),
         "devices": 1,
@@ -1456,6 +1932,14 @@ def build_result_rows(
     seed: int,
     batch_size: int,
     learning_rate: float,
+    hidden_size: int,
+    attention_head_size: int,
+    hidden_continuous_size: int,
+    dropout: float,
+    gradient_clip_val: float,
+    num_workers: int,
+    trainer_precision: str,
+    matmul_precision: str | None,
     evaluation_results: Sequence[tuple[str, str, WindowDescriptorIndex, EvaluationMetrics]],
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
@@ -1488,6 +1972,14 @@ def build_result_rows(
         "seed": seed,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
+        "hidden_size": hidden_size,
+        "attention_head_size": attention_head_size,
+        "hidden_continuous_size": hidden_continuous_size,
+        "dropout": dropout,
+        "gradient_clip_val": gradient_clip_val,
+        "num_workers": num_workers,
+        "trainer_precision": trainer_precision,
+        "matmul_precision": matmul_precision,
     }
     for split_name, eval_protocol, windows, metrics in evaluation_results:
         start_timestamp, end_timestamp = _window_bounds(windows)
@@ -1541,10 +2033,23 @@ def execute_training_job(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     max_epochs: int = DEFAULT_MAX_EPOCHS,
     early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    attention_head_size: int = DEFAULT_ATTENTION_HEAD_SIZE,
+    hidden_continuous_size: int = DEFAULT_HIDDEN_CONTINUOUS_SIZE,
+    dropout: float = DEFAULT_DROPOUT,
+    gradient_clip_val: float = DEFAULT_GRADIENT_CLIP_VAL,
+    num_workers: int | None = None,
+    trainer_precision: str | None = None,
+    matmul_precision: str | None = None,
+    job_artifacts: JobArtifactPaths | None = None,
+    resume: bool = False,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     resolved_device = resolve_device(device)
     resolved_batch_size = batch_size or resolve_batch_size(resolved_device)
+    resolved_num_workers = resolve_num_workers(resolved_device) if num_workers is None else int(num_workers)
+    resolved_trainer_precision = resolve_trainer_precision(resolved_device, trainer_precision)
+    resolved_matmul_precision = resolve_matmul_precision(resolved_device, matmul_precision)
     built_datasets = build_timeseries_datasets(prepared_dataset)
     training_outcome = train_model(
         prepared_dataset,
@@ -1555,6 +2060,16 @@ def execute_training_job(
         learning_rate=learning_rate,
         max_epochs=max_epochs,
         early_stopping_patience=early_stopping_patience,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
+        gradient_clip_val=gradient_clip_val,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
+        job_artifacts=job_artifacts,
+        resume=resume,
     )
     evaluation_results: list[tuple[str, str, WindowDescriptorIndex, EvaluationMetrics]] = []
     eval_specs = iter_evaluation_specs(prepared_dataset, built_datasets)
@@ -1566,6 +2081,7 @@ def execute_training_job(
                 dataset,
                 device=training_outcome.device,
                 batch_size=resolved_batch_size,
+                num_workers=resolved_num_workers,
                 rated_power_kw=prepared_dataset.rated_power_kw,
             )
             evaluation_results.append((split_name, eval_protocol, windows, metrics))
@@ -1588,6 +2104,14 @@ def execute_training_job(
         best_val_rmse_pu=training_outcome.best_val_rmse_pu,
         test_rolling_rmse_pu=test_rolling_metrics.rmse_pu,
         runtime_seconds=round(runtime_seconds, 6),
+        batch_size=resolved_batch_size,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
     )
     return build_result_rows(
         prepared_dataset,
@@ -1596,6 +2120,14 @@ def execute_training_job(
         seed=seed,
         batch_size=resolved_batch_size,
         learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
+        gradient_clip_val=gradient_clip_val,
+        num_workers=resolved_num_workers,
+        trainer_precision=resolved_trainer_precision,
+        matmul_precision=resolved_matmul_precision,
         evaluation_results=evaluation_results,
     )
 
@@ -1656,6 +2188,15 @@ def run_experiment(
     batch_size: int | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
     early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    attention_head_size: int = DEFAULT_ATTENTION_HEAD_SIZE,
+    hidden_continuous_size: int = DEFAULT_HIDDEN_CONTINUOUS_SIZE,
+    dropout: float = DEFAULT_DROPOUT,
+    gradient_clip_val: float = DEFAULT_GRADIENT_CLIP_VAL,
+    num_workers: int | None = None,
+    trainer_precision: str | None = None,
+    matmul_precision: str | None = None,
+    resume: bool = False,
     dataset_loader: Callable[..., PreparedDataset] | None = None,
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
@@ -1664,39 +2205,68 @@ def run_experiment(
         raise ValueError(f"Unsupported input packs: {unknown_packs!r}")
     loader = dataset_loader or prepare_dataset
     runner = job_runner or execute_training_job
-    rows: list[dict[str, object]] = []
+    output = Path(output_path)
+    results = _read_results_frame(output) if resume else None
     total_jobs = len(dataset_ids) * len(input_packs)
     job_progress = _create_progress_bar(total=total_jobs, desc="tft jobs", leave=True)
     try:
         for dataset_id in dataset_ids:
             for input_pack_spec in build_requested_input_packs(dataset_id, input_packs=input_packs):
                 job_progress.set_postfix_str(f"{dataset_id}/{input_pack_spec.input_pack}")
+                if resume and _has_complete_job_results(
+                    results,
+                    dataset_id=dataset_id,
+                    input_pack=input_pack_spec.input_pack,
+                ):
+                    _profile_log(
+                        dataset_id,
+                        "job_skip_complete",
+                        input_pack=input_pack_spec.input_pack,
+                        output_path=str(output),
+                    )
+                    job_progress.update(1)
+                    continue
                 prepared = loader(
                     dataset_id,
                     input_pack_spec=input_pack_spec,
                     cache_root=cache_root,
                     max_train_origins=max_train_origins,
                 )
-                rows.extend(
-                    runner(
-                        prepared,
-                        device=device,
-                        seed=seed,
-                        batch_size=batch_size,
-                        learning_rate=learning_rate,
-                        max_epochs=max_epochs,
-                        early_stopping_patience=early_stopping_patience,
-                    )
+                job_rows = runner(
+                    prepared,
+                    device=device,
+                    seed=seed,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    early_stopping_patience=early_stopping_patience,
+                    hidden_size=hidden_size,
+                    attention_head_size=attention_head_size,
+                    hidden_continuous_size=hidden_continuous_size,
+                    dropout=dropout,
+                    gradient_clip_val=gradient_clip_val,
+                    num_workers=num_workers,
+                    trainer_precision=trainer_precision,
+                    matmul_precision=matmul_precision,
+                    job_artifacts=build_job_artifact_paths(dataset_id, input_pack_spec.input_pack),
+                    resume=resume,
                 )
+                results = _merge_job_results(
+                    results,
+                    dataset_id=prepared.dataset_id,
+                    input_pack=prepared.input_pack,
+                    job_rows=job_rows,
+                )
+                _write_result_frame(results, output)
+                del job_rows
+                del prepared
+                release_process_memory()
                 job_progress.update(1)
     finally:
         job_progress.close()
-
-    results = sort_result_frame(pl.DataFrame(rows, infer_schema_length=None).select(_RESULT_COLUMNS))
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    results.write_csv(output)
-    return results
+    if results is None:
+        return pl.DataFrame(schema={column: pl.String for column in _RESULT_COLUMNS}).select(_RESULT_COLUMNS)
+    return sort_result_frame(results.select(_RESULT_COLUMNS))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1744,6 +2314,80 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(_OUTPUT_PATH),
         help=f"Output CSV path. Defaults to {_OUTPUT_PATH}.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previously interrupted run: skip input packs already present in "
+            "the output CSV and continue unfinished training from ./.work/jobs/.../checkpoints/last.ckpt when available."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Mini-batch size. Defaults to device-specific automatic selection.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=DEFAULT_LEARNING_RATE,
+        help=f"Optimizer learning rate. Defaults to {DEFAULT_LEARNING_RATE}.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=DEFAULT_EARLY_STOPPING_PATIENCE,
+        help=f"Validation early stopping patience. Defaults to {DEFAULT_EARLY_STOPPING_PATIENCE}.",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=DEFAULT_HIDDEN_SIZE,
+        help=f"TFT hidden size. Defaults to {DEFAULT_HIDDEN_SIZE}.",
+    )
+    parser.add_argument(
+        "--attention-head-size",
+        type=int,
+        default=DEFAULT_ATTENTION_HEAD_SIZE,
+        help=f"Multi-head attention head count. Defaults to {DEFAULT_ATTENTION_HEAD_SIZE}.",
+    )
+    parser.add_argument(
+        "--hidden-continuous-size",
+        type=int,
+        default=DEFAULT_HIDDEN_CONTINUOUS_SIZE,
+        help=f"Continuous variable hidden size. Defaults to {DEFAULT_HIDDEN_CONTINUOUS_SIZE}.",
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=DEFAULT_DROPOUT,
+        help=f"Dropout rate. Defaults to {DEFAULT_DROPOUT}.",
+    )
+    parser.add_argument(
+        "--gradient-clip-val",
+        type=float,
+        default=DEFAULT_GRADIENT_CLIP_VAL,
+        help=f"Gradient clipping value. Defaults to {DEFAULT_GRADIENT_CLIP_VAL}.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader worker count. Defaults to device-specific automatic selection.",
+    )
+    parser.add_argument(
+        "--trainer-precision",
+        default="auto",
+        choices=TRAINER_PRECISION_CHOICES,
+        help="Lightning precision mode. Defaults to CUDA=bf16-mixed, otherwise 32-true.",
+    )
+    parser.add_argument(
+        "--matmul-precision",
+        default="auto",
+        choices=MATMUL_PRECISION_CHOICES,
+        help="torch float32 matmul precision. Defaults to CUDA=high, otherwise unchanged.",
+    )
     return parser
 
 
@@ -1773,6 +2417,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_epochs=args.epochs,
         max_train_origins=args.max_train_origins,
         seed=args.seed,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        early_stopping_patience=args.early_stopping_patience,
+        hidden_size=args.hidden_size,
+        attention_head_size=args.attention_head_size,
+        hidden_continuous_size=args.hidden_continuous_size,
+        dropout=args.dropout,
+        gradient_clip_val=args.gradient_clip_val,
+        num_workers=args.num_workers,
+        trainer_precision=args.trainer_precision,
+        matmul_precision=args.matmul_precision,
+        resume=args.resume,
     )
     return 0
 
