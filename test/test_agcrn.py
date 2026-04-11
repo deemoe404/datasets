@@ -245,6 +245,29 @@ def _patch_temp_bundle_loader(
     monkeypatch.setattr(module, "_load_task_bundle", _fake_load_task_bundle)
 
 
+def _patch_temp_bundle_loader_for_protocols(
+    monkeypatch,
+    module,
+    cache_root: Path,
+    *,
+    dataset_id: str = "toy_dataset",
+    feature_protocol_ids: tuple[str, ...],
+) -> None:
+    def _fake_load_task_bundle(requested_dataset_id: str, *, feature_protocol_id: str, cache_root: str | Path):
+        assert requested_dataset_id == dataset_id
+        assert feature_protocol_id in allowed_feature_protocol_ids
+        assert Path(cache_root) == cache_root_path
+        return _read_temp_bundle(
+            cache_root_path,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+
+    allowed_feature_protocol_ids = set(feature_protocol_ids)
+    cache_root_path = cache_root
+    monkeypatch.setattr(module, "_load_task_bundle", _fake_load_task_bundle)
+
+
 def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 600_000_000):
     target_indices_array = np.asarray(target_indices, dtype=np.int32)
     output_start_us = target_indices_array.astype(np.int64) * step_us
@@ -253,6 +276,14 @@ def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 6
         target_indices=target_indices_array,
         output_start_us=output_start_us,
         output_end_us=output_end_us,
+    )
+
+
+def _window_descriptor_signature(descriptor) -> tuple[list[int], list[int], list[int]]:
+    return (
+        descriptor.target_indices.tolist(),
+        descriptor.output_start_us.tolist(),
+        descriptor.output_end_us.tolist(),
     )
 
 
@@ -671,6 +702,168 @@ def test_prepare_dataset_drops_windows_with_input_feature_quality_issues(tmp_pat
     assert len(prepared.val_non_overlap_windows) == 1
 
 
+def test_prepare_dataset_single_variant_keeps_own_windows_even_when_other_variant_is_stricter(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, feature_protocol_id="power_only")
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+        missing_past_covariate_indices=(1563,),
+    )
+    _patch_temp_bundle_loader_for_protocols(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_ids=("power_only", "power_ws_hist"),
+    )
+
+    power_only = module.prepare_dataset("toy_dataset", cache_root=cache_root)
+    power_ws_hist = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WS_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert len(power_only.val_rolling_windows) == 21
+    assert len(power_ws_hist.val_rolling_windows) == 20
+
+
+def test_prepare_variant_datasets_aligns_multi_variant_windows_to_shared_strict_subset(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, feature_protocol_id="power_only")
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _patch_temp_bundle_loader_for_protocols(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_ids=("power_only", "power_ws_hist"),
+    )
+
+    power_only_direct = module.prepare_dataset("toy_dataset", cache_root=cache_root)
+    power_ws_direct = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WS_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+    power_only_aligned, power_ws_aligned = module._prepare_datasets_for_variants(
+        "toy_dataset",
+        variant_specs=module.resolve_variant_specs(),
+        cache_root=cache_root,
+    )
+
+    assert len(power_only_direct.train_windows) > len(power_only_aligned.train_windows)
+    assert len(power_only_direct.val_rolling_windows) > len(power_only_aligned.val_rolling_windows)
+    assert len(power_only_direct.test_rolling_windows) > len(power_only_aligned.test_rolling_windows)
+    assert len(power_ws_direct.train_windows) == len(power_ws_aligned.train_windows)
+    assert len(power_ws_direct.val_rolling_windows) == len(power_ws_aligned.val_rolling_windows)
+    assert len(power_ws_direct.test_rolling_windows) == len(power_ws_aligned.test_rolling_windows)
+
+    for attribute in (
+        "train_windows",
+        "val_rolling_windows",
+        "val_non_overlap_windows",
+        "test_rolling_windows",
+        "test_non_overlap_windows",
+    ):
+        assert _window_descriptor_signature(getattr(power_only_aligned, attribute)) == _window_descriptor_signature(
+            getattr(power_ws_aligned, attribute)
+        )
+        assert _window_descriptor_signature(getattr(power_ws_direct, attribute)) == _window_descriptor_signature(
+            getattr(power_ws_aligned, attribute)
+        )
+
+
+def test_prepare_variant_datasets_requires_shared_panel_axis(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, feature_protocol_id="power_only")
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+    )
+    _patch_temp_bundle_loader_for_protocols(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_ids=("power_only", "power_ws_hist"),
+    )
+
+    series_path = cache_root / "toy_dataset" / "tasks" / "next_6h_from_24h" / "power_ws_hist" / "series.parquet"
+    series = pl.read_parquet(series_path)
+    last_timestamp = series["timestamp"].max()
+    assert last_timestamp is not None
+    series.filter(pl.col("timestamp") < last_timestamp).write_parquet(series_path)
+
+    with pytest.raises(ValueError, match="do not share raw_timestamps"):
+        module._prepare_datasets_for_variants(
+            "toy_dataset",
+            variant_specs=module.resolve_variant_specs(),
+            cache_root=cache_root,
+        )
+
+
+def test_prepare_variant_datasets_rejects_empty_shared_split(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, feature_protocol_id="power_only")
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+    )
+    _patch_temp_bundle_loader_for_protocols(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_ids=("power_only", "power_ws_hist"),
+    )
+
+    reference_context = module._load_variant_dataset_context(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+    val_keys = (
+        module._split_context_window_index(reference_context)["val"]
+        .select(["output_start_ts", "output_end_ts"])
+        .with_row_index("align_idx")
+    )
+    for feature_protocol_id, keep_remainder in (("power_only", 0), ("power_ws_hist", 1)):
+        window_index_path = (
+            cache_root / "toy_dataset" / "tasks" / "next_6h_from_24h" / feature_protocol_id / "window_index.parquet"
+        )
+        window_index = pl.read_parquet(window_index_path)
+        filtered = (
+            window_index
+            .join(val_keys, on=["output_start_ts", "output_end_ts"], how="left")
+            .filter(pl.col("align_idx").is_null() | (pl.col("align_idx") % 2 == keep_remainder))
+            .drop("align_idx")
+        )
+        filtered.write_parquet(window_index_path)
+
+    with pytest.raises(ValueError, match="no shared strict windows for split 'val'.*power_only.*power_ws_hist"):
+        module._prepare_datasets_for_variants(
+            "toy_dataset",
+            variant_specs=module.resolve_variant_specs(),
+            cache_root=cache_root,
+        )
+
+
 def test_prepare_dataset_requires_rated_power_in_task_bundle_static(tmp_path, monkeypatch) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
@@ -955,6 +1148,91 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
         (module.POWER_WS_HIST_MODEL_VARIANT, "val", module.OVERALL_METRIC_SCOPE),
         (module.POWER_WS_HIST_MODEL_VARIANT, "test", module.HORIZON_METRIC_SCOPE),
     ]
+
+
+def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, feature_protocol_id="power_only")
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _patch_temp_bundle_loader_for_protocols(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_ids=("power_only", "power_ws_hist"),
+    )
+
+    def _fake_runner(prepared, **kwargs):
+        del kwargs
+        val_row = _result_row(
+            module,
+            dataset_id=prepared.dataset_id,
+            split_name="val",
+            eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+            metric_scope=module.OVERALL_METRIC_SCOPE,
+            lead_step=None,
+            model_variant=prepared.model_variant,
+            input_channels=prepared.input_channels,
+        )
+        val_row.update(
+            {
+                "window_count": len(prepared.val_rolling_windows),
+                "prediction_count": len(prepared.val_rolling_windows) * prepared.forecast_steps * prepared.node_count,
+                "train_window_count": len(prepared.train_windows),
+                "val_window_count": len(prepared.val_rolling_windows),
+                "test_window_count": len(prepared.test_rolling_windows),
+            }
+        )
+        test_row = _result_row(
+            module,
+            dataset_id=prepared.dataset_id,
+            split_name="test",
+            eval_protocol=module.NON_OVERLAP_EVAL_PROTOCOL,
+            metric_scope=module.OVERALL_METRIC_SCOPE,
+            lead_step=None,
+            model_variant=prepared.model_variant,
+            input_channels=prepared.input_channels,
+        )
+        test_row.update(
+            {
+                "window_count": len(prepared.test_non_overlap_windows),
+                "prediction_count": len(prepared.test_non_overlap_windows) * prepared.forecast_steps * prepared.node_count,
+                "train_window_count": len(prepared.train_windows),
+                "val_window_count": len(prepared.val_rolling_windows),
+                "test_window_count": len(prepared.test_rolling_windows),
+            }
+        )
+        return [val_row, test_row]
+
+    results = module.run_experiment(
+        dataset_ids=("toy_dataset",),
+        cache_root=cache_root,
+        output_path=tmp_path / "agcrn-official-aligned.csv",
+        job_runner=_fake_runner,
+    )
+
+    assert results.height == 4
+    assert results["train_window_count"].n_unique() == 1
+    assert results["val_window_count"].n_unique() == 1
+    assert results["test_window_count"].n_unique() == 1
+    val_rows = results.filter(
+        (pl.col("split_name") == "val")
+        & (pl.col("eval_protocol") == module.ROLLING_EVAL_PROTOCOL)
+    )
+    test_rows = results.filter(
+        (pl.col("split_name") == "test")
+        & (pl.col("eval_protocol") == module.NON_OVERLAP_EVAL_PROTOCOL)
+    )
+    assert val_rows.height == 2
+    assert test_rows.height == 2
+    assert val_rows["window_count"].n_unique() == 1
+    assert test_rows["window_count"].n_unique() == 1
+    assert results["input_channels"].to_list() == [1, 1, 2, 2]
 
 
 def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:

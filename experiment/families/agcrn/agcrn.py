@@ -172,6 +172,8 @@ _MODEL_VARIANT_ORDER = {
     MODEL_VARIANT: 0,
     POWER_WS_HIST_MODEL_VARIANT: 1,
 }
+_SPLIT_NAMES = ("train", "val", "test")
+_WINDOW_KEY_COLUMNS = ("output_start_ts", "output_end_ts")
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
 _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
@@ -203,6 +205,23 @@ class DatasetMetadata:
     turbine_ids: tuple[str, ...]
     rated_power_kw: float
     turbine_static: pl.DataFrame
+
+
+@dataclass(frozen=True)
+class VariantDatasetContext:
+    dataset_id: str
+    model_variant: str
+    feature_protocol_id: str
+    metadata: DatasetMetadata
+    series: pl.DataFrame
+    past_covariate_columns: tuple[str, ...]
+    strict_window_index: pl.DataFrame
+    raw_timestamps: tuple[datetime, ...]
+    resolution_minutes: int
+    timestamps_us: np.ndarray
+    target_pu: np.ndarray
+    coordinate_mode: str
+    distance_sanity: pl.DataFrame
 
 
 @dataclass(frozen=True)
@@ -689,6 +708,59 @@ def build_panel_series(
     return timestamps_us, target_pu
 
 
+def _load_variant_dataset_context(
+    dataset_id: str,
+    *,
+    variant_spec: ExperimentVariant,
+    cache_root: str | Path = _CACHE_ROOT,
+) -> VariantDatasetContext:
+    bundle = _load_task_bundle(
+        dataset_id,
+        feature_protocol_id=variant_spec.feature_protocol_id,
+        cache_root=cache_root,
+    )
+    if bundle.task_context.get("feature_protocol_id") != variant_spec.feature_protocol_id:
+        raise ValueError(
+            f"Task bundle for dataset {dataset_id!r} does not match requested "
+            f"feature_protocol_id={variant_spec.feature_protocol_id!r}."
+        )
+    metadata = load_dataset_metadata(dataset_id, bundle)
+    past_covariate_columns = resolve_past_covariate_columns(bundle)
+    strict_window_index = load_strict_window_index(
+        dataset_id,
+        bundle,
+        require_clean_input_features=bool(past_covariate_columns),
+    )
+    series = load_series_frame(
+        dataset_id,
+        bundle,
+        past_covariate_columns=past_covariate_columns,
+    )
+    coordinate_mode, distance_sanity = build_distance_sanity_frame(
+        metadata.turbine_static,
+        ordered_turbine_ids=metadata.turbine_ids,
+    )
+    panel_frame = prepare_panel_frame(series, rated_power_kw=metadata.rated_power_kw)
+    resolution_minutes = resolve_resolution_minutes(panel_frame)
+    raw_timestamps = tuple(panel_frame["timestamp"].to_list())
+    timestamps_us, target_pu = build_panel_series(panel_frame, turbine_ids=metadata.turbine_ids)
+    return VariantDatasetContext(
+        dataset_id=dataset_id,
+        model_variant=variant_spec.model_variant,
+        feature_protocol_id=variant_spec.feature_protocol_id,
+        metadata=metadata,
+        series=series,
+        past_covariate_columns=past_covariate_columns,
+        strict_window_index=strict_window_index,
+        raw_timestamps=raw_timestamps,
+        resolution_minutes=resolution_minutes,
+        timestamps_us=timestamps_us,
+        target_pu=target_pu,
+        coordinate_mode=coordinate_mode,
+        distance_sanity=distance_sanity,
+    )
+
+
 def _build_feature_panel(
     series: pl.DataFrame,
     *,
@@ -854,6 +926,222 @@ def thin_non_overlap_window_index(
     )
 
 
+def _split_context_window_index(context: VariantDatasetContext) -> dict[str, pl.DataFrame]:
+    return split_farm_window_index(
+        context.strict_window_index,
+        raw_timestamps=context.raw_timestamps,
+        resolution_minutes=context.resolution_minutes,
+    )
+
+
+def _assert_alignment_compatible(contexts: Sequence[VariantDatasetContext]) -> None:
+    if not contexts:
+        raise ValueError("At least one variant dataset context is required for alignment.")
+    reference = contexts[0]
+    feature_protocol_ids = [context.feature_protocol_id for context in contexts]
+    for context in contexts[1:]:
+        if context.dataset_id != reference.dataset_id:
+            raise ValueError(
+                f"Variant contexts must share a dataset_id, found {reference.dataset_id!r} and {context.dataset_id!r}."
+            )
+        if context.metadata.turbine_ids != reference.metadata.turbine_ids:
+            raise ValueError(
+                f"Dataset {reference.dataset_id!r} variants {feature_protocol_ids!r} do not share turbine_ids."
+            )
+        if context.metadata.rated_power_kw != reference.metadata.rated_power_kw:
+            raise ValueError(
+                f"Dataset {reference.dataset_id!r} variants {feature_protocol_ids!r} do not share rated_power_kw."
+            )
+        if context.raw_timestamps != reference.raw_timestamps:
+            raise ValueError(
+                f"Dataset {reference.dataset_id!r} variants {feature_protocol_ids!r} do not share raw_timestamps."
+            )
+        if context.resolution_minutes != reference.resolution_minutes:
+            raise ValueError(
+                f"Dataset {reference.dataset_id!r} variants {feature_protocol_ids!r} do not share resolution_minutes."
+            )
+        if not np.array_equal(context.timestamps_us, reference.timestamps_us):
+            raise ValueError(
+                f"Dataset {reference.dataset_id!r} variants {feature_protocol_ids!r} do not share panel timestamp axis."
+            )
+
+
+def _align_split_frames(
+    contexts: Sequence[VariantDatasetContext],
+) -> dict[str, dict[str, pl.DataFrame]]:
+    _assert_alignment_compatible(contexts)
+    split_frames_by_variant = {
+        context.model_variant: _split_context_window_index(context)
+        for context in contexts
+    }
+    if len(contexts) == 1:
+        return split_frames_by_variant
+
+    feature_protocol_ids = [context.feature_protocol_id for context in contexts]
+    aligned_frames_by_variant = {
+        context.model_variant: {}
+        for context in contexts
+    }
+    for split_name in _SPLIT_NAMES:
+        shared_keys: pl.DataFrame | None = None
+        for context in contexts:
+            frame_keys = (
+                split_frames_by_variant[context.model_variant][split_name]
+                .select(list(_WINDOW_KEY_COLUMNS))
+                .unique()
+                .sort(list(_WINDOW_KEY_COLUMNS))
+            )
+            shared_keys = (
+                frame_keys
+                if shared_keys is None
+                else shared_keys.join(frame_keys, on=list(_WINDOW_KEY_COLUMNS), how="inner")
+            )
+        if shared_keys is None or shared_keys.is_empty():
+            raise ValueError(
+                f"Dataset {contexts[0].dataset_id!r} has no shared strict windows for split {split_name!r} "
+                f"across feature_protocol_ids={feature_protocol_ids!r}."
+            )
+        for context in contexts:
+            aligned_frames_by_variant[context.model_variant][split_name] = (
+                split_frames_by_variant[context.model_variant][split_name]
+                .join(shared_keys, on=list(_WINDOW_KEY_COLUMNS), how="inner")
+                .sort("output_start_ts")
+            )
+        _profile_log(
+            contexts[0].dataset_id,
+            "align_split_frames",
+            split_name=split_name,
+            feature_protocol_ids=feature_protocol_ids,
+            shared_windows=shared_keys.height,
+        )
+    return aligned_frames_by_variant
+
+
+def _limit_split_frames(
+    split_frames: dict[str, pl.DataFrame],
+    *,
+    max_train_origins: int | None = None,
+    max_eval_origins: int | None = None,
+) -> dict[str, pl.DataFrame]:
+    limited_frames = {
+        split_name: frame
+        for split_name, frame in split_frames.items()
+    }
+    if max_train_origins is not None:
+        limited_frames["train"] = limited_frames["train"].head(max_train_origins)
+    if max_eval_origins is not None:
+        limited_frames["val"] = limited_frames["val"].head(max_eval_origins)
+        limited_frames["test"] = limited_frames["test"].head(max_eval_origins)
+    return limited_frames
+
+
+def _finalize_prepared_dataset(
+    context: VariantDatasetContext,
+    *,
+    split_frames: dict[str, pl.DataFrame],
+    max_train_origins: int | None = None,
+    max_eval_origins: int | None = None,
+) -> PreparedDataset:
+    limited_split_frames = _limit_split_frames(
+        split_frames,
+        max_train_origins=max_train_origins,
+        max_eval_origins=max_eval_origins,
+    )
+    train_windows = build_window_descriptor_index(limited_split_frames["train"], timestamps_us=context.timestamps_us)
+    val_rolling_windows = build_window_descriptor_index(
+        limited_split_frames["val"],
+        timestamps_us=context.timestamps_us,
+    )
+    test_rolling_windows = build_window_descriptor_index(
+        limited_split_frames["test"],
+        timestamps_us=context.timestamps_us,
+    )
+    val_non_overlap_windows = thin_non_overlap_window_index(val_rolling_windows, forecast_steps=FORECAST_STEPS)
+    test_non_overlap_windows = thin_non_overlap_window_index(test_rolling_windows, forecast_steps=FORECAST_STEPS)
+    source_tensor, input_channel_names = build_source_tensor(
+        context.series,
+        turbine_ids=context.metadata.turbine_ids,
+        raw_timestamps=context.raw_timestamps,
+        target_pu=context.target_pu,
+        past_covariate_columns=context.past_covariate_columns,
+        train_windows=train_windows,
+        history_steps=HISTORY_STEPS,
+    )
+    _profile_log(
+        context.dataset_id,
+        "prepare_dataset_complete",
+        coordinate_mode=context.coordinate_mode,
+        feature_protocol_id=context.feature_protocol_id,
+        input_channels=source_tensor.shape[2],
+        model_variant=context.model_variant,
+        node_count=len(context.metadata.turbine_ids),
+        train_windows=len(train_windows),
+        val_rolling_windows=len(val_rolling_windows),
+        val_non_overlap_windows=len(val_non_overlap_windows),
+        test_rolling_windows=len(test_rolling_windows),
+        test_non_overlap_windows=len(test_non_overlap_windows),
+        nearest_neighbors=context.distance_sanity.to_dicts(),
+        rated_power_kw=context.metadata.rated_power_kw,
+        resolution_minutes=context.resolution_minutes,
+    )
+    return PreparedDataset(
+        dataset_id=context.dataset_id,
+        model_variant=context.model_variant,
+        feature_protocol_id=context.feature_protocol_id,
+        resolution_minutes=context.resolution_minutes,
+        rated_power_kw=context.metadata.rated_power_kw,
+        history_steps=HISTORY_STEPS,
+        forecast_steps=FORECAST_STEPS,
+        stride_steps=STRIDE_STEPS,
+        turbine_ids=context.metadata.turbine_ids,
+        coordinate_mode=context.coordinate_mode,
+        node_count=len(context.metadata.turbine_ids),
+        timestamps_us=context.timestamps_us,
+        input_channel_names=input_channel_names,
+        source_tensor=source_tensor,
+        target_pu=context.target_pu,
+        train_windows=train_windows,
+        val_rolling_windows=val_rolling_windows,
+        val_non_overlap_windows=val_non_overlap_windows,
+        test_rolling_windows=test_rolling_windows,
+        test_non_overlap_windows=test_non_overlap_windows,
+    )
+
+
+def _prepare_datasets_for_variants(
+    dataset_id: str,
+    *,
+    variant_specs: Sequence[ExperimentVariant],
+    cache_root: str | Path = _CACHE_ROOT,
+    max_train_origins: int | None = None,
+    max_eval_origins: int | None = None,
+) -> tuple[PreparedDataset, ...]:
+    contexts = tuple(
+        _load_variant_dataset_context(
+            dataset_id,
+            variant_spec=variant_spec,
+            cache_root=cache_root,
+        )
+        for variant_spec in variant_specs
+    )
+    if not contexts:
+        raise ValueError("At least one variant_spec is required to prepare datasets.")
+    split_frames_by_variant = (
+        _align_split_frames(contexts)
+        if len(contexts) > 1
+        else {contexts[0].model_variant: _split_context_window_index(contexts[0])}
+    )
+    return tuple(
+        _finalize_prepared_dataset(
+            context,
+            split_frames=split_frames_by_variant[context.model_variant],
+            max_train_origins=max_train_origins,
+            max_eval_origins=max_eval_origins,
+        )
+        for context in contexts
+    )
+
+
 if Dataset is not None:
 
     class PanelWindowDataset(Dataset):
@@ -906,99 +1194,16 @@ def prepare_dataset(
     max_eval_origins: int | None = None,
 ) -> PreparedDataset:
     resolved_variant = variant_spec or VARIANT_SPECS[0]
-    bundle = _load_task_bundle(
+    context = _load_variant_dataset_context(
         dataset_id,
-        feature_protocol_id=resolved_variant.feature_protocol_id,
+        variant_spec=resolved_variant,
         cache_root=cache_root,
     )
-    if bundle.task_context.get("feature_protocol_id") != resolved_variant.feature_protocol_id:
-        raise ValueError(
-            f"Task bundle for dataset {dataset_id!r} does not match requested "
-            f"feature_protocol_id={resolved_variant.feature_protocol_id!r}."
-        )
-    metadata = load_dataset_metadata(dataset_id, bundle)
-    past_covariate_columns = resolve_past_covariate_columns(bundle)
-    strict_window_index = load_strict_window_index(
-        dataset_id,
-        bundle,
-        require_clean_input_features=bool(past_covariate_columns),
-    )
-    series = load_series_frame(
-        dataset_id,
-        bundle,
-        past_covariate_columns=past_covariate_columns,
-    )
-    coordinate_mode, distance_sanity = build_distance_sanity_frame(
-        metadata.turbine_static,
-        ordered_turbine_ids=metadata.turbine_ids,
-    )
-    panel_frame = prepare_panel_frame(series, rated_power_kw=metadata.rated_power_kw)
-    resolution_minutes = resolve_resolution_minutes(panel_frame)
-    raw_timestamps = panel_frame["timestamp"].to_list()
-    split_frames = split_farm_window_index(
-        strict_window_index,
-        raw_timestamps=raw_timestamps,
-        resolution_minutes=resolution_minutes,
-    )
-    if max_train_origins is not None:
-        split_frames["train"] = split_frames["train"].head(max_train_origins)
-    if max_eval_origins is not None:
-        split_frames["val"] = split_frames["val"].head(max_eval_origins)
-        split_frames["test"] = split_frames["test"].head(max_eval_origins)
-
-    timestamps_us, target_pu = build_panel_series(panel_frame, turbine_ids=metadata.turbine_ids)
-    train_windows = build_window_descriptor_index(split_frames["train"], timestamps_us=timestamps_us)
-    val_rolling_windows = build_window_descriptor_index(split_frames["val"], timestamps_us=timestamps_us)
-    test_rolling_windows = build_window_descriptor_index(split_frames["test"], timestamps_us=timestamps_us)
-    val_non_overlap_windows = thin_non_overlap_window_index(val_rolling_windows, forecast_steps=FORECAST_STEPS)
-    test_non_overlap_windows = thin_non_overlap_window_index(test_rolling_windows, forecast_steps=FORECAST_STEPS)
-    source_tensor, input_channel_names = build_source_tensor(
-        series,
-        turbine_ids=metadata.turbine_ids,
-        raw_timestamps=raw_timestamps,
-        target_pu=target_pu,
-        past_covariate_columns=past_covariate_columns,
-        train_windows=train_windows,
-        history_steps=HISTORY_STEPS,
-    )
-    _profile_log(
-        dataset_id,
-        "prepare_dataset_complete",
-        coordinate_mode=coordinate_mode,
-        feature_protocol_id=resolved_variant.feature_protocol_id,
-        input_channels=source_tensor.shape[2],
-        model_variant=resolved_variant.model_variant,
-        node_count=len(metadata.turbine_ids),
-        train_windows=len(train_windows),
-        val_rolling_windows=len(val_rolling_windows),
-        val_non_overlap_windows=len(val_non_overlap_windows),
-        test_rolling_windows=len(test_rolling_windows),
-        test_non_overlap_windows=len(test_non_overlap_windows),
-        nearest_neighbors=distance_sanity.to_dicts(),
-        rated_power_kw=metadata.rated_power_kw,
-        resolution_minutes=resolution_minutes,
-    )
-    return PreparedDataset(
-        dataset_id=dataset_id,
-        model_variant=resolved_variant.model_variant,
-        feature_protocol_id=resolved_variant.feature_protocol_id,
-        resolution_minutes=resolution_minutes,
-        rated_power_kw=metadata.rated_power_kw,
-        history_steps=HISTORY_STEPS,
-        forecast_steps=FORECAST_STEPS,
-        stride_steps=STRIDE_STEPS,
-        turbine_ids=metadata.turbine_ids,
-        coordinate_mode=coordinate_mode,
-        node_count=len(metadata.turbine_ids),
-        timestamps_us=timestamps_us,
-        input_channel_names=input_channel_names,
-        source_tensor=source_tensor,
-        target_pu=target_pu,
-        train_windows=train_windows,
-        val_rolling_windows=val_rolling_windows,
-        val_non_overlap_windows=val_non_overlap_windows,
-        test_rolling_windows=test_rolling_windows,
-        test_non_overlap_windows=test_non_overlap_windows,
+    return _finalize_prepared_dataset(
+        context,
+        split_frames=_split_context_window_index(context),
+        max_train_origins=max_train_origins,
+        max_eval_origins=max_eval_origins,
     )
 
 
@@ -1743,21 +1948,33 @@ def run_experiment(
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
     variant_specs = resolve_variant_specs(variant_names)
-    loader = dataset_loader or prepare_dataset
     runner = job_runner or execute_training_job
     rows: list[dict[str, object]] = []
     job_progress = _create_progress_bar(total=len(dataset_ids) * len(variant_specs), desc="agcrn jobs", leave=True)
     try:
         for dataset_id in dataset_ids:
-            for variant_spec in variant_specs:
-                job_progress.set_postfix_str(f"{dataset_id}/{variant_spec.model_variant}")
-                prepared = loader(
+            prepared_datasets = (
+                _prepare_datasets_for_variants(
                     dataset_id,
-                    variant_spec=variant_spec,
+                    variant_specs=variant_specs,
                     cache_root=cache_root,
                     max_train_origins=max_train_origins,
                     max_eval_origins=max_eval_origins,
                 )
+                if dataset_loader is None
+                else tuple(
+                    dataset_loader(
+                        dataset_id,
+                        variant_spec=variant_spec,
+                        cache_root=cache_root,
+                        max_train_origins=max_train_origins,
+                        max_eval_origins=max_eval_origins,
+                    )
+                    for variant_spec in variant_specs
+                )
+            )
+            for prepared in prepared_datasets:
+                job_progress.set_postfix_str(f"{prepared.dataset_id}/{prepared.model_variant}")
                 rows.extend(
                     runner(
                         prepared,

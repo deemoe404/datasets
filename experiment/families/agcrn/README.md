@@ -45,6 +45,18 @@ Only windows satisfying all of the following are kept:
 - `is_fully_synchronous_input == true`
 - `is_fully_synchronous_output == true`
 
+This strict filtering still happens inside the AGCRN family code rather than in
+the dataset task cache.
+
+When one CLI run includes multiple variants, the runner first computes each
+variant's strict `train`/`val`/`test` rolling windows independently, then
+intersects those splits on `(output_start_ts, output_end_ts)` before applying
+`--max-train-origins` / `--max-eval-origins` and before deriving
+`non_overlap`.
+
+Running a single variant keeps that variant's own strict windows without any
+cross-protocol shrinkage.
+
 ## Environment
 
 Create or update the isolated experiment environment:
@@ -91,6 +103,10 @@ Useful smoke-test options:
 - `split_name in {val, test}`
 - `eval_protocol in {rolling_origin_no_refit, non_overlap}`
 - `metric_scope in {overall, horizon}`
+
+For one dataset and one eval view, runs that include both active variants should
+now report matching window counts across `official_aligned_power_only_farm_sync`
+and `official_aligned_power_ws_hist_farm_sync`.
 
 That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
 Running both active variants by default yields `2 * 148 = 296` rows.
