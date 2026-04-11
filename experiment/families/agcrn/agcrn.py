@@ -180,6 +180,10 @@ class TaskCachePaths:
     task_context_path: Path
     turbine_static_path: Path
 
+    @property
+    def dataset_turbine_static_path(self) -> Path:
+        return self.dataset_root / "silver" / "meta" / "turbine_static.parquet"
+
 
 @dataclass(frozen=True)
 class DatasetMetadata:
@@ -363,6 +367,73 @@ def resolve_cache_paths(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT
     )
 
 
+def _has_complete_static_columns(frame: pl.DataFrame, columns: Sequence[str]) -> bool:
+    return set(columns).issubset(frame.columns) and all(frame[column].null_count() == 0 for column in columns)
+
+
+def _supplement_task_static_metadata(
+    task_static: pl.DataFrame,
+    *,
+    dataset_id: str,
+    paths: TaskCachePaths,
+) -> pl.DataFrame:
+    has_rated_power = _has_complete_static_columns(task_static, ("rated_power_kw",))
+    has_xy_coordinates = _has_complete_static_columns(task_static, ("coord_x", "coord_y"))
+    has_latlon_coordinates = _has_complete_static_columns(task_static, ("latitude", "longitude"))
+    if has_rated_power and (has_xy_coordinates or has_latlon_coordinates):
+        return task_static
+
+    dataset_static_path = paths.dataset_turbine_static_path
+    if not dataset_static_path.exists():
+        missing_parts = []
+        if not has_rated_power:
+            missing_parts.append("rated_power_kw")
+        if not (has_xy_coordinates or has_latlon_coordinates):
+            missing_parts.append("coordinates")
+        raise ValueError(
+            f"Task-local turbine_static for dataset {dataset_id!r} is missing required "
+            f"{', '.join(missing_parts)} and dataset-level turbine static is unavailable at {dataset_static_path}."
+        )
+
+    dataset_static = pl.read_parquet(dataset_static_path)
+    missing_join_keys = [column for column in ("dataset", "turbine_id") if column not in dataset_static.columns]
+    if missing_join_keys:
+        raise ValueError(
+            f"Dataset-level turbine_static for dataset {dataset_id!r} is missing join keys {missing_join_keys!r}."
+        )
+
+    metadata_columns = [
+        column
+        for column in ("rated_power_kw", "coord_x", "coord_y", "latitude", "longitude")
+        if column in dataset_static.columns
+    ]
+    if not metadata_columns:
+        return task_static
+
+    joined = task_static.join(
+        dataset_static.select(
+            [
+                "dataset",
+                "turbine_id",
+                *(pl.col(column).alias(f"{column}__dataset") for column in metadata_columns),
+            ]
+        ),
+        on=["dataset", "turbine_id"],
+        how="left",
+    )
+    supplemented = joined.with_columns(
+        [
+            (
+                pl.coalesce(pl.col(column), pl.col(f"{column}__dataset"))
+                if column in task_static.columns
+                else pl.col(f"{column}__dataset")
+            ).alias(column)
+            for column in metadata_columns
+        ]
+    )
+    return supplemented.drop([f"{column}__dataset" for column in metadata_columns]).sort("turbine_index")
+
+
 def ensure_task_cache(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> TaskCachePaths:
     paths = resolve_cache_paths(dataset_id, cache_root=cache_root)
     required_paths = (
@@ -422,6 +493,7 @@ def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_RO
         raise ValueError(
             f"Task-local turbine_static order for dataset {dataset_id!r} does not match task_context turbine_ids."
         )
+    ordered_static = _supplement_task_static_metadata(ordered_static, dataset_id=dataset_id, paths=paths)
 
     rated_powers = sorted({float(value) for value in ordered_static["rated_power_kw"].drop_nulls().to_list()})
     if len(rated_powers) != 1:

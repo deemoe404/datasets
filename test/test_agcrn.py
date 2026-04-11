@@ -58,10 +58,13 @@ def _build_temp_cache(
     dataset_id: str = "toy_dataset",
     history_steps: int = 144,
     forecast_steps: int = 36,
+    task_static_layout: str = "minimal",
 ) -> None:
     dataset_root = cache_root / dataset_id
     task_dir = dataset_root / "tasks" / "next_6h_from_24h" / "power_only"
+    silver_meta_dir = dataset_root / "silver" / "meta"
     task_dir.mkdir(parents=True, exist_ok=True)
+    silver_meta_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
         datetime(2024, 1, 1, 0, 0, 0),
@@ -135,14 +138,39 @@ def _build_temp_cache(
         {
             "dataset": [dataset_id] * len(turbine_ids),
             "turbine_id": list(turbine_ids),
-            "turbine_index": [0, 1, 2],
-            "rated_power_kw": [2050.0, 2050.0, 2050.0],
             "coord_x": [0.0, 100.0, 210.0],
             "coord_y": [0.0, 0.0, 0.0],
             "latitude": [None, None, None],
             "longitude": [None, None, None],
+            "rated_power_kw": [2050.0, 2050.0, 2050.0],
         }
-    ).write_parquet(task_dir / "static.parquet")
+    ).write_parquet(silver_meta_dir / "turbine_static.parquet")
+
+    if task_static_layout == "minimal":
+        task_static = pl.DataFrame(
+            {
+                "dataset": [dataset_id] * len(turbine_ids),
+                "turbine_id": list(turbine_ids),
+                "turbine_index": [0, 1, 2],
+            }
+        )
+    elif task_static_layout == "rich":
+        task_static = pl.DataFrame(
+            {
+                "dataset": [dataset_id] * len(turbine_ids),
+                "turbine_id": list(turbine_ids),
+                "turbine_index": [0, 1, 2],
+                "rated_power_kw": [2050.0, 2050.0, 2050.0],
+                "coord_x": [0.0, 100.0, 210.0],
+                "coord_y": [0.0, 0.0, 0.0],
+                "latitude": [None, None, None],
+                "longitude": [None, None, None],
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported task_static_layout {task_static_layout!r}.")
+
+    task_static.write_parquet(task_dir / "static.parquet")
 
 
 def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 600_000_000):
@@ -464,7 +492,7 @@ def test_thin_non_overlap_window_index_keeps_every_forecast_step() -> None:
 def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
-    _build_temp_cache(cache_root)
+    _build_temp_cache(cache_root, task_static_layout="minimal")
 
     prepared = module.prepare_dataset("toy_dataset", cache_root=cache_root)
 
@@ -486,7 +514,7 @@ def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path)
 def test_prepare_dataset_applies_train_and_eval_limits(tmp_path) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
-    _build_temp_cache(cache_root)
+    _build_temp_cache(cache_root, task_static_layout="minimal")
 
     prepared = module.prepare_dataset(
         "toy_dataset",
