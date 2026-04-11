@@ -34,22 +34,6 @@ class TaskContract:
 
 
 @dataclass(frozen=True)
-class FeatureProtocolSpec:
-    feature_protocol_id: str
-    display_name: str
-    protocol_kind: str
-    summary: str
-    uses_target_history: bool
-    uses_static_covariates: bool
-    uses_known_future_covariates: bool
-    uses_past_covariates: bool
-    uses_target_derived_covariates: bool
-    aliases: tuple[str, ...]
-    past_covariate_source: str | None = None
-    past_covariate_stage: str | None = None
-
-
-@dataclass(frozen=True)
 class ExperimentFamilySpec:
     family_id: str
     display_name: str
@@ -79,7 +63,6 @@ class ExperimentFamilySpec:
 class RegistrySnapshot:
     repo_root: Path
     registry_root: Path
-    feature_protocols: dict[str, FeatureProtocolSpec]
     families: dict[str, ExperimentFamilySpec]
 
 
@@ -127,13 +110,6 @@ def _optional_string(data: dict[str, Any], key: str, *, path: Path) -> str | Non
     return value.strip()
 
 
-def _require_bool(data: dict[str, Any], key: str, *, path: Path) -> bool:
-    value = data.get(key)
-    if not isinstance(value, bool):
-        raise ValueError(f"{path}: expected boolean field {key!r}.")
-    return value
-
-
 def _require_string_tuple(data: dict[str, Any], key: str, *, path: Path) -> tuple[str, ...]:
     value = data.get(key)
     if not isinstance(value, list) or not value:
@@ -176,35 +152,6 @@ def _require_string_map(data: dict[str, Any], key: str, *, path: Path) -> dict[s
             raise ValueError(f"{path}: table {key!r} must have non-empty string values.")
         normalized[raw_key.strip()] = raw_value.strip()
     return normalized
-
-
-def _load_feature_protocol_spec(path: Path) -> FeatureProtocolSpec:
-    data = _load_toml(path)
-    schema_version = data.get("schema_version")
-    if schema_version != 1:
-        raise ValueError(f"{path}: unsupported schema_version {schema_version!r}.")
-    feature_protocol_id = _require_string(data, "feature_protocol_id", path=path)
-    if path.stem != feature_protocol_id:
-        raise ValueError(f"{path}: filename stem must match feature_protocol_id {feature_protocol_id!r}.")
-    spec = FeatureProtocolSpec(
-        feature_protocol_id=feature_protocol_id,
-        display_name=_require_string(data, "display_name", path=path),
-        protocol_kind=_require_string(data, "protocol_kind", path=path),
-        summary=_require_string(data, "summary", path=path),
-        uses_target_history=_require_bool(data, "uses_target_history", path=path),
-        uses_static_covariates=_require_bool(data, "uses_static_covariates", path=path),
-        uses_known_future_covariates=_require_bool(data, "uses_known_future_covariates", path=path),
-        uses_past_covariates=_require_bool(data, "uses_past_covariates", path=path),
-        uses_target_derived_covariates=_require_bool(data, "uses_target_derived_covariates", path=path),
-        aliases=_optional_string_tuple(data, "aliases", path=path),
-        past_covariate_source=_optional_string(data, "past_covariate_source", path=path),
-        past_covariate_stage=_optional_string(data, "past_covariate_stage", path=path),
-    )
-    if not spec.uses_past_covariates and (spec.past_covariate_source is not None or spec.past_covariate_stage is not None):
-        raise ValueError(f"{path}: past covariate metadata is only allowed when uses_past_covariates=true.")
-    if spec.uses_past_covariates and spec.past_covariate_source is None:
-        raise ValueError(f"{path}: uses_past_covariates=true requires past_covariate_source.")
-    return spec
 
 
 def _load_family_spec(path: Path) -> ExperimentFamilySpec:
@@ -272,38 +219,16 @@ def _load_family_spec(path: Path) -> ExperimentFamilySpec:
 def load_registry_snapshot(repo_root: str | Path | None = None) -> RegistrySnapshot:
     registry_root = _registry_root_from(repo_root)
     repo_root_path = _repo_root_from_registry_root(registry_root)
-    feature_dir = registry_root / "feature_protocols"
     family_dir = registry_root / "families"
-    if not feature_dir.exists():
-        raise FileNotFoundError(f"Registry feature protocol directory is missing: {feature_dir}")
     if not family_dir.exists():
         raise FileNotFoundError(f"Registry family directory is missing: {family_dir}")
-
-    feature_protocols: dict[str, FeatureProtocolSpec] = {}
-    alias_owner: dict[str, str] = {}
-    for path in sorted(feature_dir.glob("*.toml")):
-        spec = _load_feature_protocol_spec(path)
-        if spec.feature_protocol_id in feature_protocols:
-            raise ValueError(f"Duplicate feature_protocol_id {spec.feature_protocol_id!r}.")
-        feature_protocols[spec.feature_protocol_id] = spec
-        for alias in (spec.feature_protocol_id, *spec.aliases):
-            owner = alias_owner.get(alias)
-            if owner is not None:
-                raise ValueError(f"Feature protocol alias {alias!r} is duplicated between {owner!r} and {spec.feature_protocol_id!r}.")
-            alias_owner[alias] = spec.feature_protocol_id
 
     families: dict[str, ExperimentFamilySpec] = {}
     for path in sorted(family_dir.glob("*.toml")):
         spec = _load_family_spec(path)
         if spec.family_id in families:
             raise ValueError(f"Duplicate family_id {spec.family_id!r}.")
-        unknown_protocols = sorted(set(spec.supported_feature_protocols) - set(feature_protocols))
-        if unknown_protocols:
-            raise ValueError(f"{path}: unknown feature protocol ids {unknown_protocols!r}.")
         bound_protocols = tuple(spec.implementation_bindings[label] for label in spec.implementation_labels)
-        unknown_bound_protocols = sorted(set(bound_protocols) - set(spec.supported_feature_protocols))
-        if unknown_bound_protocols:
-            raise ValueError(f"{path}: implementation bindings reference unsupported feature protocols {unknown_bound_protocols!r}.")
         if set(bound_protocols) != set(spec.supported_feature_protocols):
             raise ValueError(f"{path}: supported_feature_protocols must exactly match the protocols referenced by implementation_bindings.")
         _validate_repo_path(repo_root_path, spec.implementation_root, path=path, field_name="implementation_root", must_exist=True)
@@ -319,7 +244,6 @@ def load_registry_snapshot(repo_root: str | Path | None = None) -> RegistrySnaps
     return RegistrySnapshot(
         repo_root=repo_root_path,
         registry_root=registry_root,
-        feature_protocols=feature_protocols,
         families=families,
     )
 
@@ -484,7 +408,6 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "families": sorted(snapshot.families),
-                    "feature_protocols": sorted(snapshot.feature_protocols),
                     "coverage_rows": coverage_rows_to_dicts(rows),
                 },
                 ensure_ascii=False,

@@ -1,14 +1,14 @@
 # Experiment Registry
 
 This directory is the repository's machine-readable registry for experiment
-families and canonical feature protocols.
+families and published-result indexes.
 
 The registry is the first step toward a single source of truth for questions
 such as:
 
 - which experiment families are formal benchmark lines vs pilots or prototypes
 - which datasets a family officially covers
-- which canonical feature protocols a family supports
+- which dataset-side `feature_protocol_id` values a family supports
 - where the family implementation and default output paths live
 
 ## Layout
@@ -16,12 +16,10 @@ such as:
 ```text
 experiment/infra/registry/
   families/
-  feature_protocols/
   published/
 ```
 
 - `families/`: one TOML file per canonical experiment family
-- `feature_protocols/`: one TOML file per canonical feature protocol
 - `published/`: reserved for future benchmark indexes derived from formal run
   manifests
 
@@ -43,21 +41,9 @@ Each family TOML declares:
   `implementation_labels`, `implementation_bindings`
 
 The `implementation_bindings` table maps current family-local labels
-(`input_pack`, `covariate_stage`, `variant`, and so on) onto canonical feature
-protocol ids.
-
-## Feature Protocol Schema
-
-Each feature protocol TOML declares:
-
-- identity: `feature_protocol_id`, `display_name`
-- semantics: `protocol_kind`, `summary`
-- covariate usage flags
-- optional aliases for current implementation labels
-
-The canonical feature protocol is intentionally separate from model family,
-layout, and training strategy. `stage1/2/3` therefore lives here as a feature
-protocol concept, not as the top-level experiment lifecycle.
+(`input_pack`, `variant`, and so on) onto dataset-side `feature_protocol_id`
+strings. Feature-protocol semantics and task-bundle column selection are owned
+by `src/wind_datasets/feature_protocols.py`, not by the experiment registry.
 
 ## Validation
 
@@ -70,5 +56,5 @@ Example:
 ./.conda/bin/python experiment/infra/common/experiment_registry.py --format markdown
 ```
 
-That command validates the registry and prints the current dataset x family x
-feature-protocol matrix.
+That command validates the family registry and prints the current dataset x
+family x feature-protocol matrix.

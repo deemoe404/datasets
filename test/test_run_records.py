@@ -89,7 +89,7 @@ def test_record_cli_run_rejects_protocols_not_supported_by_family(tmp_path) -> N
             output_path=output_path,
             result_row_count=1,
             dataset_ids=("kelmarsh",),
-            feature_protocol_ids=("static_calendar",),
+            feature_protocol_ids=("unexpected_protocol",),
         )
     except ValueError as exc:
         assert "unsupported feature protocols" in str(exc)

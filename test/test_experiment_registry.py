@@ -22,22 +22,12 @@ def _load_module():
     return module
 
 
-def test_registry_snapshot_contains_only_active_family_and_protocols() -> None:
+def test_registry_snapshot_contains_only_active_family() -> None:
     module = _load_module()
 
     snapshot = module.load_registry_snapshot()
 
     assert set(snapshot.families) == {"agcrn_official_aligned"}
-    assert set(snapshot.feature_protocols) == {
-        "power_only",
-        "power_stats_history",
-        "staged_past_covariates.stage1_core",
-        "staged_past_covariates.stage2_ops",
-        "staged_past_covariates.stage3_regime",
-        "static_calendar",
-        "static_calendar_stage1",
-        "static_calendar_stage2",
-    }
 
 
 def test_registry_family_bindings_capture_current_active_contract() -> None:

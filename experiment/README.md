@@ -28,4 +28,4 @@ Canonical runtime artifacts:
 
 - `agcrn_official_aligned` is the only registry-backed family currently intended for use.
 - The active task contract is `24h -> 6h`, dense sliding windows, `farm` granularity.
-- Dataset-side feature protocol definitions remain in `src/wind_datasets/feature_protocols.py`.
+- The only supported `feature_protocol_id` today is `power_only`, and its semantics live exclusively in `src/wind_datasets/feature_protocols.py`.

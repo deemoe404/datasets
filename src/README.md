@@ -157,24 +157,13 @@ The default task is `TaskSpec.next_6h_from_24h()`, which resolves to:
 Feature protocol definitions live in
 [wind_datasets/feature_protocols.py](./wind_datasets/feature_protocols.py).
 
-The current protocol IDs are:
+The only supported protocol ID today is:
 
 - `power_only`
-- `power_stats_history`
-- `staged_past_covariates.stage1_core`
-- `staged_past_covariates.stage2_ops`
-- `staged_past_covariates.stage3_regime`
-- `static_calendar`
-- `static_calendar_stage1`
-- `static_calendar_stage2`
 
-Protocol semantics at a glance:
+Protocol semantics:
 
 - `power_only`: target history only
-- `power_stats_history`: target history plus retained target-derived statistics
-- `staged_past_covariates.*`: target history plus dataset-native past covariates by stage
-- `static_calendar`: target history plus static covariates and deterministic calendar features
-- `static_calendar_stage1/2`: `static_calendar` plus stage-1 or stage-2 past covariates
 
 The default feature protocol is `power_only`.
 
@@ -197,7 +186,7 @@ They drive the dataset builders and define:
 - which raw source columns are retained
 - which columns are retained with masking
 - which canonical outputs those source columns feed
-- which feature protocols require them
+- which active feature protocols require them, when applicable
 
 These CSVs are part of cache freshness for the layers that depend on them.
 
@@ -272,7 +261,7 @@ from wind_datasets.models import TaskSpec
 
 dataset_id = "kelmarsh"
 task = TaskSpec.next_6h_from_24h()
-feature_protocol_id = "static_calendar_stage1"
+feature_protocol_id = "power_only"
 
 build_task_cache(dataset_id, task, feature_protocol_id=feature_protocol_id)
 
