@@ -83,24 +83,6 @@
 - `src/wind_datasets/data/source_column_policy/hill_of_towie.csv`
 - `src/wind_datasets/data/source_column_policy/sdwpf_kddcup.csv`
 
-切分 train/val/test 时的注意事项（时间顺序按照 70/10/20 比例）：
-
-- Hill of Towie 中，`wtc_ActualWindDirection_mean`/`days_since_tuneup_effective_start`/`days_since_tuneup_deployment_end` 在 train/val/test 上大量缺失。
-- Hill of Towie 中，`tuneup_post_effective`/`tuneup_in_deployment_window` 在 train/val/test 上大量为 0。
-- Hill of Towie 中，`farm_grid__frequency` 在 train 上波动很小，且会出现 0 值（可能是缺失哨兵）。
-- Hill of Towie 中，`wtc_GridFreq_mean` 在时间轴上会出现 0 值（可能是缺失哨兵）。
-- Hill of Towie 中，`days_since_aeroup_start`/`days_since_aeroup_end` 在 train 上几乎全部缺失；到 val/test 时缺失显著减少，但分布范围也随之明显变化。
-
-- Kelmarsh 中，`farm_pmu__gms_power_setpoint_kw`/`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上几乎为常数，test 上会出现 0 值。
-- Kelmarsh 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
-
-- Penmanshiel 中，`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上波动很小，test 上会出现 0 值。
-- Penmanshiel 中，`farm_pmu__gms_power_setpoint_kw` 在 train 上接近常数。
-- Penmanshiel 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
-- Penmanshiel 中，`farm_pmu__gms_power_kw`/`farm_pmu__gms_reactive_power_kvar`/`farm_pmu__gms_current_a` 在 train 上大量缺失，val/test 上缺失很少。
-- Penmanshiel 中，`Blade angle (pitch position) A (°)`/`Blade angle (pitch position) B (°)`/`Blade angle (pitch position) C (°)` 在 train 上大量缺失，val/test 上缺失显著更少。
-- Penmanshiel 中，`farm_evt_active_count`/`farm_evt_total_overlap_seconds` 在 train 与 val/test 上分布差异很大；train 中 0 值更多，val/test 更集中于较高取值。
-
 ## 滑窗式构建 `24H->6H` 窗口
 
 `farm-synchronous` 基于共享 farm timestamp 轴统计；默认 farm task cache 也按同一时间轴聚窗，不受 `series.parquet` 物理行序影响。下表在此基础上再删除所有 `quality_flags != ""` 的目标行：
@@ -111,12 +93,3 @@
 | Penmanshiel    |   685,431 / 6,318,676 = 10.85% | 90,032 / 451,334 = 19.95% |     326,816 / 451,155 |     72.44% | 15,651 步 ≈ 108.7 天   |
 | Hill of Towie  |   120,034 / 9,574,005 =  1.25% | 50,570 / 455,905 = 11.09% |     332,356 / 455,726 |     72.93% |  8,629 步 ≈  59.9 天   |
 | sdwpf_kddcup   | 1,131,661 / 4,727,520 = 23.94% | 31,860 / 35,280  = 90.31% |           0 /  35,101 |      0.00% |     37 步 ≈   6.2 小时 |
-
-`turbine` 按每台机组各自的首末观测 active span 聚窗，不按共享 farm timestamp 轴补齐；删除所有 `quality_flags != ""` 的目标行：
-
-| 数据集         | flagged 行损失                 | 可构造窗口            | 窗口保留率 | 0 窗口机组 |
-| -------------- | -----------------------------: | --------------------: | ---------: | ---------: |
-| Kelmarsh       |    54,948 / 2,839,104 =  1.94% | 2,641,667 / 2,838,030 |     93.08% |    0 /   6 |
-| Penmanshiel    |   165,907 / 5,799,152 =  2.86% | 5,405,463 / 5,796,646 |     93.25% |    0 /  14 |
-| Hill of Towie  |   120,034 / 9,574,005 =  1.25% | 9,129,924 / 9,570,246 |     95.40% |    0 /  21 |
-| sdwpf_kddcup   | 1,131,661 / 4,727,520 = 23.94% |   269,772 / 4,703,534 |      5.74% |    0 / 134 |
