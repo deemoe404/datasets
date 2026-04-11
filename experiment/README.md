@@ -1,7 +1,14 @@
 # Experiment Overview
 
-This directory contains the repository-tracked experiment runners and result
-CSVs for the repository forecasting tasks.
+This directory contains the repository-tracked experiment runners, machine-
+readable registry, and runtime artifact contracts for the repository
+forecasting tasks.
+
+## Layout
+
+- `families/`: concrete experiment-family code, environments, and family-local `.work/`
+- `infra/`: shared experiment infrastructure such as registry and common protocol helpers
+- `artifacts/`: published outputs, formal run records, and scratch outputs
 
 - `chronos-2` and `chronos-2-exogenous` use `24h look back -> 6h ahead`, dense
   sliding windows at the raw turbine timestep, and the shared raw-timestamp
@@ -18,26 +25,25 @@ CSVs for the repository forecasting tasks.
 
 ## Experiments
 
-- [chronos-2](./chronos-2/README.md): Chronos-2 `power_only` baselines
-- [chronos-2-exogenous](./chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
-- [agcrn](./agcrn/README.md): Kelmarsh farm-synchronous AGCRN `power_only` pilot
-- [ltsf-linear](./ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
-- [tft](./tft/README.md): Kelmarsh TFT pilot with static, deterministic known-future, and staged historical inputs
+- [chronos-2](./families/chronos-2/README.md): Chronos-2 `power_only` baselines
+- [chronos-2-exogenous](./families/chronos-2-exogenous/README.md): Chronos-2 with staged dataset-native past covariates
+- [agcrn](./families/agcrn/README.md): Kelmarsh farm-synchronous AGCRN `power_only` pilot
+- [ltsf-linear](./families/ltsf-linear/README.md): local `NLinear` / `DLinear` baselines with staged past covariates
+- [tft](./families/tft/README.md): Kelmarsh TFT pilot with static, deterministic known-future, and staged historical inputs
 
-Tracked result files:
+Canonical runtime artifacts:
 
-- `./chronos-2.csv`
-- `./chronos-2-exogenous.csv`
-- `./agcrn-pilot.csv`
-- `./ltsf-linear.csv`
-- `./tft-pilot.csv`
+- `./artifacts/published/<family_id>/latest.csv`: current formal family-level result CSV
+- `./artifacts/runs/<family_id>/<timestamp>/manifest.json`: immutable run record for one CLI invocation
+- `./artifacts/scratch/<family_id>/...`: ad hoc smoke/debug outputs
+- `./families/<family>/.work/`: family-local resume, chunk, and checkpoint artifacts
 
 ## Covariate Stages
 
 The staged exogenous packs are defined in
-[`experiment/common/covariate_packs.py`](./common/covariate_packs.py).
-`kelmarsh` and `penmanshiel` use `feature_set="lightweight"`. `hill_of_towie`
-and `sdwpf_kddcup` use `feature_set="default"`.
+[`experiment/infra/common/covariate_packs.py`](./infra/common/covariate_packs.py). They
+now resolve directly against the canonical `gold_base/<quality_profile>/<layout>`
+cache and select required columns from that single series view.
 
 ### Kelmarsh / Penmanshiel
 
@@ -62,8 +68,6 @@ and `sdwpf_kddcup` use `feature_set="default"`.
 - `farm_pmu__gms_power_kw`
 - `farm_pmu__gms_reactive_power_kvar`
 - `farm_pmu__gms_current_a`
-- `farm_pmu__production_meter_data_availability`
-- `farm_grid_meter__grid_meter_data_availability`
 
 `stage3_regime`
 
@@ -153,11 +157,13 @@ when present in the selected feature set.
   Kelmarsh only, `power_only` only, and full-synchronous farm windows only.
 - `chronos-2-exogenous` and `ltsf-linear` share the same staged covariate pack
   definitions.
-- `chronos-2.csv` and `chronos-2-exogenous.csv` are long result files with
+- `artifacts/published/chronos2_power_only/latest.csv` and
+  `artifacts/published/chronos2_exogenous/latest.csv` are long result files with
   `split_name=test`, `eval_protocol`, `metric_scope`, `lead_step`, and split
   window-count metadata.
 - `ltsf-linear` currently reads the same staged packs but may react differently
   to sparse flags and near-constant covariates because it uses train-only
   z-score normalization on past covariates.
-- `ltsf-linear.csv` is also a long result file: each job emits `val/test`,
-  `rolling_origin_no_refit/non_overlap`, and `overall/horizon-wise` rows.
+- `artifacts/published/ltsf_linear_local/latest.csv` is also a long result file: each job
+  emits `val/test`, `rolling_origin_no_refit/non_overlap`, and
+  `overall/horizon-wise` rows.

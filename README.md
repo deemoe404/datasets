@@ -22,12 +22,72 @@
 | Hill of Towie | `wtc_ActPower_*` 的 min/max/stddev/endvalue/mean over 10 min |            机组/场级 SCADA 多表 + 告警事件 + AeroUp/TuneUp |
 | sdwpf_kddcup  |                                      `Patv` mean over 10 min | `Wspd/Wdir/Etmp/Itmp/Ndir/Pab1/Pab2/Pab3/Prtv` + 质量 flag |
 
+## 当前保留字段概览
+
+下表按 `src/wind_datasets/data/source_column_policy/*.csv` 汇总当前会被保留到数据集处理链路中的原始字段，仅统计 `keep` 与 `keep+mask`。  
+这张表回答的是“原始 source key 哪些还会进入后续处理”；如果你要看某个 `feature_protocol_id` 最终进入实验的数据列，还需要看 task bundle 的 `task_context.json`。
+
+### Kelmarsh
+
+| 源表/文件 | 当前保留字段 |
+| -------- | ------------ |
+| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
+| `Device_Data_PMU` | `Date and time`, `GMS Current (A)`, `GMS Power (kW)`, `GMS Reactive power (kvar)` |
+| `Device_Data_Grid_Meter` | `Date and time` |
+| `Status` | `Timestamp start`, `Timestamp end`, `Status`, `Code`, `Service contract category`, `IEC category` |
+| `WT_static` | `Title`, `Identity`, `Latitude`, `Longitude`, `Elevation (m)`, `Rated power (kW)`, `Hub Height (m)`, `Rotor Diameter (m)`, `Manufacturer`, `Model`, `Country`, `Commercial Operations Date` |
+
+### Penmanshiel
+
+| 源表/文件 | 当前保留字段 |
+| -------- | ------------ |
+| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
+| `Device_Data_PMU` | `Date and time`, `GMS Current (A)`, `GMS Power (kW)`, `GMS Reactive power (kvar)` |
+| `Device_Data_Grid_Meter` | `Date and time` |
+| `Status` | `Timestamp start`, `Timestamp end`, `Status`, `Code`, `Service contract category`, `IEC category` |
+| `WT_static` | `Title`, `Identity`, `Latitude`, `Longitude`, `Elevation (m)`, `Rated power (kW)`, `Hub Height (m)`, `Rotor Diameter (m)`, `Manufacturer`, `Model`, `Country`, `Commercial Operations Date` |
+
+### Hill of Towie
+
+| 源表/文件 | 当前保留字段 |
+| -------- | ------------ |
+| `Hill_of_Towie_turbine_metadata` | `Turbine Name`, `Station ID`, `Latitude`, `Longitude`, `Manufacturer`, `Model`, `Rated power (kW)`, `Hub Height (m)`, `Rotor Diameter (m)`, `Country`, `Commercial Operations Date` |
+| `tblSCTurbine` | `TimeStamp`, `StationId`, `wtc_GenRpm_mean`, `wtc_MainSRpm_mean`, `wtc_PitchRef_BladeA_mean`, `wtc_PitchRef_BladeB_mean`, `wtc_PitchRef_BladeC_mean`, `wtc_PriAnemo_mean`, `wtc_SecAnemo_mean`, `wtc_TwrHumid_mean`, `wtc_YawPos_mean` |
+| `tblSCTurGrid` | `TimeStamp`, `StationId`, `wtc_ActPower_mean`, `wtc_ActPower_min`, `wtc_ActPower_max`, `wtc_ActPower_stddev`, `wtc_ActPower_endvalue` |
+| `tblSCTurFlag` | `TimeStamp`, `StationId` |
+| `tblGrid` | `TimeStamp`, `ActivePower`, `ReActivePower`, `PowerFactor` |
+| `tblGridScientific` | `TimeStamp` |
+| `tblSCTurCount` | `TimeStamp`, `StationId` |
+| `tblSCTurDigiIn` | `TimeStamp`, `StationId` |
+| `tblSCTurDigiOut` | `TimeStamp`, `StationId` |
+| `tblSCTurIntern` | `TimeStamp`, `StationId` |
+| `tblSCTurPress` | `TimeStamp`, `StationId`, `wtc_HydPress_mean` |
+| `tblSCTurTemp` | `TimeStamp`, `StationId`, `wtc_AmbieTmp_mean`, `wtc_NacelTmp_mean`, `wtc_GeOilTmp_mean` |
+| `tblAlarmLog` | `TimeOn`, `TimeOff`, `StationNr`, `Alarmcode` |
+| `Hill_of_Towie_AeroUp_install_dates` | `Turbine`, `First date of AeroUp works`, `Last date of AeroUp works` |
+| `ShutdownDuration` | `TimeStamp_StartFormat`, `TurbineName`, `ShutdownDuration` |
+
+### sdwpf_kddcup
+
+| 源表/文件 | 当前保留字段 |
+| -------- | ------------ |
+| `sdwpf_main` | `TurbID`, `Day`, `Tmstamp`, `Patv`, `Wspd`, `Wdir (keep+mask)`, `Etmp`, `Itmp`, `Ndir (keep+mask)`, `Pab1 (keep+mask)`, `Pab2 (keep+mask)`, `Pab3 (keep+mask)`, `Prtv` |
+| `sdwpf_location` | `TurbID`, `x`, `y` |
+
+如果要看最精确的规则，请直接查看：
+
+- `src/wind_datasets/data/source_column_policy/kelmarsh.csv`
+- `src/wind_datasets/data/source_column_policy/penmanshiel.csv`
+- `src/wind_datasets/data/source_column_policy/hill_of_towie.csv`
+- `src/wind_datasets/data/source_column_policy/sdwpf_kddcup.csv`
+
 切分 train/val/test 时的注意事项（时间顺序按照 70/10/20 比例）：
 
 - Hill of Towie 中，`wtc_ActualWindDirection_mean`/`days_since_tuneup_effective_start`/`days_since_tuneup_deployment_end` 在 train/val/test 上大量缺失。
 - Hill of Towie 中，`tuneup_post_effective`/`tuneup_in_deployment_window` 在 train/val/test 上大量为 0。
 - Hill of Towie 中，`farm_grid__frequency` 在 train 上波动很小，且会出现 0 值（可能是缺失哨兵）。
 - Hill of Towie 中，`wtc_GridFreq_mean` 在时间轴上会出现 0 值（可能是缺失哨兵）。
+- Hill of Towie 中，`days_since_aeroup_start`/`days_since_aeroup_end` 在 train 上几乎全部缺失；到 val/test 时缺失显著减少，但分布范围也随之明显变化。
 
 - Kelmarsh 中，`farm_pmu__gms_power_setpoint_kw`/`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上几乎为常数，test 上会出现 0 值。
 - Kelmarsh 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
@@ -35,6 +95,9 @@
 - Penmanshiel 中，`farm_pmu__gms_grid_frequency_hz`/`farm_pmu__gms_voltage_v` 在 train 上波动很小，test 上会出现 0 值。
 - Penmanshiel 中，`farm_pmu__gms_power_setpoint_kw` 在 train 上接近常数。
 - Penmanshiel 中，`Grid frequency (Hz)` 在时间轴上会出现 0 值（可能是缺失哨兵）。
+- Penmanshiel 中，`farm_pmu__gms_power_kw`/`farm_pmu__gms_reactive_power_kvar`/`farm_pmu__gms_current_a` 在 train 上大量缺失，val/test 上缺失很少。
+- Penmanshiel 中，`Blade angle (pitch position) A (°)`/`Blade angle (pitch position) B (°)`/`Blade angle (pitch position) C (°)` 在 train 上大量缺失，val/test 上缺失显著更少。
+- Penmanshiel 中，`farm_evt_active_count`/`farm_evt_total_overlap_seconds` 在 train 与 val/test 上分布差异很大；train 中 0 值更多，val/test 更集中于较高取值。
 
 ## 滑窗式构建 `24H->6H` 窗口
 
@@ -61,67 +124,3 @@
 *Hill of Towie 数据集除了 `quality_flags` 外还有代表 sidecar 文件导致的质量问题的 `feature_quality_flags`。
 
 ---
-
-## 环境准备
-
-项目根目录下创建或更新 `wind_datasets.local.toml`:
-
-```toml
-[paths]
-source_data_root = "/path/to/Wind Power Forecasting"
-```
-
-建立项目根环境：
-
-```shell
-./scripts/create_env.sh
-```
-
-重建数据集缓存：
-
-```shell
-./scripts/rebuild_cache.sh --clean --include-turbine
-./scripts/rebuild_cache.sh --check
-```
-
-## 运行实验
-
-chronos-2 实验：
-
-```shell
-cd experiment/chronos-2
-./create_env.sh
-./.conda/bin/python run_power_only_full.py
-```
-
-chronos-2-exogenous 实验：
-
-```shell
-cd experiment/chronos-2-exogenous
-./create_env.sh
-./.conda/bin/python run_exogenous_full.py
-```
-
-ltsf-linear 实验：
-
-```shell
-cd experiment/ltsf-linear
-./create_env.sh
-./.conda/bin/python run_ltsf_linear_full.py
-```
-
-tft pilot 实验：
-
-```shell
-cd experiment/tft
-./create_env.sh
-./.conda/bin/python run_tft.py
-```
-
-AGCRN pilot 实验：
-
-```shell
-cd experiment/agcrn
-./create_env.sh
-./.conda/bin/python run_agcrn.py
-```

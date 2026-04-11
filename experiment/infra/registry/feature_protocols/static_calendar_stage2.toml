@@ -1,0 +1,13 @@
+schema_version = 1
+feature_protocol_id = "static_calendar_stage2"
+display_name = "Static Plus Calendar Plus Stage 2"
+protocol_kind = "mixed"
+summary = "Use target history with static spatial covariates, deterministic calendar covariates, and stage2 past covariates."
+uses_target_history = true
+uses_static_covariates = true
+uses_known_future_covariates = true
+uses_past_covariates = true
+uses_target_derived_covariates = false
+past_covariate_source = "dataset_native_past_covariates"
+past_covariate_stage = "stage2_ops"
+aliases = ["mixed_stage2"]

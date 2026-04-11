@@ -18,9 +18,9 @@ def _load_module(path_parts: tuple[str, ...], name: str):
 
 
 def test_shared_covariate_manifest_matches_chronos_shim() -> None:
-    shared = _load_module(("experiment", "common", "covariate_packs.py"), "shared_covariate_packs")
+    shared = _load_module(("experiment", "infra", "common", "covariate_packs.py"), "shared_covariate_packs")
     shim = _load_module(
-        ("experiment", "chronos-2-exogenous", "chronos2_exogenous_manifest.py"),
+        ("experiment", "families", "chronos-2-exogenous", "chronos2_exogenous_manifest.py"),
         "chronos2_exogenous_manifest",
     )
 
@@ -32,8 +32,8 @@ def test_shared_covariate_manifest_matches_chronos_shim() -> None:
         assert asdict(shared.reference_pack_for(dataset_id)) == asdict(shim.reference_pack_for(dataset_id))
 
 
-def test_reference_pack_and_stage_feature_sets_are_expected() -> None:
-    shared = _load_module(("experiment", "common", "covariate_packs.py"), "shared_covariate_packs_expected")
+def test_reference_pack_and_stage_columns_are_expected() -> None:
+    shared = _load_module(("experiment", "infra", "common", "covariate_packs.py"), "shared_covariate_packs_expected")
 
     kelmarsh_reference = shared.reference_pack_for("kelmarsh")
     hill_stage3 = shared.resolve_covariate_pack("hill_of_towie", "stage3_regime")
@@ -43,14 +43,12 @@ def test_reference_pack_and_stage_feature_sets_are_expected() -> None:
 
     assert kelmarsh_reference.stage == "reference"
     assert kelmarsh_reference.pack_name == "power_only"
-    assert kelmarsh_reference.feature_set == "lightweight"
     assert len(kelmarsh_stage1.required_columns) == 12
     assert "Grid frequency (Hz)" not in kelmarsh_stage1.required_columns
-    assert len(penmanshiel_stage2.required_columns) == 17
+    assert len(penmanshiel_stage2.required_columns) == 15
     assert "farm_pmu__gms_power_setpoint_kw" not in penmanshiel_stage2.required_columns
     assert "farm_pmu__gms_voltage_v" not in penmanshiel_stage2.required_columns
     assert "farm_pmu__gms_grid_frequency_hz" not in penmanshiel_stage2.required_columns
-    assert hill_stage3.feature_set == "default"
     assert len(hill_stage3.required_columns) == 23
     assert "wtc_ActualWindDirection_mean" not in hill_stage3.required_columns
     assert "wtc_GridFreq_mean" not in hill_stage3.required_columns

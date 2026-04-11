@@ -11,6 +11,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "ltsf-linear"
         / "run_ltsf_linear_full.py"
     )
@@ -81,7 +82,6 @@ def _result_row(
         "lead_minutes": None if lead_step is None else lead_step * 10,
         "covariate_stage": covariate_stage,
         "covariate_pack": covariate_pack,
-        "feature_set": "lightweight" if dataset_id in {"kelmarsh", "penmanshiel"} else "default",
         "covariate_count": covariate_count,
         "covariate_policy": "none" if covariate_count == 0 else "past_only_train_zscore_fill0_mask",
         "window_count": 10,

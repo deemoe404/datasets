@@ -15,6 +15,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "agcrn"
         / "agcrn.py"
     )
@@ -59,10 +60,8 @@ def _build_temp_cache(
     forecast_steps: int = 36,
 ) -> None:
     dataset_root = cache_root / dataset_id
-    task_dir = dataset_root / "tasks" / "default" / "farm" / "next_6h_from_24h"
-    series_dir = dataset_root / "gold_base" / "default" / "farm" / "default"
+    task_dir = dataset_root / "tasks" / "next_6h_from_24h" / "power_only"
     task_dir.mkdir(parents=True, exist_ok=True)
-    series_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
         datetime(2024, 1, 1, 0, 0, 0),
@@ -83,7 +82,7 @@ def _build_temp_cache(
                     "target_kw": float(offset + index),
                 }
             )
-    pl.DataFrame(rows).write_parquet(series_dir / "series.parquet")
+    pl.DataFrame(rows).write_parquet(task_dir / "series.parquet")
 
     window_rows = []
     for start_index in range(history_steps, len(timestamps) - forecast_steps + 1):
@@ -105,7 +104,8 @@ def _build_temp_cache(
         json.dumps(
             {
                 "dataset_id": dataset_id,
-                "quality_profile": "default",
+                "schema_version": "task_bundle.v1",
+                "feature_protocol_id": "power_only",
                 "turbine_ids": list(turbine_ids),
                 "task": {
                     "task_id": "next_6h_from_24h",
@@ -113,13 +113,27 @@ def _build_temp_cache(
                     "forecast_steps": forecast_steps,
                     "stride_steps": 1,
                 },
-                "series_layout": "farm",
+                "time_axis_semantics": "farm_synchronous_long_panel",
             }
         ),
         encoding="utf-8",
     )
     pl.DataFrame(
         {
+            "dataset": [dataset_id for _ in timestamps],
+            "timestamp": timestamps,
+            "calendar_hour_sin": [0.0] * len(timestamps),
+            "calendar_hour_cos": [1.0] * len(timestamps),
+            "calendar_weekday_sin": [0.0] * len(timestamps),
+            "calendar_weekday_cos": [1.0] * len(timestamps),
+            "calendar_month_sin": [0.0] * len(timestamps),
+            "calendar_month_cos": [1.0] * len(timestamps),
+            "calendar_is_weekend": [0] * len(timestamps),
+        }
+    ).write_parquet(task_dir / "known_future.parquet")
+    pl.DataFrame(
+        {
+            "dataset": [dataset_id] * len(turbine_ids),
             "turbine_id": list(turbine_ids),
             "turbine_index": [0, 1, 2],
             "rated_power_kw": [2050.0, 2050.0, 2050.0],
@@ -128,7 +142,7 @@ def _build_temp_cache(
             "latitude": [None, None, None],
             "longitude": [None, None, None],
         }
-    ).write_parquet(task_dir / "turbine_static.parquet")
+    ).write_parquet(task_dir / "static.parquet")
 
 
 def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 600_000_000):

@@ -13,6 +13,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "chronos-2"
         / "run_power_only_full.py"
     )

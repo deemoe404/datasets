@@ -10,7 +10,13 @@ import pytest
 
 
 def _load_module():
-    module_path = Path(__file__).resolve().parents[1] / "experiment" / "common" / "window_protocols.py"
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "experiment"
+        / "infra"
+        / "common"
+        / "window_protocols.py"
+    )
     spec = spec_from_file_location("window_protocols", module_path)
     assert spec is not None
     assert spec.loader is not None
@@ -45,7 +51,7 @@ def test_legacy_window_protocol_is_rejected() -> None:
         module.resolve_window_protocol("legacy_6h_stride")
 
 
-def test_default_output_paths_use_canonical_csv_names() -> None:
+def test_default_output_paths_use_canonical_published_locations() -> None:
     module = _load_module()
     repo_root = Path("/tmp/datasets")
 
@@ -53,12 +59,12 @@ def test_default_output_paths_use_canonical_csv_names() -> None:
         repo_root=repo_root,
         experiment_name="chronos-2",
         window_protocol="dense_sliding",
-    ) == (repo_root / "experiment" / "chronos-2.csv")
+    ) == (repo_root.resolve() / "experiment" / "artifacts" / "published" / "chronos2_power_only" / "latest.csv")
     assert module.default_output_path(
         repo_root=repo_root,
         experiment_name="chronos-2-exogenous",
         window_protocol="dense_sliding",
-    ) == (repo_root / "experiment" / "chronos-2-exogenous.csv")
+    ) == (repo_root.resolve() / "experiment" / "artifacts" / "published" / "chronos2_exogenous" / "latest.csv")
 
 
 def test_build_chrono_split_lookup_uses_unique_raw_timestamps() -> None:

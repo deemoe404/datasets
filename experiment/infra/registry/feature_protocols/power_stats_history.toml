@@ -1,0 +1,11 @@
+schema_version = 1
+feature_protocol_id = "power_stats_history"
+display_name = "Power-Stats History"
+protocol_kind = "target_derived_history"
+summary = "Augment target history with target-derived historical power statistics."
+uses_target_history = true
+uses_static_covariates = false
+uses_known_future_covariates = false
+uses_past_covariates = false
+uses_target_derived_covariates = true
+aliases = ["power_stats"]

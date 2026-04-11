@@ -1,0 +1,11 @@
+schema_version = 1
+feature_protocol_id = "power_only"
+display_name = "Power Only"
+protocol_kind = "reference"
+summary = "Use only target power history as model input."
+uses_target_history = true
+uses_static_covariates = false
+uses_known_future_covariates = false
+uses_past_covariates = false
+uses_target_derived_covariates = false
+aliases = ["reference"]

@@ -13,6 +13,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "chronos-2-exogenous"
         / "run_exogenous_full.py"
     )
@@ -106,11 +107,6 @@ def _install_fake_popen(monkeypatch, module, attempts: list[dict[str, object]]) 
 def _read_log(log_path: Path) -> dict[str, object]:
     return json.loads(log_path.read_text())
 
-
-def _feature_set_for(dataset_id: str) -> str:
-    return "lightweight" if dataset_id in {"kelmarsh", "penmanshiel"} else "default"
-
-
 def _covariate_count_for(dataset_id: str) -> int:
     return 13 if dataset_id in {"kelmarsh", "penmanshiel"} else 30
 
@@ -168,7 +164,6 @@ def _result_row(
         "layout": module.LAYOUT,
         "covariate_stage": covariate_stage,
         "covariate_pack": covariate_pack,
-        "feature_set": _feature_set_for(dataset_id),
         "covariate_count": _covariate_count_for(dataset_id),
         "covariate_policy": module.COVARIATE_POLICY,
         "train_window_count": 70,

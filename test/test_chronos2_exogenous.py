@@ -16,6 +16,7 @@ def _load_manifest_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "chronos-2-exogenous"
         / "chronos2_exogenous_manifest.py"
     )
@@ -32,6 +33,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "chronos-2-exogenous"
         / "chronos2_exogenous.py"
     )
@@ -373,7 +375,7 @@ def test_resolve_dataset_progress_plan_counts_batches_from_series_budget(monkeyp
     monkeypatch.setattr(
         module,
         "load_target_series_frame",
-        lambda dataset_id, *, feature_set, cache_root, turbine_ids=None: (spec, feature_set, Path("series.parquet"), target_series),
+        lambda dataset_id, *, cache_root, turbine_ids=None: (spec, Path("series.parquet"), target_series),
     )
     monkeypatch.setattr(module.pl, "read_parquet_schema", lambda path: stage2_series.schema)
 
@@ -422,7 +424,7 @@ def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) ->
     monkeypatch.setattr(
         module,
         "load_covariate_series_frame",
-        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
+        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, Path("series.parquet"), pack.required_columns, series),
     )
     _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
@@ -444,7 +446,6 @@ def test_evaluate_univariate_covariate_pack_kelmarsh_stage1_core(monkeypatch) ->
     assert overall["dataset_id"] == "kelmarsh"
     assert overall["covariate_stage"] == "stage1_core"
     assert overall["covariate_pack"] == "stage1_core"
-    assert overall["feature_set"] == "lightweight"
     assert overall["covariate_count"] == len(pack.required_columns)
     assert overall["window_count"] == 1
     assert overall["prediction_count"] == 1
@@ -476,7 +477,7 @@ def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) 
     monkeypatch.setattr(
         module,
         "load_covariate_series_frame",
-        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
+        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, Path("series.parquet"), pack.required_columns, series),
     )
     _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
@@ -490,7 +491,7 @@ def test_evaluate_univariate_covariate_pack_penmanshiel_stage2_ops(monkeypatch) 
     )
     overall = _overall_row(module, result)
 
-    assert pipeline.batch_sizes == [18]
+    assert pipeline.batch_sizes == [len(pack.required_columns) + 1]
     assert overall["covariate_stage"] == "stage2_ops"
     assert overall["covariate_count"] == len(pack.required_columns)
 
@@ -524,7 +525,7 @@ def test_evaluate_univariate_covariate_pack_hill_stage3_regime(monkeypatch) -> N
     monkeypatch.setattr(
         module,
         "load_covariate_series_frame",
-        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
+        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, Path("series.parquet"), pack.required_columns, series),
     )
     _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
@@ -575,7 +576,7 @@ def test_evaluate_univariate_covariate_pack_sdwpf_stage3_regime(monkeypatch) -> 
     monkeypatch.setattr(
         module,
         "load_covariate_series_frame",
-        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, pack.feature_set, Path("series.parquet"), pack.required_columns, series),
+        lambda dataset_id, *, pack, cache_root, turbine_ids=None: (spec, Path("series.parquet"), pack.required_columns, series),
     )
     _patch_split_windows(monkeypatch, module, series["timestamp"], target_indices=[3])
 
@@ -625,7 +626,6 @@ def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> No
         "load_covariate_series_frame",
         lambda dataset_id, *, pack, cache_root, turbine_ids=None: (
             spec,
-            pack.feature_set,
             Path("series.parquet"),
             pack.required_columns,
             stage2_series.select(list(module._BASE_COLUMNS) + list(pack.required_columns)),
@@ -634,7 +634,7 @@ def test_run_experiment_emits_exact_progress_events(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(
         module,
         "load_target_series_frame",
-        lambda dataset_id, *, feature_set, cache_root, turbine_ids=None: (spec, feature_set, Path("series.parquet"), target_series),
+        lambda dataset_id, *, cache_root, turbine_ids=None: (spec, Path("series.parquet"), target_series),
     )
     monkeypatch.setattr(module.pl, "read_parquet_schema", lambda path: stage2_series.schema)
     monkeypatch.setattr(
@@ -703,7 +703,6 @@ def test_run_experiment_includes_reference_and_stage_rows(monkeypatch, tmp_path)
             "layout": module.LAYOUT,
             "covariate_stage": pack.stage,
             "covariate_pack": pack.pack_name,
-            "feature_set": pack.feature_set,
             "covariate_count": len(pack.required_columns),
             "covariate_policy": module.COVARIATE_POLICY,
             "train_window_count": 100,
@@ -806,7 +805,6 @@ def test_run_experiment_emits_dense_test_only_metadata(monkeypatch, tmp_path) ->
                 "layout": module.LAYOUT,
                 "covariate_stage": "stage1_core",
                 "covariate_pack": "stage1_core",
-                "feature_set": "lightweight",
                 "covariate_count": 1,
                 "covariate_policy": module.COVARIATE_POLICY,
                 "train_window_count": 100,

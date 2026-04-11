@@ -16,6 +16,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "tft"
         / "tft.py"
     )
@@ -37,12 +38,10 @@ def _build_temp_cache(
 ) -> None:
     dataset_root = cache_root / dataset_id
     task_dir = dataset_root / "tasks" / "default" / "turbine" / "next_6h_from_24h"
-    default_series_dir = dataset_root / "gold_base" / "default" / "turbine" / "default"
-    lightweight_series_dir = dataset_root / "gold_base" / "default" / "turbine" / "lightweight"
+    series_dir = dataset_root / "gold_base" / "default" / "turbine"
     static_dir = dataset_root / "silver" / "meta"
     task_dir.mkdir(parents=True, exist_ok=True)
-    default_series_dir.mkdir(parents=True, exist_ok=True)
-    lightweight_series_dir.mkdir(parents=True, exist_ok=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
     static_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
@@ -93,8 +92,7 @@ def _build_temp_cache(
         .otherwise(pl.col("farm_grid_meter__grid_meter_data_availability"))
         .alias("farm_grid_meter__grid_meter_data_availability"),
     )
-    series.write_parquet(default_series_dir / "series.parquet")
-    series.write_parquet(lightweight_series_dir / "series.parquet")
+    series.write_parquet(series_dir / "series.parquet")
 
     window_rows = []
     for turbine_id in ("T01", "T02"):
@@ -175,7 +173,6 @@ def _small_prepared_dataset(module, *, input_pack_spec):
         stride_steps=1,
         input_pack=input_pack_spec.input_pack,
         historical_covariate_stage=input_pack_spec.historical_covariate_stage,
-        feature_set=input_pack_spec.feature_set,
         uses_static_covariates=input_pack_spec.uses_static_covariates,
         uses_known_future_covariates=input_pack_spec.uses_known_future_covariates,
         static_covariate_columns=("static_coord_1", "static_coord_2") if static_count else (),
@@ -239,10 +236,9 @@ def test_resolve_input_pack_configures_flags_and_counts() -> None:
 
     assert hist_stage1.historical_covariate_stage == "stage1_core"
     assert hist_stage1.historical_covariate_count == 12
-    assert hist_stage1.feature_set == "lightweight"
 
     assert mixed_stage2.historical_covariate_stage == "stage2_ops"
-    assert mixed_stage2.historical_covariate_count == 17
+    assert mixed_stage2.historical_covariate_count == 15
     assert mixed_stage2.uses_static_covariates is True
     assert mixed_stage2.uses_known_future_covariates is True
 
@@ -377,7 +373,6 @@ def test_prepare_dataset_reads_dense_cache_and_downsamples_train_only(tmp_path) 
     )
 
     assert prepared.input_pack == "mixed_stage1"
-    assert prepared.feature_set == "lightweight"
     assert prepared.static_covariate_count == 2
     assert prepared.known_covariate_count == 5
     assert prepared.historical_covariate_count == 12
@@ -404,7 +399,6 @@ def test_build_frame_for_windows_trims_unused_missing_targets() -> None:
         stride_steps=1,
         input_pack="reference",
         historical_covariate_stage=None,
-        feature_set="default",
         uses_static_covariates=False,
         uses_known_future_covariates=False,
         static_covariate_columns=(),
@@ -466,8 +460,11 @@ def test_run_experiment_all_input_packs_emits_expected_888_row_grid(tmp_path) ->
         num_workers,
         trainer_precision,
         matmul_precision,
+        job_artifacts,
+        resume,
     ):
         del device, max_epochs, early_stopping_patience, num_workers, trainer_precision, matmul_precision
+        del job_artifacts, resume
         evaluation_results = [
             ("val", module.ROLLING_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows, _evaluation_metrics(module, window_count=1, forecast_steps=36, base=0.10)),
             ("val", module.NON_OVERLAP_EVAL_PROTOCOL, prepared_dataset.val_non_overlap_windows, _evaluation_metrics(module, window_count=1, forecast_steps=36, base=0.11)),
@@ -523,7 +520,7 @@ def test_resolve_batch_size_uses_cpu_default_for_mps() -> None:
 
     assert module.resolve_batch_size("cpu") == 128
     assert module.resolve_batch_size("mps") == 128
-    assert module.resolve_batch_size("cuda") == 512
+    assert module.resolve_batch_size("cuda") == 256
 
 
 def test_runtime_auto_resolution_prefers_cuda_fast_path() -> None:
@@ -531,7 +528,7 @@ def test_runtime_auto_resolution_prefers_cuda_fast_path() -> None:
 
     assert module.resolve_num_workers("cpu") == 0
     assert module.resolve_num_workers("mps") == 0
-    assert module.resolve_num_workers("cuda") >= 4
+    assert module.resolve_num_workers("cuda") == 0
     assert module.resolve_trainer_precision("cpu") == "32-true"
     assert module.resolve_trainer_precision("cuda") == "bf16-mixed"
     assert module.resolve_matmul_precision("cpu") is None

@@ -15,6 +15,7 @@ def _load_module():
     module_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
+        / "families"
         / "ltsf-linear"
         / "ltsf_linear.py"
     )
@@ -60,12 +61,10 @@ def _build_temp_cache(
 ) -> None:
     dataset_root = cache_root / dataset_id
     task_dir = dataset_root / "tasks" / "default" / "turbine" / "next_6h_from_24h"
-    default_series_dir = dataset_root / "gold_base" / "default" / "turbine" / "default"
-    lightweight_series_dir = dataset_root / "gold_base" / "default" / "turbine" / "lightweight"
+    series_dir = dataset_root / "gold_base" / "default" / "turbine"
     static_dir = dataset_root / "silver" / "meta"
     task_dir.mkdir(parents=True, exist_ok=True)
-    default_series_dir.mkdir(parents=True, exist_ok=True)
-    lightweight_series_dir.mkdir(parents=True, exist_ok=True)
+    series_dir.mkdir(parents=True, exist_ok=True)
     static_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
@@ -98,8 +97,7 @@ def _build_temp_cache(
         "status_flag": status_t01 + status_t02,
     }
     series = pl.DataFrame(rows)
-    series.write_parquet(default_series_dir / "series.parquet")
-    series.write_parquet(lightweight_series_dir / "series.parquet")
+    series.write_parquet(series_dir / "series.parquet")
 
     window_rows = []
     for turbine_id in ("T01", "T02"):
@@ -160,7 +158,6 @@ def _small_prepared_dataset(
     dataset_id: str = "kelmarsh",
     covariate_stage: str = "reference",
     covariate_pack: str = "power_only",
-    feature_set: str = "default",
     covariate_columns: tuple[str, ...] = (),
     forecast_steps: int = 36,
 ):
@@ -185,7 +182,6 @@ def _small_prepared_dataset(
         stride_steps=1,
         covariate_stage=covariate_stage,
         covariate_pack=covariate_pack,
-        feature_set=feature_set,
         covariate_columns=covariate_columns,
         covariate_count=covariate_count,
         covariate_policy=module.COVARIATE_POLICY if covariate_count else module.REFERENCE_COVARIATE_POLICY,
@@ -251,7 +247,6 @@ def _result_row(
         "lead_minutes": lead_minutes,
         "covariate_stage": covariate_stage,
         "covariate_pack": covariate_pack,
-        "feature_set": "lightweight" if dataset_id in {"kelmarsh", "penmanshiel"} else "default",
         "covariate_count": 0 if covariate_stage == "reference" else 3,
         "covariate_policy": "none" if covariate_stage == "reference" else module.COVARIATE_POLICY,
         "window_count": 10,
@@ -479,7 +474,6 @@ def test_prepare_dataset_reads_dense_cache_and_builds_dual_eval_windows(tmp_path
         dataset_id="toy_dataset",
         stage="stage1_core",
         pack_name="stage1_core",
-        feature_set="default",
         required_columns=("wind_speed", "ambient_temp", "status_flag"),
     )
 
