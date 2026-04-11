@@ -1,0 +1,13 @@
+feature_name,decision,mask_rule,reason,notes
+sdwpf_is_unknown,keep,,Retained because it is part of the current graph forecasting feature packs.,
+sdwpf_is_abnormal,keep,,Retained because it is part of the current graph forecasting feature packs.,
+sdwpf_is_masked,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Wspd,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Wdir,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Etmp,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Itmp,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Ndir,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Pab1,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Pab2,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Pab3,keep,,Retained because it is part of the current graph forecasting feature packs.,
+Prtv,keep,,Retained because it is part of the current graph forecasting feature packs.,
