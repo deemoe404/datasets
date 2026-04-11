@@ -59,6 +59,7 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
         granularity="farm",
     )
     builder.build_task_cache(task)
+    bundle = builder.load_task_bundle(task)
     window_index = builder.load_window_index(task)
     task_report = json.loads(builder.task_bundle_paths(task).task_report_path.read_text())
     assert window_index.height > 0
@@ -69,6 +70,8 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     assert task_report["task"]["task_id"] == "short_task"
     assert task_report["granularity"] == "farm"
     assert task_report["window_count"] == window_index.height
+    assert bundle.task_context["column_groups"]["static"] == bundle.static.columns
+    assert "rated_power_kw" in bundle.static.columns
 
 
 def test_end_to_end_hill_pipeline(tmp_path) -> None:

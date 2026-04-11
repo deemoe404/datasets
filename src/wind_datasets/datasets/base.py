@@ -259,7 +259,7 @@ class BaseDatasetBuilder:
         known_future = build_known_future_frame(series_frame)
         known_future.write_parquet(task_paths.known_future_path)
 
-        self._write_task_static(task_paths, selection.static_columns)
+        task_static = self._write_task_static(task_paths)
 
         build_window_index_from_series_path(
             series_path=task_paths.series_path,
@@ -269,7 +269,13 @@ class BaseDatasetBuilder:
             quality_profile="default",
             available_columns=set(series_frame.columns),
         )
-        self._write_task_context(task_paths, resolved, feature_protocol_id, selection)
+        self._write_task_context(
+            task_paths,
+            resolved,
+            feature_protocol_id,
+            selection,
+            static_columns=tuple(task_static.columns),
+        )
         self._finalize_task_report(task_paths, resolved, feature_protocol_id, selection)
         self._write_task_build_meta(task=resolved, feature_protocol_id=feature_protocol_id)
         return task_paths.task_dir
@@ -366,7 +372,7 @@ class BaseDatasetBuilder:
             "source_column_policy_entry_count": len(policy.entries),
         }
 
-    def _task_static_frame(self, selected_columns: tuple[str, ...]) -> pl.DataFrame:
+    def _task_static_frame(self) -> pl.DataFrame:
         turbine_static = self.load_turbine_static()
         with_index = turbine_static.join(
             pl.DataFrame(
@@ -379,13 +385,15 @@ class BaseDatasetBuilder:
             how="right",
         ).sort("turbine_index")
         base_columns = ["dataset", "turbine_id", "turbine_index"]
-        selected = [column for column in (*base_columns, *selected_columns) if column in with_index.columns]
-        return with_index.select(selected)
+        metadata_columns = [
+            column for column in with_index.columns if column not in {"dataset", "turbine_id", "turbine_index"}
+        ]
+        return with_index.select([*base_columns, *metadata_columns])
 
-    def _write_task_static(self, task_paths: TaskBundlePaths, selected_columns: tuple[str, ...]) -> Path:
-        frame = self._task_static_frame(selected_columns)
+    def _write_task_static(self, task_paths: TaskBundlePaths) -> pl.DataFrame:
+        frame = self._task_static_frame()
         frame.write_parquet(task_paths.static_path)
-        return task_paths.static_path
+        return frame
 
     def _write_task_context(
         self,
@@ -393,6 +401,8 @@ class BaseDatasetBuilder:
         task: ResolvedTaskSpec,
         feature_protocol_id: str,
         selection,
+        *,
+        static_columns: tuple[str, ...],
     ) -> Path:
         payload = protocol_context_dict(
             dataset_id=self.spec.dataset_id,
@@ -400,6 +410,7 @@ class BaseDatasetBuilder:
             feature_protocol_id=feature_protocol_id,
             turbine_ids=self.spec.turbine_ids,
             selection=selection,
+            static_columns=static_columns,
         )
         return write_json(task_paths.task_context_path, payload)
 

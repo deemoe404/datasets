@@ -27,7 +27,6 @@ _SERIES_OPTIONAL_AUDIT_COLUMNS = (
     "sdwpf_is_abnormal",
     "sdwpf_is_masked",
 )
-_STATIC_BASE_COLUMNS = ("dataset", "turbine_id", "turbine_index")
 _KNOWN_FUTURE_COLUMNS = (
     "dataset",
     "timestamp",
@@ -153,6 +152,7 @@ def protocol_context_dict(
     feature_protocol_id: str,
     turbine_ids: tuple[str, ...],
     selection: TaskSeriesSelection,
+    static_columns: tuple[str, ...],
 ) -> dict[str, object]:
     protocol = get_feature_protocol_spec(feature_protocol_id)
     return {
@@ -181,7 +181,7 @@ def protocol_context_dict(
             "past_covariates": list(selection.past_covariate_columns),
             "target_derived_covariates": list(selection.target_derived_columns),
             "known_future": list(selection.known_future_columns),
-            "static": list((_STATIC_BASE_COLUMNS + selection.static_columns)),
+            "static": list(static_columns),
             "audit": list(selection.audit_columns),
         },
     }

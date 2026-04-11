@@ -5,6 +5,7 @@ from importlib.util import module_from_spec, spec_from_file_location
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
@@ -58,13 +59,11 @@ def _build_temp_cache(
     dataset_id: str = "toy_dataset",
     history_steps: int = 144,
     forecast_steps: int = 36,
-    task_static_layout: str = "minimal",
+    task_static_layout: str = "complete",
 ) -> None:
     dataset_root = cache_root / dataset_id
     task_dir = dataset_root / "tasks" / "next_6h_from_24h" / "power_only"
-    silver_meta_dir = dataset_root / "silver" / "meta"
     task_dir.mkdir(parents=True, exist_ok=True)
-    silver_meta_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
         datetime(2024, 1, 1, 0, 0, 0),
@@ -117,6 +116,14 @@ def _build_temp_cache(
                     "stride_steps": 1,
                 },
                 "time_axis_semantics": "farm_synchronous_long_panel",
+                "column_groups": {
+                    "series": ["dataset", "turbine_id", "timestamp", "target_kw"],
+                    "past_covariates": [],
+                    "target_derived_covariates": [],
+                    "known_future": ["dataset", "timestamp"],
+                    "static": [],
+                    "audit": [],
+                },
             }
         ),
         encoding="utf-8",
@@ -134,27 +141,8 @@ def _build_temp_cache(
             "calendar_is_weekend": [0] * len(timestamps),
         }
     ).write_parquet(task_dir / "known_future.parquet")
-    pl.DataFrame(
-        {
-            "dataset": [dataset_id] * len(turbine_ids),
-            "turbine_id": list(turbine_ids),
-            "coord_x": [0.0, 100.0, 210.0],
-            "coord_y": [0.0, 0.0, 0.0],
-            "latitude": [None, None, None],
-            "longitude": [None, None, None],
-            "rated_power_kw": [2050.0, 2050.0, 2050.0],
-        }
-    ).write_parquet(silver_meta_dir / "turbine_static.parquet")
 
-    if task_static_layout == "minimal":
-        task_static = pl.DataFrame(
-            {
-                "dataset": [dataset_id] * len(turbine_ids),
-                "turbine_id": list(turbine_ids),
-                "turbine_index": [0, 1, 2],
-            }
-        )
-    elif task_static_layout == "rich":
+    if task_static_layout == "complete":
         task_static = pl.DataFrame(
             {
                 "dataset": [dataset_id] * len(turbine_ids),
@@ -167,10 +155,59 @@ def _build_temp_cache(
                 "longitude": [None, None, None],
             }
         )
+    elif task_static_layout == "missing_rated_power":
+        task_static = pl.DataFrame(
+            {
+                "dataset": [dataset_id] * len(turbine_ids),
+                "turbine_id": list(turbine_ids),
+                "turbine_index": [0, 1, 2],
+                "coord_x": [0.0, 100.0, 210.0],
+                "coord_y": [0.0, 0.0, 0.0],
+                "latitude": [None, None, None],
+                "longitude": [None, None, None],
+            }
+        )
+    elif task_static_layout == "missing_coordinates":
+        task_static = pl.DataFrame(
+            {
+                "dataset": [dataset_id] * len(turbine_ids),
+                "turbine_id": list(turbine_ids),
+                "turbine_index": [0, 1, 2],
+                "rated_power_kw": [2050.0, 2050.0, 2050.0],
+                "coord_x": [None, None, None],
+                "coord_y": [None, None, None],
+                "latitude": [None, None, None],
+                "longitude": [None, None, None],
+            }
+        )
     else:
         raise ValueError(f"Unsupported task_static_layout {task_static_layout!r}.")
 
+    task_context = json.loads((task_dir / "task_context.json").read_text(encoding="utf-8"))
+    task_context["column_groups"]["static"] = task_static.columns
+    (task_dir / "task_context.json").write_text(json.dumps(task_context), encoding="utf-8")
     task_static.write_parquet(task_dir / "static.parquet")
+
+
+def _read_temp_bundle(cache_root: Path, *, dataset_id: str = "toy_dataset") -> SimpleNamespace:
+    task_dir = cache_root / dataset_id / "tasks" / "next_6h_from_24h" / "power_only"
+    return SimpleNamespace(
+        series=pl.read_parquet(task_dir / "series.parquet"),
+        known_future=pl.read_parquet(task_dir / "known_future.parquet"),
+        static=pl.read_parquet(task_dir / "static.parquet"),
+        window_index=pl.read_parquet(task_dir / "window_index.parquet"),
+        task_context=json.loads((task_dir / "task_context.json").read_text(encoding="utf-8")),
+    )
+
+
+def _patch_temp_bundle_loader(monkeypatch, module, cache_root: Path, *, dataset_id: str = "toy_dataset") -> None:
+    def _fake_load_task_bundle(requested_dataset_id: str, *, cache_root: str | Path):
+        assert requested_dataset_id == dataset_id
+        assert Path(cache_root) == cache_root_path
+        return _read_temp_bundle(cache_root_path, dataset_id=dataset_id)
+
+    cache_root_path = cache_root
+    monkeypatch.setattr(module, "_load_task_bundle", _fake_load_task_bundle)
 
 
 def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 600_000_000):
@@ -489,10 +526,12 @@ def test_thin_non_overlap_window_index_keeps_every_forecast_step() -> None:
     assert thinned.target_indices.tolist() == [0, 3, 6, 9]
 
 
-def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path) -> None:
+def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path, monkeypatch) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
-    _build_temp_cache(cache_root, task_static_layout="minimal")
+    _build_temp_cache(cache_root)
+    assert not (cache_root / "toy_dataset" / "silver").exists()
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root)
 
     prepared = module.prepare_dataset("toy_dataset", cache_root=cache_root)
 
@@ -509,12 +548,14 @@ def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path)
     assert len(prepared.test_non_overlap_windows) == 7
     assert prepared.val_non_overlap_windows.target_indices.tolist() == [1544]
     assert prepared.test_non_overlap_windows.target_indices.tolist() == [1744, 1780, 1816, 1852, 1888, 1924, 1960]
+    assert not (cache_root / "toy_dataset" / "silver").exists()
 
 
-def test_prepare_dataset_applies_train_and_eval_limits(tmp_path) -> None:
+def test_prepare_dataset_applies_train_and_eval_limits(tmp_path, monkeypatch) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
-    _build_temp_cache(cache_root, task_static_layout="minimal")
+    _build_temp_cache(cache_root)
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root)
 
     prepared = module.prepare_dataset(
         "toy_dataset",
@@ -528,6 +569,26 @@ def test_prepare_dataset_applies_train_and_eval_limits(tmp_path) -> None:
     assert len(prepared.val_non_overlap_windows) == 1
     assert len(prepared.test_rolling_windows) == 4
     assert len(prepared.test_non_overlap_windows) == 1
+
+
+def test_prepare_dataset_requires_rated_power_in_task_bundle_static(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, task_static_layout="missing_rated_power")
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root)
+
+    with pytest.raises(ValueError, match="missing non-null rated_power_kw"):
+        module.prepare_dataset("toy_dataset", cache_root=cache_root)
+
+
+def test_prepare_dataset_requires_coordinates_in_task_bundle_static(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(cache_root, task_static_layout="missing_coordinates")
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root)
+
+    with pytest.raises(ValueError, match="coord_x/coord_y or full latitude/longitude"):
+        module.prepare_dataset("toy_dataset", cache_root=cache_root)
 
 
 def test_avwgcn_matches_official_reference() -> None:

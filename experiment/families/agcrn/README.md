@@ -19,7 +19,9 @@ The alignment target is the model core only. Data loading, window filtering, spl
 
 ## Data Contract
 
-The runner reads:
+The runner loads the public task bundle through `wind_datasets.load_task_bundle(...)`.
+
+For the current Kelmarsh run, that bundle is materialized under:
 
 ```text
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/series.parquet
@@ -27,6 +29,9 @@ cache/kelmarsh/tasks/next_6h_from_24h/power_only/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/static.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/task_context.json
 ```
+
+`static.parquet` is treated as the complete experiment-facing static sidecar; the
+runner does not read `silver` or `gold_base` artifacts directly.
 
 Only windows satisfying all of the following are kept:
 

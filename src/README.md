@@ -139,7 +139,7 @@ Each task bundle contains:
 
 - `series.parquet`: protocol-selected farm-level long panel
 - `known_future.parquet`: deterministic calendar covariates for the bundle timestamp axis
-- `static.parquet`: turbine static sidecar with stable `turbine_index`
+- `static.parquet`: complete normalized turbine static sidecar with stable `turbine_index`
 - `window_index.parquet`: dense sliding window index over the selected series
 - `task_context.json`: machine-readable protocol/task description
 - `task_report.json`: build diagnostics and column summaries
@@ -246,7 +246,7 @@ Normal invalidation behavior:
 - packaged dependency changes invalidate the layer that declares them, then all descendants
 - task parameter or `feature_protocol_id` changes invalidate only the affected task layer
 
-Read helpers such as `load_series(...)`, `load_task_bundle(...)`, and
+Read helpers such as `load_task_bundle(...)`, `load_series(...)`, and
 `profile_dataset(...)` automatically rebuild missing or stale parent layers.
 
 Special case:
@@ -265,14 +265,16 @@ feature_protocol_id = "power_only"
 
 build_task_cache(dataset_id, task, feature_protocol_id=feature_protocol_id)
 
-gold_series = load_series(dataset_id)
 bundle = load_task_bundle(dataset_id, task, feature_protocol_id=feature_protocol_id)
 
-print(gold_series.columns)
 print(bundle.series.columns)
 print(bundle.static.columns)
 print(bundle.known_future.columns)
 print(bundle.task_context["feature_protocol_id"])
+
+# Lower-level dataset access remains available when you explicitly want gold_base.
+gold_series = load_series(dataset_id)
+print(gold_series.columns)
 ```
 
 ## Rebuild CLI

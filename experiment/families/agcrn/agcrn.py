@@ -171,27 +171,11 @@ _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
 
 
 @dataclass(frozen=True)
-class TaskCachePaths:
-    dataset_id: str
-    dataset_root: Path
-    task_dir: Path
-    series_path: Path
-    window_index_path: Path
-    task_context_path: Path
-    turbine_static_path: Path
-
-    @property
-    def dataset_turbine_static_path(self) -> Path:
-        return self.dataset_root / "silver" / "meta" / "turbine_static.parquet"
-
-
-@dataclass(frozen=True)
 class DatasetMetadata:
     dataset_id: str
     turbine_ids: tuple[str, ...]
     rated_power_kw: float
     turbine_static: pl.DataFrame
-    task_paths: TaskCachePaths
 
 
 @dataclass(frozen=True)
@@ -353,125 +337,33 @@ def _normalize_target_values(values: Sequence[float | None], rated_power_kw: flo
     return normalized
 
 
-def resolve_cache_paths(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> TaskCachePaths:
-    dataset_root = Path(cache_root) / dataset_id
-    task_dir = dataset_root / "tasks" / TASK_ID / FEATURE_PROTOCOL_ID
-    return TaskCachePaths(
-        dataset_id=dataset_id,
-        dataset_root=dataset_root,
-        task_dir=task_dir,
-        series_path=task_dir / "series.parquet",
-        window_index_path=task_dir / "window_index.parquet",
-        task_context_path=task_dir / "task_context.json",
-        turbine_static_path=task_dir / "static.parquet",
-    )
-
-
 def _has_complete_static_columns(frame: pl.DataFrame, columns: Sequence[str]) -> bool:
     return set(columns).issubset(frame.columns) and all(frame[column].null_count() == 0 for column in columns)
 
 
-def _supplement_task_static_metadata(
-    task_static: pl.DataFrame,
-    *,
-    dataset_id: str,
-    paths: TaskCachePaths,
-) -> pl.DataFrame:
-    has_rated_power = _has_complete_static_columns(task_static, ("rated_power_kw",))
-    has_xy_coordinates = _has_complete_static_columns(task_static, ("coord_x", "coord_y"))
-    has_latlon_coordinates = _has_complete_static_columns(task_static, ("latitude", "longitude"))
-    if has_rated_power and (has_xy_coordinates or has_latlon_coordinates):
-        return task_static
-
-    dataset_static_path = paths.dataset_turbine_static_path
-    if not dataset_static_path.exists():
-        missing_parts = []
-        if not has_rated_power:
-            missing_parts.append("rated_power_kw")
-        if not (has_xy_coordinates or has_latlon_coordinates):
-            missing_parts.append("coordinates")
-        raise ValueError(
-            f"Task-local turbine_static for dataset {dataset_id!r} is missing required "
-            f"{', '.join(missing_parts)} and dataset-level turbine static is unavailable at {dataset_static_path}."
-        )
-
-    dataset_static = pl.read_parquet(dataset_static_path)
-    missing_join_keys = [column for column in ("dataset", "turbine_id") if column not in dataset_static.columns]
-    if missing_join_keys:
-        raise ValueError(
-            f"Dataset-level turbine_static for dataset {dataset_id!r} is missing join keys {missing_join_keys!r}."
-        )
-
-    metadata_columns = [
-        column
-        for column in ("rated_power_kw", "coord_x", "coord_y", "latitude", "longitude")
-        if column in dataset_static.columns
-    ]
-    if not metadata_columns:
-        return task_static
-
-    joined = task_static.join(
-        dataset_static.select(
-            [
-                "dataset",
-                "turbine_id",
-                *(pl.col(column).alias(f"{column}__dataset") for column in metadata_columns),
-            ]
-        ),
-        on=["dataset", "turbine_id"],
-        how="left",
-    )
-    supplemented = joined.with_columns(
-        [
-            (
-                pl.coalesce(pl.col(column), pl.col(f"{column}__dataset"))
-                if column in task_static.columns
-                else pl.col(f"{column}__dataset")
-            ).alias(column)
-            for column in metadata_columns
-        ]
-    )
-    return supplemented.drop([f"{column}__dataset" for column in metadata_columns]).sort("turbine_index")
-
-
-def ensure_task_cache(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> TaskCachePaths:
-    paths = resolve_cache_paths(dataset_id, cache_root=cache_root)
-    required_paths = (
-        paths.series_path,
-        paths.window_index_path,
-        paths.task_context_path,
-        paths.turbine_static_path,
-    )
-    if all(path.exists() for path in required_paths):
-        return paths
-
+def _load_task_bundle(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> Any:
     _ensure_repo_src_on_path()
     try:
-        from wind_datasets import build_task_cache
+        from wind_datasets import load_task_bundle
     except ImportError as exc:  # pragma: no cover - defensive
-        raise RuntimeError("Unable to import wind_datasets for task cache construction.") from exc
+        raise RuntimeError("Unable to import wind_datasets for task bundle loading.") from exc
 
     try:
-        build_task_cache(
+        return load_task_bundle(
             dataset_id,
             build_task_spec(),
             cache_root=cache_root,
             feature_protocol_id=FEATURE_PROTOCOL_ID,
         )
-    except Exception as exc:  # pragma: no cover - exercised only when cache is missing
+    except Exception as exc:  # pragma: no cover - exercised only when cache is unavailable
         raise RuntimeError(
-            f"Farm task cache for dataset {dataset_id!r} is missing and could not be rebuilt. "
+            f"Unable to load the farm task bundle for dataset {dataset_id!r}. "
             "Either prebuild the cache artifacts or configure wind_datasets.local.toml."
         ) from exc
 
-    if not all(path.exists() for path in required_paths):
-        raise RuntimeError(f"Dataset cache for {dataset_id!r} is incomplete after rebuild.")
-    return paths
 
-
-def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> DatasetMetadata:
-    paths = ensure_task_cache(dataset_id, cache_root=cache_root)
-    task_context = json.loads(paths.task_context_path.read_text(encoding="utf-8"))
+def load_dataset_metadata(dataset_id: str, bundle: Any) -> DatasetMetadata:
+    task_context = bundle.task_context
     task = task_context.get("task", {})
     if (
         int(task.get("history_steps", HISTORY_STEPS)) != HISTORY_STEPS
@@ -479,21 +371,30 @@ def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_RO
         or int(task.get("stride_steps", STRIDE_STEPS)) != STRIDE_STEPS
     ):
         raise ValueError(
-            f"Cached task context for dataset {dataset_id!r} does not match the expected "
+            f"Task bundle context for dataset {dataset_id!r} does not match the expected "
             f"{HISTORY_STEPS}/{FORECAST_STEPS}/{STRIDE_STEPS} task."
         )
 
-    turbine_static = pl.read_parquet(paths.turbine_static_path)
+    turbine_static = bundle.static
     if "turbine_index" not in turbine_static.columns:
-        raise ValueError(f"Task-local turbine_static for dataset {dataset_id!r} is missing turbine_index.")
+        raise ValueError(f"Task bundle static sidecar for dataset {dataset_id!r} is missing turbine_index.")
     ordered_static = turbine_static.sort("turbine_index")
     ordered_ids = tuple(ordered_static["turbine_id"].to_list())
     context_ids = tuple(task_context["turbine_ids"])
     if ordered_ids != context_ids:
         raise ValueError(
-            f"Task-local turbine_static order for dataset {dataset_id!r} does not match task_context turbine_ids."
+            f"Task bundle static sidecar order for dataset {dataset_id!r} does not match task_context turbine_ids."
         )
-    ordered_static = _supplement_task_static_metadata(ordered_static, dataset_id=dataset_id, paths=paths)
+
+    if not _has_complete_static_columns(ordered_static, ("rated_power_kw",)):
+        raise ValueError(f"Task bundle static sidecar for dataset {dataset_id!r} is missing non-null rated_power_kw.")
+    try:
+        resolve_static_coordinate_columns(ordered_static)
+    except ValueError as exc:
+        raise ValueError(
+            f"Task bundle static sidecar for dataset {dataset_id!r} must include either full "
+            "coord_x/coord_y or full latitude/longitude."
+        ) from exc
 
     rated_powers = sorted({float(value) for value in ordered_static["rated_power_kw"].drop_nulls().to_list()})
     if len(rated_powers) != 1:
@@ -504,25 +405,18 @@ def load_dataset_metadata(dataset_id: str, *, cache_root: str | Path = _CACHE_RO
         turbine_ids=context_ids,
         rated_power_kw=rated_powers[0],
         turbine_static=ordered_static,
-        task_paths=paths,
     )
 
 
-def load_series_frame(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> pl.DataFrame:
-    paths = ensure_task_cache(dataset_id, cache_root=cache_root)
-    available_columns = set(pl.read_parquet_schema(paths.series_path))
+def load_series_frame(dataset_id: str, bundle: Any) -> pl.DataFrame:
+    available_columns = set(bundle.series.columns)
     missing_base = [column for column in _SERIES_BASE_COLUMNS if column not in available_columns]
     if missing_base:
         raise ValueError(
-            f"Series {paths.series_path} for dataset {dataset_id!r} is missing required base columns {missing_base!r}."
+            f"Task bundle series for dataset {dataset_id!r} is missing required base columns {missing_base!r}."
         )
     load_started = time.monotonic()
-    frame = (
-        pl.scan_parquet(paths.series_path)
-        .select(list(_SERIES_BASE_COLUMNS))
-        .sort(["turbine_id", "timestamp"])
-        .collect()
-    )
+    frame = bundle.series.select(list(_SERIES_BASE_COLUMNS)).sort(["turbine_id", "timestamp"])
     _profile_log(
         dataset_id,
         "load_series",
@@ -533,11 +427,16 @@ def load_series_frame(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) 
     return frame
 
 
-def load_strict_window_index(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> pl.DataFrame:
-    paths = ensure_task_cache(dataset_id, cache_root=cache_root)
+def load_strict_window_index(dataset_id: str, bundle: Any) -> pl.DataFrame:
+    available_columns = set(bundle.window_index.columns)
+    missing_columns = [column for column in _TASK_WINDOW_COLUMNS if column not in available_columns]
+    if missing_columns:
+        raise ValueError(
+            f"Task bundle window_index for dataset {dataset_id!r} is missing required columns {missing_columns!r}."
+        )
     load_started = time.monotonic()
     frame = (
-        pl.scan_parquet(paths.window_index_path)
+        bundle.window_index
         .select(list(_TASK_WINDOW_COLUMNS))
         .filter(
             pl.col("is_complete_input")
@@ -547,7 +446,6 @@ def load_strict_window_index(dataset_id: str, *, cache_root: str | Path = _CACHE
             & (pl.col("quality_flags").fill_null("") == "")
         )
         .sort("output_start_ts")
-        .collect()
     )
     _profile_log(
         dataset_id,
@@ -809,9 +707,10 @@ def prepare_dataset(
     max_train_origins: int | None = None,
     max_eval_origins: int | None = None,
 ) -> PreparedDataset:
-    metadata = load_dataset_metadata(dataset_id, cache_root=cache_root)
-    strict_window_index = load_strict_window_index(dataset_id, cache_root=cache_root)
-    series = load_series_frame(dataset_id, cache_root=cache_root)
+    bundle = _load_task_bundle(dataset_id, cache_root=cache_root)
+    metadata = load_dataset_metadata(dataset_id, bundle)
+    strict_window_index = load_strict_window_index(dataset_id, bundle)
+    series = load_series_frame(dataset_id, bundle)
     coordinate_mode, distance_sanity = build_distance_sanity_frame(
         metadata.turbine_static,
         ordered_turbine_ids=metadata.turbine_ids,

@@ -16,6 +16,7 @@ from wind_datasets.api import (
     load_event_features,
     load_interventions,
     load_shared_timeseries,
+    load_task_bundle,
     load_task_turbine_static,
     load_turbine_static,
 )
@@ -394,10 +395,21 @@ def test_api_build_farm_task_cache_then_load_task_turbine_static(tmp_path, monke
         granularity="farm",
     )
     build_task_cache("hill_of_towie", task_spec=task, cache_root=tmp_path / "cache")
+    bundle = load_task_bundle("hill_of_towie", task_spec=task, cache_root=tmp_path / "cache")
     turbine_static = load_task_turbine_static("hill_of_towie", task_spec=task, cache_root=tmp_path / "cache")
+    expected_columns = [
+        "dataset",
+        "turbine_id",
+        "turbine_index",
+        *(column for column in TURBINE_STATIC_SCHEMA if column not in {"dataset", "turbine_id"}),
+    ]
 
     assert turbine_static["turbine_id"].to_list() == ["T01", "T02"]
     assert turbine_static["turbine_index"].to_list() == [0, 1]
+    assert turbine_static.columns == expected_columns
+    assert bundle.static.columns == expected_columns
+    assert bundle.static.equals(turbine_static)
+    assert bundle.task_context["column_groups"]["static"] == expected_columns
 
 
 def test_manifest_audits_sdwpf_time_semantics_and_reports_incompatible_minutes(tmp_path) -> None:
