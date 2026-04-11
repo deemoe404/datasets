@@ -76,6 +76,7 @@ from window_protocols import (  # noqa: E402
 MODEL_ID = "AGCRN"
 FAMILY_ID = "agcrn_official_aligned"
 MODEL_VARIANT = "official_aligned_power_only_farm_sync"
+POWER_WS_HIST_MODEL_VARIANT = "official_aligned_power_ws_hist_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -84,6 +85,7 @@ HISTORY_STEPS = 144
 FORECAST_STEPS = 36
 STRIDE_STEPS = 1
 FEATURE_PROTOCOL_ID = "power_only"
+POWER_WS_HIST_FEATURE_PROTOCOL_ID = "power_ws_hist"
 GRAPH_MODE = "adaptive"
 GRAPH_SOURCE = "learned_node_embeddings"
 INPUT_CHANNELS = 1
@@ -112,6 +114,7 @@ _TASK_WINDOW_COLUMNS = (
     "is_fully_synchronous_input",
     "is_fully_synchronous_output",
     "quality_flags",
+    "feature_quality_flags",
 )
 _SERIES_BASE_COLUMNS = (
     "dataset",
@@ -165,9 +168,33 @@ _RESULT_COLUMNS = [
     "learning_rate",
 ]
 _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_DATASETS)}
+_MODEL_VARIANT_ORDER = {
+    MODEL_VARIANT: 0,
+    POWER_WS_HIST_MODEL_VARIANT: 1,
+}
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
 _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
+
+
+@dataclass(frozen=True)
+class ExperimentVariant:
+    model_variant: str
+    feature_protocol_id: str
+
+
+VARIANT_SPECS = (
+    ExperimentVariant(model_variant=MODEL_VARIANT, feature_protocol_id=FEATURE_PROTOCOL_ID),
+    ExperimentVariant(
+        model_variant=POWER_WS_HIST_MODEL_VARIANT,
+        feature_protocol_id=POWER_WS_HIST_FEATURE_PROTOCOL_ID,
+    ),
+)
+DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
+_VARIANT_SPECS_BY_NAME = {
+    spec.model_variant: spec
+    for spec in VARIANT_SPECS
+}
 
 
 @dataclass(frozen=True)
@@ -199,6 +226,8 @@ class FarmWindowDescriptorIndex:
 @dataclass(frozen=True)
 class PreparedDataset:
     dataset_id: str
+    model_variant: str
+    feature_protocol_id: str
     resolution_minutes: int
     rated_power_kw: float
     history_steps: int
@@ -208,12 +237,18 @@ class PreparedDataset:
     coordinate_mode: str
     node_count: int
     timestamps_us: np.ndarray
+    input_channel_names: tuple[str, ...]
+    source_tensor: np.ndarray
     target_pu: np.ndarray
     train_windows: FarmWindowDescriptorIndex
     val_rolling_windows: FarmWindowDescriptorIndex
     val_non_overlap_windows: FarmWindowDescriptorIndex
     test_rolling_windows: FarmWindowDescriptorIndex
     test_non_overlap_windows: FarmWindowDescriptorIndex
+
+    @property
+    def input_channels(self) -> int:
+        return int(self.source_tensor.shape[2])
 
 
 @dataclass(frozen=True)
@@ -268,6 +303,23 @@ def _create_progress_bar(
         disable=not (progress_is_enabled() if enabled is None else enabled),
         dynamic_ncols=True,
     )
+
+
+def resolve_variant_specs(variant_names: Sequence[str] | None = None) -> tuple[ExperimentVariant, ...]:
+    requested = tuple(variant_names or DEFAULT_VARIANTS)
+    resolved: list[ExperimentVariant] = []
+    seen: set[str] = set()
+    for variant_name in requested:
+        try:
+            spec = _VARIANT_SPECS_BY_NAME[variant_name]
+        except KeyError as exc:
+            supported = ", ".join(DEFAULT_VARIANTS)
+            raise ValueError(f"Unknown model variant {variant_name!r}. Expected one of: {supported}.") from exc
+        if spec.model_variant in seen:
+            continue
+        resolved.append(spec)
+        seen.add(spec.model_variant)
+    return tuple(resolved)
 
 
 def _loader_batch_total(loader: object) -> int | None:
@@ -341,7 +393,12 @@ def _has_complete_static_columns(frame: pl.DataFrame, columns: Sequence[str]) ->
     return set(columns).issubset(frame.columns) and all(frame[column].null_count() == 0 for column in columns)
 
 
-def _load_task_bundle(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) -> Any:
+def _load_task_bundle(
+    dataset_id: str,
+    *,
+    feature_protocol_id: str = FEATURE_PROTOCOL_ID,
+    cache_root: str | Path = _CACHE_ROOT,
+) -> Any:
     _ensure_repo_src_on_path()
     try:
         from wind_datasets import load_task_bundle
@@ -353,11 +410,12 @@ def _load_task_bundle(dataset_id: str, *, cache_root: str | Path = _CACHE_ROOT) 
             dataset_id,
             build_task_spec(),
             cache_root=cache_root,
-            feature_protocol_id=FEATURE_PROTOCOL_ID,
+            feature_protocol_id=feature_protocol_id,
         )
     except Exception as exc:  # pragma: no cover - exercised only when cache is unavailable
         raise RuntimeError(
-            f"Unable to load the farm task bundle for dataset {dataset_id!r}. "
+            f"Unable to load the farm task bundle for dataset {dataset_id!r} with "
+            f"feature_protocol_id={feature_protocol_id!r}. "
             "Either prebuild the cache artifacts or configure wind_datasets.local.toml."
         ) from exc
 
@@ -408,15 +466,29 @@ def load_dataset_metadata(dataset_id: str, bundle: Any) -> DatasetMetadata:
     )
 
 
-def load_series_frame(dataset_id: str, bundle: Any) -> pl.DataFrame:
+def resolve_past_covariate_columns(bundle: Any) -> tuple[str, ...]:
+    column_groups = bundle.task_context.get("column_groups", {})
+    if not isinstance(column_groups, dict):
+        raise ValueError("Task bundle task_context is missing column_groups.")
+    raw_columns = column_groups.get("past_covariates") or ()
+    return tuple(str(column) for column in raw_columns)
+
+
+def load_series_frame(
+    dataset_id: str,
+    bundle: Any,
+    *,
+    past_covariate_columns: Sequence[str] = (),
+) -> pl.DataFrame:
     available_columns = set(bundle.series.columns)
-    missing_base = [column for column in _SERIES_BASE_COLUMNS if column not in available_columns]
-    if missing_base:
+    required_columns = (*_SERIES_BASE_COLUMNS, *past_covariate_columns)
+    missing_columns = [column for column in required_columns if column not in available_columns]
+    if missing_columns:
         raise ValueError(
-            f"Task bundle series for dataset {dataset_id!r} is missing required base columns {missing_base!r}."
+            f"Task bundle series for dataset {dataset_id!r} is missing required columns {missing_columns!r}."
         )
     load_started = time.monotonic()
-    frame = bundle.series.select(list(_SERIES_BASE_COLUMNS)).sort(["turbine_id", "timestamp"])
+    frame = bundle.series.select(list(required_columns)).sort(["turbine_id", "timestamp"])
     _profile_log(
         dataset_id,
         "load_series",
@@ -427,7 +499,12 @@ def load_series_frame(dataset_id: str, bundle: Any) -> pl.DataFrame:
     return frame
 
 
-def load_strict_window_index(dataset_id: str, bundle: Any) -> pl.DataFrame:
+def load_strict_window_index(
+    dataset_id: str,
+    bundle: Any,
+    *,
+    require_clean_input_features: bool = False,
+) -> pl.DataFrame:
     available_columns = set(bundle.window_index.columns)
     missing_columns = [column for column in _TASK_WINDOW_COLUMNS if column not in available_columns]
     if missing_columns:
@@ -435,6 +512,7 @@ def load_strict_window_index(dataset_id: str, bundle: Any) -> pl.DataFrame:
             f"Task bundle window_index for dataset {dataset_id!r} is missing required columns {missing_columns!r}."
         )
     load_started = time.monotonic()
+    feature_quality_expr = pl.col("feature_quality_flags").fill_null("")
     frame = (
         bundle.window_index
         .select(list(_TASK_WINDOW_COLUMNS))
@@ -444,6 +522,11 @@ def load_strict_window_index(dataset_id: str, bundle: Any) -> pl.DataFrame:
             & pl.col("is_fully_synchronous_input")
             & pl.col("is_fully_synchronous_output")
             & (pl.col("quality_flags").fill_null("") == "")
+            & (
+                ~feature_quality_expr.str.contains(r"(^|\|)feature_quality_issues_input($|\|)")
+                if require_clean_input_features
+                else pl.lit(True)
+            )
         )
         .sort("output_start_ts")
     )
@@ -606,6 +689,118 @@ def build_panel_series(
     return timestamps_us, target_pu
 
 
+def _build_feature_panel(
+    series: pl.DataFrame,
+    *,
+    feature_column: str,
+    turbine_ids: Sequence[str],
+    expected_timestamps: Sequence[datetime],
+) -> np.ndarray:
+    panel = (
+        series.select(["timestamp", "turbine_id", feature_column])
+        .pivot(on="turbine_id", index="timestamp", values=feature_column, aggregate_function="first")
+        .sort("timestamp")
+    )
+    if panel["timestamp"].to_list() != list(expected_timestamps):
+        raise ValueError(f"Feature panel {feature_column!r} does not align to the task bundle timestamp axis.")
+    missing_columns = [turbine_id for turbine_id in turbine_ids if turbine_id not in panel.columns]
+    if missing_columns:
+        raise ValueError(f"Feature panel {feature_column!r} is missing turbine columns {missing_columns!r}.")
+    return panel.select(list(turbine_ids)).to_numpy().astype(np.float32, copy=False)
+
+
+def _history_row_mask(
+    *,
+    target_indices: np.ndarray,
+    history_steps: int,
+    total_steps: int,
+) -> np.ndarray:
+    mask = np.zeros((total_steps,), dtype=bool)
+    for target_index in np.unique(np.asarray(target_indices, dtype=np.int64)):
+        start_index = int(target_index) - history_steps
+        end_index = int(target_index)
+        if start_index < 0 or end_index > total_steps:
+            raise ValueError(f"History window [{start_index}, {end_index}) falls outside the available panel axis.")
+        mask[start_index:end_index] = True
+    return mask
+
+
+def _compute_train_covariate_stats(
+    covariate_tensor: np.ndarray,
+    *,
+    train_windows: FarmWindowDescriptorIndex,
+    history_steps: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if covariate_tensor.ndim != 3:
+        raise ValueError(f"Expected covariate tensor with shape [time, node, channel], got {covariate_tensor.shape!r}.")
+    if covariate_tensor.shape[2] == 0:
+        return (
+            np.zeros((0,), dtype=np.float32),
+            np.ones((0,), dtype=np.float32),
+        )
+    if len(train_windows) == 0:
+        raise ValueError("At least one train window is required to compute covariate normalization statistics.")
+    history_mask = _history_row_mask(
+        target_indices=train_windows.target_indices,
+        history_steps=history_steps,
+        total_steps=covariate_tensor.shape[0],
+    )
+    train_history = covariate_tensor[history_mask]
+    means = np.zeros((covariate_tensor.shape[2],), dtype=np.float32)
+    stds = np.ones((covariate_tensor.shape[2],), dtype=np.float32)
+    for channel_index in range(covariate_tensor.shape[2]):
+        values = train_history[:, :, channel_index].reshape(-1)
+        finite_values = values[np.isfinite(values)]
+        if finite_values.size == 0:
+            raise ValueError(f"Covariate channel {channel_index} has no finite training values for normalization.")
+        mean = float(finite_values.mean())
+        std = float(finite_values.std())
+        if np.isfinite(std) and std > 0:
+            means[channel_index] = mean
+            stds[channel_index] = std
+    return means, stds
+
+
+def build_source_tensor(
+    series: pl.DataFrame,
+    *,
+    turbine_ids: Sequence[str],
+    raw_timestamps: Sequence[datetime],
+    target_pu: np.ndarray,
+    past_covariate_columns: Sequence[str],
+    train_windows: FarmWindowDescriptorIndex,
+    history_steps: int,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    source_channels = [target_pu.astype(np.float32, copy=False)]
+    input_channel_names: list[str] = ["target_pu"]
+    if past_covariate_columns:
+        covariate_channels = np.stack(
+            [
+                _build_feature_panel(
+                    series,
+                    feature_column=feature_column,
+                    turbine_ids=turbine_ids,
+                    expected_timestamps=raw_timestamps,
+                )
+                for feature_column in past_covariate_columns
+            ],
+            axis=-1,
+        )
+        means, stds = _compute_train_covariate_stats(
+            covariate_channels,
+            train_windows=train_windows,
+            history_steps=history_steps,
+        )
+        normalized_covariates = ((covariate_channels - means.reshape(1, 1, -1)) / stds.reshape(1, 1, -1)).astype(
+            np.float32,
+            copy=False,
+        )
+        source_channels.extend(normalized_covariates[:, :, index] for index in range(normalized_covariates.shape[2]))
+        input_channel_names.extend(past_covariate_columns)
+    source_tensor = np.stack(source_channels, axis=-1).astype(np.float32, copy=False)
+    return source_tensor, tuple(input_channel_names)
+
+
 def build_window_descriptor_index(
     window_index: pl.DataFrame,
     *,
@@ -664,12 +859,14 @@ if Dataset is not None:
     class PanelWindowDataset(Dataset):
         def __init__(
             self,
+            source_tensor: np.ndarray,
             target_pu: np.ndarray,
             windows: FarmWindowDescriptorIndex,
             *,
             history_steps: int,
             forecast_steps: int,
         ) -> None:
+            self.source_tensor = np.asarray(source_tensor, dtype=np.float32)
             self.target_pu = np.asarray(target_pu, dtype=np.float32)
             self.windows = windows
             self.history_steps = history_steps
@@ -680,16 +877,16 @@ if Dataset is not None:
 
         def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray]:
             target_index = int(self.windows.target_indices[index])
-            history = self.target_pu[target_index - self.history_steps : target_index]
+            history = self.source_tensor[target_index - self.history_steps : target_index]
             targets = self.target_pu[target_index : target_index + self.forecast_steps]
-            if history.shape != (self.history_steps, self.target_pu.shape[1]):
+            if history.shape != (self.history_steps, self.source_tensor.shape[1], self.source_tensor.shape[2]):
                 raise ValueError(f"History slice for index {index} has unexpected shape {history.shape!r}.")
             if targets.shape != (self.forecast_steps, self.target_pu.shape[1]):
                 raise ValueError(f"Target slice for index {index} has unexpected shape {targets.shape!r}.")
             if not np.isfinite(history).all() or not np.isfinite(targets).all():
-                raise ValueError(f"Window index {index} contains non-finite target values despite strict filtering.")
+                raise ValueError(f"Window index {index} contains non-finite values despite strict filtering.")
             return (
-                history[:, :, None].astype(np.float32, copy=True),
+                history.astype(np.float32, copy=True),
                 targets[:, :, None].astype(np.float32, copy=True),
             )
 
@@ -703,14 +900,34 @@ else:
 def prepare_dataset(
     dataset_id: str,
     *,
+    variant_spec: ExperimentVariant | None = None,
     cache_root: str | Path = _CACHE_ROOT,
     max_train_origins: int | None = None,
     max_eval_origins: int | None = None,
 ) -> PreparedDataset:
-    bundle = _load_task_bundle(dataset_id, cache_root=cache_root)
+    resolved_variant = variant_spec or VARIANT_SPECS[0]
+    bundle = _load_task_bundle(
+        dataset_id,
+        feature_protocol_id=resolved_variant.feature_protocol_id,
+        cache_root=cache_root,
+    )
+    if bundle.task_context.get("feature_protocol_id") != resolved_variant.feature_protocol_id:
+        raise ValueError(
+            f"Task bundle for dataset {dataset_id!r} does not match requested "
+            f"feature_protocol_id={resolved_variant.feature_protocol_id!r}."
+        )
     metadata = load_dataset_metadata(dataset_id, bundle)
-    strict_window_index = load_strict_window_index(dataset_id, bundle)
-    series = load_series_frame(dataset_id, bundle)
+    past_covariate_columns = resolve_past_covariate_columns(bundle)
+    strict_window_index = load_strict_window_index(
+        dataset_id,
+        bundle,
+        require_clean_input_features=bool(past_covariate_columns),
+    )
+    series = load_series_frame(
+        dataset_id,
+        bundle,
+        past_covariate_columns=past_covariate_columns,
+    )
     coordinate_mode, distance_sanity = build_distance_sanity_frame(
         metadata.turbine_static,
         ordered_turbine_ids=metadata.turbine_ids,
@@ -735,10 +952,22 @@ def prepare_dataset(
     test_rolling_windows = build_window_descriptor_index(split_frames["test"], timestamps_us=timestamps_us)
     val_non_overlap_windows = thin_non_overlap_window_index(val_rolling_windows, forecast_steps=FORECAST_STEPS)
     test_non_overlap_windows = thin_non_overlap_window_index(test_rolling_windows, forecast_steps=FORECAST_STEPS)
+    source_tensor, input_channel_names = build_source_tensor(
+        series,
+        turbine_ids=metadata.turbine_ids,
+        raw_timestamps=raw_timestamps,
+        target_pu=target_pu,
+        past_covariate_columns=past_covariate_columns,
+        train_windows=train_windows,
+        history_steps=HISTORY_STEPS,
+    )
     _profile_log(
         dataset_id,
         "prepare_dataset_complete",
         coordinate_mode=coordinate_mode,
+        feature_protocol_id=resolved_variant.feature_protocol_id,
+        input_channels=source_tensor.shape[2],
+        model_variant=resolved_variant.model_variant,
         node_count=len(metadata.turbine_ids),
         train_windows=len(train_windows),
         val_rolling_windows=len(val_rolling_windows),
@@ -751,6 +980,8 @@ def prepare_dataset(
     )
     return PreparedDataset(
         dataset_id=dataset_id,
+        model_variant=resolved_variant.model_variant,
+        feature_protocol_id=resolved_variant.feature_protocol_id,
         resolution_minutes=resolution_minutes,
         rated_power_kw=metadata.rated_power_kw,
         history_steps=HISTORY_STEPS,
@@ -760,6 +991,8 @@ def prepare_dataset(
         coordinate_mode=coordinate_mode,
         node_count=len(metadata.turbine_ids),
         timestamps_us=timestamps_us,
+        input_channel_names=input_channel_names,
+        source_tensor=source_tensor,
         target_pu=target_pu,
         train_windows=train_windows,
         val_rolling_windows=val_rolling_windows,
@@ -950,6 +1183,7 @@ else:
 def build_model(
     *,
     node_count: int,
+    input_channels: int = INPUT_CHANNELS,
     hidden_dim: int,
     embed_dim: int,
     num_layers: int,
@@ -959,7 +1193,7 @@ def build_model(
     require_torch()
     return AGCRN(
         node_count=node_count,
-        input_channels=INPUT_CHANNELS,
+        input_channels=input_channels,
         hidden_dim=hidden_dim,
         forecast_steps=forecast_steps,
         embed_dim=embed_dim,
@@ -988,6 +1222,7 @@ def _build_dataloader(
 ):
     resolved_torch, _, _, resolved_loader, _ = require_torch()
     dataset = PanelWindowDataset(
+        prepared_dataset.source_tensor,
         prepared_dataset.target_pu,
         windows,
         history_steps=prepared_dataset.history_steps,
@@ -1131,6 +1366,7 @@ def train_model(
     resolved_device = resolve_device(device)
     model = build_model(
         node_count=prepared_dataset.node_count,
+        input_channels=prepared_dataset.input_channels,
         hidden_dim=hidden_dim,
         embed_dim=embed_dim,
         num_layers=num_layers,
@@ -1278,7 +1514,7 @@ def build_result_rows(
     base_row = {
         "dataset_id": prepared_dataset.dataset_id,
         "model_id": MODEL_ID,
-        "model_variant": MODEL_VARIANT,
+        "model_variant": prepared_dataset.model_variant,
         "task_id": TASK_ID,
         "window_protocol": WINDOW_PROTOCOL,
         "history_steps": prepared_dataset.history_steps,
@@ -1289,7 +1525,7 @@ def build_result_rows(
         "graph_source": GRAPH_SOURCE,
         "coordinate_mode": prepared_dataset.coordinate_mode,
         "node_count": prepared_dataset.node_count,
-        "input_channels": INPUT_CHANNELS,
+        "input_channels": prepared_dataset.input_channels,
         "hidden_dim": hidden_dim,
         "embed_dim": embed_dim,
         "num_layers": num_layers,
@@ -1366,7 +1602,7 @@ def execute_training_job(
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
-    progress_label = prepared_dataset.dataset_id
+    progress_label = f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}"
     training_outcome = train_model(
         prepared_dataset,
         device=resolve_device(device),
@@ -1419,6 +1655,9 @@ def execute_training_job(
         best_epoch=training_outcome.best_epoch,
         epochs_ran=training_outcome.epochs_ran,
         best_val_rmse_pu=training_outcome.best_val_rmse_pu,
+        feature_protocol_id=prepared_dataset.feature_protocol_id,
+        input_channels=prepared_dataset.input_channels,
+        model_variant=prepared_dataset.model_variant,
         test_rolling_rmse_pu=test_rolling_metrics.rmse_pu,
         runtime_seconds=round(runtime_seconds, 6),
     )
@@ -1444,6 +1683,9 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("dataset_id")
             .replace_strict(_DATASET_ORDER, default=len(_DATASET_ORDER))
             .alias("__dataset_order"),
+            pl.col("model_variant")
+            .replace_strict(_MODEL_VARIANT_ORDER, default=len(_MODEL_VARIANT_ORDER))
+            .alias("__model_variant_order"),
             pl.col("split_name")
             .replace_strict(_SPLIT_ORDER, default=len(_SPLIT_ORDER))
             .alias("__split_order"),
@@ -1458,6 +1700,7 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .sort(
             [
                 "__dataset_order",
+                "__model_variant_order",
                 "__split_order",
                 "__eval_protocol_order",
                 "__metric_scope_order",
@@ -1467,6 +1710,7 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .drop(
             [
                 "__dataset_order",
+                "__model_variant_order",
                 "__split_order",
                 "__eval_protocol_order",
                 "__metric_scope_order",
@@ -1479,6 +1723,7 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
 def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
+    variant_names: Sequence[str] | None = None,
     cache_root: str | Path = _CACHE_ROOT,
     output_path: str | Path = _OUTPUT_PATH,
     device: str | None = None,
@@ -1497,36 +1742,39 @@ def run_experiment(
     dataset_loader: Callable[..., PreparedDataset] | None = None,
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
+    variant_specs = resolve_variant_specs(variant_names)
     loader = dataset_loader or prepare_dataset
     runner = job_runner or execute_training_job
     rows: list[dict[str, object]] = []
-    job_progress = _create_progress_bar(total=len(dataset_ids), desc="agcrn jobs", leave=True)
+    job_progress = _create_progress_bar(total=len(dataset_ids) * len(variant_specs), desc="agcrn jobs", leave=True)
     try:
         for dataset_id in dataset_ids:
-            job_progress.set_postfix_str(dataset_id)
-            prepared = loader(
-                dataset_id,
-                cache_root=cache_root,
-                max_train_origins=max_train_origins,
-                max_eval_origins=max_eval_origins,
-            )
-            rows.extend(
-                runner(
-                    prepared,
-                    device=device,
-                    seed=seed,
-                    batch_size=batch_size,
-                    learning_rate=learning_rate,
-                    max_epochs=max_epochs,
-                    early_stopping_patience=early_stopping_patience,
-                    hidden_dim=hidden_dim,
-                    embed_dim=embed_dim,
-                    num_layers=num_layers,
-                    cheb_k=cheb_k,
-                    grad_clip_norm=grad_clip_norm,
+            for variant_spec in variant_specs:
+                job_progress.set_postfix_str(f"{dataset_id}/{variant_spec.model_variant}")
+                prepared = loader(
+                    dataset_id,
+                    variant_spec=variant_spec,
+                    cache_root=cache_root,
+                    max_train_origins=max_train_origins,
+                    max_eval_origins=max_eval_origins,
                 )
-            )
-            job_progress.update(1)
+                rows.extend(
+                    runner(
+                        prepared,
+                        device=device,
+                        seed=seed,
+                        batch_size=batch_size,
+                        learning_rate=learning_rate,
+                        max_epochs=max_epochs,
+                        early_stopping_patience=early_stopping_patience,
+                        hidden_dim=hidden_dim,
+                        embed_dim=embed_dim,
+                        num_layers=num_layers,
+                        cheb_k=cheb_k,
+                        grad_clip_norm=grad_clip_norm,
+                    )
+                )
+                job_progress.update(1)
     finally:
         job_progress.close()
 
@@ -1539,7 +1787,7 @@ def run_experiment(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the official-aligned Kelmarsh farm-synchronous power-only AGCRN baseline."
+        description="Run the official-aligned Kelmarsh farm-synchronous AGCRN variants."
     )
     parser.add_argument(
         "--dataset",
@@ -1553,6 +1801,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("auto", "cuda", "mps", "cpu"),
         default="auto",
         help="Training device. Defaults to auto (cuda -> mps -> cpu).",
+    )
+    parser.add_argument(
+        "--variant",
+        action="append",
+        choices=list(DEFAULT_VARIANTS),
+        dest="variants",
+        help="Limit execution to one or more model variants. Defaults to running both active variants.",
     )
     parser.add_argument(
         "--epochs",
@@ -1649,8 +1904,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
     results = run_experiment(
         dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
+        variant_names=tuple(spec.model_variant for spec in variant_specs),
         device=args.device,
         max_epochs=args.epochs,
         output_path=args.output_path,
@@ -1676,8 +1933,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_path=args.output_path,
             result_row_count=results.height,
             dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
-            feature_protocol_ids=("power_only",),
-            model_variants=(MODEL_VARIANT,),
+            feature_protocol_ids=tuple(spec.feature_protocol_id for spec in variant_specs),
+            model_variants=tuple(spec.model_variant for spec in variant_specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("val", "test"),
             run_label=args.run_label,

@@ -5,7 +5,7 @@ readable registry, and runtime artifact contracts for the forecasting task.
 
 ## Active Family
 
-- [agcrn](./families/agcrn/README.md): Kelmarsh-only, farm-synchronous, `power_only` AGCRN pilot
+- [agcrn](./families/agcrn/README.md): Kelmarsh-only, farm-synchronous, `power_only` + `power_ws_hist` AGCRN pilot
 
 Archived experiment families have been removed from the active tree. The
 current experiment surface is intentionally narrow while the dataset/task
@@ -28,4 +28,4 @@ Canonical runtime artifacts:
 
 - `agcrn_official_aligned` is the only registry-backed family currently intended for use.
 - The active task contract is `24h -> 6h`, dense sliding windows, `farm` granularity.
-- The only supported `feature_protocol_id` today is `power_only`, and its semantics live exclusively in `src/wind_datasets/feature_protocols.py`.
+- The active dataset-side protocol surface is `power_only` + `power_ws_hist`, and their semantics live exclusively in `src/wind_datasets/feature_protocols.py`.

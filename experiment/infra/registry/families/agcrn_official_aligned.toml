@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "agcrn_official_aligned"
 display_name = "AGCRN Official-Aligned"
 status = "pilot"
-summary = "Official-aligned AGCRN baseline on the Kelmarsh farm-synchronous power-only task."
+summary = "Official-aligned AGCRN baseline on the Kelmarsh farm-synchronous power-only and wind-speed-history tasks."
 model_family = "agcrn"
 training_mode = "trainable"
 implementation_root = "experiment/families/agcrn"
@@ -13,10 +13,16 @@ default_output_schema_version = "agcrn_official_aligned.long_metrics.v1"
 dataset_scope = ["kelmarsh"]
 supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
 supported_result_splits = ["val", "test"]
-supported_feature_protocols = ["power_only"]
+supported_feature_protocols = ["power_only", "power_ws_hist"]
 implementation_label_kind = "model_variant"
-implementation_labels = ["official_aligned_power_only_farm_sync"]
-model_variants = ["official_aligned_power_only_farm_sync"]
+implementation_labels = [
+  "official_aligned_power_only_farm_sync",
+  "official_aligned_power_ws_hist_farm_sync",
+]
+model_variants = [
+  "official_aligned_power_only_farm_sync",
+  "official_aligned_power_ws_hist_farm_sync",
+]
 notes = [
   "This family is currently narrower than the other trainable baselines: Kelmarsh only and farm-synchronous only.",
 ]
@@ -31,3 +37,4 @@ granularity = "farm"
 
 [implementation_bindings]
 official_aligned_power_only_farm_sync = "power_only"
+official_aligned_power_ws_hist_farm_sync = "power_ws_hist"

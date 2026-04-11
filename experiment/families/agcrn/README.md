@@ -7,7 +7,7 @@ This experiment runs an official-aligned AGCRN baseline on:
 The scope is intentionally narrow:
 
 - `24h look back -> 6h ahead`
-- `power-only`
+- `power_only` and `power_ws_hist`
 - `farm-synchronous` turbine panel with stable task-local `turbine_index`
 - official AGCRN core architecture (`AVWGCN` + `AGCRNCell` + encoder + `end_conv`)
 - train on `train`
@@ -21,13 +21,17 @@ The alignment target is the model core only. Data loading, window filtering, spl
 
 The runner loads the public task bundle through `wind_datasets.load_task_bundle(...)`.
 
-For the current Kelmarsh run, that bundle is materialized under:
+For the current Kelmarsh run, those bundles are materialized under:
 
 ```text
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/static.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_only/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/task_context.json
 ```
 
 `static.parquet` is treated as the complete experiment-facing static sidecar; the
@@ -77,6 +81,7 @@ Useful smoke-test options:
 
 ```bash
 ./.conda/bin/python run_agcrn.py --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
 
 ## Output Schema
@@ -88,3 +93,4 @@ Useful smoke-test options:
 - `metric_scope in {overall, horizon}`
 
 That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
+Running both active variants by default yields `2 * 148 = 296` rows.

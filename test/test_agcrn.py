@@ -57,12 +57,15 @@ def _build_temp_cache(
     cache_root: Path,
     *,
     dataset_id: str = "toy_dataset",
+    feature_protocol_id: str = "power_only",
+    past_covariate_columns: tuple[str, ...] = (),
+    missing_past_covariate_indices: tuple[int, ...] = (),
     history_steps: int = 144,
     forecast_steps: int = 36,
     task_static_layout: str = "complete",
 ) -> None:
     dataset_root = cache_root / dataset_id
-    task_dir = dataset_root / "tasks" / "next_6h_from_24h" / "power_only"
+    task_dir = dataset_root / "tasks" / "next_6h_from_24h" / feature_protocol_id
     task_dir.mkdir(parents=True, exist_ok=True)
 
     timestamps = pl.datetime_range(
@@ -76,18 +79,31 @@ def _build_temp_cache(
     for turbine_index, turbine_id in enumerate(turbine_ids):
         offset = turbine_index * 10_000
         for index, timestamp in enumerate(timestamps):
-            rows.append(
-                {
-                    "dataset": dataset_id,
-                    "turbine_id": turbine_id,
-                    "timestamp": timestamp,
-                    "target_kw": float(offset + index),
-                }
-            )
+            row = {
+                "dataset": dataset_id,
+                "turbine_id": turbine_id,
+                "timestamp": timestamp,
+                "target_kw": float(offset + index),
+            }
+            for column_index, column_name in enumerate(past_covariate_columns, start=1):
+                row[column_name] = (
+                    None
+                    if index in missing_past_covariate_indices
+                    else float((column_index * 1000) + offset + index)
+                )
+            rows.append(row)
     pl.DataFrame(rows).write_parquet(task_dir / "series.parquet")
 
+    missing_indices = set(missing_past_covariate_indices)
     window_rows = []
     for start_index in range(history_steps, len(timestamps) - forecast_steps + 1):
+        input_indices = range(start_index - history_steps, start_index)
+        output_indices = range(start_index, start_index + forecast_steps)
+        feature_flags: list[str] = []
+        if any(index in missing_indices for index in input_indices):
+            feature_flags.append("feature_quality_issues_input")
+        if any(index in missing_indices for index in output_indices):
+            feature_flags.append("feature_quality_issues_output")
         window_rows.append(
             {
                 "dataset": dataset_id,
@@ -98,6 +114,7 @@ def _build_temp_cache(
                 "is_fully_synchronous_input": True,
                 "is_fully_synchronous_output": True,
                 "quality_flags": "",
+                "feature_quality_flags": "|".join(feature_flags),
             }
         )
     pl.DataFrame(window_rows).write_parquet(task_dir / "window_index.parquet")
@@ -107,7 +124,7 @@ def _build_temp_cache(
             {
                 "dataset_id": dataset_id,
                 "schema_version": "task_bundle.v1",
-                "feature_protocol_id": "power_only",
+                "feature_protocol_id": feature_protocol_id,
                 "turbine_ids": list(turbine_ids),
                 "task": {
                     "task_id": "next_6h_from_24h",
@@ -117,8 +134,8 @@ def _build_temp_cache(
                 },
                 "time_axis_semantics": "farm_synchronous_long_panel",
                 "column_groups": {
-                    "series": ["dataset", "turbine_id", "timestamp", "target_kw"],
-                    "past_covariates": [],
+                    "series": ["dataset", "turbine_id", "timestamp", "target_kw", *past_covariate_columns],
+                    "past_covariates": list(past_covariate_columns),
                     "target_derived_covariates": [],
                     "known_future": ["dataset", "timestamp"],
                     "static": [],
@@ -189,8 +206,13 @@ def _build_temp_cache(
     task_static.write_parquet(task_dir / "static.parquet")
 
 
-def _read_temp_bundle(cache_root: Path, *, dataset_id: str = "toy_dataset") -> SimpleNamespace:
-    task_dir = cache_root / dataset_id / "tasks" / "next_6h_from_24h" / "power_only"
+def _read_temp_bundle(
+    cache_root: Path,
+    *,
+    dataset_id: str = "toy_dataset",
+    feature_protocol_id: str = "power_only",
+) -> SimpleNamespace:
+    task_dir = cache_root / dataset_id / "tasks" / "next_6h_from_24h" / feature_protocol_id
     return SimpleNamespace(
         series=pl.read_parquet(task_dir / "series.parquet"),
         known_future=pl.read_parquet(task_dir / "known_future.parquet"),
@@ -200,13 +222,26 @@ def _read_temp_bundle(cache_root: Path, *, dataset_id: str = "toy_dataset") -> S
     )
 
 
-def _patch_temp_bundle_loader(monkeypatch, module, cache_root: Path, *, dataset_id: str = "toy_dataset") -> None:
-    def _fake_load_task_bundle(requested_dataset_id: str, *, cache_root: str | Path):
+def _patch_temp_bundle_loader(
+    monkeypatch,
+    module,
+    cache_root: Path,
+    *,
+    dataset_id: str = "toy_dataset",
+    feature_protocol_id: str = "power_only",
+) -> None:
+    def _fake_load_task_bundle(requested_dataset_id: str, *, feature_protocol_id: str, cache_root: str | Path):
         assert requested_dataset_id == dataset_id
+        assert feature_protocol_id == expected_feature_protocol_id
         assert Path(cache_root) == cache_root_path
-        return _read_temp_bundle(cache_root_path, dataset_id=dataset_id)
+        return _read_temp_bundle(
+            cache_root_path,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
 
     cache_root_path = cache_root
+    expected_feature_protocol_id = feature_protocol_id
     monkeypatch.setattr(module, "_load_task_bundle", _fake_load_task_bundle)
 
 
@@ -221,7 +256,15 @@ def _descriptor(module, *, target_indices, forecast_steps: int, step_us: int = 6
     )
 
 
-def _small_prepared_dataset(module, *, dataset_id: str = "kelmarsh", forecast_steps: int = 36):
+def _small_prepared_dataset(
+    module,
+    *,
+    dataset_id: str = "kelmarsh",
+    forecast_steps: int = 36,
+    model_variant: str | None = None,
+    feature_protocol_id: str | None = None,
+    input_channels: int = 1,
+):
     timestamps_us = np.arange(0, 500 * 600_000_000, 600_000_000, dtype=np.int64)
     target_pu = np.stack(
         [
@@ -231,8 +274,13 @@ def _small_prepared_dataset(module, *, dataset_id: str = "kelmarsh", forecast_st
         ],
         axis=1,
     )
+    source_channels = [target_pu]
+    for channel_index in range(1, input_channels):
+        source_channels.append(target_pu + (channel_index * 0.05))
     return module.PreparedDataset(
         dataset_id=dataset_id,
+        model_variant=model_variant or module.MODEL_VARIANT,
+        feature_protocol_id=feature_protocol_id or module.FEATURE_PROTOCOL_ID,
         resolution_minutes=10,
         rated_power_kw=2050.0,
         history_steps=144,
@@ -242,6 +290,10 @@ def _small_prepared_dataset(module, *, dataset_id: str = "kelmarsh", forecast_st
         coordinate_mode="coord_xy",
         node_count=3,
         timestamps_us=timestamps_us,
+        input_channel_names=tuple(
+            ["target_pu", *[f"covariate_{index}" for index in range(1, input_channels)]]
+        ),
+        source_tensor=np.stack(source_channels, axis=-1).astype(np.float32, copy=False),
         target_pu=target_pu,
         train_windows=_descriptor(module, target_indices=[200, 201, 202, 203], forecast_steps=forecast_steps),
         val_rolling_windows=_descriptor(module, target_indices=[300, 301], forecast_steps=forecast_steps),
@@ -279,12 +331,14 @@ def _result_row(
     eval_protocol: str,
     metric_scope: str,
     lead_step: int | None,
+    model_variant: str | None = None,
+    input_channels: int | None = None,
 ) -> dict[str, object]:
     lead_minutes = None if lead_step is None else lead_step * 10
     return {
         "dataset_id": dataset_id,
         "model_id": module.MODEL_ID,
-        "model_variant": module.MODEL_VARIANT,
+        "model_variant": model_variant or module.MODEL_VARIANT,
         "task_id": module.TASK_ID,
         "window_protocol": module.WINDOW_PROTOCOL,
         "history_steps": 144,
@@ -308,7 +362,7 @@ def _result_row(
         "graph_source": module.GRAPH_SOURCE,
         "coordinate_mode": "coord_xy",
         "node_count": 3,
-        "input_channels": module.INPUT_CHANNELS,
+        "input_channels": input_channels or module.INPUT_CHANNELS,
         "hidden_dim": module.DEFAULT_HIDDEN_DIM,
         "embed_dim": module.DEFAULT_EMBED_DIM,
         "num_layers": module.DEFAULT_NUM_LAYERS,
@@ -540,7 +594,9 @@ def test_prepare_dataset_reads_farm_cache_and_builds_dual_eval_windows(tmp_path,
     assert prepared.rated_power_kw == 2050.0
     assert prepared.coordinate_mode == "coord_xy"
     assert prepared.node_count == 3
+    assert prepared.input_channels == 1
     assert prepared.target_pu.shape == (2000, 3)
+    assert prepared.source_tensor.shape == (2000, 3, 1)
     assert len(prepared.train_windows) == 1221
     assert len(prepared.val_rolling_windows) == 21
     assert len(prepared.val_non_overlap_windows) == 1
@@ -569,6 +625,50 @@ def test_prepare_dataset_applies_train_and_eval_limits(tmp_path, monkeypatch) ->
     assert len(prepared.val_non_overlap_windows) == 1
     assert len(prepared.test_rolling_windows) == 4
     assert len(prepared.test_non_overlap_windows) == 1
+
+
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_ws_hist(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_ws_hist")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WS_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_WS_HIST_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == ("target_pu", "Wind speed (m/s)")
+    assert prepared.input_channels == 2
+    assert prepared.source_tensor.shape == (2000, 3, 2)
+
+
+def test_prepare_dataset_drops_windows_with_input_feature_quality_issues(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_hist",
+        past_covariate_columns=("Wind speed (m/s)",),
+        missing_past_covariate_indices=(1563,),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_ws_hist")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WS_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert len(prepared.val_rolling_windows) == 20
+    assert len(prepared.val_non_overlap_windows) == 1
 
 
 def test_prepare_dataset_requires_rated_power_in_task_bundle_static(tmp_path, monkeypatch) -> None:
@@ -672,7 +772,12 @@ def test_agcrn_matches_official_reference_and_outputs_4d() -> None:
 
 def test_execute_training_job_emits_long_rows_for_all_eval_protocols(monkeypatch) -> None:
     module = _load_module()
-    prepared = _small_prepared_dataset(module)
+    prepared = _small_prepared_dataset(
+        module,
+        model_variant=module.POWER_WS_HIST_MODEL_VARIANT,
+        feature_protocol_id=module.POWER_WS_HIST_FEATURE_PROTOCOL_ID,
+        input_channels=2,
+    )
 
     def _fake_train_model(*args, **kwargs):
         del args, kwargs
@@ -715,8 +820,9 @@ def test_execute_training_job_emits_long_rows_for_all_eval_protocols(monkeypatch
         module.NON_OVERLAP_EVAL_PROTOCOL,
     }
     assert all(row["graph_mode"] == module.GRAPH_MODE for row in rows)
+    assert all(row["model_variant"] == module.POWER_WS_HIST_MODEL_VARIANT for row in rows)
     assert all(row["node_count"] == 3 for row in rows)
-    assert all(row["input_channels"] == module.INPUT_CHANNELS for row in rows)
+    assert all(row["input_channels"] == 2 for row in rows)
     assert all(row["train_window_count"] == 4 for row in rows)
     assert all(row["val_window_count"] == 2 for row in rows)
     assert all(row["test_window_count"] == 3 for row in rows)
@@ -747,6 +853,16 @@ def test_sort_result_frame_orders_long_results() -> None:
                 dataset_id="kelmarsh",
                 split_name="val",
                 eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=module.POWER_WS_HIST_MODEL_VARIANT,
+                input_channels=2,
+            ),
+            _result_row(
+                module,
+                dataset_id="kelmarsh",
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
                 metric_scope=module.HORIZON_METRIC_SCOPE,
                 lead_step=1,
             ),
@@ -757,6 +873,7 @@ def test_sort_result_frame_orders_long_results() -> None:
 
     assert list(
         zip(
+            sorted_frame["model_variant"].to_list(),
             sorted_frame["split_name"].to_list(),
             sorted_frame["eval_protocol"].to_list(),
             sorted_frame["metric_scope"].to_list(),
@@ -764,18 +881,31 @@ def test_sort_result_frame_orders_long_results() -> None:
             strict=True,
         )
     ) == [
-        ("val", module.ROLLING_EVAL_PROTOCOL, module.OVERALL_METRIC_SCOPE, None),
-        ("val", module.ROLLING_EVAL_PROTOCOL, module.HORIZON_METRIC_SCOPE, 1),
-        ("test", module.NON_OVERLAP_EVAL_PROTOCOL, module.HORIZON_METRIC_SCOPE, 2),
+        (module.MODEL_VARIANT, "val", module.ROLLING_EVAL_PROTOCOL, module.OVERALL_METRIC_SCOPE, None),
+        (module.MODEL_VARIANT, "val", module.ROLLING_EVAL_PROTOCOL, module.HORIZON_METRIC_SCOPE, 1),
+        (module.MODEL_VARIANT, "test", module.NON_OVERLAP_EVAL_PROTOCOL, module.HORIZON_METRIC_SCOPE, 2),
+        (
+            module.POWER_WS_HIST_MODEL_VARIANT,
+            "val",
+            module.ROLLING_EVAL_PROTOCOL,
+            module.OVERALL_METRIC_SCOPE,
+            None,
+        ),
     ]
 
 
 def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
     module = _load_module()
 
-    def _fake_loader(dataset_id, *, cache_root, max_train_origins, max_eval_origins):
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
         del cache_root, max_train_origins, max_eval_origins
-        return _small_prepared_dataset(module, dataset_id=dataset_id)
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+        )
 
     def _fake_runner(prepared, **kwargs):
         del kwargs
@@ -787,6 +917,8 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
                 eval_protocol=module.ROLLING_EVAL_PROTOCOL,
                 metric_scope=module.OVERALL_METRIC_SCOPE,
                 lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
             ),
             _result_row(
                 module,
@@ -795,6 +927,8 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
                 eval_protocol=module.NON_OVERLAP_EVAL_PROTOCOL,
                 metric_scope=module.HORIZON_METRIC_SCOPE,
                 lead_step=1,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
             ),
         ]
 
@@ -806,17 +940,20 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
         job_runner=_fake_runner,
     )
 
-    assert results.height == 2
+    assert results.height == 4
     assert output_path.exists()
     assert list(
         zip(
+            results["model_variant"].to_list(),
             results["split_name"].to_list(),
             results["metric_scope"].to_list(),
             strict=True,
         )
     ) == [
-        ("val", module.OVERALL_METRIC_SCOPE),
-        ("test", module.HORIZON_METRIC_SCOPE),
+        (module.MODEL_VARIANT, "val", module.OVERALL_METRIC_SCOPE),
+        (module.MODEL_VARIANT, "test", module.HORIZON_METRIC_SCOPE),
+        (module.POWER_WS_HIST_MODEL_VARIANT, "val", module.OVERALL_METRIC_SCOPE),
+        (module.POWER_WS_HIST_MODEL_VARIANT, "test", module.HORIZON_METRIC_SCOPE),
     ]
 
 
@@ -824,9 +961,15 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
     module = _load_module()
     _TqdmRecorder.instances.clear()
 
-    def _fake_loader(dataset_id, *, cache_root, max_train_origins, max_eval_origins):
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
         del cache_root, max_train_origins, max_eval_origins
-        return _small_prepared_dataset(module, dataset_id=dataset_id)
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+        )
 
     def _fake_runner(prepared, **kwargs):
         del kwargs
@@ -838,6 +981,8 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
                 eval_protocol=module.ROLLING_EVAL_PROTOCOL,
                 metric_scope=module.OVERALL_METRIC_SCOPE,
                 lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
             ),
         ]
 
@@ -853,8 +998,50 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
 
     assert len(_TqdmRecorder.instances) == 1
     progress = _TqdmRecorder.instances[0]
-    assert progress.total == 1
-    assert progress.n == 1
+    assert progress.total == 2
+    assert progress.n == 2
     assert progress.closed is True
     assert progress.desc == "agcrn jobs"
-    assert "kelmarsh" in progress.postfixes
+    assert any("kelmarsh" in value for value in progress.postfixes)
+    assert any(module.POWER_WS_HIST_MODEL_VARIANT in value for value in progress.postfixes)
+
+
+def test_run_experiment_can_limit_variants(tmp_path) -> None:
+    module = _load_module()
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+        )
+
+    def _fake_runner(prepared, **kwargs):
+        del kwargs
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
+            ),
+        ]
+
+    results = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.POWER_WS_HIST_MODEL_VARIANT,),
+        output_path=tmp_path / "agcrn-official-aligned.csv",
+        dataset_loader=_fake_loader,
+        job_runner=_fake_runner,
+    )
+
+    assert results.height == 1
+    assert results["model_variant"].to_list() == [module.POWER_WS_HIST_MODEL_VARIANT]
+    assert results["input_channels"].to_list() == [2]
