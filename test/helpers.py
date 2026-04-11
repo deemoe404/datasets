@@ -171,7 +171,7 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
     _write_text(
         root / "2024" / "tblSCTurbine_2024_03.csv",
         """
-        TimeStamp,StationId,wtc_PrWindSp_mean,dup_label
+        TimeStamp,StationId,wtc_AcWindSp_mean,dup_label
         2024-03-14 17:10:00,1001,7.0,ok
         2024-03-14 17:10:00,1002,6.5,ok
         2024-03-14 17:20:00,1001,7.2,ok

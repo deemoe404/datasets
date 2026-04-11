@@ -103,13 +103,14 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "farm_turbines_observed" in series.columns
     assert "farm_turbines_with_target" in series.columns
     assert "feature_quality_flags" in series.columns
+    assert "wtc_AcWindSp_mean" in series.columns
     assert "farm_grid_sci__activepowermean" not in series.columns
     assert "shutdown_duration_s" not in series.columns
     assert "tuneup_in_deployment_window" not in series.columns
     assert duplicate_audit.height == 6
-    assert duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict").height == 2
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict").height == 3
     assert duplicate_audit.filter(pl.col("duplicate_kind") == "normalized_equal").height == 0
-    assert duplicate_audit.filter(pl.col("duplicate_kind") == "identical").height == 4
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "identical").height == 3
     grid_conflict = duplicate_audit.filter(
         (pl.col("table_name") == "tblGrid") & (pl.col("duplicate_kind") == "true_conflict")
     )
@@ -121,7 +122,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     default_conflict = duplicate_audit.filter(
         (pl.col("table_name") == "tblSCTurbine") & (pl.col("duplicate_kind") == "true_conflict")
     )
-    assert default_conflict.is_empty()
+    assert default_conflict["affected_series_columns"].to_list() == [["wtc_AcWindSp_mean"]]
     assert shutdown["timestamp"].null_count() == 0
     assert shutdown.height == 4
     assert shutdown.filter(
@@ -188,12 +189,13 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "feature_source_conflict__turbine_temp" in t02_1810["feature_quality_flags"][0]
     assert report["target_missing_count"] >= 1
     assert report["duplicate_audit_count"] == 6
-    assert report["duplicate_true_conflict_count"] == 2
+    assert report["duplicate_true_conflict_count"] == 3
     assert report["duplicate_true_conflict_count_by_table"] == {
         "tblGrid": 1,
         "tblSCTurTemp": 1,
+        "tblSCTurbine": 1,
     }
-    assert report["row_conflict_row_count"] == 0
+    assert report["row_conflict_row_count"] == 1
     assert report["feature_conflict_row_count"] == 2
     assert report["series_layout"] == "farm_synchronous"
     assert report["full_synchrony_ratio"] == 1.0
@@ -208,6 +210,9 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     builder.build_task_cache(farm_task)
     farm_window_index = builder.load_window_index(farm_task)
     farm_task_static = builder.load_task_turbine_static(farm_task)
+    power_only_bundle = builder.load_task_bundle(farm_task)
+    builder.build_task_cache(farm_task, feature_protocol_id="power_ws_hist")
+    power_ws_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_ws_hist")
     farm_task_report = json.loads(builder.task_bundle_paths(farm_task).task_report_path.read_text())
     turbine_task = TaskSpec(
         history_duration="20m",
@@ -230,6 +235,13 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert farm_task_report["window_count"] == farm_window_index.height
     assert farm_task_report["window_count"] > 0
     assert farm_task_report["granularity"] == "farm"
+    assert "wtc_AcWindSp_mean" not in power_only_bundle.series.columns
+    assert "wtc_AcWindSp_mean" in power_ws_bundle.series.columns
+    assert power_ws_bundle.task_context["column_groups"]["past_covariates"] == ["wtc_AcWindSp_mean"]
+    assert power_ws_bundle.series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
 
 
 def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_path) -> None:

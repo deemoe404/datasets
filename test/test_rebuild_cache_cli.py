@@ -78,6 +78,7 @@ def test_rebuild_cli_defaults_to_all_datasets_and_farm_only(monkeypatch, capsys)
         "silver",
         "gold_base",
         "tasks/next_6h_from_24h/power_only",
+        "tasks/next_6h_from_24h/power_ws_hist",
     ]
     assert calls == [
         (dataset, stage)
@@ -102,6 +103,7 @@ def test_rebuild_cli_include_turbine_is_accepted_but_noop(monkeypatch, capsys) -
         ("kelmarsh", "silver"),
         ("kelmarsh", "gold_base"),
         ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
+        ("kelmarsh", "tasks/next_6h_from_24h/power_ws_hist"),
     ]
     captured = capsys.readouterr()
     assert "--include-turbine is deprecated and is currently a no-op" in captured.err
@@ -167,10 +169,10 @@ def test_rebuild_cli_records_failure_and_continues_next_dataset(monkeypatch, cap
     assert code == 1
     assert ("kelmarsh", "gold_base") not in calls
     assert calls[-4:] == [
-        ("penmanshiel", "manifest"),
         ("penmanshiel", "silver"),
         ("penmanshiel", "gold_base"),
         ("penmanshiel", "tasks/next_6h_from_24h/power_only"),
+        ("penmanshiel", "tasks/next_6h_from_24h/power_ws_hist"),
     ]
     captured = capsys.readouterr()
     assert "completed with 1 failed dataset" in captured.err
@@ -194,11 +196,13 @@ def test_rebuild_cli_summarizes_sdwpf_gold_block_without_running_tasks(monkeypat
     assert ("sdwpf_kddcup", "manifest") in calls
     assert ("sdwpf_kddcup", "silver") in calls
     assert ("sdwpf_kddcup", "tasks/next_6h_from_24h/power_only") not in calls
-    assert calls[-4:] == [
+    assert ("sdwpf_kddcup", "tasks/next_6h_from_24h/power_ws_hist") not in calls
+    assert calls[-5:] == [
         ("kelmarsh", "manifest"),
         ("kelmarsh", "silver"),
         ("kelmarsh", "gold_base"),
         ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
+        ("kelmarsh", "tasks/next_6h_from_24h/power_ws_hist"),
     ]
     captured = capsys.readouterr()
     assert "sdwpf_kddcup" in captured.err

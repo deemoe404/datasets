@@ -5,3 +5,5 @@ dependencies:
   - python=3.13
   - pip
   - ipykernel
+  - setuptools>=80
+  - wheel

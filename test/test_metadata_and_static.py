@@ -266,8 +266,8 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
     assert hill_builder.cache_paths.hill_duplicate_audit_path.exists()
     assert hill_builder.cache_paths.duplicate_effects_path.exists()
     assert hill_duplicate_audit.height == 6
-    assert hill_duplicate_effects.height == 2
-    assert hill_duplicate_effects.filter(pl.col("effect_scope") == "row").is_empty()
+    assert hill_duplicate_effects.height == 3
+    assert hill_duplicate_effects.filter(pl.col("effect_scope") == "row").height == 1
     assert hill_duplicate_effects.filter(pl.col("effect_scope") == "feature_broadcast").height == 1
     assert hill_duplicate_effects.filter(pl.col("effect_scope") == "feature_turbine").height == 1
     assert hill_shutdown["timestamp"].null_count() == 0

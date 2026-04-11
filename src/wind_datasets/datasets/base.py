@@ -30,8 +30,10 @@ from ..source_column_policy import (
     load_source_column_policy,
     validate_policy_coverage,
 )
-from ..utils import ensure_directory, read_json, write_json
+from ..utils import ensure_directory, join_flags, read_json, write_json
 from .common import DUPLICATE_AUDIT_SCHEMA, build_window_index_from_series_path
+
+_TASK_MISSING_PAST_COVARIATE_FLAG = "missing_past_covariates"
 
 
 class BaseDatasetBuilder:
@@ -254,6 +256,31 @@ class BaseDatasetBuilder:
             .sort(["turbine_id", "timestamp"])
             .collect()
         )
+        if selection.past_covariate_columns:
+            missing_past_covariate_expr = pl.any_horizontal(
+                [pl.col(column).is_null() for column in selection.past_covariate_columns]
+            )
+            series_frame = (
+                series_frame
+                .with_columns(
+                    pl.when(missing_past_covariate_expr)
+                    .then(pl.lit(_TASK_MISSING_PAST_COVARIATE_FLAG))
+                    .otherwise(pl.lit(None))
+                    .alias("__task_feature_quality_flag")
+                )
+                .with_columns(
+                    pl.struct(["feature_quality_flags", "__task_feature_quality_flag"])
+                    .map_elements(
+                        lambda value: join_flags(
+                            value["feature_quality_flags"],
+                            value["__task_feature_quality_flag"],
+                        ),
+                        return_dtype=pl.String,
+                    )
+                    .alias("feature_quality_flags")
+                )
+                .drop("__task_feature_quality_flag")
+            )
         series_frame.write_parquet(task_paths.series_path)
 
         known_future = build_known_future_frame(series_frame)

@@ -11,13 +11,14 @@ from typing import Callable, Sequence
 from .api import build_gold_base, build_manifest, build_silver, build_task_cache
 from .config import ProjectConfigError
 from .datasets import get_builder
-from .feature_protocols import DEFAULT_FEATURE_PROTOCOL_ID
+from .feature_protocols import list_feature_protocol_ids
 from .models import TaskSpec
 from .registry import get_dataset_spec, list_dataset_ids
 
 SUPPORTED_DATASETS = list_dataset_ids()
 
 _FARM_TASK = TaskSpec.next_6h_from_24h(granularity="farm")
+_TASK_FEATURE_PROTOCOL_IDS = list_feature_protocol_ids()
 
 
 @dataclass(frozen=True)
@@ -107,16 +108,19 @@ def rebuild_stages(include_turbine: bool) -> tuple[RebuildStage, ...]:
             name="gold_base",
             run=lambda dataset, cache_root: build_gold_base(dataset, cache_root=cache_root),
         ),
-        RebuildStage(
-            name=f"tasks/{_FARM_TASK.task_id}/{DEFAULT_FEATURE_PROTOCOL_ID}",
-            run=lambda dataset, cache_root: build_task_cache(
-                dataset,
-                _FARM_TASK,
-                cache_root=cache_root,
-                feature_protocol_id=DEFAULT_FEATURE_PROTOCOL_ID,
-            ),
-        ),
     ]
+    for feature_protocol_id in _TASK_FEATURE_PROTOCOL_IDS:
+        stages.append(
+            RebuildStage(
+                name=f"tasks/{_FARM_TASK.task_id}/{feature_protocol_id}",
+                run=lambda dataset, cache_root, protocol_id=feature_protocol_id: build_task_cache(
+                    dataset,
+                    _FARM_TASK,
+                    cache_root=cache_root,
+                    feature_protocol_id=protocol_id,
+                ),
+            )
+        )
     return tuple(stages)
 
 
@@ -126,8 +130,11 @@ def check_targets(include_turbine: bool) -> tuple[tuple[str, str, TaskSpec | Non
         ("manifest", "manifest", None),
         ("silver", "silver", None),
         ("gold_base", "farm", None),
-        (f"tasks/{_FARM_TASK.task_id}/{DEFAULT_FEATURE_PROTOCOL_ID}", "task", _FARM_TASK),
     ]
+    targets.extend(
+        (f"tasks/{_FARM_TASK.task_id}/{feature_protocol_id}", "task", _FARM_TASK)
+        for feature_protocol_id in _TASK_FEATURE_PROTOCOL_IDS
+    )
     return tuple(targets)
 
 
@@ -197,7 +204,8 @@ def run_check(
             elif target_kind == "farm":
                 status = builder.gold_base_status()
             elif task_spec is not None:
-                status = builder.task_cache_status(task_spec, feature_protocol_id=DEFAULT_FEATURE_PROTOCOL_ID)
+                feature_protocol_id = layer_name.rsplit("/", 1)[-1]
+                status = builder.task_cache_status(task_spec, feature_protocol_id=feature_protocol_id)
             else:
                 raise ValueError(f"Unsupported check target {target_kind!r}.")
             results.append(

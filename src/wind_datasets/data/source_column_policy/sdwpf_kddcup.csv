@@ -14,4 +14,4 @@ main_csv,sdwpf_main,Prtv,keep,,Prtv,,Retained by the current dataset-side proces
 main_csv,sdwpf_main,Tmstamp,keep,,clock,all,Retained by the current dataset-side processing pipeline. Required to derive timestamps.,
 main_csv,sdwpf_main,TurbID,keep,,turbine_id,all,Retained by the current dataset-side processing pipeline. Structural turbine key.,
 main_csv,sdwpf_main,Wdir,keep+mask,sdwpf_wdir_out_of_range,Wdir,,Retained by the current dataset-side processing pipeline. Auxiliary covariate with documented abnormal ranges retained in normalized outputs.,
-main_csv,sdwpf_main,Wspd,keep,,Wspd,,Retained by the current dataset-side processing pipeline. Auxiliary turbine covariate retained in normalized outputs.,
+main_csv,sdwpf_main,Wspd,keep,,Wspd,power_ws_hist,Retained by the current dataset-side processing pipeline. Auxiliary turbine covariate retained in normalized outputs.,

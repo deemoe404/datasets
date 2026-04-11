@@ -157,13 +157,15 @@ The default task is `TaskSpec.next_6h_from_24h()`, which resolves to:
 Feature protocol definitions live in
 [wind_datasets/feature_protocols.py](./wind_datasets/feature_protocols.py).
 
-The only supported protocol ID today is:
+The active protocol IDs today are:
 
 - `power_only`
+- `power_ws_hist`
 
 Protocol semantics:
 
 - `power_only`: target history only
+- `power_ws_hist`: target history plus dataset-native past wind-speed covariates
 
 The default feature protocol is `power_only`.
 

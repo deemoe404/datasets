@@ -38,6 +38,12 @@ _KNOWN_FUTURE_COLUMNS = (
     "calendar_month_cos",
     "calendar_is_weekend",
 )
+_POWER_WS_HIST_COLUMNS_BY_DATASET = {
+    "kelmarsh": ("Wind speed (m/s)",),
+    "penmanshiel": ("Wind speed (m/s)",),
+    "hill_of_towie": ("wtc_AcWindSp_mean",),
+    "sdwpf_kddcup": ("Wspd",),
+}
 
 
 @dataclass(frozen=True)
@@ -79,20 +85,64 @@ _POWER_ONLY_PROTOCOL = FeatureProtocolSpec(
     uses_target_derived_covariates=False,
     aliases=("reference",),
 )
+_POWER_WS_HIST_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_ws_hist",
+    display_name="Power + Wind Speed History",
+    protocol_kind="past_covariate_ablation",
+    summary="Use target power history plus dataset-native past wind-speed covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_ws_history",),
+)
+_FEATURE_PROTOCOLS = (
+    _POWER_ONLY_PROTOCOL,
+    _POWER_WS_HIST_PROTOCOL,
+)
+_FEATURE_PROTOCOLS_BY_ID = {
+    protocol.feature_protocol_id: protocol
+    for protocol in _FEATURE_PROTOCOLS
+}
 
 
 def list_feature_protocol_ids() -> tuple[str, ...]:
-    return (_POWER_ONLY_PROTOCOL.feature_protocol_id,)
+    return tuple(protocol.feature_protocol_id for protocol in _FEATURE_PROTOCOLS)
 
 
 def list_feature_protocol_specs() -> tuple[FeatureProtocolSpec, ...]:
-    return (_POWER_ONLY_PROTOCOL,)
+    return _FEATURE_PROTOCOLS
 
 
 def get_feature_protocol_spec(feature_protocol_id: str) -> FeatureProtocolSpec:
-    if feature_protocol_id == _POWER_ONLY_PROTOCOL.feature_protocol_id:
-        return _POWER_ONLY_PROTOCOL
-    raise ValueError(f"Unknown feature_protocol_id {feature_protocol_id!r}.")
+    try:
+        return _FEATURE_PROTOCOLS_BY_ID[feature_protocol_id]
+    except KeyError as exc:
+        raise ValueError(f"Unknown feature_protocol_id {feature_protocol_id!r}.") from exc
+
+
+def _past_covariate_columns_for_protocol(
+    *,
+    dataset_id: str,
+    available_columns: set[str],
+    feature_protocol_id: str,
+) -> tuple[str, ...]:
+    if feature_protocol_id != _POWER_WS_HIST_PROTOCOL.feature_protocol_id:
+        return ()
+    try:
+        configured_columns = _POWER_WS_HIST_COLUMNS_BY_DATASET[dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+        ) from exc
+    missing_columns = [column for column in configured_columns if column not in available_columns]
+    if missing_columns:
+        raise ValueError(
+            f"feature_protocol_id {feature_protocol_id!r} for dataset {dataset_id!r} requires "
+            f"missing gold-base columns {missing_columns!r}."
+        )
+    return configured_columns
 
 
 def select_task_series_columns(
@@ -102,13 +152,18 @@ def select_task_series_columns(
     feature_protocol_id: str,
     turbine_static_columns: set[str] | None = None,
 ) -> TaskSeriesSelection:
-    del dataset_id, turbine_static_columns
+    del turbine_static_columns
     get_feature_protocol_spec(feature_protocol_id)
+    past_covariate_columns = _past_covariate_columns_for_protocol(
+        dataset_id=dataset_id,
+        available_columns=available_columns,
+        feature_protocol_id=feature_protocol_id,
+    )
     audit_columns = tuple(column for column in _SERIES_OPTIONAL_AUDIT_COLUMNS if column in available_columns)
     return TaskSeriesSelection(
         feature_protocol_id=feature_protocol_id,
-        all_columns=tuple((*_SERIES_BASE_COLUMNS, *audit_columns)),
-        past_covariate_columns=(),
+        all_columns=tuple((*_SERIES_BASE_COLUMNS, *past_covariate_columns, *audit_columns)),
+        past_covariate_columns=past_covariate_columns,
         known_future_columns=("dataset", "timestamp"),
         static_columns=(),
         target_derived_columns=(),
