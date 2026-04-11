@@ -26,20 +26,15 @@ def _load_module():
     return module
 
 
-def test_resolve_family_feature_protocol_ids_maps_local_labels_to_registry_ids() -> None:
+def test_resolve_family_feature_protocol_ids_maps_active_labels_to_registry_ids() -> None:
     module = _load_module()
     repo_root = Path(__file__).resolve().parents[1]
 
     assert module.resolve_family_feature_protocol_ids(
-        "tft_turbine_pilot",
-        ("reference", "mixed_stage2"),
+        "agcrn_official_aligned",
+        ("official_aligned_power_only_farm_sync",),
         repo_root=repo_root,
-    ) == ("power_only", "static_calendar_stage2")
-    assert module.resolve_family_feature_protocol_ids(
-        "ltsf_linear_local",
-        ("reference", "stage3_regime"),
-        repo_root=repo_root,
-    ) == ("power_only", "staged_past_covariates.stage3_regime")
+    ) == ("power_only",)
 
 
 def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
@@ -50,31 +45,31 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
     output_path.write_text("dataset_id,metric\nkelmarsh,1.0\n", encoding="utf-8")
 
     manifest_path = module.record_cli_run(
-        family_id="chronos2_exogenous",
+        family_id="agcrn_official_aligned",
         repo_root=repo_root,
         runs_root=runs_root,
         invocation_kind="family_runner",
-        entrypoint="experiment/families/chronos-2-exogenous/run_exogenous.py",
-        args={"dataset": ["kelmarsh"], "covariate_stage": ["stage1_core"]},
+        entrypoint="experiment/families/agcrn/run_agcrn.py",
+        args={"dataset": ["kelmarsh"]},
         output_path=output_path,
         result_row_count=1,
         dataset_ids=("kelmarsh",),
-        feature_protocol_ids=("staged_past_covariates.stage1_core",),
+        feature_protocol_ids=("power_only",),
         eval_protocols=("rolling_origin_no_refit", "non_overlap"),
-        result_splits=("test",),
+        result_splits=("val", "test"),
         artifacts={"cache_root": repo_root / "cache"},
-        run_label="kelmarsh-stage1",
+        run_label="kelmarsh-power-only",
     )
 
     assert manifest_path.exists()
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert payload["family"]["family_id"] == "chronos2_exogenous"
+    assert payload["family"]["family_id"] == "agcrn_official_aligned"
     assert payload["selection"]["dataset_ids"] == ["kelmarsh"]
-    assert payload["selection"]["feature_protocol_ids"] == ["staged_past_covariates.stage1_core"]
+    assert payload["selection"]["feature_protocol_ids"] == ["power_only"]
     assert payload["result"]["row_count"] == 1
     assert payload["artifacts"]["primary_output"]["exists"] is True
     assert payload["artifacts"]["primary_output"]["sha256"]
-    assert payload["invocation"]["run_label"] == "kelmarsh-stage1"
+    assert payload["invocation"]["run_label"] == "kelmarsh-power-only"
 
 
 def test_record_cli_run_rejects_protocols_not_supported_by_family(tmp_path) -> None:
@@ -89,7 +84,7 @@ def test_record_cli_run_rejects_protocols_not_supported_by_family(tmp_path) -> N
             repo_root=repo_root,
             runs_root=tmp_path / "runs",
             invocation_kind="family_runner",
-                entrypoint="experiment/families/agcrn/run_agcrn.py",
+            entrypoint="experiment/families/agcrn/run_agcrn.py",
             args={},
             output_path=output_path,
             result_row_count=1,

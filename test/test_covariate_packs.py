@@ -17,19 +17,16 @@ def _load_module(path_parts: tuple[str, ...], name: str):
     return module
 
 
-def test_shared_covariate_manifest_matches_chronos_shim() -> None:
+def test_shared_covariate_manifest_matches_dataset_side_protocol_source() -> None:
     shared = _load_module(("experiment", "infra", "common", "covariate_packs.py"), "shared_covariate_packs")
-    shim = _load_module(
-        ("experiment", "families", "chronos-2-exogenous", "chronos2_exogenous_manifest.py"),
-        "chronos2_exogenous_manifest",
-    )
+    source = _load_module(("src", "wind_datasets", "feature_protocols.py"), "dataset_feature_protocols")
 
     for dataset_id in ("kelmarsh", "penmanshiel", "hill_of_towie", "sdwpf_kddcup"):
         for stage in shared.DEFAULT_COVARIATE_STAGES:
             assert asdict(shared.resolve_covariate_pack(dataset_id, stage)) == asdict(
-                shim.resolve_covariate_pack(dataset_id, stage)
+                source.resolve_covariate_pack(dataset_id, stage)
             )
-        assert asdict(shared.reference_pack_for(dataset_id)) == asdict(shim.reference_pack_for(dataset_id))
+        assert asdict(shared.reference_pack_for(dataset_id)) == asdict(source.reference_pack_for(dataset_id))
 
 
 def test_reference_pack_and_stage_columns_are_expected() -> None:

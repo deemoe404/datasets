@@ -6,17 +6,11 @@ from pathlib import Path
 DEFAULT_PUBLISHED_FILENAME = "latest.csv"
 
 _KNOWN_FAMILY_IDS = {
-    "chronos2_power_only",
-    "chronos2_exogenous",
-    "ltsf_linear_local",
-    "tft_turbine_pilot",
     "agcrn_official_aligned",
-    "persistence_turbine_baseline",
 }
 
 _EXPERIMENT_NAME_TO_FAMILY_ID = {
-    "chronos-2": "chronos2_power_only",
-    "chronos-2-exogenous": "chronos2_exogenous",
+    "agcrn": "agcrn_official_aligned",
 }
 
 

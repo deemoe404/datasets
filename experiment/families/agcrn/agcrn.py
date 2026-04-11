@@ -58,6 +58,7 @@ COMMON_DIR = EXPERIMENT_ROOT / "infra" / "common"
 if str(COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(COMMON_DIR))
 
+import window_protocols  # noqa: E402
 from run_records import record_cli_run  # noqa: E402
 from published_outputs import default_family_output_path  # noqa: E402
 from window_protocols import (  # noqa: E402
@@ -68,9 +69,7 @@ from window_protocols import (  # noqa: E402
     ROLLING_EVAL_PROTOCOL,
     SPLIT_PROTOCOL,
     WindowProtocolSpec,
-    build_chrono_split_lookup as shared_build_chrono_split_lookup,
     resolve_window_protocol,
-    split_window_index as shared_split_window_index,
 )
 
 
@@ -489,11 +488,7 @@ def load_strict_window_index(dataset_id: str, *, cache_root: str | Path = _CACHE
     return frame
 
 
-def build_chrono_split_lookup(raw_timestamps: Sequence[datetime]) -> pl.DataFrame:
-    return shared_build_chrono_split_lookup(raw_timestamps)
-
-
-def split_window_index(
+def split_farm_window_index(
     window_index: pl.DataFrame,
     *,
     raw_timestamps: Sequence[datetime],
@@ -505,7 +500,7 @@ def split_window_index(
         if "turbine_id" in window_index.columns
         else window_index.with_columns(pl.lit("__farm__").alias("turbine_id"))
     )
-    split_frames = shared_split_window_index(
+    split_frames = window_protocols.split_window_index(
         sortable_window_index,
         raw_timestamps=raw_timestamps,
         resolution_minutes=resolution_minutes,
@@ -752,7 +747,7 @@ def prepare_dataset(
     panel_frame = prepare_panel_frame(series, rated_power_kw=metadata.rated_power_kw)
     resolution_minutes = resolve_resolution_minutes(panel_frame)
     raw_timestamps = panel_frame["timestamp"].to_list()
-    split_frames = split_window_index(
+    split_frames = split_farm_window_index(
         strict_window_index,
         raw_timestamps=raw_timestamps,
         resolution_minutes=resolution_minutes,

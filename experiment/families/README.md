@@ -11,9 +11,4 @@ Each family owns:
 
 Current families:
 
-- `chronos-2`
-- `chronos-2-exogenous`
-- `ltsf-linear`
-- `tft`
 - `agcrn`
-- `persistence` (registered placeholder, not yet a first-class runner)
