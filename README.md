@@ -1,4 +1,6 @@
-# Notes
+# README
+
+本文件是数据集侧的正式总览；维护速记见 `./NOTE.md`，实验结构见 `./experiment/README.md`。
 
 ## 数据集概览
 
@@ -122,5 +124,3 @@
 | sdwpf_kddcup   | 1,131,661 / 4,727,520 = 23.94% |   269,772 / 4,703,534 |      5.74% |    0 / 134 |
 
 *Hill of Towie 数据集除了 `quality_flags` 外还有代表 sidecar 文件导致的质量问题的 `feature_quality_flags`。
-
----

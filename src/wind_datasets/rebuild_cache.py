@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-turbine",
         action="store_true",
-        help="Deprecated compatibility flag. Turbine-target caches are archived and no longer rebuilt.",
+        help="Deprecated no-op compatibility flag. Turbine-target caches are archived and no longer rebuilt.",
     )
     parser.add_argument(
         "datasets",
@@ -226,6 +226,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     cache_root = Path(args.cache_root)
+    if args.include_turbine:
+        print(
+            "[rebuild] warning: --include-turbine is deprecated and is currently a no-op.",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
         if args.check:
             results = run_check(

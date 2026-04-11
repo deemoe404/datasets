@@ -24,7 +24,10 @@ else
 fi
 
 "${ENV_PREFIX}/bin/python" -m pip install --upgrade pip
-"${ENV_PREFIX}/bin/python" -m pip install --upgrade --editable "${REPO_ROOT}"
+(
+  cd "${REPO_ROOT}"
+  "${ENV_PREFIX}/bin/python" -m pip install --upgrade --editable ".[test]"
+)
 
 echo "Dataset processing environment is ready at ${ENV_PREFIX}"
 echo "Run cache rebuilds with:"

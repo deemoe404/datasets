@@ -89,7 +89,7 @@ def test_rebuild_cli_defaults_to_all_datasets_and_farm_only(monkeypatch, capsys)
     assert "turbine" not in captured.out
 
 
-def test_rebuild_cli_include_turbine_adds_compatibility_stages(monkeypatch) -> None:
+def test_rebuild_cli_include_turbine_is_accepted_but_noop(monkeypatch, capsys) -> None:
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(rebuild_module, "SUPPORTED_DATASETS", ("kelmarsh",))
     _patch_rebuild_api(monkeypatch, calls)
@@ -103,6 +103,8 @@ def test_rebuild_cli_include_turbine_adds_compatibility_stages(monkeypatch) -> N
         ("kelmarsh", "gold_base"),
         ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
     ]
+    captured = capsys.readouterr()
+    assert "--include-turbine is deprecated and is currently a no-op" in captured.err
 
 
 def test_rebuild_cli_all_and_duplicate_datasets_stay_deduped_and_ordered(monkeypatch) -> None:
@@ -336,7 +338,7 @@ def test_scripts_create_env_script_bootstraps_conda_env_and_editable_install(tmp
     log_text = log_path.read_text(encoding="utf-8")
     assert f"conda=env create --prefix {repo_root / '.conda'} --file {repo_root / 'scripts' / 'environment.yml'}" in log_text
     assert "python=-m pip install --upgrade pip" in log_text
-    assert f"python=-m pip install --upgrade --editable {repo_root}" in log_text
+    assert "python=-m pip install --upgrade --editable .[test]" in log_text
     assert "Dataset processing environment is ready" in result.stdout
 
 

@@ -1,3 +1,7 @@
+## 维护者速记
+
+`README.md` 和 `experiment/README.md` 是当前仓库的正式说明；本文件只保留维护时常用的最短路径。
+
 ## 环境准备
 
 项目根目录下创建或更新 `wind_datasets.local.toml`:
@@ -13,48 +17,25 @@ source_data_root = "/path/to/Wind Power Forecasting"
 ./scripts/create_env.sh
 ```
 
-重建数据集缓存：
+这个环境会安装仓库本体和测试依赖，可直接运行：
+
+```shell
+./.conda/bin/python -m pytest
+```
+
+## 缓存重建
+
+常用命令：
 
 ```shell
 ./scripts/rebuild_cache.sh --clean
 ./scripts/rebuild_cache.sh --check
+./scripts/rebuild_cache.sh hill_of_towie
 ```
 
-## 运行实验
+## 实验运行
 
-chronos-2 实验：
-
-```shell
-cd experiment/families/chronos-2
-./create_env.sh
-./.conda/bin/python run_power_only_full.py
-```
-
-chronos-2-exogenous 实验：
-
-```shell
-cd experiment/families/chronos-2-exogenous
-./create_env.sh
-./.conda/bin/python run_exogenous_full.py
-```
-
-ltsf-linear 实验：
-
-```shell
-cd experiment/families/ltsf-linear
-./create_env.sh
-./.conda/bin/python run_ltsf_linear_full.py
-```
-
-tft pilot 实验：
-
-```shell
-cd experiment/families/tft
-./create_env.sh
-./.conda/bin/python run_tft.py
-```
-
-AGCRN pilot 实验：
+当前 active tree 中只保留 `agcrn` family：
 
 ```shell
 cd experiment/families/agcrn

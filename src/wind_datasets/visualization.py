@@ -73,11 +73,10 @@ def load_turbine_power_series(
     dataset_id: str,
     selector: int | str,
     cache_root: str | Path = "cache",
-    quality_profile: str | None = None,
 ) -> pl.DataFrame:
+    """Load one turbine's canonical power series for visualization-only workflows."""
     cache_root_path = Path(cache_root)
     cache_paths = dataset_cache_paths(cache_root_path, dataset_id)
-    del quality_profile
     gold_base_path = cache_paths.gold_base_series_path
     if not gold_base_path.exists():
         build_gold_base(dataset_id, cache_root=cache_root_path)

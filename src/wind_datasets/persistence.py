@@ -43,11 +43,14 @@ def run_persistence_experiment(
     dataset_id: str,
     *,
     cache_root: str | Path = "cache",
-    quality_profile: str | None = None,
     task_spec: TaskSpec | None = None,
 ) -> PersistenceExperimentResult:
+    """Evaluate a turbine-level persistence baseline from canonical gold-base rows.
+
+    This analysis helper intentionally stays outside the active farm task-bundle
+    experiment surface.
+    """
     spec = get_dataset_spec(dataset_id)
-    resolved_quality_profile = quality_profile or spec.default_quality_profile
     resolved_task = (
         task_spec or TaskSpec.next_6h_from_24h(granularity="turbine")
     ).resolve(spec.resolution_minutes)
@@ -55,12 +58,11 @@ def run_persistence_experiment(
     series = _load_persistence_series(
         spec=spec,
         cache_root=Path(cache_root),
-        quality_profile=resolved_quality_profile,
     )
     return _evaluate_persistence_series(
         series,
         spec=spec,
-        quality_profile=resolved_quality_profile,
+        quality_profile=spec.default_quality_profile,
         task=resolved_task,
         rated_power_by_turbine=rated_power_by_turbine,
     )
@@ -70,9 +72,7 @@ def _load_persistence_series(
     *,
     spec: DatasetSpec,
     cache_root: Path,
-    quality_profile: str,
 ) -> pl.DataFrame:
-    del quality_profile
     cache_paths = dataset_cache_paths(cache_root, spec.dataset_id)
     gold_base_path = cache_paths.gold_base_series_path
     if not gold_base_path.exists():
