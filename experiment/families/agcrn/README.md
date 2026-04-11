@@ -52,6 +52,13 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
+Current tuned defaults favor faster full runs on this workspace:
+
+- `--device auto` (prefers CUDA when available)
+- `--batch-size 1024`
+- `--epochs 15`
+- `--patience 4`
+
 This writes:
 
 ```text

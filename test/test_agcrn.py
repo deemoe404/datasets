@@ -286,7 +286,7 @@ def _result_row(
         "epochs_ran": 3,
         "best_val_rmse_pu": 0.09,
         "seed": 42,
-        "batch_size": 128,
+        "batch_size": module.DEFAULT_BATCH_SIZE,
         "learning_rate": 1e-3,
     }
 
