@@ -213,6 +213,20 @@ def test_manifest_reports_layout_problem_for_zip_only_sources(tmp_path) -> None:
     assert manifest["warnings"]
 
 
+def test_manifest_file_inventory_uses_created_time_and_not_sha256(tmp_path) -> None:
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
+
+    manifest = read_json(build_manifest_for_spec(spec, tmp_path / "cache"))
+    first_file = manifest["files"][0]
+
+    assert "relative_path" in first_file
+    assert "size_bytes" in first_file
+    assert isinstance(first_file["created_ns"], int)
+    assert first_file["created_ns"] > 0
+    assert "mtime_ns" not in first_file
+    assert "sha256" not in first_file
+
+
 def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -> None:
     greenbyte_spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
     hill_spec = build_hill_fixture(tmp_path / "raw" / "hill")
@@ -321,16 +335,17 @@ def test_penmanshiel_registry_notes_and_readme_document_partial_2024_coverage(co
     extended_release = next(
         release for release in spec.official_releases if release.release_id == "extended_2025"
     )
-    readme = Path("src/README.md").read_text(encoding="utf-8")
+    src_readme = Path("src/README.md").read_text(encoding="utf-8")
+    root_readme = Path("README.md").read_text(encoding="utf-8")
 
     assert "WT11-15" in extended_release.notes
     assert "WT01/02/04/05/06/07/08/09/10" in extended_release.notes
     assert "2023-12-31" in extended_release.notes
     assert "2024-12-31" in extended_release.notes
-    assert "turbine-level caveat: `WT11-15` extend to `2024-12-31`" in readme
-    assert "`WT01/02/04/05/06/07/08/09/10` have last observations on `2023-12-31`" in readme
-    assert "`common_coverage_end = 2023-12-31T23:50:00`" in readme
-    assert "`full_target_coverage_end = 2023-12-31T23:50:00`" in readme
+    assert "For dataset coverage and retained raw columns, read [../README.md](../README.md)." in src_readme
+    assert "Penmanshiel 无 WT03。" in root_readme
+    assert "WT01/02/04/05/06/07/08/09/10 的最后观测日为 2023-12-31" in root_readme
+    assert "WT11/12/13/14/15 的最后观测日为 2024-12-31" in root_readme
 
 
 def test_featureize_tuneup_interventions_respects_interval_end_semantics() -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from datetime import timedelta
@@ -65,15 +64,6 @@ def duration_to_steps(duration: timedelta, resolution_minutes: int) -> int:
             f"{resolution_minutes} minutes."
         )
     return duration_seconds // resolution_seconds
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
 
 def write_json(path: Path, payload: Any) -> Path:
     ensure_directory(path.parent)

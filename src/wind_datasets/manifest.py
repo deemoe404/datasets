@@ -7,15 +7,15 @@ import re
 
 import polars as pl
 
-from .cache_state import manifest_meta_from_payload, write_build_meta
+from .cache_state import manifest_meta_from_payload, source_file_record_for, write_build_meta
 from .models import DatasetSpec
 from .paths import dataset_cache_paths
 from .source_schema import build_source_schema_inventory
-from .utils import ensure_directory, sha256_file, write_json
+from .utils import ensure_directory, write_json
 
 _IGNORED_FILE_NAMES = {".DS_Store"}
 _IGNORED_SUFFIXES = {".swp", ".webloc"}
-_BUILD_VERSION = "v2"
+_BUILD_VERSION = "v3"
 _GREENBYTE_RANGE_PATTERN = re.compile(
     r"Turbine_Data_.*?_(?P<start>\d{4}-\d{2}-\d{2})_-_(?P<end>\d{4}-\d{2}-\d{2})(?:_|\.csv)"
 )
@@ -416,13 +416,8 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
             for name in ("polars", "pyarrow", "duckdb", "pytest")
         },
         "files": [
-            {
-                "relative_path": relative_path,
-                "size_bytes": path.stat().st_size,
-                "mtime_ns": path.stat().st_mtime_ns,
-                "sha256": sha256_file(path),
-            }
-            for path, relative_path in zip(source_files, relative_paths, strict=True)
+            source_file_record_for(path, spec.source_root)
+            for path in source_files
         ],
     }
     if time_semantics_check is not None:

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -156,14 +157,26 @@ def source_snapshot_for(spec: DatasetSpec) -> list[dict[str, object]]:
         if path.suffix.lower() in _IGNORED_SUFFIXES:
             continue
         paths.append(path)
-    return [
-        {
-            "relative_path": str(path.relative_to(spec.source_root)),
-            "size_bytes": path.stat().st_size,
-            "mtime_ns": path.stat().st_mtime_ns,
-        }
-        for path in paths
-    ]
+    return [source_file_record_for(path, spec.source_root) for path in paths]
+
+
+def source_file_record_for(path: Path, root: Path) -> dict[str, object]:
+    stat_result = path.stat()
+    return {
+        "relative_path": str(path.relative_to(root)),
+        "size_bytes": stat_result.st_size,
+        "created_ns": _created_ns_for_stat(stat_result),
+    }
+
+
+def _created_ns_for_stat(stat_result: os.stat_result) -> int:
+    birthtime_ns = getattr(stat_result, "st_birthtime_ns", None)
+    if birthtime_ns is not None:
+        return int(birthtime_ns)
+    birthtime = getattr(stat_result, "st_birthtime", None)
+    if birthtime is not None:
+        return int(float(birthtime) * 1_000_000_000)
+    return int(stat_result.st_ctime_ns)
 
 
 def build_layer_fingerprint(
@@ -249,7 +262,7 @@ def manifest_meta_from_payload(spec: DatasetSpec, payload: dict[str, Any]) -> La
         {
             "relative_path": item["relative_path"],
             "size_bytes": item["size_bytes"],
-            "mtime_ns": item["mtime_ns"],
+            "created_ns": item.get("created_ns", item.get("mtime_ns")),
         }
         for item in payload.get("files", [])
     ]

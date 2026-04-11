@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import polars as pl
 import pytest
 
@@ -101,9 +99,8 @@ def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -
     assert gold_meta_before is not None
     assert task_meta_before is not None
 
-    source_path = sorted(spec.source_root.rglob("Turbine_Data_*.csv"))[0]
-    updated_ns = source_path.stat().st_mtime_ns + 1_000_000_000
-    os.utime(source_path, ns=(updated_ns, updated_ns))
+    marker_path = spec.source_root / "local_snapshot_marker.txt"
+    marker_path.write_text("cache freshness probe\n", encoding="utf-8")
 
     assert builder.manifest_status().status == "stale"
     assert builder.manifest_status().reason == "source_snapshot_changed"
