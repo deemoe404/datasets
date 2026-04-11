@@ -8,6 +8,7 @@ from typing import Any
 import polars as pl
 import pyarrow.parquet as pq
 
+from ..source_column_policy import filter_source_frame
 from ..utils import ensure_directory, join_flags
 from .base import BaseDatasetBuilder
 from .common import (
@@ -67,15 +68,9 @@ _HILL_SHARED_TABLE_SPECS = (
 
 _HILL_BROADCAST_SHARED_GROUPS = (
     "farm_grid",
-    "farm_grid_sci",
 )
 
 _HILL_TURBINE_SHARED_GROUPS = (
-    "turbine_shutdown_duration",
-    "turbine_count",
-    "turbine_digi_in",
-    "turbine_digi_out",
-    "turbine_intern",
     "turbine_press",
     "turbine_temp",
 )
@@ -83,7 +78,6 @@ _HILL_TURBINE_SHARED_GROUPS = (
 _HILL_EVENT_FEATURE_GROUPS = (
     "alarmlog",
     "aeroup",
-    "tuneup",
 )
 
 _HILL_TUNEUP_METADATA_PACKAGE = "wind_datasets.data"
@@ -104,6 +98,22 @@ def _read_csv_with_fallback(path):
         except pl.exceptions.ComputeError:
             continue
     return pl.read_csv(path, encoding="utf8-lossy")
+
+
+def _classify_hill_source_csv(path: Path) -> tuple[str, str]:
+    stem = path.stem
+    if stem.startswith("tbl"):
+        table_name = stem.split("_20", 1)[0]
+        if table_name == stem:
+            table_name = stem.split("_", 1)[0]
+        return table_name, table_name
+    if stem == "Hill_of_Towie_turbine_metadata":
+        return "turbine_metadata", stem
+    if stem == "Hill_of_Towie_AeroUp_install_dates":
+        return "aeroup_timeline", stem
+    if stem == "ShutdownDuration":
+        return "shutdown_duration", stem
+    return stem, stem
 
 
 def _load_packaged_hill_tuneup_metadata() -> pl.DataFrame:
@@ -1368,6 +1378,23 @@ def _hill_default_feature_columns(cache_paths, target_column: str) -> list[str]:
     return feature_columns
 
 
+def _hill_extra_feature_columns(cache_paths) -> list[str]:
+    feature_columns: list[str] = []
+    extra_paths = (
+        [cache_paths.silver_shared_ts_path(group_name) for group_name in _HILL_BROADCAST_SHARED_GROUPS]
+        + [cache_paths.silver_shared_ts_path(group_name) for group_name in _HILL_TURBINE_SHARED_GROUPS]
+        + [cache_paths.silver_event_features_path(group_name) for group_name in _HILL_EVENT_FEATURE_GROUPS]
+    )
+    for path in extra_paths:
+        if not path.exists():
+            continue
+        for column in pl.scan_parquet(path).collect_schema().names():
+            if column in {"dataset", "turbine_id", "timestamp"} or column in feature_columns:
+                continue
+            feature_columns.append(column)
+    return feature_columns
+
+
 def _hill_default_time_bounds(cache_paths) -> tuple[Any | None, Any | None]:
     scans = [
         pl.scan_parquet(path).select("timestamp")
@@ -1813,6 +1840,7 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
 
     def build_silver(self) -> Path:
         self.ensure_manifest()
+        source_policy = self.load_source_column_policy()
         ensure_directory(self.cache_paths.silver_dir)
         ensure_directory(self.cache_paths.silver_events_dir)
         ensure_directory(self.cache_paths.silver_shared_ts_dir)
@@ -1824,7 +1852,13 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             relative = path.relative_to(self.spec.source_root)
             output_path = self.cache_paths.silver_dir / relative.with_suffix(".parquet")
             ensure_directory(output_path.parent)
-            _read_csv_with_fallback(path).write_parquet(output_path)
+            source_asset, source_table_or_file = _classify_hill_source_csv(path)
+            filter_source_frame(
+                _read_csv_with_fallback(path),
+                policy=source_policy,
+                source_asset=source_asset,
+                source_table_or_file=source_table_or_file,
+            ).write_parquet(output_path)
         metadata_path = self.spec.source_root / "Hill_of_Towie_turbine_metadata.csv"
         if metadata_path.exists():
             turbine_static = ensure_turbine_static_schema(
@@ -1962,32 +1996,17 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> Path:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
         self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
-        ensure_directory(
-            self.cache_paths.gold_base_profile_dir(
-                resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
-        )
-        series_path = self.cache_paths.gold_base_series_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        quality_path = self.cache_paths.gold_base_quality_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        temp_series_path = series_path.with_suffix(".tmp.parquet") if resolved_layout == "farm" else None
+        source_policy = self.load_source_column_policy()
+        ensure_directory(self.cache_paths.gold_base_dir)
+        series_path = self.cache_paths.gold_base_series_path
+        quality_path = self.cache_paths.gold_base_quality_path
+        temp_series_path = series_path.with_suffix(".tmp.parquet")
         duplicate_audit_path = self.cache_paths.duplicate_audit_path
         existing_duplicate_audit = (
             pl.read_parquet(duplicate_audit_path)
@@ -2000,17 +2019,17 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             if duplicate_effects_path.exists()
             else _empty_hill_duplicate_effect_frame()
         )
+        feature_columns = _hill_default_feature_columns(self.cache_paths, self.spec.target_column)
         existing_report_extra = {
-            "quality_profile": resolved_quality_profile,
-            "layout": resolved_layout,
-            "feature_set": resolved_feature_set,
+            "series_layout": "farm_synchronous",
+            **self.source_policy_report_extra(source_policy),
             **_build_hill_duplicate_report_extra(
                 existing_duplicate_audit,
                 existing_duplicate_effects,
                 self.spec.turbine_ids,
             ),
         }
-        if resolved_layout == "farm" and temp_series_path is not None and temp_series_path.exists() and not series_path.exists():
+        if temp_series_path.exists() and not series_path.exists():
             coverage_summary = _finalize_hill_farm_temp(temp_series_path, series_path, self.spec)
             report_frame = load_quality_report_frame(series_path)
             report = build_quality_report(
@@ -2020,11 +2039,7 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
                 extra={**existing_report_extra, **coverage_summary},
             )
             write_quality_report(quality_path, report)
-            self._write_gold_base_build_meta(
-                quality_profile=resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
+            self._write_gold_base_build_meta()
             return series_path
         if series_path.exists() and not quality_path.exists():
             report_frame = load_quality_report_frame(series_path)
@@ -2035,11 +2050,7 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
                 extra={**existing_report_extra, **build_coverage_summary(report_frame, self.spec)},
             )
             write_quality_report(quality_path, report)
-            self._write_gold_base_build_meta(
-                quality_profile=resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
+            self._write_gold_base_build_meta()
             return series_path
 
         global_start, global_end = _hill_default_time_bounds(self.cache_paths)
@@ -2055,31 +2066,29 @@ class HillOfTowieDatasetBuilder(BaseDatasetBuilder):
             for row in turbine_static.iter_rows(named=True)
             if row["turbine_id"] is not None and row["StationId"] is not None
         }
-        feature_columns = _hill_default_feature_columns(self.cache_paths, self.spec.target_column)
         quality_accumulator, coverage_summary = _write_hill_gold_with_extras(
             _iter_hill_base_chunks(
                 cache_paths=self.cache_paths,
                 spec=self.spec,
-                layout=resolved_layout,
+                layout="farm",
                 feature_columns=feature_columns,
                 station_by_turbine=station_by_turbine,
             ),
             self.cache_paths,
             series_path,
             self.spec,
-            layout=resolved_layout,
+            layout="farm",
         )
 
         report = finalize_quality_report(
             quality_accumulator,
             manifest_payload,
             self.spec,
-            extra={**existing_report_extra, **coverage_summary},
+            extra={
+                **existing_report_extra,
+                **coverage_summary,
+            },
         )
         write_quality_report(quality_path, report)
-        self._write_gold_base_build_meta(
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
+        self._write_gold_base_build_meta()
         return series_path

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
+from wind_datasets.datasets.common import build_window_index_from_series_path
 from wind_datasets.datasets.hill_of_towie import HillOfTowieDatasetBuilder
 from wind_datasets.models import DatasetSpec, TaskSpec
 from wind_datasets.persistence import _evaluate_persistence_series
@@ -30,6 +31,7 @@ def test_persistence_repeats_anchor_value_across_all_horizons() -> None:
         history_duration="30m",
         forecast_duration="20m",
         task_id="short_persistence",
+        granularity="turbine",
     ).resolve(spec.resolution_minutes)
     timestamps = pl.datetime_range(
         datetime(2024, 1, 1, 0, 0, 0),
@@ -107,10 +109,19 @@ def test_persistence_eligible_windows_match_clean_window_index(tmp_path) -> None
     )
     resolved_task = task_spec.resolve(spec.resolution_minutes)
 
-    builder.build_gold_base(layout="turbine")
-    builder.build_task_cache(task_spec)
-    series = builder.load_series(layout="turbine")
-    window_index = builder.load_window_index(task_spec)
+    builder.build_gold_base()
+    series = builder.load_series()
+    window_index_path = tmp_path / "window_index.parquet"
+    window_report_path = tmp_path / "task_report.json"
+    build_window_index_from_series_path(
+        series_path=builder.cache_paths.gold_base_series_path,
+        task=resolved_task,
+        output_path=window_index_path,
+        report_path=window_report_path,
+        quality_profile="default",
+        available_columns=set(series.columns),
+    )
+    window_index = pl.read_parquet(window_index_path)
 
     result = _evaluate_persistence_series(
         series,
@@ -136,6 +147,6 @@ def test_persistence_eligible_windows_match_clean_window_index(tmp_path) -> None
     assert result.summary["eligible_windows"][0] == strict_window_index.height
     assert result.summary["prediction_count"][0] == strict_window_index.height * resolved_task.forecast_steps
     assert result.summary["rated_power_kw"][0] == 2300.0
-    assert per_turbine_counts == {"T01": 4, "T02": 2}
+    assert per_turbine_counts == {"T01": 5, "T02": 2}
     assert per_turbine_counts == {"T01": strict_counts["T01"], "T02": strict_counts["T02"]}
     assert set(result.per_turbine["rated_power_kw"].to_list()) == {2300.0}

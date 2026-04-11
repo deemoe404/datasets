@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
+import polars as pl
+
 from .utils import duration_to_steps, format_duration, parse_duration
 
 
@@ -88,7 +90,7 @@ class TaskSpec:
     task_id: str | None = None
     stride_duration: timedelta | str | None = None
     target_mode: str = "multi_step"
-    granularity: str = "turbine"
+    granularity: str = "farm"
     allow_partial_input: bool = False
     allow_partial_output: bool = False
 
@@ -143,3 +145,29 @@ class TaskSpec:
             "allow_partial_input": self.allow_partial_input,
             "allow_partial_output": self.allow_partial_output,
         }
+
+
+@dataclass(frozen=True)
+class TaskBundlePaths:
+    dataset_id: str
+    task_id: str
+    feature_protocol_id: str
+    task_dir: Path
+    series_path: Path
+    known_future_path: Path
+    static_path: Path
+    window_index_path: Path
+    task_context_path: Path
+    task_report_path: Path
+    build_meta_path: Path
+
+
+@dataclass(frozen=True)
+class LoadedTaskBundle:
+    paths: TaskBundlePaths
+    series: pl.DataFrame
+    known_future: pl.DataFrame
+    static: pl.DataFrame
+    window_index: pl.DataFrame
+    task_context: dict[str, object]
+    task_report: dict[str, object]

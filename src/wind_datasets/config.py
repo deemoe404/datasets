@@ -85,6 +85,7 @@ def get_source_data_root() -> Path:
 
 
 def clear_config_caches() -> None:
-    get_source_data_root.cache_clear()
-    load_project_config.cache_clear()
-    _cached_project_root.cache_clear()
+    for cached_fn in (get_source_data_root, load_project_config, _cached_project_root):
+        cache_clear = getattr(cached_fn, "cache_clear", None)
+        if callable(cache_clear):
+            cache_clear()

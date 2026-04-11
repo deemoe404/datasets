@@ -72,18 +72,13 @@ def _load_persistence_series(
     cache_root: Path,
     quality_profile: str,
 ) -> pl.DataFrame:
+    del quality_profile
     cache_paths = dataset_cache_paths(cache_root, spec.dataset_id)
-    gold_base_path = cache_paths.gold_base_series_path_for(
-        quality_profile,
-        layout="turbine",
-        feature_set="default",
-    )
+    gold_base_path = cache_paths.gold_base_series_path
     if not gold_base_path.exists():
         build_gold_base(
             spec.dataset_id,
             cache_root=cache_root,
-            quality_profile=quality_profile,
-            layout="turbine",
         )
     return (
         pl.scan_parquet(gold_base_path)
@@ -312,13 +307,18 @@ def _evaluate_turbine_frame(
         return {
             "row": _build_turbine_row(
                 turbine_id=turbine_id,
+                rated_power_kw=rated_power_kw,
                 eligible_windows=0,
                 prediction_count=0,
                 abs_error_sum=0.0,
                 squared_error_sum=0.0,
+                normalized_abs_error_sum=0.0,
+                normalized_squared_error_sum=0.0,
             ),
             "horizon_abs_error_sums": horizon_abs_error_sums,
             "horizon_squared_error_sums": horizon_squared_error_sums,
+            "horizon_normalized_abs_error_sums": horizon_normalized_abs_error_sums,
+            "horizon_normalized_squared_error_sums": horizon_normalized_squared_error_sums,
             "horizon_prediction_counts": horizon_prediction_counts,
         }
 

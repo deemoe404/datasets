@@ -77,20 +77,10 @@ def load_turbine_power_series(
 ) -> pl.DataFrame:
     cache_root_path = Path(cache_root)
     cache_paths = dataset_cache_paths(cache_root_path, dataset_id)
-    spec = get_dataset_spec(dataset_id)
-    resolved_quality_profile = quality_profile or spec.default_quality_profile
-    gold_base_path = cache_paths.gold_base_series_path_for(
-        resolved_quality_profile,
-        layout="turbine",
-        feature_set="default",
-    )
+    del quality_profile
+    gold_base_path = cache_paths.gold_base_series_path
     if not gold_base_path.exists():
-        build_gold_base(
-            dataset_id,
-            cache_root=cache_root_path,
-            quality_profile=resolved_quality_profile,
-            layout="turbine",
-        )
+        build_gold_base(dataset_id, cache_root=cache_root_path)
 
     turbine_id = resolve_turbine_selector(dataset_id, selector)
     frame = (

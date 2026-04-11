@@ -32,7 +32,7 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     assert "farm_turbines_observed" in series.columns
     assert "farm_is_fully_synchronous" in series.columns
     assert "farm_pmu__gms_power_kw" in series.columns
-    assert "farm_grid_meter__grid_meter_energy_export_kwh" in series.columns
+    assert "farm_grid_meter__grid_meter_energy_export_kwh" not in series.columns
     assert "evt_stop_active" in series.columns
     assert "evt_status_code__710" in series.columns
     assert "farm_evt_status__communication" in series.columns
@@ -40,7 +40,6 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     assert turbine_static["turbine_id"].to_list() == [spec.turbine_ids[0]]
     observed_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
     assert observed_row["farm_pmu__gms_power_kw"][0] == 920.0
-    assert observed_row["farm_grid_meter__grid_meter_energy_export_kwh"][0] == 102.0
     assert observed_row["evt_status__informational"][0] is True
     assert observed_row["farm_evt_status__communication"][0] is True
     assert series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")[
@@ -48,27 +47,27 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     ][0] is False
     _assert_unique_series_keys(series)
     assert report["conflict_value_count"] == 1
-    assert report["layout"] == "farm"
-    assert report["feature_set"] == "default"
+    assert report["series_layout"] == "farm_synchronous"
+    assert report["source_column_policy_path"] == "data/source_column_policy/kelmarsh.csv"
+    assert report["source_column_policy_decision_counts"]["keep"] > 0
     assert "long_gaps" in report
 
     task = TaskSpec(
         history_duration="30m",
         forecast_duration="30m",
         task_id="short_task",
-        granularity="turbine",
+        granularity="farm",
     )
     builder.build_task_cache(task)
     window_index = builder.load_window_index(task)
-    task_report = json.loads(
-        builder.cache_paths.task_report_path_for("default", "turbine", "short_task").read_text()
-    )
+    task_report = json.loads(builder.task_bundle_paths(task).task_report_path.read_text())
     assert window_index.height > 0
-    assert "turbine_id" in window_index.columns
+    assert "turbine_id" not in window_index.columns
     assert "quality_flags" in window_index.columns
     assert "feature_quality_flags" in window_index.columns
     assert set(series["feature_quality_flags"].unique().to_list()) == {""}
     assert task_report["task"]["task_id"] == "short_task"
+    assert task_report["granularity"] == "farm"
     assert task_report["window_count"] == window_index.height
 
 
@@ -77,39 +76,37 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     builder = HillOfTowieDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     builder.build_gold_base()
-    builder.build_gold_base(layout="turbine")
     series = builder.load_series()
-    turbine_series = builder.load_series(layout="turbine")
     turbine_static = builder.load_turbine_static()
     report = builder.profile_dataset()
     duplicate_audit = pl.read_parquet(builder.cache_paths.hill_duplicate_audit_path)
     shutdown = pl.read_parquet(builder.cache_paths.silver_shared_ts_path("turbine_shutdown_duration"))
 
+    with pytest.raises(ValueError, match="layout='farm'"):
+        builder.build_gold_base(layout="turbine")
+
     _assert_unique_series_keys(series)
     assert turbine_static.height == len(spec.turbine_ids)
     assert "farm_grid__activepower" in series.columns
-    assert "farm_grid_sci__activepowermean" in series.columns
-    assert "tur_count__wtc_turrdhrt_endvalue" in series.columns
-    assert "tur_digi_in__wtc_smokenac_counts" in series.columns
-    assert "tur_digi_out__wtc_turbinok_counts" in series.columns
-    assert "tur_intern__wtc_valsuppv_mean" in series.columns
-    assert "tur_press__wtc_brakpres_mean" in series.columns
+    assert "farm_grid__powerfactor" in series.columns
+    assert "farm_grid__reactivepower" in series.columns
     assert "tur_temp__wtc_ambietmp_mean" in series.columns
-    assert "shutdown_duration_s" in series.columns
     assert "alarm_any_active" in series.columns
     assert "alarm_code__42" in series.columns
     assert "aeroup_post_install" in series.columns
     assert "aeroup_in_install_window" in series.columns
-    assert "tuneup_in_deployment_window" in series.columns
-    assert "tuneup_post_effective" in series.columns
+    assert "days_since_aeroup_start" in series.columns
+    assert "days_since_aeroup_end" in series.columns
     assert "farm_turbines_observed" in series.columns
     assert "farm_turbines_with_target" in series.columns
     assert "feature_quality_flags" in series.columns
-    assert "farm_turbines_observed" not in turbine_series.columns
+    assert "farm_grid_sci__activepowermean" not in series.columns
+    assert "shutdown_duration_s" not in series.columns
+    assert "tuneup_in_deployment_window" not in series.columns
     assert duplicate_audit.height == 6
-    assert duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict").height == 3
-    assert duplicate_audit.filter(pl.col("duplicate_kind") == "normalized_equal").height == 1
-    assert duplicate_audit.filter(pl.col("duplicate_kind") == "identical").height == 2
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "true_conflict").height == 2
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "normalized_equal").height == 0
+    assert duplicate_audit.filter(pl.col("duplicate_kind") == "identical").height == 4
     grid_conflict = duplicate_audit.filter(
         (pl.col("table_name") == "tblGrid") & (pl.col("duplicate_kind") == "true_conflict")
     )
@@ -121,7 +118,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     default_conflict = duplicate_audit.filter(
         (pl.col("table_name") == "tblSCTurbine") & (pl.col("duplicate_kind") == "true_conflict")
     )
-    assert default_conflict["conflicting_source_columns"].to_list() == [["wtc_PrWindSp_mean"]]
+    assert default_conflict.is_empty()
     assert shutdown["timestamp"].null_count() == 0
     assert shutdown.height == 4
     assert shutdown.filter(
@@ -165,15 +162,6 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     )
     assert t01_1730["farm_grid__activepower"][0] == 2020.0
-    assert t01_1730["farm_grid_sci__activepowermean"][0] == 2020.0
-    assert t01_1730["shutdown_duration_s"][0] == 0.0
-    assert t01_1740["shutdown_duration_s"][0] == 600.0
-    assert t01_1750["shutdown_duration_s"][0] == 300.0
-    assert t02_1750["shutdown_duration_s"][0] == 120.0
-    assert turbine_series.filter(
-        (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:40:00")
-    )["shutdown_duration_s"][0] == 600.0
     assert t01_1730["alarm_any_active"][0] is True
     assert t01_1730["alarm_code__42"][0] is True
     assert t01_1730["farm_turbines_observed"][0] == 2
@@ -181,26 +169,15 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert t01_1730["farm_is_fully_synchronous"][0] is True
     assert t01_1720["aeroup_post_install"][0] is True
     assert t02_1720["aeroup_in_install_window"][0] is True
-    assert t02_1720["tuneup_in_deployment_window"][0] is False
-    assert t02_1720["tuneup_post_effective"][0] is True
-    assert t01_1720["tuneup_in_deployment_window"][0] is False
-    assert t01_1720["tuneup_post_effective"][0] is False
-    assert t02_1810["tuneup_post_effective"][0] is True
-    assert "duplicate_conflict_resolved" in series.filter(
-        (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
-    )["quality_flags"][0]
+    assert t01_1720["days_since_aeroup_start"][0] > 1.0
+    assert t02_1720["days_since_aeroup_end"][0] is None
     assert series.filter(
         (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:30:00")
     )["target_kw"][0] is None
-    assert series.filter(
-        (pl.col("turbine_id") == "T01")
-        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
-    )["wtc_PrWindSp_mean"][0] is None
     assert t01_1810["target_kw"][0] == 1060.0
     assert t01_1810["farm_grid__activepower"][0] is None
-    assert t01_1810["farm_grid__frequency"][0] == 50.0
+    assert t01_1810["farm_grid__reactivepower"][0] == 106.0
     assert "feature_source_conflict__farm_grid" in t01_1810["feature_quality_flags"][0]
     assert t02_1810["farm_grid__activepower"][0] is None
     assert t02_1810["tur_temp__wtc_ambietmp_mean"][0] is None
@@ -208,15 +185,14 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert "feature_source_conflict__turbine_temp" in t02_1810["feature_quality_flags"][0]
     assert report["target_missing_count"] >= 1
     assert report["duplicate_audit_count"] == 6
-    assert report["duplicate_true_conflict_count"] == 3
+    assert report["duplicate_true_conflict_count"] == 2
     assert report["duplicate_true_conflict_count_by_table"] == {
         "tblGrid": 1,
         "tblSCTurTemp": 1,
-        "tblSCTurbine": 1,
     }
-    assert report["row_conflict_row_count"] == 1
+    assert report["row_conflict_row_count"] == 0
     assert report["feature_conflict_row_count"] == 2
-    assert report["layout"] == "farm"
+    assert report["series_layout"] == "farm_synchronous"
     assert report["full_synchrony_ratio"] == 1.0
     assert report["full_target_ratio"] < 1.0
 
@@ -229,20 +205,15 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     builder.build_task_cache(farm_task)
     farm_window_index = builder.load_window_index(farm_task)
     farm_task_static = builder.load_task_turbine_static(farm_task)
-    farm_task_report = json.loads(
-        builder.cache_paths.task_report_path_for("default", "farm", "farm_short").read_text()
-    )
+    farm_task_report = json.loads(builder.task_bundle_paths(farm_task).task_report_path.read_text())
     turbine_task = TaskSpec(
         history_duration="20m",
         forecast_duration="10m",
         task_id="turbine_short",
         granularity="turbine",
     )
-    builder.build_task_cache(turbine_task)
-    turbine_window_index = builder.load_window_index(turbine_task)
-    turbine_task_report = json.loads(
-        builder.cache_paths.task_report_path_for("default", "turbine", "turbine_short").read_text()
-    )
+    with pytest.raises(ValueError, match="Only farm-level task bundles remain supported"):
+        builder.build_task_cache(turbine_task)
     output_gap_window = farm_window_index.filter(
         pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:20:00"
     )
@@ -255,17 +226,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert farm_task_static["turbine_index"].to_list() == [0, 1]
     assert farm_task_report["window_count"] == farm_window_index.height
     assert farm_task_report["window_count"] > 0
-    assert turbine_window_index.height > 0
-    assert "turbine_id" in turbine_window_index.columns
-    assert "feature_quality_flags" in turbine_window_index.columns
-    feature_only_window = turbine_window_index.filter(
-        (pl.col("turbine_id") == "T02")
-        & (pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:00:00")
-    )
-    assert feature_only_window["quality_flags"][0] == ""
-    assert feature_only_window["feature_quality_flags"][0] == "feature_quality_issues_output"
-    assert turbine_task_report["window_count"] == turbine_window_index.height
-    assert turbine_task_report["window_count"] > 0
+    assert farm_task_report["granularity"] == "farm"
 
 
 def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_path) -> None:
@@ -273,7 +234,8 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     builder = SDWPFKDDCupDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     gold_path = builder.build_gold_base()
-    assert gold_path.parts[-4:] == ("default", "farm", "default", "series.parquet")
+    assert gold_path.name == "series.parquet"
+    assert gold_path.parent.name == "gold_base"
     before_mtime = gold_path.stat().st_mtime_ns
 
     default_series = builder.load_series()
@@ -299,7 +261,7 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert default_negative["feature_quality_flags"][0] == ""
     assert "target_kw_raw" not in default_series.columns
     assert "sdwpf_has_negative_patv" not in default_series.columns
-    assert report["quality_profile"] == "default"
+    assert report["series_layout"] == "farm_synchronous"
     assert report["sdwpf_unknown_count"] == 2
     assert report["sdwpf_abnormal_count"] == 2
     assert report["sdwpf_masked_count"] == 4
@@ -311,38 +273,36 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert "sdwpf_patv_zeroed" not in report["sdwpf_flag_counts"]
     assert not report["long_gaps"]
 
-    task_a = TaskSpec(history_duration="30m", forecast_duration="20m", task_id="short_a", granularity="turbine")
-    task_b = TaskSpec(history_duration="40m", forecast_duration="20m", task_id="short_b", granularity="turbine")
+    task_a = TaskSpec(history_duration="30m", forecast_duration="20m", task_id="short_a", granularity="farm")
+    task_b = TaskSpec(history_duration="40m", forecast_duration="20m", task_id="short_b", granularity="farm")
     builder.build_task_cache(task_a)
     builder.build_task_cache(task_b)
 
     after_mtime = gold_path.stat().st_mtime_ns
     window_index = builder.load_window_index(task_a)
-    task_report = json.loads(
-        (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_a" / "task_report.json").read_text()
-    )
+    task_report = json.loads(builder.task_bundle_paths(task_a).task_report_path.read_text())
     anchor_window = window_index.filter(
-        (pl.col("turbine_id") == "1")
-        & (pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:20:00")
+        pl.col("input_end_ts").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:20:00"
     )
 
     assert before_mtime == after_mtime
-    assert "input_masked_steps" in window_index.columns
-    assert "output_masked_steps" in window_index.columns
-    assert "input_unknown_steps" in window_index.columns
-    assert "output_abnormal_steps" in window_index.columns
-    assert anchor_window["input_masked_steps"][0] == 1
-    assert anchor_window["output_masked_steps"][0] == 2
-    assert anchor_window["input_unknown_steps"][0] == 1
-    assert anchor_window["output_unknown_steps"][0] == 1
+    assert "turbine_id" not in window_index.columns
+    assert "input_turbines_masked_per_step" in window_index.columns
+    assert "output_turbines_masked_per_step" in window_index.columns
+    assert "input_turbines_unknown_per_step" in window_index.columns
+    assert "output_turbines_abnormal_per_step" in window_index.columns
+    assert anchor_window["input_turbines_masked_per_step"].to_list()[0] == [0, 0, 1]
+    assert anchor_window["output_turbines_masked_per_step"].to_list()[0] == [1, 1]
+    assert anchor_window["input_turbines_unknown_per_step"].to_list()[0] == [0, 0, 1]
+    assert anchor_window["output_turbines_unknown_per_step"].to_list()[0] == [1, 0]
     assert "masked_input" in anchor_window["quality_flags"][0]
     assert "masked_output" in anchor_window["quality_flags"][0]
     assert task_report["quality_profile"] == "default"
     assert task_report["masked_input_windows"] > 0
     assert task_report["masked_output_windows"] > 0
-    assert task_report["fully_complete_and_unmasked_output_windows"] > 0
-    assert (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_a" / "window_index.parquet").exists()
-    assert (builder.cache_paths.tasks_dir / "default" / "turbine" / "short_b" / "window_index.parquet").exists()
+    assert task_report["fully_synchronous_and_unmasked_output_windows"] > 0
+    assert builder.task_bundle_paths(task_a).window_index_path.exists()
+    assert builder.task_bundle_paths(task_b).window_index_path.exists()
 
     for legacy_profile in ("official_v1", "raw_v1", "official_v1_zero_negative_patv"):
         with pytest.raises(ValueError):

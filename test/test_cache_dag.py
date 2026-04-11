@@ -21,7 +21,7 @@ def test_load_series_rebuilds_gold_when_build_meta_missing(tmp_path) -> None:
     builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     builder.build_gold_base()
-    gold_meta_path = builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+    gold_meta_path = builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
     gold_meta_path.unlink()
 
     status = builder.gold_base_status()
@@ -72,7 +72,7 @@ def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -
     manifest_meta_before = read_build_meta(builder.cache_paths.manifest_build_meta_path)
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
     gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
     )
     task_meta_before = read_build_meta(
         builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
@@ -106,7 +106,7 @@ def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
         read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
         ).fingerprint
         != gold_meta_before.fingerprint
     )
@@ -125,7 +125,7 @@ def test_build_gold_base_ensures_silver_fresh_when_code_fingerprint_changes(tmp_
     builder.build_gold_base()
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
     gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
     )
     assert silver_meta_before is not None
     assert gold_meta_before is not None
@@ -152,7 +152,7 @@ def test_build_gold_base_ensures_silver_fresh_when_code_fingerprint_changes(tmp_
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
         read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
         ).fingerprint
         != gold_meta_before.fingerprint
     )
@@ -174,7 +174,7 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
 
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
     gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
     )
     task_meta_before = read_build_meta(
         builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
@@ -193,9 +193,9 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
 
     original = cache_state.packaged_dependency_fingerprint_for
 
-    def _patched(layer: str, handler: str) -> str | None:
-        fingerprint = original(layer, handler)
-        if layer == "silver" and handler == "hill_of_towie":
+    def _patched(layer: str, spec) -> str | None:
+        fingerprint = original(layer, spec)
+        if layer == "silver" and spec.handler == "hill_of_towie":
             assert fingerprint is not None
             return f"patched-{fingerprint}"
         return fingerprint
@@ -218,8 +218,62 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
         read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm", feature_set="default")
+            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
         ).fingerprint
+        != gold_meta_before.fingerprint
+    )
+    assert (
+        read_build_meta(builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")).fingerprint
+        != task_meta_before.fingerprint
+    )
+
+
+def test_gold_base_policy_dependency_change_invalidates_gold_and_task(tmp_path, monkeypatch) -> None:
+    from wind_datasets import cache_state
+
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        task_id="farm_short",
+        granularity="farm",
+    )
+
+    builder.build_task_cache(task)
+    gold_meta_before = read_build_meta(
+        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
+    )
+    task_meta_before = read_build_meta(
+        builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
+    )
+    assert gold_meta_before is not None
+    assert task_meta_before is not None
+    assert "packaged_dependency_fingerprint" in gold_meta_before.params
+
+    original = cache_state.packaged_dependency_fingerprint_for
+
+    def _patched(layer: str, spec) -> str | None:
+        fingerprint = original(layer, spec)
+        if layer == "gold_base" and spec.dataset_id == "kelmarsh":
+            assert fingerprint is not None
+            return f"patched-{fingerprint}"
+        return fingerprint
+
+    monkeypatch.setattr(cache_state, "packaged_dependency_fingerprint_for", _patched)
+
+    assert builder.gold_base_status().status == "stale"
+    assert builder.gold_base_status().reason == "params_changed"
+    assert builder.task_cache_status(task).status == "stale"
+    assert builder.task_cache_status(task).reason == "parent_fingerprint_changed"
+
+    window_index = builder.load_window_index(task)
+
+    assert window_index.height > 0
+    assert builder.gold_base_status().status == "fresh"
+    assert builder.task_cache_status(task).status == "fresh"
+    assert (
+        read_build_meta(builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")).fingerprint
         != gold_meta_before.fingerprint
     )
     assert (
@@ -259,12 +313,12 @@ def test_rebuild_cli_check_reports_fresh_and_stale_layers(monkeypatch, capsys) -
         def silver_status(self) -> LayerStatus:
             return LayerStatus(status="stale", reason="missing_build_meta", fingerprint="silver")
 
-        def gold_base_status(self, quality_profile=None, layout=None, feature_set=None) -> LayerStatus:
-            del quality_profile, layout, feature_set
+        def gold_base_status(self, quality_profile=None, layout=None) -> LayerStatus:
+            del quality_profile, layout
             return LayerStatus(status="fresh", reason=None, fingerprint="gold")
 
-        def task_cache_status(self, task_spec, quality_profile=None) -> LayerStatus:
-            del task_spec, quality_profile
+        def task_cache_status(self, task_spec, feature_protocol_id="power_only", quality_profile=None) -> LayerStatus:
+            del task_spec, feature_protocol_id, quality_profile
             return LayerStatus(status="fresh", reason=None, fingerprint="task")
 
     monkeypatch.setattr(rebuild_module, "get_dataset_spec", lambda dataset: object())

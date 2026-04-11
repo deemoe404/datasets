@@ -11,20 +11,13 @@ from typing import Callable, Sequence
 from .api import build_gold_base, build_manifest, build_silver, build_task_cache
 from .config import ProjectConfigError
 from .datasets import get_builder
+from .feature_protocols import DEFAULT_FEATURE_PROTOCOL_ID
 from .models import TaskSpec
 from .registry import get_dataset_spec, list_dataset_ids
 
 SUPPORTED_DATASETS = list_dataset_ids()
 
 _FARM_TASK = TaskSpec.next_6h_from_24h(granularity="farm")
-_TURBINE_TASK = TaskSpec.next_6h_from_24h(granularity="turbine")
-_TURBINE_STRIDE_TASK = TaskSpec(
-    task_id="next_6h_from_24h_stride_6h",
-    history_duration="24h",
-    forecast_duration="6h",
-    stride_duration="6h",
-    granularity="turbine",
-)
 
 
 @dataclass(frozen=True)
@@ -72,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-turbine",
         action="store_true",
-        help="Also build explicit turbine compatibility caches.",
+        help="Deprecated compatibility flag. Turbine-target caches are archived and no longer rebuilt.",
     )
     parser.add_argument(
         "datasets",
@@ -100,6 +93,7 @@ def normalize_datasets(requested: Sequence[str]) -> list[str]:
 
 
 def rebuild_stages(include_turbine: bool) -> tuple[RebuildStage, ...]:
+    del include_turbine
     stages = [
         RebuildStage(
             name="manifest",
@@ -110,61 +104,30 @@ def rebuild_stages(include_turbine: bool) -> tuple[RebuildStage, ...]:
             run=lambda dataset, cache_root: build_silver(dataset, cache_root=cache_root),
         ),
         RebuildStage(
-            name="gold_base/default/farm/default",
+            name="gold_base",
             run=lambda dataset, cache_root: build_gold_base(dataset, cache_root=cache_root),
         ),
         RebuildStage(
-            name="tasks/default/farm/next_6h_from_24h",
-            run=lambda dataset, cache_root: build_task_cache(dataset, _FARM_TASK, cache_root=cache_root),
+            name=f"tasks/{_FARM_TASK.task_id}/{DEFAULT_FEATURE_PROTOCOL_ID}",
+            run=lambda dataset, cache_root: build_task_cache(
+                dataset,
+                _FARM_TASK,
+                cache_root=cache_root,
+                feature_protocol_id=DEFAULT_FEATURE_PROTOCOL_ID,
+            ),
         ),
     ]
-    if include_turbine:
-        stages.extend(
-            [
-                RebuildStage(
-                    name="gold_base/default/turbine/default",
-                    run=lambda dataset, cache_root: build_gold_base(
-                        dataset,
-                        cache_root=cache_root,
-                        layout="turbine",
-                    ),
-                ),
-                RebuildStage(
-                    name="tasks/default/turbine/next_6h_from_24h",
-                    run=lambda dataset, cache_root: build_task_cache(
-                        dataset,
-                        _TURBINE_TASK,
-                        cache_root=cache_root,
-                    ),
-                ),
-                RebuildStage(
-                    name="tasks/default/turbine/next_6h_from_24h_stride_6h",
-                    run=lambda dataset, cache_root: build_task_cache(
-                        dataset,
-                        _TURBINE_STRIDE_TASK,
-                        cache_root=cache_root,
-                    ),
-                ),
-            ]
-        )
     return tuple(stages)
 
 
 def check_targets(include_turbine: bool) -> tuple[tuple[str, str, TaskSpec | None], ...]:
+    del include_turbine
     targets: list[tuple[str, str, TaskSpec | None]] = [
         ("manifest", "manifest", None),
         ("silver", "silver", None),
-        ("gold_base/default/farm/default", "farm", None),
-        ("tasks/default/farm/next_6h_from_24h", "task", _FARM_TASK),
+        ("gold_base", "farm", None),
+        (f"tasks/{_FARM_TASK.task_id}/{DEFAULT_FEATURE_PROTOCOL_ID}", "task", _FARM_TASK),
     ]
-    if include_turbine:
-        targets.extend(
-            [
-                ("gold_base/default/turbine/default", "turbine", None),
-                ("tasks/default/turbine/next_6h_from_24h", "task", _TURBINE_TASK),
-                ("tasks/default/turbine/next_6h_from_24h_stride_6h", "task", _TURBINE_STRIDE_TASK),
-            ]
-        )
     return tuple(targets)
 
 
@@ -233,10 +196,8 @@ def run_check(
                 status = builder.silver_status()
             elif target_kind == "farm":
                 status = builder.gold_base_status()
-            elif target_kind == "turbine":
-                status = builder.gold_base_status(layout="turbine")
             elif task_spec is not None:
-                status = builder.task_cache_status(task_spec)
+                status = builder.task_cache_status(task_spec, feature_protocol_id=DEFAULT_FEATURE_PROTOCOL_ID)
             else:
                 raise ValueError(f"Unsupported check target {target_kind!r}.")
             results.append(

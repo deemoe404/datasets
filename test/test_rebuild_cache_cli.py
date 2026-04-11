@@ -11,8 +11,8 @@ from wind_datasets import rebuild_cache as rebuild_module
 from wind_datasets.config import ProjectConfigError
 
 
-def _stage_name_for_task(task_id: str, granularity: str) -> str:
-    return f"tasks/default/{granularity}/{task_id}"
+def _stage_name_for_task(task_id: str, feature_protocol_id: str) -> str:
+    return f"tasks/{task_id}/{feature_protocol_id}"
 
 
 def _patch_rebuild_api(
@@ -41,24 +41,24 @@ def _patch_rebuild_api(
         cache_root: str | Path = "cache",
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> Path:
-        del quality_profile, feature_set
-        resolved_layout = layout or "farm"
-        stage_name = f"gold_base/default/{resolved_layout}/default"
+        del quality_profile
+        del layout
+        stage_name = "gold_base"
         _record(stage_name, dataset_id)
-        return Path(cache_root) / dataset_id / "gold_base" / "default" / resolved_layout / "default" / "series.parquet"
+        return Path(cache_root) / dataset_id / "gold_base" / "series.parquet"
 
     def _build_task_cache(
         dataset_id: str,
         task_spec,
         cache_root: str | Path = "cache",
+        feature_protocol_id: str = "power_only",
         quality_profile: str | None = None,
     ) -> Path:
         del quality_profile
-        stage_name = _stage_name_for_task(task_spec.task_id, task_spec.granularity)
+        stage_name = _stage_name_for_task(task_spec.task_id, feature_protocol_id)
         _record(stage_name, dataset_id)
-        return Path(cache_root) / dataset_id / "tasks" / "default" / task_spec.granularity / task_spec.task_id
+        return Path(cache_root) / dataset_id / "tasks" / task_spec.task_id / feature_protocol_id
 
     monkeypatch.setattr(rebuild_module, "build_manifest", _build_manifest)
     monkeypatch.setattr(rebuild_module, "build_silver", _build_silver)
@@ -76,8 +76,8 @@ def test_rebuild_cli_defaults_to_all_datasets_and_farm_only(monkeypatch, capsys)
     expected_stages = [
         "manifest",
         "silver",
-        "gold_base/default/farm/default",
-        "tasks/default/farm/next_6h_from_24h",
+        "gold_base",
+        "tasks/next_6h_from_24h/power_only",
     ]
     assert calls == [
         (dataset, stage)
@@ -100,11 +100,8 @@ def test_rebuild_cli_include_turbine_adds_compatibility_stages(monkeypatch) -> N
     assert calls == [
         ("kelmarsh", "manifest"),
         ("kelmarsh", "silver"),
-        ("kelmarsh", "gold_base/default/farm/default"),
-        ("kelmarsh", "tasks/default/farm/next_6h_from_24h"),
-        ("kelmarsh", "gold_base/default/turbine/default"),
-        ("kelmarsh", "tasks/default/turbine/next_6h_from_24h"),
-        ("kelmarsh", "tasks/default/turbine/next_6h_from_24h_stride_6h"),
+        ("kelmarsh", "gold_base"),
+        ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
     ]
 
 
@@ -166,12 +163,12 @@ def test_rebuild_cli_records_failure_and_continues_next_dataset(monkeypatch, cap
     code = rebuild_module.main(["kelmarsh", "penmanshiel"])
 
     assert code == 1
-    assert ("kelmarsh", "gold_base/default/farm/default") not in calls
+    assert ("kelmarsh", "gold_base") not in calls
     assert calls[-4:] == [
         ("penmanshiel", "manifest"),
         ("penmanshiel", "silver"),
-        ("penmanshiel", "gold_base/default/farm/default"),
-        ("penmanshiel", "tasks/default/farm/next_6h_from_24h"),
+        ("penmanshiel", "gold_base"),
+        ("penmanshiel", "tasks/next_6h_from_24h/power_only"),
     ]
     captured = capsys.readouterr()
     assert "completed with 1 failed dataset" in captured.err
@@ -184,7 +181,7 @@ def test_rebuild_cli_summarizes_sdwpf_gold_block_without_running_tasks(monkeypat
     _patch_rebuild_api(
         monkeypatch,
         calls,
-        fail_stage="gold_base/default/farm/default",
+        fail_stage="gold_base",
         fail_dataset="sdwpf_kddcup",
         fail_message="Refusing to build sdwpf_kddcup gold/task cache. blocked by audit.",
     )
@@ -194,12 +191,12 @@ def test_rebuild_cli_summarizes_sdwpf_gold_block_without_running_tasks(monkeypat
     assert code == 1
     assert ("sdwpf_kddcup", "manifest") in calls
     assert ("sdwpf_kddcup", "silver") in calls
-    assert ("sdwpf_kddcup", "tasks/default/farm/next_6h_from_24h") not in calls
+    assert ("sdwpf_kddcup", "tasks/next_6h_from_24h/power_only") not in calls
     assert calls[-4:] == [
         ("kelmarsh", "manifest"),
         ("kelmarsh", "silver"),
-        ("kelmarsh", "gold_base/default/farm/default"),
-        ("kelmarsh", "tasks/default/farm/next_6h_from_24h"),
+        ("kelmarsh", "gold_base"),
+        ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
     ]
     captured = capsys.readouterr()
     assert "sdwpf_kddcup" in captured.err

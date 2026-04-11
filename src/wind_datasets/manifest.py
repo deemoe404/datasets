@@ -10,6 +10,7 @@ import polars as pl
 from .cache_state import manifest_meta_from_payload, write_build_meta
 from .models import DatasetSpec
 from .paths import dataset_cache_paths
+from .source_schema import build_source_schema_inventory
 from .utils import ensure_directory, sha256_file, write_json
 
 _IGNORED_FILE_NAMES = {".DS_Store"}
@@ -409,6 +410,7 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
         "source_layout": source_layout,
         "source_release_check": release_check,
         "warnings": [*layout_warnings, *release_warnings, *time_semantics_warnings],
+        "source_schema_inventory": build_source_schema_inventory(spec),
         "dependencies": {
             name: metadata.version(name)
             for name in ("polars", "pyarrow", "duckdb", "pytest")

@@ -18,17 +18,18 @@ Typical entry points:
 
 - `build_manifest(dataset_id)`
 - `build_silver(dataset_id)`
-- `build_gold_base(dataset_id, quality_profile=None, layout=None, feature_set=None)`
-- `build_task_cache(dataset_id, task_spec, quality_profile=None)`
-- `load_series(dataset_id, quality_profile=None, layout=None, feature_set=None)`
+- `build_gold_base(dataset_id)`
+- `build_task_cache(dataset_id, task_spec, feature_protocol_id="power_only")`
+- `load_series(dataset_id)`
+- `load_task_bundle(dataset_id, task_spec, feature_protocol_id="power_only")`
 - `load_shared_timeseries(dataset_id, group_name)`
 - `load_event_features(dataset_id, group_name)`
 - `load_interventions(dataset_id, group_name)`
 - `load_duplicate_audit(dataset_id)`
-- `load_window_index(dataset_id, task_spec, quality_profile=None)`
-- `load_task_turbine_static(dataset_id, task_spec, quality_profile=None)`
+- `load_window_index(dataset_id, task_spec, feature_protocol_id="power_only")`
+- `load_task_turbine_static(dataset_id, task_spec, feature_protocol_id="power_only")`
 - `load_turbine_static(dataset_id)`
-- `profile_dataset(dataset_id, quality_profile=None, layout=None, feature_set=None)`
+- `profile_dataset(dataset_id)`
 
 `TaskSpec` lives in [wind_datasets/models.py](./wind_datasets/models.py). It is duration-based, not step-based. Runtime step counts are derived from each dataset's native resolution.
 
@@ -61,12 +62,18 @@ cache/<dataset>/
       duplicate_audit.parquet
       duplicate_effects.parquet
       turbine_static.parquet
-  gold_base/<quality_profile>/<layout>/<feature_set>/
-  tasks/<quality_profile>/<granularity>/<task_id>/
+  gold_base/
+    series.parquet
+    quality_report.json
+    _build_meta.json
+  tasks/<task_id>/<feature_protocol_id>/
+    series.parquet
+    known_future.parquet
+    static.parquet
     window_index.parquet
     task_report.json
-    turbine_static.parquet
     task_context.json
+    _build_meta.json
 ```
 
 Layer meanings:
@@ -79,8 +86,8 @@ Layer meanings:
 - `silver/shared_ts/*`: standardized regular shared or turbine-level auxiliary time series
 - `silver/event_features/*`: regularized causal features derived from interval events
 - `silver/interventions/*`: normalized intervention timelines kept outside the default graph assumptions
-- `gold_base/<quality_profile>/<layout>/<feature_set>`: model-ready regular series cache
-- `tasks/<quality_profile>/<granularity>/<task_id>`: task-specific window index and task-local metadata
+- `gold_base`: single public farm-synchronous canonical series cache
+- `tasks/<task_id>/<feature_protocol_id>`: experiment-facing task bundle with protocol-selected series/static/known-future payloads
 
 The cache is disposable and can be rebuilt from the read-only source dataset directories.
 
@@ -118,11 +125,12 @@ This sidecar is the repository's default spatial interface. It does not precompu
 ## Current Semantics
 
 - The package is forecasting-oriented, not a faithful table-by-table mirror of the official releases.
-- `silver` preserves dataset-specific structure; `gold_base` is the model-ready projection.
-- Default `gold_base` layout is farm-synchronous long form on a shared farm time axis.
-- Explicit `layout="turbine"` remains available for single-turbine baselines and compatibility consumers.
+- `silver` preserves dataset-specific structure; `gold_base` is the shared canonical farm-synchronous projection.
+- `gold_base` no longer exposes public `quality_profile` or `layout` dimensions.
+- Raw source-column filtering is driven by `src/wind_datasets/data/source_column_policy/<dataset>.csv` and happens before downstream normalization/join work.
 - Farm-synchronous rows expose `farm_turbines_expected`, `farm_turbines_observed`, `farm_turbines_with_target`, and synchronous-coverage flags.
-- Farm task caches write a task-local `turbine_static.parquet` with stable `turbine_index` ordering.
+- Task bundles are the only supported experiment entry point for active families.
+- Farm task caches write a task-local `static.parquet` with stable `turbine_index` ordering.
 - Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is the row-blocking audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented row-level rule flagged it.
 - `feature_quality_flags` is a non-blocking feature-source audit field. It records duplicate-resolution or auxiliary-source issues that should stay visible downstream without automatically invalidating the row.
@@ -130,6 +138,8 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - `sdwpf_kddcup default` means “implemented SDWPF unknown/abnormal rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
 - `sdwpf_kddcup` gold/task builds are fail-closed when manifest time-semantics audit finds `Day + Tmstamp` values incompatible with the documented 245-day 10-minute grid.
 - `TaskSpec.next_6h_from_24h()` now defaults to `granularity="farm"`.
+
+Exact retained raw columns and masking behavior are defined by the per-dataset source policy CSVs. Dataset-card summaries below are descriptive; the source policy files are the operational ground truth.
 
 ## Dataset Cards
 
@@ -161,8 +171,7 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
-  - default feature set: all numeric turbine SCADA predictors found in the continuous exports
-  - explicit `feature_set="lightweight"`: 13 selected SCADA continuous features
+  - all numeric turbine SCADA predictors found in the continuous exports
   - farm-shared PMU features
   - farm-shared grid meter features
   - turbine status event features
@@ -183,7 +192,7 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - legacy release: `2016-06-02` to `2021-06-30`
   - extended release package: `2016-06-02` to `2024-12-31`
   - turbine-level caveat: `WT11-15` extend to `2024-12-31`; `WT01/02/04/05/06/07/08/09/10` have last observations on `2023-12-31`
-  - farm-synchronous caveat: do not treat `2024-12-31` as full-farm task-ready coverage; current `cache/penmanshiel/gold_base/default/farm/default/quality_report.json` reports `common_coverage_end = 2023-12-31T23:50:00` and `full_target_coverage_end = 2023-12-31T23:50:00`
+  - farm-synchronous caveat: do not treat `2024-12-31` as full-farm task-ready coverage; current `cache/penmanshiel/gold_base/default/farm/quality_report.json` reports `common_coverage_end = 2023-12-31T23:50:00` and `full_target_coverage_end = 2023-12-31T23:50:00`
 - Time semantics: UTC, source timestamps are treated as naive UTC values
 - Official assets:
   - KMZ layout
@@ -203,8 +212,7 @@ This sidecar is the repository's default spatial interface. It does not precompu
   - causal turbine/farm status event features
 - Current default `gold_base`:
   - target `Power (kW)`
-  - default feature set: all numeric turbine SCADA predictors found in the continuous exports
-  - explicit `feature_set="lightweight"`: 13 selected SCADA continuous features
+  - all numeric turbine SCADA predictors found in the continuous exports
   - farm-shared PMU features
   - farm-shared grid meter features
   - turbine status event features
@@ -373,7 +381,7 @@ That default command rebuilds the standard cache stack for all four supported da
 
 - `manifest`
 - `silver`
-- `gold_base/default/farm/default`
+- `gold_base/default/farm`
 - `tasks/default/farm/next_6h_from_24h`
 
 Common variants:
@@ -423,7 +431,7 @@ Fingerprint inputs are layer-specific:
 
 - `manifest`: dataset id, handler, dataset-spec fingerprint, manifest-layer code fingerprint, and a source snapshot fingerprint derived from source file `relative_path + size_bytes + mtime_ns`
 - `silver`: dataset id, handler, dataset-spec fingerprint, silver-layer code fingerprint, the resolved `manifest` fingerprint, and any declared repo-packaged preprocessing dependency fingerprints
-- `gold_base`: dataset id, handler, dataset-spec fingerprint, gold-layer code fingerprint, the resolved `silver` fingerprint, plus `quality_profile`, `layout`, and `feature_set`
+- `gold_base`: dataset id, handler, dataset-spec fingerprint, gold-layer code fingerprint, the resolved `silver` fingerprint, plus `quality_profile`, `layout`, and the dataset feature-policy fingerprint
 - `task`: dataset id, handler, dataset-spec fingerprint, task-layer code fingerprint, the resolved `gold_base` fingerprint, plus the resolved `TaskSpec`
 
 This gives the usual layered invalidation behavior:
@@ -431,7 +439,7 @@ This gives the usual layered invalidation behavior:
 - source data changes invalidate `manifest`, which in turn invalidates `silver`, `gold_base`, and `task`
 - preprocessing code changes invalidate the layer whose code fingerprint changed, then all descendants
 - repo-packaged preprocessing dependency changes invalidate the layer that declares them, then all descendants
-- parameter changes such as `layout`, `feature_set`, `quality_profile`, or `TaskSpec` invalidate only the affected layer and its descendants
+- parameter changes such as `layout`, `quality_profile`, or `TaskSpec`, plus feature-policy CSV edits, invalidate only the affected layer and its descendants
 - caches created before `_build_meta.json` existed are treated as stale and are rebuilt on first read or explicit rebuild
 
 Read paths now require freshness, not just file presence:

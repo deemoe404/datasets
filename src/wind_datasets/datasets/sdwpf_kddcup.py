@@ -6,6 +6,7 @@ from pathlib import Path
 
 import polars as pl
 
+from ..source_column_policy import apply_keep_mask_rules, kept_source_columns
 from ..utils import ensure_directory, read_json
 from .base import BaseDatasetBuilder
 from .common import (
@@ -74,6 +75,7 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
 
     def build_silver(self) -> Path:
         self.ensure_manifest()
+        source_policy = self.load_source_column_policy()
         ensure_directory(self.cache_paths.silver_meta_dir)
         ensure_directory(self.cache_paths.silver_dir)
         (
@@ -81,9 +83,26 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
                 self.spec.source_root / _KDDCUP_MAIN_CSV,
                 null_values=["NaN", "nan"],
             )
+            .select(
+                list(
+                    kept_source_columns(
+                        source_policy,
+                        source_asset="main_csv",
+                        source_table_or_file="sdwpf_main",
+                    )
+                )
+            )
             .sink_parquet(self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET)
         )
-        location_frame = pl.read_csv(self.spec.source_root / _KDDCUP_LOCATION_CSV)
+        location_frame = pl.read_csv(self.spec.source_root / _KDDCUP_LOCATION_CSV).select(
+            list(
+                kept_source_columns(
+                    source_policy,
+                    source_asset="location_csv",
+                    source_table_or_file="sdwpf_location",
+                )
+            )
+        )
         location_frame.write_parquet(
             self.cache_paths.silver_meta_dir / _KDDCUP_LOCATION_PARQUET
         )
@@ -118,11 +137,7 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
 
     def gold_base_blocked_reason(
         self,
-        quality_profile: str,
-        layout: str,
-        feature_set: str,
     ) -> str | None:
-        del quality_profile, layout, feature_set
         if self.manifest_status().status != "fresh":
             return None
         manifest_payload = read_json(self.cache_paths.manifest_path)
@@ -135,32 +150,26 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
 
     def task_cache_blocked_reason(
         self,
-        quality_profile: str,
         task,
+        feature_protocol_id: str,
     ) -> str | None:
-        del quality_profile, task
-        return self.gold_base_blocked_reason("default", "farm", "default")
+        del task, feature_protocol_id
+        return self.gold_base_blocked_reason()
 
     def build_gold_base(
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> Path:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
         self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
         _assert_sdwpf_time_semantics_supported(manifest_payload)
+        source_policy = self.load_source_column_policy()
         frame = pl.read_parquet(self.cache_paths.silver_dir / _KDDCUP_MAIN_PARQUET)
         timestamp_expr = _timestamp_expr_for_dtypes(frame.schema["Tmstamp"])
-        feature_columns = [
-            column
-            for column in frame.columns
-            if column not in {"TurbID", "Day", "Tmstamp", self.spec.target_column}
-        ]
         target_expr = pl.col(self.spec.target_column).cast(pl.Float64, strict=False)
         unknown_patv_wspd_expr = (
             target_expr.le(0) & pl.col("Wspd").cast(pl.Float64, strict=False).gt(2.5)
@@ -180,33 +189,59 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             pl.col("Wdir").cast(pl.Float64, strict=False).lt(-180)
             | pl.col("Wdir").cast(pl.Float64, strict=False).gt(180)
         ).fill_null(False)
-        is_unknown_value_expr = (unknown_patv_wspd_expr | unknown_pitch_expr).fill_null(False)
-        is_abnormal_value_expr = (abnormal_ndir_expr | abnormal_wdir_expr).fill_null(False)
-        base_quality_flags_expr = pl.concat_str(
-            [
-                pl.when(unknown_patv_wspd_expr)
-                .then(pl.lit("sdwpf_unknown_patv_wspd"))
-                .otherwise(None),
-                pl.when(unknown_pitch_expr).then(pl.lit("sdwpf_unknown_pitch")).otherwise(None),
-                pl.when(abnormal_ndir_expr).then(pl.lit("sdwpf_abnormal_ndir")).otherwise(None),
-                pl.when(abnormal_wdir_expr).then(pl.lit("sdwpf_abnormal_wdir")).otherwise(None),
-            ],
-            separator="|",
-            ignore_nulls=True,
-        ).fill_null("")
+        flagged_frame = frame.with_columns(
+            unknown_patv_wspd_expr.alias("__flag_unknown_patv_wspd"),
+            unknown_pitch_expr.alias("__flag_unknown_pitch"),
+            abnormal_ndir_expr.alias("__flag_abnormal_ndir"),
+            abnormal_wdir_expr.alias("__flag_abnormal_wdir"),
+        )
+        masked_frame = apply_keep_mask_rules(
+            flagged_frame,
+            policy=source_policy,
+            source_asset="main_csv",
+            source_table_or_file="sdwpf_main",
+        )
+        feature_columns = [
+            column
+            for column in masked_frame.columns
+            if column not in {"TurbID", "Day", "Tmstamp", self.spec.target_column}
+            and not column.startswith("__flag_")
+        ]
 
-        gold_input = frame.with_columns(
+        gold_input = masked_frame.with_columns(
             pl.col("TurbID").cast(pl.String).alias("turbine_id"),
             timestamp_expr,
             target_expr.alias("target_kw"),
             pl.lit(self.spec.dataset_id).alias("dataset"),
             pl.lit(True).alias("__row_present"),
-            is_unknown_value_expr.alias("sdwpf_is_unknown"),
-            is_abnormal_value_expr.alias("sdwpf_is_abnormal"),
-            (is_unknown_value_expr | is_abnormal_value_expr)
+            (pl.col("__flag_unknown_patv_wspd") | pl.col("__flag_unknown_pitch"))
+            .fill_null(False)
+            .alias("sdwpf_is_unknown"),
+            (pl.col("__flag_abnormal_ndir") | pl.col("__flag_abnormal_wdir"))
+            .fill_null(False)
+            .alias("sdwpf_is_abnormal"),
+            (
+                pl.col("__flag_unknown_patv_wspd")
+                | pl.col("__flag_unknown_pitch")
+                | pl.col("__flag_abnormal_ndir")
+                | pl.col("__flag_abnormal_wdir")
+            )
             .fill_null(False)
             .alias("sdwpf_is_masked"),
-            base_quality_flags_expr.alias("__base_quality_flags"),
+            pl.concat_str(
+                [
+                    pl.when(pl.col("__flag_unknown_patv_wspd"))
+                    .then(pl.lit("sdwpf_unknown_patv_wspd"))
+                    .otherwise(None),
+                    pl.when(pl.col("__flag_unknown_pitch")).then(pl.lit("sdwpf_unknown_pitch")).otherwise(None),
+                    pl.when(pl.col("__flag_abnormal_ndir")).then(pl.lit("sdwpf_abnormal_ndir")).otherwise(None),
+                    pl.when(pl.col("__flag_abnormal_wdir")).then(pl.lit("sdwpf_abnormal_wdir")).otherwise(None),
+                ],
+                separator="|",
+                ignore_nulls=True,
+            )
+            .fill_null("")
+            .alias("__base_quality_flags"),
             pl.lit("").alias("__feature_quality_flags"),
             *[pl.col(column).cast(pl.Float64, strict=False) for column in feature_columns],
         ).select(
@@ -225,24 +260,10 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             ]
         )
 
-        gold_base = reindex_regular_series(gold_input, self.spec, layout=resolved_layout)
-        ensure_directory(
-            self.cache_paths.gold_base_profile_dir(
-                resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
-        )
-        series_path = self.cache_paths.gold_base_series_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        quality_path = self.cache_paths.gold_base_quality_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
+        gold_base = reindex_regular_series(gold_input, self.spec, layout="farm")
+        ensure_directory(self.cache_paths.gold_base_dir)
+        series_path = self.cache_paths.gold_base_series_path
+        quality_path = self.cache_paths.gold_base_quality_path
         gold_base.write_parquet(series_path)
 
         flag_counts = gold_input.select(
@@ -286,13 +307,12 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             manifest_payload,
             self.spec,
             extra={
-                "quality_profile": resolved_quality_profile,
-                "layout": resolved_layout,
-                "feature_set": resolved_feature_set,
+                "series_layout": "farm_synchronous",
                 "calendar_anchor_date": _KDDCUP_CALENDAR_ANCHOR.date().isoformat(),
                 "sdwpf_unknown_count": int(flag_counts["sdwpf_unknown_count"] or 0),
                 "sdwpf_abnormal_count": int(flag_counts["sdwpf_abnormal_count"] or 0),
                 "sdwpf_masked_count": int(flag_counts["sdwpf_masked_count"] or 0),
+                **self.source_policy_report_extra(source_policy),
                 "sdwpf_flag_counts": {
                     "sdwpf_unknown_patv_wspd": int(flag_counts["sdwpf_unknown_patv_wspd"] or 0),
                     "sdwpf_unknown_pitch": int(flag_counts["sdwpf_unknown_pitch"] or 0),
@@ -303,9 +323,5 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
             },
         )
         write_quality_report(quality_path, report)
-        self._write_gold_base_build_meta(
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
+        self._write_gold_base_build_meta()
         return series_path

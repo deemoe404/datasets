@@ -15,6 +15,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..utils import ensure_directory, read_json, write_json
+from ..source_column_policy import filter_source_frame, kept_source_columns
+from ..source_schema import normalize_source_header
 from .base import BaseDatasetBuilder
 from .common import (
     ParquetChunkWriter,
@@ -29,22 +31,6 @@ from .common import (
     write_quality_report,
 )
 
-_GREENBYTE_LIGHTWEIGHT_FEATURES = [
-    "Wind speed (m/s)",
-    "Wind direction (°)",
-    "Nacelle position (°)",
-    "Generator RPM (RPM)",
-    "Rotor speed (RPM)",
-    "Ambient temperature (converter) (°C)",
-    "Nacelle temperature (°C)",
-    "Power factor (cosphi)",
-    "Reactive power (kvar)",
-    "Grid frequency (Hz)",
-    "Blade angle (pitch position) A (°)",
-    "Blade angle (pitch position) B (°)",
-    "Blade angle (pitch position) C (°)",
-]
-_GREENBYTE_SUPPORTED_FEATURE_SETS = {"default", "lightweight"}
 _GREENBYTE_NON_FEATURE_COLUMNS = {
     "Date and time",
     "turbine_id",
@@ -193,10 +179,12 @@ def _write_greenbyte_comment_table_file(
     dataset_id: str,
     entity_column: str,
     entity_value: str,
+    selected_headers: tuple[str, ...] | None = None,
     conflict_output_path: Path | None = None,
 ) -> dict[str, Any]:
     metadata = _read_greenbyte_comment_table_metadata(path)
-    headers = next(csv.reader([metadata["header_line"]]))
+    headers = normalize_source_header(next(csv.reader([metadata["header_line"]])), drop_empty=True)
+    selected_header_set = set(selected_headers or ())
     source_file = str(path.relative_to(path.parents[1]))
     data_writer = ParquetChunkWriter(output_path)
     conflict_writer = (
@@ -274,7 +262,11 @@ def _write_greenbyte_comment_table_file(
         for idx in range(1, column_count):
             merged[headers[idx]] = best_values[idx]
             seen_value = seen_values[idx]
-            if isinstance(seen_value, set) and len(seen_value) > 1:
+            if (
+                isinstance(seen_value, set)
+                and len(seen_value) > 1
+                and (not selected_header_set or headers[idx] in selected_header_set)
+            ):
                 conflict_columns += 1
                 existing_value = best_values[idx]
                 for alternative_value in sorted(value for value in seen_value if value != existing_value):
@@ -301,6 +293,12 @@ def _write_greenbyte_comment_table_file(
         merged["source_file"] = source_file
         merged["row_conflict_count"] = conflict_columns
         merged["source_row_count"] = state["source_row_count"]
+        if selected_header_set:
+            merged = {
+                key: value
+                for key, value in merged.items()
+                if key in selected_header_set or key in {entity_column, "source_file", "row_conflict_count", "source_row_count"}
+            }
         merged_buffer.append(merged)
         if len(merged_buffer) >= 10_000:
             data_writer.write_rows(merged_buffer)
@@ -326,6 +324,7 @@ def _write_greenbyte_continuous_file(
     output_path: Path,
     conflict_output_path: Path,
     dataset_id: str,
+    selected_headers: tuple[str, ...],
 ) -> dict[str, Any]:
     metadata = _read_greenbyte_metadata(path)
     return _write_greenbyte_comment_table_file(
@@ -334,6 +333,7 @@ def _write_greenbyte_continuous_file(
         dataset_id,
         entity_column="turbine_id",
         entity_value=metadata["turbine_id"],
+        selected_headers=selected_headers,
         conflict_output_path=conflict_output_path,
     )
 
@@ -344,12 +344,14 @@ def _process_greenbyte_continuous_source(
     conflict_output_path_str: str,
     stats_output_path_str: str,
     dataset_id: str,
+    selected_headers: tuple[str, ...],
 ) -> dict[str, Any]:
     stats = _write_greenbyte_continuous_file(
         Path(path_str),
         Path(output_path_str),
         Path(conflict_output_path_str),
         dataset_id,
+        selected_headers,
     )
     write_json(Path(stats_output_path_str), stats)
     return stats
@@ -504,7 +506,13 @@ def _standardize_greenbyte_shared_parts(
     )
 
 
-def _write_greenbyte_device_part(path: Path, output_path: Path, dataset_id: str) -> dict[str, Any]:
+def _write_greenbyte_device_part(
+    path: Path,
+    output_path: Path,
+    dataset_id: str,
+    *,
+    selected_headers: tuple[str, ...],
+) -> dict[str, Any]:
     metadata = _read_greenbyte_comment_table_metadata(path)
     return _write_greenbyte_comment_table_file(
         path,
@@ -512,6 +520,7 @@ def _write_greenbyte_device_part(path: Path, output_path: Path, dataset_id: str)
         dataset_id,
         entity_column="asset_id",
         entity_value=metadata["asset_id"],
+        selected_headers=selected_headers,
     )
 
 
@@ -643,15 +652,6 @@ def _join_greenbyte_extra_frames(base: pl.DataFrame, cache_paths) -> pl.DataFram
 
 
 class GreenbyteDatasetBuilder(BaseDatasetBuilder):
-    def resolve_feature_set(self, feature_set: str | None = None) -> str:
-        resolved = feature_set or "default"
-        if resolved not in _GREENBYTE_SUPPORTED_FEATURE_SETS:
-            supported = ", ".join(sorted(_GREENBYTE_SUPPORTED_FEATURE_SETS))
-            raise ValueError(
-                f"Unsupported greenbyte feature_set {resolved!r}. Expected one of: {supported}."
-            )
-        return resolved
-
     def required_silver_paths(self) -> tuple[Path, ...]:
         return (
             self.cache_paths.silver_turbine_static_path,
@@ -665,6 +665,7 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
 
     def build_silver(self) -> Path:
         self.ensure_manifest()
+        source_policy = self.load_source_column_policy()
         ensure_directory(self.cache_paths.silver_continuous_dir)
         ensure_directory(self.cache_paths.silver_events_dir)
         ensure_directory(self.cache_paths.silver_shared_ts_dir)
@@ -690,6 +691,12 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
                     str(conflict_part_path),
                     str(stats_part_path),
                     self.spec.dataset_id,
+                    kept_source_columns(
+                        source_policy,
+                        source_asset="turbine_scada",
+                        source_table_or_file="Turbine_Data",
+                        always_keep=("Date and time",),
+                    ),
                 )
             )
 
@@ -717,7 +724,18 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
                 continue
             part_path = shared_parts_dir / f"{path.stem}.parquet"
             if not part_path.exists():
-                _write_greenbyte_device_part(path, part_path, self.spec.dataset_id)
+                source_table = "Device_Data_PMU" if group_name == "farm_pmu" else "Device_Data_Grid_Meter"
+                _write_greenbyte_device_part(
+                    path,
+                    part_path,
+                    self.spec.dataset_id,
+                    selected_headers=kept_source_columns(
+                        source_policy,
+                        source_asset=group_name,
+                        source_table_or_file=source_table,
+                        always_keep=("Date and time",),
+                    ),
+                )
             if group_name == "farm_pmu":
                 pmu_part_paths.append(part_path)
             elif group_name == "farm_grid_meter":
@@ -735,22 +753,43 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         ).write_parquet(self.cache_paths.silver_shared_ts_path("farm_grid_meter"))
 
         for path in sorted(self.spec.source_root.rglob("Status_*.csv")):
-            frame = _parse_status_csv(path)
+            frame = filter_source_frame(
+                _parse_status_csv(path),
+                policy=source_policy,
+                source_asset="status_events",
+                source_table_or_file="Status",
+                always_keep=("asset_id", "asset_type", "turbine_id", "source_file"),
+            )
             frame.write_parquet(self.cache_paths.silver_events_dir / f"{path.stem}.parquet")
         _build_greenbyte_status_event_features(self.spec, self.cache_paths)
 
         for path in sorted(self.spec.source_root.glob("*_static.csv")):
-            pl.read_csv(path).write_parquet(self.cache_paths.silver_meta_dir / f"{path.stem}.parquet")
+            filter_source_frame(
+                pl.read_csv(path),
+                policy=source_policy,
+                source_asset="site_static",
+                source_table_or_file="static",
+            ).write_parquet(self.cache_paths.silver_meta_dir / f"{path.stem}.parquet")
 
         for path in sorted(self.spec.source_root.glob("*_dataSignalMapping.csv")):
-            pl.read_csv(path).write_parquet(self.cache_paths.silver_meta_dir / f"{path.stem}.parquet")
+            filter_source_frame(
+                pl.read_csv(path),
+                policy=source_policy,
+                source_asset="signal_mapping",
+                source_table_or_file="dataSignalMapping",
+            ).write_parquet(self.cache_paths.silver_meta_dir / f"{path.stem}.parquet")
 
         for path in sorted(self.spec.source_root.glob("*_dataSignalMapping.xlsx")):
             shutil.copy2(path, self.cache_paths.silver_meta_dir / path.name)
 
         static_frames: list[pl.DataFrame] = []
         for path in sorted(self.spec.source_root.glob("*_WT_static.csv")):
-            frame = pl.read_csv(path).select(
+            frame = filter_source_frame(
+                pl.read_csv(path),
+                policy=source_policy,
+                source_asset="turbine_static",
+                source_table_or_file="WT_static",
+            ).select(
                 pl.lit(self.spec.dataset_id).alias("dataset"),
                 pl.col("Title").cast(pl.String).alias("turbine_id"),
                 pl.coalesce(
@@ -798,25 +837,21 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> Path:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
         self.ensure_silver_fresh()
 
         manifest_payload = self.ensure_manifest()
+        source_policy = self.load_source_column_policy()
         frames: list[pl.DataFrame] = []
         duplicate_source_rows = 0
         conflict_value_count = 0
         continuous_paths = sorted(self.cache_paths.silver_continuous_dir.glob("*.parquet"))
-        if resolved_feature_set == "lightweight":
-            selected_feature_columns = list(_GREENBYTE_LIGHTWEIGHT_FEATURES)
-        else:
-            selected_feature_columns = _discover_greenbyte_feature_columns(
-                continuous_paths,
-                self.spec.target_column,
-            )
+        selected_feature_columns = _discover_greenbyte_feature_columns(
+            continuous_paths,
+            self.spec.target_column,
+        )
 
         for path in continuous_paths:
             frame = pl.read_parquet(path)
@@ -862,26 +897,12 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
         gold_base = reindex_regular_series(
             pl.concat(frames, how="vertical"),
             self.spec,
-            layout=resolved_layout,
+            layout="farm",
         )
         gold_base = _join_greenbyte_extra_frames(gold_base, self.cache_paths)
-        ensure_directory(
-            self.cache_paths.gold_base_profile_dir(
-                resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
-        )
-        series_path = self.cache_paths.gold_base_series_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        quality_path = self.cache_paths.gold_base_quality_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
+        ensure_directory(self.cache_paths.gold_base_dir)
+        series_path = self.cache_paths.gold_base_series_path
+        quality_path = self.cache_paths.gold_base_quality_path
         gold_base.write_parquet(series_path)
         del gold_base
         del frames
@@ -893,18 +914,13 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
             manifest_payload,
             self.spec,
             extra={
-                "quality_profile": resolved_quality_profile,
-                "layout": resolved_layout,
-                "feature_set": resolved_feature_set,
+                "series_layout": "farm_synchronous",
                 "duplicate_source_row_groups": duplicate_source_rows,
                 "conflict_value_count": conflict_value_count,
+                **self.source_policy_report_extra(source_policy),
                 **build_coverage_summary(report_frame, self.spec),
             },
         )
         write_quality_report(quality_path, report)
-        self._write_gold_base_build_meta(
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
+        self._write_gold_base_build_meta()
         return series_path

@@ -11,7 +11,7 @@ from .models import DatasetSpec, ResolvedTaskSpec
 from .paths import DatasetCachePaths
 from .utils import ensure_directory, read_json, write_json
 
-CACHE_STATE_SCHEMA_VERSION = "v1"
+CACHE_STATE_SCHEMA_VERSION = "v2"
 
 _IGNORED_FILE_NAMES = {".DS_Store"}
 _IGNORED_SUFFIXES = {".swp", ".webloc"}
@@ -27,7 +27,10 @@ _PACKAGED_LAYER_DEPENDENCIES = {
 _COMMON_FILES = (
     "datasets/base.py",
     "datasets/common.py",
+    "feature_protocols.py",
     "models.py",
+    "source_column_policy.py",
+    "source_schema.py",
     "utils.py",
     "paths.py",
 )
@@ -98,6 +101,7 @@ def code_fingerprint_for(layer: str, handler: str) -> str:
             _PACKAGE_ROOT / "manifest.py",
             _PACKAGE_ROOT / "registry.py",
             _PACKAGE_ROOT / "models.py",
+            _PACKAGE_ROOT / "source_schema.py",
             _PACKAGE_ROOT / "utils.py",
             _PACKAGE_ROOT / "paths.py",
         ]
@@ -111,8 +115,10 @@ def code_fingerprint_for(layer: str, handler: str) -> str:
     return hash_files(files)
 
 
-def packaged_dependency_fingerprint_for(layer: str, handler: str) -> str | None:
-    relative_paths = _PACKAGED_LAYER_DEPENDENCIES.get((layer, handler), ())
+def packaged_dependency_fingerprint_for(layer: str, spec: DatasetSpec) -> str | None:
+    relative_paths = list(_PACKAGED_LAYER_DEPENDENCIES.get((layer, spec.handler), ()))
+    if layer == "gold_base":
+        relative_paths.append(f"data/source_column_policy/{spec.dataset_id}.csv")
     if not relative_paths:
         return None
     files = [_PACKAGE_ROOT / relative for relative in relative_paths]
@@ -187,26 +193,19 @@ def build_meta_path_for(
     cache_paths: DatasetCachePaths,
     layer: str,
     *,
-    quality_profile: str | None = None,
-    layout: str | None = None,
-    feature_set: str | None = None,
-    granularity: str | None = None,
     task_id: str | None = None,
+    feature_protocol_id: str | None = None,
 ) -> Path:
     if layer == "manifest":
         return cache_paths.manifest_build_meta_path
     if layer == "silver":
         return cache_paths.silver_build_meta_path
     if layer == "gold_base":
-        assert quality_profile is not None
-        assert layout is not None
-        assert feature_set is not None
-        return cache_paths.gold_base_build_meta_path_for(quality_profile, layout=layout, feature_set=feature_set)
+        return cache_paths.gold_base_build_meta_path
     if layer == "task":
-        assert quality_profile is not None
-        assert granularity is not None
         assert task_id is not None
-        return cache_paths.task_build_meta_path_for(quality_profile, granularity, task_id)
+        assert feature_protocol_id is not None
+        return cache_paths.task_build_meta_path_for(task_id, feature_protocol_id)
     raise ValueError(f"Unsupported cache layer {layer!r}.")
 
 
@@ -272,7 +271,7 @@ def manifest_meta_from_payload(spec: DatasetSpec, payload: dict[str, Any]) -> La
 def expected_silver_meta(spec: DatasetSpec) -> LayerBuildMeta:
     manifest_meta = expected_manifest_meta(spec)
     params: dict[str, Any] = {}
-    packaged_dependency_fingerprint = packaged_dependency_fingerprint_for("silver", spec.handler)
+    packaged_dependency_fingerprint = packaged_dependency_fingerprint_for("silver", spec)
     if packaged_dependency_fingerprint is not None:
         params["packaged_dependency_fingerprint"] = packaged_dependency_fingerprint
     return _make_meta(
@@ -287,40 +286,29 @@ def expected_silver_meta(spec: DatasetSpec) -> LayerBuildMeta:
 
 def expected_gold_base_meta(
     spec: DatasetSpec,
-    *,
-    quality_profile: str,
-    layout: str,
-    feature_set: str,
 ) -> LayerBuildMeta:
     silver_meta = expected_silver_meta(spec)
+    params: dict[str, Any] = {}
+    packaged_dependency_fingerprint = packaged_dependency_fingerprint_for("gold_base", spec)
+    if packaged_dependency_fingerprint is not None:
+        params["packaged_dependency_fingerprint"] = packaged_dependency_fingerprint
     return _make_meta(
         layer="gold_base",
         dataset_id=spec.dataset_id,
         code_fingerprint=code_fingerprint_for("gold_base", spec.handler),
         parent_fingerprint=silver_meta.fingerprint,
         spec_fingerprint=spec_fingerprint_for(spec),
-        params={
-            "quality_profile": quality_profile,
-            "layout": layout,
-            "feature_set": feature_set,
-        },
+        params=params,
     )
 
 
 def expected_task_meta(
     spec: DatasetSpec,
     *,
-    quality_profile: str,
     task: ResolvedTaskSpec,
-    feature_set: str,
+    feature_protocol_id: str,
 ) -> LayerBuildMeta:
-    layout = "farm" if task.granularity == "farm" else "turbine"
-    gold_meta = expected_gold_base_meta(
-        spec,
-        quality_profile=quality_profile,
-        layout=layout,
-        feature_set=feature_set,
-    )
+    gold_meta = expected_gold_base_meta(spec)
     return _make_meta(
         layer="task",
         dataset_id=spec.dataset_id,
@@ -328,8 +316,8 @@ def expected_task_meta(
         parent_fingerprint=gold_meta.fingerprint,
         spec_fingerprint=spec_fingerprint_for(spec),
         params={
-            "quality_profile": quality_profile,
             "task": task.to_dict(),
+            "feature_protocol_id": feature_protocol_id,
         },
     )
 
@@ -361,37 +349,15 @@ def check_gold_base_status(
     spec: DatasetSpec,
     cache_paths: DatasetCachePaths,
     *,
-    quality_profile: str,
-    layout: str,
-    feature_set: str,
     blocked_reason: str | None = None,
 ) -> LayerStatus:
-    expected = expected_gold_base_meta(
-        spec,
-        quality_profile=quality_profile,
-        layout=layout,
-        feature_set=feature_set,
-    )
+    expected = expected_gold_base_meta(spec)
     return _check_layer_status(
         expected=expected,
-        actual=read_build_meta(
-            cache_paths.gold_base_build_meta_path_for(
-                quality_profile,
-                layout=layout,
-                feature_set=feature_set,
-            )
-        ),
+        actual=read_build_meta(cache_paths.gold_base_build_meta_path),
         required_outputs=(
-            cache_paths.gold_base_series_path_for(
-                quality_profile,
-                layout=layout,
-                feature_set=feature_set,
-            ),
-            cache_paths.gold_base_quality_path_for(
-                quality_profile,
-                layout=layout,
-                feature_set=feature_set,
-            ),
+            cache_paths.gold_base_series_path,
+            cache_paths.gold_base_quality_path,
         ),
         layer="gold_base",
         blocked_reason=blocked_reason,
@@ -402,35 +368,26 @@ def check_task_status(
     spec: DatasetSpec,
     cache_paths: DatasetCachePaths,
     *,
-    quality_profile: str,
     task: ResolvedTaskSpec,
-    feature_set: str,
+    feature_protocol_id: str,
     blocked_reason: str | None = None,
 ) -> LayerStatus:
     required_outputs = [
-        cache_paths.task_window_index_path_for(quality_profile, task.granularity, task.task_id),
-        cache_paths.task_report_path_for(quality_profile, task.granularity, task.task_id),
-        cache_paths.task_context_path_for(quality_profile, task.granularity, task.task_id),
+        cache_paths.task_series_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_known_future_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_turbine_static_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_window_index_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_report_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_context_path_for(task.task_id, feature_protocol_id),
     ]
-    if task.granularity == "farm":
-        required_outputs.append(
-            cache_paths.task_turbine_static_path_for(quality_profile, task.granularity, task.task_id)
-        )
     expected = expected_task_meta(
         spec,
-        quality_profile=quality_profile,
         task=task,
-        feature_set=feature_set,
+        feature_protocol_id=feature_protocol_id,
     )
     return _check_layer_status(
         expected=expected,
-        actual=read_build_meta(
-            cache_paths.task_build_meta_path_for(
-                quality_profile,
-                task.granularity,
-                task.task_id,
-            )
-        ),
+        actual=read_build_meta(cache_paths.task_build_meta_path_for(task.task_id, feature_protocol_id)),
         required_outputs=tuple(required_outputs),
         layer="task",
         blocked_reason=blocked_reason,

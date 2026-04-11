@@ -16,9 +16,20 @@ from ..cache_state import (
     expected_task_meta,
     write_build_meta,
 )
+from ..feature_protocols import (
+    DEFAULT_FEATURE_PROTOCOL_ID,
+    build_known_future_frame,
+    protocol_context_dict,
+    select_task_series_columns,
+)
 from ..manifest import build_manifest
-from ..models import DatasetSpec, ResolvedTaskSpec, TaskSpec
+from ..models import DatasetSpec, LoadedTaskBundle, ResolvedTaskSpec, TaskBundlePaths, TaskSpec
 from ..paths import dataset_cache_paths
+from ..source_column_policy import (
+    SourceColumnPolicy,
+    load_source_column_policy,
+    validate_policy_coverage,
+)
 from ..utils import ensure_directory, read_json, write_json
 from .common import DUPLICATE_AUDIT_SCHEMA, build_window_index_from_series_path
 
@@ -30,19 +41,29 @@ class BaseDatasetBuilder:
         self.cache_paths = dataset_cache_paths(cache_root, spec.dataset_id)
 
     def resolve_quality_profile(self, quality_profile: str | None = None) -> str:
-        return quality_profile or self.spec.default_quality_profile
+        resolved = quality_profile or self.spec.default_quality_profile
+        if resolved != "default":
+            raise ValueError(
+                "quality_profile is no longer a public cache dimension. Only the legacy default profile remains valid."
+            )
+        return resolved
 
     def resolve_series_layout(self, layout: str | None = None) -> str:
         resolved = layout or "farm"
-        if resolved not in {"farm", "turbine"}:
-            raise ValueError(f"Unsupported series layout {resolved!r}. Expected 'farm' or 'turbine'.")
+        if resolved != "farm":
+            raise ValueError(
+                "gold_base is now a single farm-synchronous cache. Only layout='farm' remains supported."
+            )
         return resolved
 
-    def resolve_feature_set(self, feature_set: str | None = None) -> str:
-        return feature_set or "default"
-
-    def default_task_feature_set(self) -> str:
-        return self.resolve_feature_set(None)
+    def _resolve_supported_task(self, task_spec: TaskSpec) -> ResolvedTaskSpec:
+        resolved = task_spec.resolve(self.spec.resolution_minutes)
+        if resolved.granularity != "farm":
+            raise ValueError(
+                "Only farm-level task bundles remain supported in the active architecture. "
+                f"Received granularity={resolved.granularity!r}."
+            )
+        return resolved
 
     def ensure_manifest(self) -> dict[str, Any]:
         if self.manifest_status().status != "fresh":
@@ -69,58 +90,40 @@ class BaseDatasetBuilder:
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> LayerStatus:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
         return check_gold_base_status(
             self.spec,
             self.cache_paths,
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-            blocked_reason=self.gold_base_blocked_reason(
-                resolved_quality_profile,
-                resolved_layout,
-                resolved_feature_set,
-            ),
+            blocked_reason=self.gold_base_blocked_reason(),
         )
 
     def task_cache_status(
         self,
         task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
         quality_profile: str | None = None,
     ) -> LayerStatus:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_task = task_spec.resolve(self.spec.resolution_minutes)
+        self.resolve_quality_profile(quality_profile)
+        resolved_task = self._resolve_supported_task(task_spec)
         return check_task_status(
             self.spec,
             self.cache_paths,
-            quality_profile=resolved_quality_profile,
             task=resolved_task,
-            feature_set=self.default_task_feature_set(),
-            blocked_reason=self.task_cache_blocked_reason(
-                resolved_quality_profile,
-                resolved_task,
-            ),
+            feature_protocol_id=feature_protocol_id,
+            blocked_reason=self.task_cache_blocked_reason(resolved_task, feature_protocol_id),
         )
 
-    def gold_base_blocked_reason(
-        self,
-        quality_profile: str,
-        layout: str,
-        feature_set: str,
-    ) -> str | None:
-        del quality_profile, layout, feature_set
+    def gold_base_blocked_reason(self) -> str | None:
         return None
 
     def task_cache_blocked_reason(
         self,
-        quality_profile: str,
         task: ResolvedTaskSpec,
+        feature_protocol_id: str,
     ) -> str | None:
-        del quality_profile, task
+        del task, feature_protocol_id
         return None
 
     def ensure_silver_fresh(self) -> None:
@@ -131,26 +134,26 @@ class BaseDatasetBuilder:
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> None:
-        if self.gold_base_status(
-            quality_profile=quality_profile,
-            layout=layout,
-            feature_set=feature_set,
-        ).status != "fresh":
-            self.build_gold_base(
-                quality_profile=quality_profile,
-                layout=layout,
-                feature_set=feature_set,
-            )
+        if self.gold_base_status(quality_profile=quality_profile, layout=layout).status != "fresh":
+            self.build_gold_base(quality_profile=quality_profile, layout=layout)
 
     def ensure_task_cache_fresh(
         self,
         task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
         quality_profile: str | None = None,
     ) -> None:
-        if self.task_cache_status(task_spec, quality_profile=quality_profile).status != "fresh":
-            self.build_task_cache(task_spec, quality_profile=quality_profile)
+        if self.task_cache_status(
+            task_spec,
+            feature_protocol_id=feature_protocol_id,
+            quality_profile=quality_profile,
+        ).status != "fresh":
+            self.build_task_cache(
+                task_spec,
+                feature_protocol_id=feature_protocol_id,
+                quality_profile=quality_profile,
+            )
 
     def build_silver(self) -> Path:
         raise NotImplementedError
@@ -159,7 +162,6 @@ class BaseDatasetBuilder:
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> Path:
         raise NotImplementedError
 
@@ -199,136 +201,174 @@ class BaseDatasetBuilder:
             self.build_silver()
         return pl.read_parquet(path)
 
-    def build_task_cache(self, task_spec: TaskSpec, quality_profile: str | None = None) -> Path:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved = task_spec.resolve(self.spec.resolution_minutes)
-        series_layout = self.resolve_series_layout(resolved.granularity)
-        self.ensure_gold_base_fresh(
-            quality_profile=resolved_quality_profile,
-            layout=series_layout,
-            feature_set=self.default_task_feature_set(),
-        )
-        gold_base_path = self.cache_paths.gold_base_series_path_for(
-            resolved_quality_profile,
-            layout=series_layout,
-            feature_set=self.default_task_feature_set(),
+    def task_bundle_paths(
+        self,
+        task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
+    ) -> TaskBundlePaths:
+        resolved = self._resolve_supported_task(task_spec)
+        task_dir = self.cache_paths.task_dir_for(resolved.task_id, feature_protocol_id)
+        return TaskBundlePaths(
+            dataset_id=self.spec.dataset_id,
+            task_id=resolved.task_id,
+            feature_protocol_id=feature_protocol_id,
+            task_dir=task_dir,
+            series_path=self.cache_paths.task_series_path_for(resolved.task_id, feature_protocol_id),
+            known_future_path=self.cache_paths.task_known_future_path_for(resolved.task_id, feature_protocol_id),
+            static_path=self.cache_paths.task_turbine_static_path_for(resolved.task_id, feature_protocol_id),
+            window_index_path=self.cache_paths.task_window_index_path_for(resolved.task_id, feature_protocol_id),
+            task_context_path=self.cache_paths.task_context_path_for(resolved.task_id, feature_protocol_id),
+            task_report_path=self.cache_paths.task_report_path_for(resolved.task_id, feature_protocol_id),
+            build_meta_path=self.cache_paths.task_build_meta_path_for(resolved.task_id, feature_protocol_id),
         )
 
-        task_dir = ensure_directory(
-            self.cache_paths.task_dir_for(
-                resolved_quality_profile,
-                resolved.granularity,
-                resolved.task_id,
-            )
+    def build_task_cache(
+        self,
+        task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
+        quality_profile: str | None = None,
+    ) -> Path:
+        self.resolve_quality_profile(quality_profile)
+        resolved = self._resolve_supported_task(task_spec)
+        self.ensure_gold_base_fresh()
+
+        task_paths = self.task_bundle_paths(task_spec, feature_protocol_id=feature_protocol_id)
+        ensure_directory(task_paths.task_dir)
+
+        available_columns = set(pl.scan_parquet(self.cache_paths.gold_base_series_path).collect_schema().names())
+        static_columns = (
+            set(pl.scan_parquet(self.cache_paths.silver_turbine_static_path).collect_schema().names())
+            if self.cache_paths.silver_turbine_static_path.exists()
+            else set()
         )
-        available_columns = set(pl.scan_parquet(gold_base_path).collect_schema().names())
-        output_path = build_window_index_from_series_path(
-            series_path=gold_base_path,
-            task=resolved,
-            output_path=task_dir / "window_index.parquet",
-            report_path=task_dir / "task_report.json",
-            quality_profile=resolved_quality_profile,
+        selection = select_task_series_columns(
+            dataset_id=self.spec.dataset_id,
             available_columns=available_columns,
+            feature_protocol_id=feature_protocol_id,
+            turbine_static_columns=static_columns,
         )
-        if resolved.granularity == "farm":
-            self._write_task_turbine_static(resolved_quality_profile, resolved.task_id, resolved.granularity)
-        self._write_task_context(resolved_quality_profile, resolved)
-        self._write_task_build_meta(
-            quality_profile=resolved_quality_profile,
+
+        series_frame = (
+            pl.scan_parquet(self.cache_paths.gold_base_series_path)
+            .select(list(selection.all_columns))
+            .sort(["turbine_id", "timestamp"])
+            .collect()
+        )
+        series_frame.write_parquet(task_paths.series_path)
+
+        known_future = build_known_future_frame(series_frame)
+        known_future.write_parquet(task_paths.known_future_path)
+
+        self._write_task_static(task_paths, selection.static_columns)
+
+        build_window_index_from_series_path(
+            series_path=task_paths.series_path,
             task=resolved,
+            output_path=task_paths.window_index_path,
+            report_path=task_paths.task_report_path,
+            quality_profile="default",
+            available_columns=set(series_frame.columns),
         )
-        return output_path
+        self._write_task_context(task_paths, resolved, feature_protocol_id, selection)
+        self._finalize_task_report(task_paths, resolved, feature_protocol_id, selection)
+        self._write_task_build_meta(task=resolved, feature_protocol_id=feature_protocol_id)
+        return task_paths.task_dir
 
     def load_series(
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> pl.DataFrame:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
-        self.ensure_gold_base_fresh(
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
+        self.ensure_gold_base_fresh()
+        if not self.cache_paths.gold_base_series_path.exists():
+            self.build_gold_base()
+        return pl.read_parquet(self.cache_paths.gold_base_series_path)
+
+    def load_task_bundle(
+        self,
+        task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
+        quality_profile: str | None = None,
+    ) -> LoadedTaskBundle:
+        self.ensure_task_cache_fresh(
+            task_spec,
+            feature_protocol_id=feature_protocol_id,
+            quality_profile=quality_profile,
         )
-        gold_base_path = self.cache_paths.gold_base_series_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
+        paths = self.task_bundle_paths(task_spec, feature_protocol_id=feature_protocol_id)
+        return LoadedTaskBundle(
+            paths=paths,
+            series=pl.read_parquet(paths.series_path),
+            known_future=pl.read_parquet(paths.known_future_path),
+            static=pl.read_parquet(paths.static_path),
+            window_index=pl.read_parquet(paths.window_index_path),
+            task_context=read_json(paths.task_context_path),
+            task_report=read_json(paths.task_report_path),
         )
-        if not gold_base_path.exists():
-            self.build_gold_base(
-                quality_profile=resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
-        return pl.read_parquet(gold_base_path)
 
     def load_window_index(
         self,
         task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
         quality_profile: str | None = None,
     ) -> pl.DataFrame:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved = task_spec.resolve(self.spec.resolution_minutes)
-        self.ensure_task_cache_fresh(task_spec, quality_profile=resolved_quality_profile)
-        task_path = self.cache_paths.task_window_index_path_for(
-            resolved_quality_profile,
-            resolved.granularity,
-            resolved.task_id,
+        self.ensure_task_cache_fresh(
+            task_spec,
+            feature_protocol_id=feature_protocol_id,
+            quality_profile=quality_profile,
         )
+        task_path = self.task_bundle_paths(task_spec, feature_protocol_id=feature_protocol_id).window_index_path
         if not task_path.exists():
-            self.build_task_cache(task_spec, quality_profile=resolved_quality_profile)
+            self.build_task_cache(task_spec, feature_protocol_id=feature_protocol_id, quality_profile=quality_profile)
         return pl.read_parquet(task_path)
 
     def load_task_turbine_static(
         self,
         task_spec: TaskSpec,
+        feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
         quality_profile: str | None = None,
     ) -> pl.DataFrame:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved = task_spec.resolve(self.spec.resolution_minutes)
-        self.ensure_task_cache_fresh(task_spec, quality_profile=resolved_quality_profile)
-        static_path = self.cache_paths.task_turbine_static_path_for(
-            resolved_quality_profile,
-            resolved.granularity,
-            resolved.task_id,
+        self.ensure_task_cache_fresh(
+            task_spec,
+            feature_protocol_id=feature_protocol_id,
+            quality_profile=quality_profile,
         )
+        static_path = self.task_bundle_paths(task_spec, feature_protocol_id=feature_protocol_id).static_path
         if not static_path.exists():
-            self.build_task_cache(task_spec, quality_profile=resolved_quality_profile)
+            self.build_task_cache(task_spec, feature_protocol_id=feature_protocol_id, quality_profile=quality_profile)
         return pl.read_parquet(static_path)
 
     def profile_dataset(
         self,
         quality_profile: str | None = None,
         layout: str | None = None,
-        feature_set: str | None = None,
     ) -> dict[str, Any]:
-        resolved_quality_profile = self.resolve_quality_profile(quality_profile)
-        resolved_layout = self.resolve_series_layout(layout)
-        resolved_feature_set = self.resolve_feature_set(feature_set)
-        self.ensure_gold_base_fresh(
-            quality_profile=resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        quality_path = self.cache_paths.gold_base_quality_path_for(
-            resolved_quality_profile,
-            layout=resolved_layout,
-            feature_set=resolved_feature_set,
-        )
-        if not quality_path.exists():
-            self.build_gold_base(
-                quality_profile=resolved_quality_profile,
-                layout=resolved_layout,
-                feature_set=resolved_feature_set,
-            )
-        return read_json(quality_path)
+        self.resolve_quality_profile(quality_profile)
+        self.resolve_series_layout(layout)
+        self.ensure_gold_base_fresh()
+        if not self.cache_paths.gold_base_quality_path.exists():
+            self.build_gold_base()
+        return read_json(self.cache_paths.gold_base_quality_path)
 
-    def _write_task_turbine_static(self, quality_profile: str, task_id: str, granularity: str) -> Path:
-        turbine_static = self.load_turbine_static().join(
+    def load_source_column_policy(self) -> SourceColumnPolicy:
+        policy = load_source_column_policy(self.spec.dataset_id)
+        manifest_payload = self.ensure_manifest()
+        inventory_rows = manifest_payload.get("source_schema_inventory") or ()
+        validate_policy_coverage(policy, inventory_rows)
+        return policy
+
+    def source_policy_report_extra(self, policy: SourceColumnPolicy) -> dict[str, Any]:
+        return {
+            "source_column_policy_path": policy.relative_path,
+            "source_column_policy_decision_counts": policy.decision_counts,
+            "source_column_policy_entry_count": len(policy.entries),
+        }
+
+    def _task_static_frame(self, selected_columns: tuple[str, ...]) -> pl.DataFrame:
+        turbine_static = self.load_turbine_static()
+        with_index = turbine_static.join(
             pl.DataFrame(
                 {
                     "turbine_id": list(self.spec.turbine_ids),
@@ -338,66 +378,74 @@ class BaseDatasetBuilder:
             on="turbine_id",
             how="right",
         ).sort("turbine_index")
-        output_path = self.cache_paths.task_turbine_static_path_for(quality_profile, granularity, task_id)
-        ensure_directory(output_path.parent)
-        turbine_static.write_parquet(output_path)
-        return output_path
+        base_columns = ["dataset", "turbine_id", "turbine_index"]
+        selected = [column for column in (*base_columns, *selected_columns) if column in with_index.columns]
+        return with_index.select(selected)
 
-    def _write_task_context(self, quality_profile: str, task) -> Path:
-        output_path = self.cache_paths.task_context_path_for(quality_profile, task.granularity, task.task_id)
-        return write_json(
-            output_path,
-            {
-                "dataset_id": self.spec.dataset_id,
-                "quality_profile": quality_profile,
-                "task": task.to_dict(),
-                "turbine_ids": list(self.spec.turbine_ids),
-                "series_layout": self.resolve_series_layout(task.granularity),
-            },
+    def _write_task_static(self, task_paths: TaskBundlePaths, selected_columns: tuple[str, ...]) -> Path:
+        frame = self._task_static_frame(selected_columns)
+        frame.write_parquet(task_paths.static_path)
+        return task_paths.static_path
+
+    def _write_task_context(
+        self,
+        task_paths: TaskBundlePaths,
+        task: ResolvedTaskSpec,
+        feature_protocol_id: str,
+        selection,
+    ) -> Path:
+        payload = protocol_context_dict(
+            dataset_id=self.spec.dataset_id,
+            task=task.to_dict(),
+            feature_protocol_id=feature_protocol_id,
+            turbine_ids=self.spec.turbine_ids,
+            selection=selection,
         )
+        return write_json(task_paths.task_context_path, payload)
+
+    def _finalize_task_report(
+        self,
+        task_paths: TaskBundlePaths,
+        task: ResolvedTaskSpec,
+        feature_protocol_id: str,
+        selection,
+    ) -> Path:
+        payload = read_json(task_paths.task_report_path) if task_paths.task_report_path.exists() else {}
+        payload.update(
+            {
+                "schema_version": "task_report.v1",
+                "dataset_id": self.spec.dataset_id,
+                "task_id": task.task_id,
+                "feature_protocol_id": feature_protocol_id,
+                "granularity": task.granularity,
+                "series_columns": list(selection.all_columns),
+                "past_covariate_columns": list(selection.past_covariate_columns),
+                "target_derived_columns": list(selection.target_derived_columns),
+                "known_future_columns": list(selection.known_future_columns),
+            }
+        )
+        return write_json(task_paths.task_report_path, payload)
 
     def _write_silver_build_meta(self) -> Path:
         expected = expected_silver_meta(self.spec)
         return write_build_meta(self.cache_paths.silver_build_meta_path, expected)
 
-    def _write_gold_base_build_meta(
-        self,
-        quality_profile: str,
-        layout: str,
-        feature_set: str,
-    ) -> Path:
-        expected = expected_gold_base_meta(
-            self.spec,
-            quality_profile=quality_profile,
-            layout=layout,
-            feature_set=feature_set,
-        )
-        return write_build_meta(
-            self.cache_paths.gold_base_build_meta_path_for(
-                quality_profile,
-                layout=layout,
-                feature_set=feature_set,
-            ),
-            expected,
-        )
+    def _write_gold_base_build_meta(self) -> Path:
+        expected = expected_gold_base_meta(self.spec)
+        return write_build_meta(self.cache_paths.gold_base_build_meta_path, expected)
 
     def _write_task_build_meta(
         self,
         *,
-        quality_profile: str,
         task: ResolvedTaskSpec,
+        feature_protocol_id: str,
     ) -> Path:
         expected = expected_task_meta(
             self.spec,
-            quality_profile=quality_profile,
             task=task,
-            feature_set=self.default_task_feature_set(),
+            feature_protocol_id=feature_protocol_id,
         )
         return write_build_meta(
-            self.cache_paths.task_build_meta_path_for(
-                quality_profile,
-                task.granularity,
-                task.task_id,
-            ),
+            self.cache_paths.task_build_meta_path_for(task.task_id, feature_protocol_id),
             expected,
         )
