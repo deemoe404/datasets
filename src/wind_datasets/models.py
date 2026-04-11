@@ -170,4 +170,4 @@ class LoadedTaskBundle:
     static: pl.DataFrame
     window_index: pl.DataFrame
     task_context: dict[str, object]
-    task_report: dict[str, object]
+    task_report: dict[str, object] | None

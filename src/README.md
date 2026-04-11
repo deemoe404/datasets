@@ -71,8 +71,8 @@ cache/<dataset>/
     known_future.parquet
     static.parquet
     window_index.parquet
-    task_report.json
     task_context.json
+    task_report.json  # optional diagnostic sidecar
     _build_meta.json
 ```
 
@@ -88,6 +88,7 @@ Layer meanings:
 - `silver/interventions/*`: normalized intervention timelines kept outside the default graph assumptions
 - `gold_base`: single public farm-synchronous canonical series cache
 - `tasks/<task_id>/<feature_protocol_id>`: experiment-facing task bundle with protocol-selected series/static/known-future payloads
+- `tasks/.../task_report.json`: optional diagnostic summary; no longer required for task-cache freshness
 
 The cache is disposable and can be rebuilt from the read-only source dataset directories.
 
@@ -134,7 +135,6 @@ This sidecar is the repository's default spatial interface. It does not precompu
 - Suitable regular time assets flow into default `gold_base`; text-heavy, daily summary, and raw interval tables remain in `silver`.
 - `quality_flags` is the row-blocking audit field. `quality_flags == ""` does not mean a row is physically perfect; it only means no implemented row-level rule flagged it.
 - `feature_quality_flags` is a non-blocking feature-source audit field. It records duplicate-resolution or auxiliary-source issues that should stay visible downstream without automatically invalidating the row.
-- `sdwpf_kddcup` defaults to `quality_profile="default"`.
 - `sdwpf_kddcup default` means “implemented SDWPF unknown/abnormal rules are encoded as flags and mask columns.” It does not mean “official evaluation filtering has already been applied.”
 - `sdwpf_kddcup` gold/task builds are fail-closed when manifest time-semantics audit finds `Day + Tmstamp` values incompatible with the documented 245-day 10-minute grid.
 - `TaskSpec.next_6h_from_24h()` now defaults to `granularity="farm"`.
@@ -350,23 +350,18 @@ from wind_datasets.models import TaskSpec
 
 dataset_id = "kelmarsh"
 farm_task = TaskSpec.next_6h_from_24h()
-turbine_task = TaskSpec.next_6h_from_24h(granularity="turbine")
 
 build_manifest(dataset_id)
 build_silver(dataset_id)
-build_gold_base(dataset_id)  # default: farm layout
-build_gold_base(dataset_id, layout="turbine")  # explicit compatibility layout
+build_gold_base(dataset_id)
 build_task_cache(dataset_id, farm_task)
-build_task_cache(dataset_id, turbine_task)
 
 series = load_series(dataset_id)
-turbine_series = load_series(dataset_id, layout="turbine")
 turbine_static = load_turbine_static(dataset_id)
 farm_task_turbine_static = load_task_turbine_static(dataset_id, farm_task)
 farm_pmu = load_shared_timeseries(dataset_id, "farm_pmu")
 status_features = load_event_features(dataset_id, "turbine_status")
 farm_window_index = load_window_index(dataset_id, farm_task)
-turbine_window_index = load_window_index(dataset_id, turbine_task)
 ```
 
 ## Cache Rebuild
@@ -422,8 +417,8 @@ Each cache layer writes a `_build_meta.json` sidecar next to its main outputs:
 
 - `cache/<dataset>/manifest/_build_meta.json`
 - `cache/<dataset>/silver/_build_meta.json`
-- `cache/<dataset>/gold_base/<quality>/<layout>/<feature>/_build_meta.json`
-- `cache/<dataset>/tasks/<quality>/<granularity>/<task_id>/_build_meta.json`
+- `cache/<dataset>/gold_base/_build_meta.json`
+- `cache/<dataset>/tasks/<task_id>/<feature_protocol_id>/_build_meta.json`
 
 Each sidecar records the layer fingerprint, the parent-layer fingerprint, the layer code fingerprint, the dataset-spec fingerprint, resolved params, the schema version, and the build timestamp.
 

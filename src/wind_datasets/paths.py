@@ -69,25 +69,10 @@ class DatasetCachePaths:
     def gold_base_build_meta_path(self) -> Path:
         return self.gold_base_dir / "_build_meta.json"
 
-    # Legacy-compatibility helpers. The public cache no longer carries quality/layout.
-    def gold_base_profile_dir(self, quality_profile: str, layout: str = "farm") -> Path:
-        self._assert_legacy_gold_args(quality_profile=quality_profile, layout=layout)
-        return self.gold_base_dir
-
-    def gold_base_series_path_for(self, quality_profile: str, layout: str = "farm") -> Path:
-        self._assert_legacy_gold_args(quality_profile=quality_profile, layout=layout)
-        return self.gold_base_series_path
-
-    def gold_base_quality_path_for(self, quality_profile: str, layout: str = "farm") -> Path:
-        self._assert_legacy_gold_args(quality_profile=quality_profile, layout=layout)
-        return self.gold_base_quality_path
-
-    def gold_base_build_meta_path_for(self, quality_profile: str, layout: str = "farm") -> Path:
-        self._assert_legacy_gold_args(quality_profile=quality_profile, layout=layout)
-        return self.gold_base_build_meta_path
-
     def task_dir_for(self, *args: str) -> Path:
-        task_id, feature_protocol_id = self._resolve_task_args(*args)
+        if len(args) != 2:
+            raise TypeError("Task cache path helpers expect exactly (task_id, feature_protocol_id).")
+        task_id, feature_protocol_id = args
         return self.tasks_dir / task_id / feature_protocol_id
 
     def task_window_index_path_for(self, *args: str) -> Path:
@@ -110,30 +95,6 @@ class DatasetCachePaths:
 
     def task_build_meta_path_for(self, *args: str) -> Path:
         return self.task_dir_for(*args) / "_build_meta.json"
-
-    def _resolve_task_args(self, *args: str) -> tuple[str, str]:
-        if len(args) == 2:
-            task_id, feature_protocol_id = args
-            return task_id, feature_protocol_id
-        if len(args) == 3:
-            quality_profile, granularity, task_id = args
-            if quality_profile != "default" or granularity != "farm":
-                raise ValueError(
-                    "Legacy task cache paths only remain available for default/farm. "
-                    f"Received quality_profile={quality_profile!r}, granularity={granularity!r}."
-                )
-            return task_id, "power_only"
-        raise TypeError(
-            "Task cache path helpers expect (task_id, feature_protocol_id) or legacy "
-            "(quality_profile, granularity, task_id) arguments."
-        )
-
-    @staticmethod
-    def _assert_legacy_gold_args(*, quality_profile: str, layout: str) -> None:
-        if quality_profile != "default" or layout != "farm":
-            raise ValueError(
-                "gold_base is now a single farm-synchronous cache. Only legacy default/farm lookups remain supported."
-            )
 
 
 def dataset_cache_paths(cache_root: Path, dataset_id: str) -> DatasetCachePaths:

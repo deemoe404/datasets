@@ -25,10 +25,7 @@ def build_silver(dataset_id: str, cache_root: str | Path = "cache") -> Path:
 def build_gold_base(
     dataset_id: str,
     cache_root: str | Path = "cache",
-    quality_profile: str | None = None,
-    layout: str | None = None,
 ) -> Path:
-    del quality_profile, layout
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.build_gold_base()
@@ -39,9 +36,7 @@ def build_task_cache(
     task_spec: TaskSpec | None = None,
     cache_root: str | Path = "cache",
     feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
-    quality_profile: str | None = None,
 ) -> Path:
-    del quality_profile
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.build_task_cache(
@@ -49,13 +44,11 @@ def build_task_cache(
         feature_protocol_id=feature_protocol_id,
     )
 
+
 def load_series(
     dataset_id: str,
     cache_root: str | Path = "cache",
-    quality_profile: str | None = None,
-    layout: str | None = None,
 ) -> pl.DataFrame:
-    del quality_profile, layout
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.load_series()
@@ -66,9 +59,7 @@ def load_task_bundle(
     task_spec: TaskSpec | None = None,
     cache_root: str | Path = "cache",
     feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
-    quality_profile: str | None = None,
 ) -> LoadedTaskBundle:
-    del quality_profile
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.load_task_bundle(
@@ -130,9 +121,7 @@ def load_window_index(
     task_spec: TaskSpec | None = None,
     cache_root: str | Path = "cache",
     feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
-    quality_profile: str | None = None,
 ) -> pl.DataFrame:
-    del quality_profile
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.load_window_index(
@@ -140,14 +129,13 @@ def load_window_index(
         feature_protocol_id=feature_protocol_id,
     )
 
+
 def load_task_turbine_static(
     dataset_id: str,
     task_spec: TaskSpec | None = None,
     cache_root: str | Path = "cache",
     feature_protocol_id: str = DEFAULT_FEATURE_PROTOCOL_ID,
-    quality_profile: str | None = None,
 ) -> pl.DataFrame:
-    del quality_profile
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.load_task_turbine_static(
@@ -159,10 +147,7 @@ def load_task_turbine_static(
 def profile_dataset(
     dataset_id: str,
     cache_root: str | Path = "cache",
-    quality_profile: str | None = None,
-    layout: str | None = None,
 ) -> dict:
-    del quality_profile, layout
     spec = get_dataset_spec(dataset_id)
     builder = get_builder(spec, Path(cache_root))
     return builder.profile_dataset()

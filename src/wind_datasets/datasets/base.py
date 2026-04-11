@@ -305,7 +305,7 @@ class BaseDatasetBuilder:
             static=pl.read_parquet(paths.static_path),
             window_index=pl.read_parquet(paths.window_index_path),
             task_context=read_json(paths.task_context_path),
-            task_report=read_json(paths.task_report_path),
+            task_report=read_json(paths.task_report_path) if paths.task_report_path.exists() else None,
         )
 
     def load_window_index(

@@ -21,7 +21,7 @@ def test_load_series_rebuilds_gold_when_build_meta_missing(tmp_path) -> None:
     builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
 
     builder.build_gold_base()
-    gold_meta_path = builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
+    gold_meta_path = builder.cache_paths.gold_base_build_meta_path
     gold_meta_path.unlink()
 
     status = builder.gold_base_status()
@@ -45,7 +45,7 @@ def test_load_window_index_rebuilds_task_when_build_meta_missing(tmp_path) -> No
     )
 
     builder.build_task_cache(task)
-    task_meta_path = builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
+    task_meta_path = builder.cache_paths.task_build_meta_path_for("farm_short", "power_only")
     task_meta_path.unlink()
 
     status = builder.task_cache_status(task)
@@ -56,6 +56,29 @@ def test_load_window_index_rebuilds_task_when_build_meta_missing(tmp_path) -> No
 
     assert window_index.height > 0
     assert builder.task_cache_status(task).status == "fresh"
+
+
+def test_missing_task_report_does_not_invalidate_task_cache(tmp_path) -> None:
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        task_id="farm_short",
+        granularity="farm",
+    )
+
+    builder.build_task_cache(task)
+    report_path = builder.task_bundle_paths(task).task_report_path
+    report_path.unlink()
+
+    status = builder.task_cache_status(task)
+    assert status.status == "fresh"
+    assert status.reason is None
+
+    bundle = builder.load_task_bundle(task)
+    assert bundle.window_index.height > 0
+    assert bundle.task_report is None
 
 
 def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -> None:
@@ -71,12 +94,8 @@ def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -
     builder.build_task_cache(task)
     manifest_meta_before = read_build_meta(builder.cache_paths.manifest_build_meta_path)
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
-    gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-    )
-    task_meta_before = read_build_meta(
-        builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
-    )
+    gold_meta_before = read_build_meta(builder.cache_paths.gold_base_build_meta_path)
+    task_meta_before = read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only"))
     assert manifest_meta_before is not None
     assert silver_meta_before is not None
     assert gold_meta_before is not None
@@ -105,13 +124,11 @@ def test_source_snapshot_change_invalidates_manifest_and_descendants(tmp_path) -
     assert read_build_meta(builder.cache_paths.manifest_build_meta_path).fingerprint != manifest_meta_before.fingerprint
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
-        read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-        ).fingerprint
+        read_build_meta(builder.cache_paths.gold_base_build_meta_path).fingerprint
         != gold_meta_before.fingerprint
     )
     assert (
-        read_build_meta(builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")).fingerprint
+        read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only")).fingerprint
         != task_meta_before.fingerprint
     )
 
@@ -124,9 +141,7 @@ def test_build_gold_base_ensures_silver_fresh_when_code_fingerprint_changes(tmp_
 
     builder.build_gold_base()
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
-    gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-    )
+    gold_meta_before = read_build_meta(builder.cache_paths.gold_base_build_meta_path)
     assert silver_meta_before is not None
     assert gold_meta_before is not None
 
@@ -151,9 +166,7 @@ def test_build_gold_base_ensures_silver_fresh_when_code_fingerprint_changes(tmp_
     assert builder.gold_base_status().status == "fresh"
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
-        read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-        ).fingerprint
+        read_build_meta(builder.cache_paths.gold_base_build_meta_path).fingerprint
         != gold_meta_before.fingerprint
     )
 
@@ -173,12 +186,8 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
     builder.build_task_cache(task)
 
     silver_meta_before = read_build_meta(builder.cache_paths.silver_build_meta_path)
-    gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-    )
-    task_meta_before = read_build_meta(
-        builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
-    )
+    gold_meta_before = read_build_meta(builder.cache_paths.gold_base_build_meta_path)
+    task_meta_before = read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only"))
     assert silver_meta_before is not None
     assert gold_meta_before is not None
     assert task_meta_before is not None
@@ -217,13 +226,11 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
     assert builder.task_cache_status(task).status == "fresh"
     assert read_build_meta(builder.cache_paths.silver_build_meta_path).fingerprint != silver_meta_before.fingerprint
     assert (
-        read_build_meta(
-            builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-        ).fingerprint
+        read_build_meta(builder.cache_paths.gold_base_build_meta_path).fingerprint
         != gold_meta_before.fingerprint
     )
     assert (
-        read_build_meta(builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")).fingerprint
+        read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only")).fingerprint
         != task_meta_before.fingerprint
     )
 
@@ -241,12 +248,8 @@ def test_gold_base_policy_dependency_change_invalidates_gold_and_task(tmp_path, 
     )
 
     builder.build_task_cache(task)
-    gold_meta_before = read_build_meta(
-        builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")
-    )
-    task_meta_before = read_build_meta(
-        builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")
-    )
+    gold_meta_before = read_build_meta(builder.cache_paths.gold_base_build_meta_path)
+    task_meta_before = read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only"))
     assert gold_meta_before is not None
     assert task_meta_before is not None
     assert "packaged_dependency_fingerprint" in gold_meta_before.params
@@ -273,11 +276,11 @@ def test_gold_base_policy_dependency_change_invalidates_gold_and_task(tmp_path, 
     assert builder.gold_base_status().status == "fresh"
     assert builder.task_cache_status(task).status == "fresh"
     assert (
-        read_build_meta(builder.cache_paths.gold_base_build_meta_path_for("default", layout="farm")).fingerprint
+        read_build_meta(builder.cache_paths.gold_base_build_meta_path).fingerprint
         != gold_meta_before.fingerprint
     )
     assert (
-        read_build_meta(builder.cache_paths.task_build_meta_path_for("default", "farm", "farm_short")).fingerprint
+        read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only")).fingerprint
         != task_meta_before.fingerprint
     )
 
