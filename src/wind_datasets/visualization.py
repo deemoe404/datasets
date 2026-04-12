@@ -18,6 +18,19 @@ if TYPE_CHECKING:
 
 
 _POWER_COLUMNS = ["dataset", "turbine_id", "timestamp", "target_kw", "is_observed", "quality_flags"]
+_SITE_COLUMNS = [
+    "dataset",
+    "turbine_id",
+    "coord_x",
+    "coord_y",
+    "coord_kind",
+    "coord_crs",
+    "latitude",
+    "longitude",
+    "elevation_m",
+    "rated_power_kw",
+]
+_EARTH_RADIUS_M = 6_371_000.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +66,40 @@ class PowerTile:
             "tile_cols": self.tile_cols,
             "min_valid_kw": self.min_valid_kw,
             "max_valid_kw": self.max_valid_kw,
+        }
+
+
+@dataclass(frozen=True)
+class SiteLayout:
+    dataset_id: str
+    turbine_ids: tuple[str, ...]
+    coordinate_mode: str
+    coord_crs: str | None
+    axis_label_x: str
+    axis_label_y: str
+    distance_unit: str
+    turbine_count: int
+    neighbor_k: int
+    edge_pairs: tuple[tuple[int, int], ...]
+    edge_lengths: tuple[float, ...]
+    x: np.ndarray
+    y: np.ndarray
+    elevations_m: np.ndarray
+    rated_power_kw: np.ndarray
+
+    def to_summary(self) -> dict[str, object]:
+        edge_lengths = np.asarray(self.edge_lengths, dtype=float)
+        edge_count = len(self.edge_pairs)
+        return {
+            "dataset_id": self.dataset_id,
+            "turbine_count": self.turbine_count,
+            "coordinate_mode": self.coordinate_mode,
+            "coord_crs": self.coord_crs,
+            "neighbor_k": self.neighbor_k,
+            "edge_count": edge_count,
+            "min_edge_distance": float(edge_lengths.min()) if edge_count else None,
+            "median_edge_distance": float(np.median(edge_lengths)) if edge_count else None,
+            "max_edge_distance": float(edge_lengths.max()) if edge_count else None,
         }
 
 
@@ -92,6 +139,23 @@ def load_turbine_power_series(
     if frame.is_empty():
         raise ValueError(f"No power rows were found for turbine {turbine_id!r} in dataset {dataset_id!r}.")
     return frame
+
+
+def load_turbine_static_for_visualization(
+    dataset_id: str,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    """Load the canonical turbine static frame for visualization-only workflows."""
+    from .api import load_turbine_static
+
+    frame = load_turbine_static(dataset_id, cache_root=cache_root)
+    missing_columns = [column for column in _SITE_COLUMNS if column not in frame.columns]
+    if missing_columns:
+        missing = ", ".join(missing_columns)
+        raise ValueError(f"Turbine static frame is missing required columns: {missing}.")
+    if frame.is_empty():
+        raise ValueError(f"Turbine static frame for dataset {dataset_id!r} is empty.")
+    return frame.select(_SITE_COLUMNS).sort("turbine_id")
 
 
 def build_power_tile(dataset_frame: pl.DataFrame) -> PowerTile:
@@ -161,6 +225,92 @@ def build_power_tile(dataset_frame: pl.DataFrame) -> PowerTile:
     )
 
 
+def build_site_layout(
+    static_frame: pl.DataFrame,
+    *,
+    neighbor_k: int = 2,
+) -> SiteLayout:
+    missing_columns = [column for column in _SITE_COLUMNS if column not in static_frame.columns]
+    if missing_columns:
+        missing = ", ".join(missing_columns)
+        raise ValueError(f"Static frame is missing required columns: {missing}.")
+    if static_frame.is_empty():
+        raise ValueError("Static frame is empty.")
+    if neighbor_k < 1:
+        raise ValueError("neighbor_k must be at least 1.")
+
+    frame = static_frame.select(_SITE_COLUMNS).sort("turbine_id")
+    dataset_id = frame["dataset"][0]
+    turbine_ids = tuple(frame["turbine_id"].to_list())
+    if len(set(turbine_ids)) != len(turbine_ids):
+        raise ValueError("Static frame contains duplicate turbine_id values.")
+
+    x, y, coordinate_mode, coord_crs, axis_label_x, axis_label_y, distance_unit = _resolve_plot_coordinates(frame)
+    turbine_count = len(turbine_ids)
+    effective_k = min(neighbor_k, max(turbine_count - 1, 0))
+    edge_pairs, edge_lengths = _build_neighbor_edges(x, y, effective_k)
+
+    elevations_m = (
+        frame["elevation_m"].fill_null(float("nan")).cast(pl.Float64).to_numpy()
+        if "elevation_m" in frame.columns
+        else np.full(turbine_count, np.nan, dtype=float)
+    )
+    rated_power_kw = (
+        frame["rated_power_kw"].fill_null(float("nan")).cast(pl.Float64).to_numpy()
+        if "rated_power_kw" in frame.columns
+        else np.full(turbine_count, np.nan, dtype=float)
+    )
+
+    return SiteLayout(
+        dataset_id=dataset_id,
+        turbine_ids=turbine_ids,
+        coordinate_mode=coordinate_mode,
+        coord_crs=coord_crs,
+        axis_label_x=axis_label_x,
+        axis_label_y=axis_label_y,
+        distance_unit=distance_unit,
+        turbine_count=turbine_count,
+        neighbor_k=effective_k,
+        edge_pairs=edge_pairs,
+        edge_lengths=edge_lengths,
+        x=x,
+        y=y,
+        elevations_m=elevations_m,
+        rated_power_kw=rated_power_kw,
+    )
+
+
+def build_turbine_neighbor_table(
+    layout: SiteLayout,
+    selector: int | str,
+    *,
+    limit: int | None = None,
+) -> pl.DataFrame:
+    turbine_id = _resolve_layout_selector(layout, selector)
+    focus_index = layout.turbine_ids.index(turbine_id)
+    distances = np.hypot(layout.x - layout.x[focus_index], layout.y - layout.y[focus_index])
+    order = np.argsort(distances)
+    rows: list[dict[str, object]] = []
+    rank = 0
+    for index in order:
+        if index == focus_index:
+            continue
+        rank += 1
+        rows.append(
+            {
+                "dataset_id": layout.dataset_id,
+                "turbine_id": turbine_id,
+                "neighbor_rank": rank,
+                "neighbor_turbine_id": layout.turbine_ids[index],
+                "distance": float(distances[index]),
+                "distance_unit": layout.distance_unit,
+            }
+        )
+        if limit is not None and rank >= limit:
+            break
+    return pl.DataFrame(rows)
+
+
 def plot_power_tile(
     tile: PowerTile,
     *,
@@ -225,3 +375,180 @@ def plot_power_tile(
     )
     figure.colorbar(valid_image, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
     return figure, ax
+
+
+def plot_site_layout(
+    layout: SiteLayout,
+    *,
+    ax: Axes | None = None,
+    highlight_selector: int | str | None = None,
+    edge_color: str = "#9aa1a6",
+    node_color: str = "#2b6f97",
+    highlight_color: str = "#d1495b",
+    edge_alpha: float = 0.65,
+    label_fontsize: int = 8,
+    max_auto_labels: int = 40,
+) -> tuple[Figure, Axes]:
+    import matplotlib.pyplot as plt
+
+    figure: Figure
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
+    else:
+        figure = ax.figure
+
+    if layout.edge_pairs:
+        for left, right in layout.edge_pairs:
+            ax.plot(
+                [layout.x[left], layout.x[right]],
+                [layout.y[left], layout.y[right]],
+                color=edge_color,
+                alpha=edge_alpha,
+                linewidth=1.0,
+                zorder=1,
+            )
+
+    ax.scatter(
+        layout.x,
+        layout.y,
+        s=52,
+        c=node_color,
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=2,
+    )
+
+    highlight_index: int | None = None
+    if highlight_selector is not None:
+        highlight_id = _resolve_layout_selector(layout, highlight_selector)
+        highlight_index = layout.turbine_ids.index(highlight_id)
+        ax.scatter(
+            [layout.x[highlight_index]],
+            [layout.y[highlight_index]],
+            s=120,
+            c=highlight_color,
+            edgecolors="black",
+            linewidths=1.2,
+            zorder=3,
+        )
+
+    span_x = float(layout.x.max() - layout.x.min()) if layout.turbine_count else 0.0
+    span_y = float(layout.y.max() - layout.y.min()) if layout.turbine_count else 0.0
+    offset = max(span_x, span_y, 1.0) * 0.015
+    if layout.turbine_count <= max_auto_labels:
+        label_indices = set(range(layout.turbine_count))
+    elif highlight_index is not None:
+        distances = np.hypot(layout.x - layout.x[highlight_index], layout.y - layout.y[highlight_index])
+        nearest = np.argsort(distances)[: min(8, layout.turbine_count)]
+        label_indices = set(int(index) for index in nearest)
+    else:
+        label_indices = set()
+
+    for index in sorted(label_indices):
+        turbine_id = layout.turbine_ids[index]
+        text_kwargs = {"fontsize": label_fontsize, "ha": "left", "va": "bottom"}
+        if index == highlight_index:
+            text_kwargs["fontweight"] = "bold"
+        ax.text(layout.x[index] + offset, layout.y[index] + offset, turbine_id, zorder=4, **text_kwargs)
+
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.margins(0.1)
+    ax.set_xlabel(layout.axis_label_x)
+    ax.set_ylabel(layout.axis_label_y)
+    title_lines = [f"{layout.dataset_id} site layout", f"k-nearest edges: {layout.neighbor_k} | mode={layout.coordinate_mode}"]
+    if highlight_index is not None:
+        title_lines.append(f"highlight: {layout.turbine_ids[highlight_index]}")
+    ax.set_title("\n".join(title_lines))
+    ax.grid(True, alpha=0.18, linewidth=0.6)
+    return figure, ax
+
+
+def _resolve_plot_coordinates(
+    frame: pl.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, str, str | None, str, str, str]:
+    projected_x = frame["coord_x"] if "coord_x" in frame.columns else None
+    projected_y = frame["coord_y"] if "coord_y" in frame.columns else None
+    if projected_x is not None and projected_y is not None:
+        projected_x_nulls = int(projected_x.null_count())
+        projected_y_nulls = int(projected_y.null_count())
+        if projected_x_nulls == 0 and projected_y_nulls == 0:
+            coord_kind = frame["coord_kind"].drop_nulls().unique().to_list()
+            coord_crs_values = frame["coord_crs"].drop_nulls().unique().to_list()
+            coordinate_mode = coord_kind[0] if coord_kind else "projected_xy"
+            coord_crs = coord_crs_values[0] if coord_crs_values else None
+            return (
+                projected_x.cast(pl.Float64).to_numpy(),
+                projected_y.cast(pl.Float64).to_numpy(),
+                coordinate_mode,
+                coord_crs,
+                "coord_x",
+                "coord_y",
+                "source_units",
+            )
+
+    if "latitude" not in frame.columns or "longitude" not in frame.columns:
+        raise ValueError("Static frame does not contain complete projected or geographic coordinates.")
+
+    latitude = frame["latitude"]
+    longitude = frame["longitude"]
+    if latitude.null_count() > 0 or longitude.null_count() > 0:
+        raise ValueError("Static frame does not contain complete projected or geographic coordinates.")
+
+    lat = latitude.cast(pl.Float64).to_numpy()
+    lon = longitude.cast(pl.Float64).to_numpy()
+    lat0 = float(np.deg2rad(lat.mean()))
+    lon0 = float(np.deg2rad(lon.mean()))
+    lat_rad = np.deg2rad(lat)
+    lon_rad = np.deg2rad(lon)
+    x = _EARTH_RADIUS_M * (lon_rad - lon0) * np.cos(lat0)
+    y = _EARTH_RADIUS_M * (lat_rad - lat_rad.mean())
+    coord_crs_values = frame["coord_crs"].drop_nulls().unique().to_list() if "coord_crs" in frame.columns else []
+    coord_crs = coord_crs_values[0] if coord_crs_values else "EPSG:4326"
+    return (
+        x.astype(float),
+        y.astype(float),
+        "local_tangent_m",
+        coord_crs,
+        "local east-west offset (m)",
+        "local north-south offset (m)",
+        "m",
+    )
+
+
+def _build_neighbor_edges(
+    x: np.ndarray,
+    y: np.ndarray,
+    neighbor_k: int,
+) -> tuple[tuple[tuple[int, int], ...], tuple[float, ...]]:
+    if neighbor_k <= 0 or len(x) <= 1:
+        return (), ()
+
+    points = np.column_stack([x, y])
+    deltas = points[:, None, :] - points[None, :, :]
+    distances = np.sqrt(np.sum(deltas**2, axis=2))
+    np.fill_diagonal(distances, np.inf)
+
+    edge_lengths: dict[tuple[int, int], float] = {}
+    for index in range(len(x)):
+        neighbors = np.argsort(distances[index])[:neighbor_k]
+        for neighbor in neighbors:
+            if not np.isfinite(distances[index, neighbor]):
+                continue
+            edge = tuple(sorted((int(index), int(neighbor))))
+            edge_lengths[edge] = float(distances[index, neighbor])
+
+    ordered_edges = tuple(sorted(edge_lengths))
+    ordered_lengths = tuple(edge_lengths[edge] for edge in ordered_edges)
+    return ordered_edges, ordered_lengths
+
+
+def _resolve_layout_selector(layout: SiteLayout, selector: int | str) -> str:
+    if isinstance(selector, str):
+        if selector in layout.turbine_ids:
+            return selector
+        raise ValueError(f"Unknown turbine selector {selector!r} for layout dataset {layout.dataset_id!r}.")
+    if isinstance(selector, bool) or not isinstance(selector, int):
+        raise TypeError("Layout selector must be a 0-based int index or an exact turbine id string.")
+    if selector < 0 or selector >= layout.turbine_count:
+        raise ValueError(f"Turbine index {selector} is out of range for layout dataset {layout.dataset_id!r}.")
+    return layout.turbine_ids[selector]
