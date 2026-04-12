@@ -163,6 +163,7 @@ The active protocol IDs today are:
 - `power_ws_hist`
 - `power_wd_hist_sincos`
 - `power_wd_yaw_hist_sincos`
+- `power_wd_yaw_pitchmean_hist_sincos`
 - `power_wd_yaw_lrpm_hist_sincos`
 - `power_ws_wd_hist_sincos`
 
@@ -172,6 +173,7 @@ Protocol semantics:
 - `power_ws_hist`: target history plus dataset-native past wind-speed covariates
 - `power_wd_hist_sincos`: target history plus task-derived wind-direction `sin/cos` covariates
 - `power_wd_yaw_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates
+- `power_wd_yaw_pitchmean_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates and task-derived `pitch_mean`
 - `power_wd_yaw_lrpm_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates and dataset-native low-speed rotor RPM history
 - `power_ws_wd_hist_sincos`: target history plus dataset-native wind speed and task-derived wind-direction `sin/cos` covariates
 

@@ -63,6 +63,11 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     bundle = builder.load_task_bundle(task)
     builder.build_task_cache(task, feature_protocol_id="power_wd_yaw_hist_sincos")
     power_wd_yaw_bundle = builder.load_task_bundle(task, feature_protocol_id="power_wd_yaw_hist_sincos")
+    builder.build_task_cache(task, feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos")
+    power_wd_yaw_pitchmean_bundle = builder.load_task_bundle(
+        task,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+    )
     builder.build_task_cache(task, feature_protocol_id="power_wd_yaw_lrpm_hist_sincos")
     power_wd_yaw_lrpm_bundle = builder.load_task_bundle(task, feature_protocol_id="power_wd_yaw_lrpm_hist_sincos")
     window_index = builder.load_window_index(task)
@@ -83,6 +88,13 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
         "yaw_error_sin",
         "yaw_error_cos",
     ]
+    assert power_wd_yaw_pitchmean_bundle.task_context["column_groups"]["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
     assert power_wd_yaw_lrpm_bundle.task_context["column_groups"]["past_covariates"] == [
         "wind_direction_sin",
         "wind_direction_cos",
@@ -99,6 +111,9 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     yaw_row = power_wd_yaw_bundle.series.filter(
         pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:00:00"
     )
+    yaw_pitchmean_row = power_wd_yaw_pitchmean_bundle.series.filter(
+        pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00"
+    )
     yaw_lrpm_row = power_wd_yaw_lrpm_bundle.series.filter(
         pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:00:00"
     )
@@ -106,11 +121,15 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     assert yaw_row["wind_direction_cos"][0] == pytest.approx(math.cos(math.radians(180.0)))
     assert yaw_row["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
     assert yaw_row["yaw_error_cos"][0] == pytest.approx(math.cos(math.radians(6.0)))
+    assert yaw_pitchmean_row["pitch_mean"][0] == pytest.approx(1.0)
     assert yaw_lrpm_row["wind_direction_sin"][0] == pytest.approx(math.sin(math.radians(180.0)))
     assert yaw_lrpm_row["wind_direction_cos"][0] == pytest.approx(math.cos(math.radians(180.0)))
     assert yaw_lrpm_row["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
     assert yaw_lrpm_row["yaw_error_cos"][0] == pytest.approx(math.cos(math.radians(6.0)))
     assert yaw_lrpm_row["Rotor speed (RPM)"][0] == pytest.approx(12.0)
+    assert power_wd_yaw_pitchmean_bundle.series.filter(
+        pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00"
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
     assert power_wd_yaw_bundle.series.filter(
         pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00"
     )["feature_quality_flags"][0].endswith("missing_past_covariates")
@@ -262,6 +281,11 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     power_wd_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_wd_hist_sincos")
     builder.build_task_cache(farm_task, feature_protocol_id="power_ws_wd_hist_sincos")
     power_ws_wd_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_ws_wd_hist_sincos")
+    builder.build_task_cache(farm_task, feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos")
+    power_wd_yaw_pitchmean_bundle = builder.load_task_bundle(
+        farm_task,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+    )
     builder.build_task_cache(farm_task, feature_protocol_id="power_wd_yaw_lrpm_hist_sincos")
     power_wd_yaw_lrpm_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_wd_yaw_lrpm_hist_sincos")
     farm_task_report = json.loads(builder.task_bundle_paths(farm_task).task_report_path.read_text())
@@ -300,6 +324,13 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         "wind_direction_sin",
         "wind_direction_cos",
     ]
+    assert power_wd_yaw_pitchmean_bundle.task_context["column_groups"]["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
     assert power_wd_yaw_lrpm_bundle.task_context["column_groups"]["past_covariates"] == [
         "wind_direction_sin",
         "wind_direction_cos",
@@ -307,7 +338,20 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
         "yaw_error_cos",
         "wtc_MainSRpm_mean",
     ]
+    assert power_wd_yaw_pitchmean_bundle.task_context["feature_protocol"]["derived_scalar_features"] == [
+        {
+            "output_column": "pitch_mean",
+            "transform_kind": "row_mean",
+            "source_columns": ["wtc_PitcPosA_mean", "wtc_PitcPosB_mean", "wtc_PitcPosC_mean"],
+            "description": "Compute the arithmetic mean of the three blade-pitch angles when all three inputs are present.",
+            "missing_value_policy": "all_sources_required",
+        }
+    ]
     wd_row = power_wd_bundle.series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:10:00")
+    )
+    yaw_pitchmean_row = power_wd_yaw_pitchmean_bundle.series.filter(
         (pl.col("turbine_id") == "T01")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:10:00")
     )
@@ -317,6 +361,7 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     )
     assert wd_row["wind_direction_sin"][0] == pytest.approx(1.0)
     assert wd_row["wind_direction_cos"][0] == pytest.approx(0.0, abs=1e-12)
+    assert yaw_pitchmean_row["pitch_mean"][0] == pytest.approx(5.0)
     assert yaw_lrpm_row["wind_direction_sin"][0] == pytest.approx(1.0)
     assert yaw_lrpm_row["wind_direction_cos"][0] == pytest.approx(0.0, abs=1e-12)
     assert yaw_lrpm_row["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
@@ -332,6 +377,10 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     )["feature_quality_flags"][0].endswith("missing_past_covariates")
     assert power_ws_wd_bundle.series.filter(
         (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert power_wd_yaw_pitchmean_bundle.series.filter(
+        (pl.col("turbine_id") == "T02")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     )["feature_quality_flags"][0].endswith("missing_past_covariates")
     assert power_wd_yaw_lrpm_bundle.series.filter(
@@ -393,6 +442,11 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     power_ws_wd_bundle = builder.load_task_bundle(task_a, feature_protocol_id="power_ws_wd_hist_sincos")
     builder.build_task_cache(task_a, feature_protocol_id="power_wd_yaw_hist_sincos")
     power_wd_yaw_bundle = builder.load_task_bundle(task_a, feature_protocol_id="power_wd_yaw_hist_sincos")
+    builder.build_task_cache(task_a, feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos")
+    power_wd_yaw_pitchmean_bundle = builder.load_task_bundle(
+        task_a,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+    )
     with pytest.raises(
         ValueError,
         match=r"feature_protocol_id 'power_wd_yaw_lrpm_hist_sincos' is not supported for dataset 'sdwpf_kddcup'\.",
@@ -435,6 +489,9 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert "Wdir" not in power_ws_wd_bundle.series.columns
     assert "Ndir" not in power_ws_wd_bundle.series.columns
     assert "Ndir" not in power_wd_yaw_bundle.series.columns
+    assert "Pab1" not in power_wd_yaw_pitchmean_bundle.series.columns
+    assert "Pab2" not in power_wd_yaw_pitchmean_bundle.series.columns
+    assert "Pab3" not in power_wd_yaw_pitchmean_bundle.series.columns
     assert power_wd_bundle.task_context["column_groups"]["past_covariates"] == [
         "wind_direction_sin",
         "wind_direction_cos",
@@ -450,6 +507,13 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
         "yaw_error_sin",
         "yaw_error_cos",
     ]
+    assert power_wd_yaw_pitchmean_bundle.task_context["column_groups"]["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
     assert power_wd_bundle.task_context["feature_protocol"]["dataset_specific_notes"] == [
         "sdwpf_kddcup reconstructs absolute wind direction as Ndir + Wdir under the repository convention.",
         "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention.",
@@ -459,6 +523,10 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
         "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention.",
     ]
     assert power_wd_yaw_bundle.task_context["feature_protocol"]["dataset_specific_notes"] == [
+        "sdwpf_kddcup reconstructs absolute wind direction as Ndir + Wdir under the repository convention.",
+        "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention.",
+    ]
+    assert power_wd_yaw_pitchmean_bundle.task_context["feature_protocol"]["dataset_specific_notes"] == [
         "sdwpf_kddcup reconstructs absolute wind direction as Ndir + Wdir under the repository convention.",
         "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention.",
     ]
@@ -483,6 +551,11 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert sdwpf_yaw_anchor["wind_direction_cos"][0] == pytest.approx(math.cos(math.radians(176.0)))
     assert sdwpf_yaw_anchor["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(171.0)))
     assert sdwpf_yaw_anchor["yaw_error_cos"][0] == pytest.approx(math.cos(math.radians(171.0)))
+    sdwpf_yaw_pitchmean_anchor = power_wd_yaw_pitchmean_bundle.series.filter(
+        (pl.col("turbine_id") == "1")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:00:00")
+    )
+    assert sdwpf_yaw_pitchmean_anchor["pitch_mean"][0] == pytest.approx(11.0)
     assert power_wd_bundle.series.filter(
         (pl.col("turbine_id") == "1")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:40:00")
@@ -494,6 +567,10 @@ def test_end_to_end_sdwpf_pipeline_and_task_switch_only_updates_task_cache(tmp_p
     assert power_ws_wd_bundle.series.filter(
         (pl.col("turbine_id") == "1")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:40:00")
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert power_wd_yaw_pitchmean_bundle.series.filter(
+        (pl.col("turbine_id") == "1")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2020-05-01 00:30:00")
     )["feature_quality_flags"][0].endswith("missing_past_covariates")
     assert power_wd_yaw_bundle.series.filter(
         (pl.col("turbine_id") == "1")

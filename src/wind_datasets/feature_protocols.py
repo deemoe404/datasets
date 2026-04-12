@@ -13,6 +13,7 @@ _WIND_DIRECTION_SIN_COLUMN = "wind_direction_sin"
 _WIND_DIRECTION_COS_COLUMN = "wind_direction_cos"
 _YAW_ERROR_SIN_COLUMN = "yaw_error_sin"
 _YAW_ERROR_COS_COLUMN = "yaw_error_cos"
+_PITCH_MEAN_COLUMN = "pitch_mean"
 _YAW_ERROR_CONVENTION = "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
 _SDWPF_YAW_ERROR_NOTE = (
     "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention."
@@ -62,6 +63,24 @@ _LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET = {
     "penmanshiel": "Rotor speed (RPM)",
     "hill_of_towie": "wtc_MainSRpm_mean",
 }
+_PITCH_COLUMNS_BY_DATASET = {
+    "kelmarsh": (
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+    ),
+    "penmanshiel": (
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+    ),
+    "hill_of_towie": (
+        "wtc_PitcPosA_mean",
+        "wtc_PitcPosB_mean",
+        "wtc_PitcPosC_mean",
+    ),
+    "sdwpf_kddcup": ("Pab1", "Pab2", "Pab3"),
+}
 _ABSOLUTE_WIND_DIRECTION_COLUMN_BY_DATASET = {
     "kelmarsh": "Wind direction (°)",
     "penmanshiel": "Wind direction (°)",
@@ -106,6 +125,15 @@ class AngleTransformSpec:
 
 
 @dataclass(frozen=True)
+class ScalarTransformSpec:
+    output_column: str
+    transform_kind: str
+    source_columns: tuple[str, ...]
+    description: str
+    missing_value_policy: str | None = None
+
+
+@dataclass(frozen=True)
 class TaskSeriesSelection:
     feature_protocol_id: str
     source_columns: tuple[str, ...]
@@ -116,6 +144,7 @@ class TaskSeriesSelection:
     target_derived_columns: tuple[str, ...]
     audit_columns: tuple[str, ...]
     derived_angle_transforms: tuple[AngleTransformSpec, ...] = ()
+    derived_scalar_transforms: tuple[ScalarTransformSpec, ...] = ()
     angle_convention: str | None = None
     dataset_specific_notes: tuple[str, ...] = ()
 
@@ -188,6 +217,23 @@ _POWER_WD_YAW_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles",
     past_covariate_stage="task_bundle.angle_sincos",
 )
+_POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+    display_name="Power + Wind Direction/Yaw Error/Pitch Mean History (Sin/Cos)",
+    protocol_kind="past_covariate_combination",
+    summary=(
+        "Use target power history plus task-derived sine/cosine wind-direction and yaw-error covariates "
+        "and task-derived pitch-mean history."
+    ),
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_wd_yaw_pitchmean_history_sincos",),
+    past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles_plus_pitch_mean",
+    past_covariate_stage="task_bundle.angle_sincos_plus_scalar_covariate",
+)
 _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     feature_protocol_id="power_wd_yaw_lrpm_hist_sincos",
     display_name="Power + Wind Direction/Yaw Error/LS RPM History (Sin/Cos)",
@@ -211,6 +257,7 @@ _FEATURE_PROTOCOLS = (
     _POWER_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_HIST_SINCOS_PROTOCOL,
+    _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
@@ -342,6 +389,22 @@ def _sum_angle_transform(
     )
 
 
+def _row_mean_scalar_transform(
+    *,
+    output_column: str,
+    source_columns: tuple[str, ...],
+    description: str,
+    missing_value_policy: str | None = None,
+) -> ScalarTransformSpec:
+    return ScalarTransformSpec(
+        output_column=output_column,
+        transform_kind="row_mean",
+        source_columns=source_columns,
+        description=description,
+        missing_value_policy=missing_value_policy,
+    )
+
+
 def _angle_transforms_for_protocol(
     *,
     dataset_id: str,
@@ -355,10 +418,12 @@ def _angle_transforms_for_protocol(
         _POWER_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
     uses_yaw_error = feature_protocol_id in {
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
 
@@ -436,12 +501,42 @@ def _angle_transforms_for_protocol(
     return tuple(transforms), angle_convention, tuple(dict.fromkeys(notes))
 
 
+def _scalar_transforms_for_protocol(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> tuple[ScalarTransformSpec, ...]:
+    if feature_protocol_id != _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id:
+        return ()
+    try:
+        pitch_columns = _PITCH_COLUMNS_BY_DATASET[dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+        ) from exc
+    return (
+        _row_mean_scalar_transform(
+            output_column=_PITCH_MEAN_COLUMN,
+            source_columns=pitch_columns,
+            description="Compute the arithmetic mean of the three blade-pitch angles when all three inputs are present.",
+            missing_value_policy="all_sources_required",
+        ),
+    )
+
+
 def _dataset_native_columns_for_protocol(
     *,
     dataset_id: str,
     available_columns: set[str],
     feature_protocol_id: str,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[AngleTransformSpec, ...], str | None, tuple[str, ...]]:
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[AngleTransformSpec, ...],
+    tuple[ScalarTransformSpec, ...],
+    str | None,
+    tuple[str, ...],
+]:
     uses_wind_speed = feature_protocol_id in {
         _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
@@ -468,6 +563,14 @@ def _dataset_native_columns_for_protocol(
         configured_columns.extend(transform.source_columns)
         output_past_covariate_columns.extend((transform.output_sin_column, transform.output_cos_column))
 
+    derived_scalar_transforms = _scalar_transforms_for_protocol(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    )
+    for transform in derived_scalar_transforms:
+        configured_columns.extend(transform.source_columns)
+        output_past_covariate_columns.append(transform.output_column)
+
     if uses_low_speed_rotor_rpm:
         configured_columns.append(
             _require_mapping_value(
@@ -489,6 +592,7 @@ def _dataset_native_columns_for_protocol(
         tuple(configured_columns),
         tuple(output_past_covariate_columns),
         derived_angle_transforms,
+        derived_scalar_transforms,
         angle_convention,
         dataset_specific_notes,
     )
@@ -520,6 +624,17 @@ def materialize_task_series_frame(
                 angle_radians.cos().alias(transform.output_cos_column),
             )
         )
+    for transform in selection.derived_scalar_transforms:
+        source_exprs = [pl.col(column).cast(pl.Float64, strict=False) for column in transform.source_columns]
+        if transform.transform_kind == "row_mean":
+            derived_columns.append(
+                pl.when(pl.all_horizontal([expr.is_not_null() for expr in source_exprs]))
+                .then(pl.sum_horizontal(source_exprs) / pl.lit(float(len(source_exprs))))
+                .otherwise(pl.lit(None, dtype=pl.Float64))
+                .alias(transform.output_column)
+            )
+            continue
+        raise ValueError(f"Unsupported scalar transform kind {transform.transform_kind!r}.")
     if derived_columns:
         series_frame = series_frame.with_columns(*derived_columns)
     return series_frame.select(list(selection.all_columns))
@@ -541,6 +656,7 @@ def select_task_series_columns(
         source_past_covariate_columns,
         past_covariate_columns,
         derived_angle_transforms,
+        derived_scalar_transforms,
         angle_convention,
         dataset_specific_notes,
     ) = _dataset_native_columns_for_protocol(
@@ -560,6 +676,7 @@ def select_task_series_columns(
         target_derived_columns=(),
         audit_columns=audit_columns,
         derived_angle_transforms=derived_angle_transforms,
+        derived_scalar_transforms=derived_scalar_transforms,
         angle_convention=angle_convention,
         dataset_specific_notes=dataset_specific_notes,
     )
@@ -605,6 +722,16 @@ def _angle_transform_context_dict(transform: AngleTransformSpec) -> dict[str, ob
     }
 
 
+def _scalar_transform_context_dict(transform: ScalarTransformSpec) -> dict[str, object]:
+    return {
+        "output_column": transform.output_column,
+        "transform_kind": transform.transform_kind,
+        "source_columns": list(transform.source_columns),
+        "description": transform.description,
+        "missing_value_policy": transform.missing_value_policy,
+    }
+
+
 def protocol_context_dict(
     *,
     dataset_id: str,
@@ -638,6 +765,10 @@ def protocol_context_dict(
                 _angle_transform_context_dict(transform)
                 for transform in selection.derived_angle_transforms
             ],
+            "derived_scalar_features": [
+                _scalar_transform_context_dict(transform)
+                for transform in selection.derived_scalar_transforms
+            ],
         },
         "task": task,
         "turbine_ids": list(turbine_ids),
@@ -659,6 +790,7 @@ __all__ = [
     "TASK_BUNDLE_SCHEMA_VERSION",
     "AngleTransformSpec",
     "FeatureProtocolSpec",
+    "ScalarTransformSpec",
     "TaskSeriesSelection",
     "build_known_future_frame",
     "feature_protocol_task_blocked_reason",

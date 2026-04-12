@@ -45,6 +45,7 @@ def test_active_feature_protocols_are_registered() -> None:
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_pitchmean_hist_sincos",
         "power_wd_yaw_lrpm_hist_sincos",
     )
 
@@ -73,6 +74,11 @@ def test_active_feature_protocols_are_registered() -> None:
     assert power_wd_yaw_hist.feature_protocol_id == "power_wd_yaw_hist_sincos"
     assert power_wd_yaw_hist.uses_target_history is True
     assert power_wd_yaw_hist.uses_past_covariates is True
+
+    power_wd_yaw_pitchmean_hist = get_feature_protocol_spec("power_wd_yaw_pitchmean_hist_sincos")
+    assert power_wd_yaw_pitchmean_hist.feature_protocol_id == "power_wd_yaw_pitchmean_hist_sincos"
+    assert power_wd_yaw_pitchmean_hist.uses_target_history is True
+    assert power_wd_yaw_pitchmean_hist.uses_past_covariates is True
 
     power_wd_yaw_lrpm_hist = get_feature_protocol_spec("power_wd_yaw_lrpm_hist_sincos")
     assert power_wd_yaw_lrpm_hist.feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos"
@@ -281,6 +287,89 @@ def test_power_wd_yaw_hist_sincos_selection_emits_four_cyclic_covariates(
 
 
 @pytest.mark.parametrize(
+    ("dataset_id", "source_columns"),
+    [
+        (
+            "kelmarsh",
+            (
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ),
+        ),
+        (
+            "penmanshiel",
+            (
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ),
+        ),
+        (
+            "hill_of_towie",
+            (
+                "wtc_ActualWindDirection_mean",
+                "wtc_YawPos_mean",
+                "wtc_PitcPosA_mean",
+                "wtc_PitcPosB_mean",
+                "wtc_PitcPosC_mean",
+            ),
+        ),
+        ("sdwpf_kddcup", ("Ndir", "Wdir", "Pab1", "Pab2", "Pab3")),
+    ],
+)
+def test_power_wd_yaw_pitchmean_hist_sincos_selection_emits_cyclic_covariates_and_pitch_mean(
+    dataset_id: str,
+    source_columns: tuple[str, ...],
+) -> None:
+    selection = _selection(dataset_id, "power_wd_yaw_pitchmean_hist_sincos", *source_columns)
+
+    assert selection.source_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        *source_columns,
+        "farm_turbines_expected",
+    )
+    assert selection.past_covariate_columns == (
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    )
+    assert selection.all_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "farm_turbines_expected",
+    )
+    assert len(selection.derived_angle_transforms) == 2
+    assert len(selection.derived_scalar_transforms) == 1
+    assert selection.derived_scalar_transforms[0].output_column == "pitch_mean"
+    assert selection.derived_scalar_transforms[0].source_columns == source_columns[-3:]
+    assert selection.derived_scalar_transforms[0].missing_value_policy == "all_sources_required"
+    assert selection.angle_convention == "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
+
+
+@pytest.mark.parametrize(
     ("dataset_id", "source_columns", "lrpm_column"),
     [
         ("kelmarsh", ("Wind direction (°)", "Nacelle position (°)"), "Rotor speed (RPM)"),
@@ -392,6 +481,43 @@ def test_materialize_task_series_frame_wraps_yaw_error_through_zero_and_360() ->
     assert frame["yaw_error_cos"].to_list() == [pytest.approx(cos_2), pytest.approx(cos_2)]
 
 
+def test_materialize_task_series_frame_computes_pitch_mean_and_requires_all_three_pitch_inputs() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "power_wd_yaw_pitchmean_hist_sincos",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+    )
+
+    frame = materialize_task_series_frame(
+        pl.DataFrame(
+            {
+                "dataset": ["kelmarsh", "kelmarsh"],
+                "turbine_id": ["T01", "T01"],
+                "timestamp": [datetime(2024, 1, 1, 0, 0), datetime(2024, 1, 1, 0, 10)],
+                "target_kw": [100.0, 110.0],
+                "is_observed": [True, True],
+                "quality_flags": ["", ""],
+                "feature_quality_flags": ["", ""],
+                "farm_turbines_expected": [6, 6],
+                "Wind direction (°)": [180.0, 180.0],
+                "Nacelle position (°)": [174.0, 174.0],
+                "Blade angle (pitch position) A (°)": [1.0, 1.0],
+                "Blade angle (pitch position) B (°)": [2.0, None],
+                "Blade angle (pitch position) C (°)": [3.0, 3.0],
+            }
+        ),
+        selection=selection,
+    )
+
+    assert frame["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
+    assert frame["yaw_error_cos"][0] == pytest.approx(math.cos(math.radians(6.0)))
+    assert frame["pitch_mean"].to_list() == [pytest.approx(2.0), None]
+
+
 def test_materialize_task_series_frame_appends_lrpm_after_derived_direction_and_yaw_error() -> None:
     selection = _selection(
         "kelmarsh",
@@ -499,9 +625,44 @@ def test_protocol_context_records_angle_convention_and_sdwpf_notes() -> None:
     assert len(feature_protocol["derived_angle_features"]) == 2
     assert feature_protocol["derived_angle_features"][0]["transform_kind"] == "sum"
     assert feature_protocol["derived_angle_features"][1]["transform_kind"] == "direct"
+    assert feature_protocol["derived_scalar_features"] == []
     assert feature_protocol["dataset_specific_notes"] == [
         "sdwpf_kddcup reconstructs absolute wind direction as Ndir + Wdir under the repository convention.",
         "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention.",
+    ]
+
+
+def test_protocol_context_records_pitch_mean_scalar_feature() -> None:
+    selection = _selection(
+        "hill_of_towie",
+        "power_wd_yaw_pitchmean_hist_sincos",
+        "wtc_ActualWindDirection_mean",
+        "wtc_YawPos_mean",
+        "wtc_PitcPosA_mean",
+        "wtc_PitcPosB_mean",
+        "wtc_PitcPosC_mean",
+    )
+
+    context = protocol_context_dict(
+        dataset_id="hill_of_towie",
+        task={"task_id": "next_6h_from_24h"},
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+        turbine_ids=("T01", "T02"),
+        selection=selection,
+        static_columns=("dataset", "turbine_id", "turbine_index"),
+    )
+
+    feature_protocol = context["feature_protocol"]
+
+    assert len(feature_protocol["derived_angle_features"]) == 2
+    assert feature_protocol["derived_scalar_features"] == [
+        {
+            "output_column": "pitch_mean",
+            "transform_kind": "row_mean",
+            "source_columns": ["wtc_PitcPosA_mean", "wtc_PitcPosB_mean", "wtc_PitcPosC_mean"],
+            "description": "Compute the arithmetic mean of the three blade-pitch angles when all three inputs are present.",
+            "missing_value_policy": "all_sources_required",
+        }
     ]
 
 
@@ -563,6 +724,7 @@ def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_pitchmean_hist_sincos",
         "power_wd_yaw_lrpm_hist_sincos",
     ],
 )

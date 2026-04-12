@@ -54,7 +54,7 @@
 | 源表/文件 | 当前保留字段 |
 | -------- | ------------ |
 | `Hill_of_Towie_turbine_metadata` | `Turbine Name`, `Station ID`, `Latitude`, `Longitude`, `Manufacturer`, `Model`, `Rated power (kW)`, `Hub Height (m)`, `Rotor Diameter (m)`, `Country`, `Commercial Operations Date` |
-| `tblSCTurbine` | `TimeStamp`, `StationId`, `wtc_AcWindSp_mean`, `wtc_ActualWindDirection_mean`, `wtc_GenRpm_mean`, `wtc_MainSRpm_mean`, `wtc_PitchRef_BladeA_mean`, `wtc_PitchRef_BladeB_mean`, `wtc_PitchRef_BladeC_mean`, `wtc_PriAnemo_mean`, `wtc_SecAnemo_mean`, `wtc_TwrHumid_mean`, `wtc_YawPos_mean` |
+| `tblSCTurbine` | `TimeStamp`, `StationId`, `wtc_AcWindSp_mean`, `wtc_ActualWindDirection_mean`, `wtc_GenRpm_mean`, `wtc_MainSRpm_mean`, `wtc_PitcPosA_mean`, `wtc_PitcPosB_mean`, `wtc_PitcPosC_mean`, `wtc_PitchRef_BladeA_mean`, `wtc_PitchRef_BladeB_mean`, `wtc_PitchRef_BladeC_mean`, `wtc_PriAnemo_mean`, `wtc_SecAnemo_mean`, `wtc_TwrHumid_mean`, `wtc_YawPos_mean` |
 | `tblSCTurGrid` | `TimeStamp`, `StationId`, `wtc_ActPower_mean`, `wtc_ActPower_min`, `wtc_ActPower_max`, `wtc_ActPower_stddev`, `wtc_ActPower_endvalue` |
 | `tblSCTurFlag` | `TimeStamp`, `StationId` |
 | `tblGrid` | `TimeStamp`, `ActivePower`, `ReActivePower`, `PowerFactor` |

@@ -10,6 +10,7 @@ def test_source_column_policies_do_not_reference_removed_feature_protocols() -> 
         "power_ws_hist",
         "power_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_pitchmean_hist_sincos",
         "power_wd_yaw_lrpm_hist_sincos",
         "power_ws_wd_hist_sincos",
     }

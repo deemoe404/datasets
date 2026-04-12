@@ -340,6 +340,7 @@ def _input_channels_for_feature_protocol(module, feature_protocol_id: str) -> in
         module.POWER_WS_HIST_FEATURE_PROTOCOL_ID: 1,
         module.POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID: 2,
         module.POWER_WD_YAW_HIST_SINCOS_FEATURE_PROTOCOL_ID: 4,
+        module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_FEATURE_PROTOCOL_ID: 5,
         module.POWER_WD_YAW_LRPM_HIST_SINCOS_FEATURE_PROTOCOL_ID: 5,
         module.POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID: 3,
     }
@@ -751,6 +752,50 @@ def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_yaw_hist
     )
     assert prepared.input_channels == 5
     assert prepared.source_tensor.shape == (2000, 3, 5)
+
+
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_yaw_pitchmean_hist_sincos(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+        past_covariate_columns=(
+            "wind_direction_sin",
+            "wind_direction_cos",
+            "yaw_error_sin",
+            "yaw_error_cos",
+            "pitch_mean",
+        ),
+    )
+    _patch_temp_bundle_loader(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+    )
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == (
+        "target_pu",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    )
+    assert prepared.input_channels == 6
+    assert prepared.source_tensor.shape == (2000, 3, 6)
 
 
 def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_yaw_lrpm_hist_sincos(
@@ -1323,6 +1368,18 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
     )
     _build_temp_cache(
         cache_root,
+        feature_protocol_id="power_wd_yaw_pitchmean_hist_sincos",
+        past_covariate_columns=(
+            "wind_direction_sin",
+            "wind_direction_cos",
+            "yaw_error_sin",
+            "yaw_error_cos",
+            "pitch_mean",
+        ),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _build_temp_cache(
+        cache_root,
         feature_protocol_id="power_wd_yaw_lrpm_hist_sincos",
         past_covariate_columns=(
             "wind_direction_sin",
@@ -1348,6 +1405,7 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
             "power_ws_hist",
             "power_wd_hist_sincos",
             "power_wd_yaw_hist_sincos",
+            "power_wd_yaw_pitchmean_hist_sincos",
             "power_wd_yaw_lrpm_hist_sincos",
             "power_ws_wd_hist_sincos",
         ),
@@ -1572,6 +1630,7 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
         module.POWER_WS_HIST_MODEL_VARIANT,
         module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT,
+        module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
     ):
@@ -1634,6 +1693,7 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
         module.POWER_WS_HIST_MODEL_VARIANT,
         module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT,
+        module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
     ):
