@@ -162,6 +162,7 @@ The active protocol IDs today are:
 - `power_only`
 - `power_ws_hist`
 - `power_wd_hist_sincos`
+- `power_wd_yaw_hist_sincos`
 - `power_ws_wd_hist_sincos`
 
 Protocol semantics:
@@ -169,7 +170,14 @@ Protocol semantics:
 - `power_only`: target history only
 - `power_ws_hist`: target history plus dataset-native past wind-speed covariates
 - `power_wd_hist_sincos`: target history plus task-derived wind-direction `sin/cos` covariates
+- `power_wd_yaw_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates
 - `power_ws_wd_hist_sincos`: target history plus dataset-native wind speed and task-derived wind-direction `sin/cos` covariates
+
+For `sdwpf_kddcup`, `Wdir` is treated as the documented relative yaw-error
+angle and absolute wind direction is reconstructed as `Ndir + Wdir` for the
+wind-direction protocols. The yaw-aware protocol additionally emits
+`yaw_error_sin/cos` directly from `Wdir`. The bundle `task_context.json`
+records the exact per-dataset angle transforms used by each protocol.
 
 The default feature protocol is `power_only`.
 

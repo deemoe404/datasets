@@ -10,6 +10,15 @@ DEFAULT_FEATURE_PROTOCOL_ID = "power_only"
 _PI = 3.141592653589793
 _WIND_DIRECTION_SIN_COLUMN = "wind_direction_sin"
 _WIND_DIRECTION_COS_COLUMN = "wind_direction_cos"
+_YAW_ERROR_SIN_COLUMN = "yaw_error_sin"
+_YAW_ERROR_COS_COLUMN = "yaw_error_cos"
+_YAW_ERROR_CONVENTION = "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
+_SDWPF_YAW_ERROR_NOTE = (
+    "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention."
+)
+_SDWPF_WIND_DIRECTION_RECONSTRUCTION_NOTE = (
+    "sdwpf_kddcup reconstructs absolute wind direction as Ndir + Wdir under the repository convention."
+)
 
 _SERIES_BASE_COLUMNS = (
     "dataset",
@@ -47,12 +56,18 @@ _POWER_WS_HIST_COLUMNS_BY_DATASET = {
     "hill_of_towie": ("wtc_AcWindSp_mean",),
     "sdwpf_kddcup": ("Wspd",),
 }
-_POWER_WD_HIST_COLUMNS_BY_DATASET = {
-    "kelmarsh": ("Wind direction (°)",),
-    "penmanshiel": ("Wind direction (°)",),
-    "hill_of_towie": ("wtc_ActualWindDirection_mean",),
-    "sdwpf_kddcup": ("Wdir",),
+_ABSOLUTE_WIND_DIRECTION_COLUMN_BY_DATASET = {
+    "kelmarsh": "Wind direction (°)",
+    "penmanshiel": "Wind direction (°)",
+    "hill_of_towie": "wtc_ActualWindDirection_mean",
 }
+_NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET = {
+    "kelmarsh": "Nacelle position (°)",
+    "penmanshiel": "Nacelle position (°)",
+    "hill_of_towie": "wtc_YawPos_mean",
+    "sdwpf_kddcup": "Ndir",
+}
+_SDWPF_YAW_ERROR_COLUMN = "Wdir"
 
 
 @dataclass(frozen=True)
@@ -72,6 +87,16 @@ class FeatureProtocolSpec:
 
 
 @dataclass(frozen=True)
+class AngleTransformSpec:
+    output_sin_column: str
+    output_cos_column: str
+    transform_kind: str
+    source_columns: tuple[str, ...]
+    description: str
+    angle_convention: str | None = None
+
+
+@dataclass(frozen=True)
 class TaskSeriesSelection:
     feature_protocol_id: str
     source_columns: tuple[str, ...]
@@ -81,7 +106,9 @@ class TaskSeriesSelection:
     static_columns: tuple[str, ...]
     target_derived_columns: tuple[str, ...]
     audit_columns: tuple[str, ...]
-    wind_direction_source_column: str | None = None
+    derived_angle_transforms: tuple[AngleTransformSpec, ...] = ()
+    angle_convention: str | None = None
+    dataset_specific_notes: tuple[str, ...] = ()
 
 
 _POWER_ONLY_PROTOCOL = FeatureProtocolSpec(
@@ -121,8 +148,8 @@ _POWER_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     uses_past_covariates=True,
     uses_target_derived_covariates=False,
     aliases=("power_with_wd_history_sincos",),
-    past_covariate_source="gold_base.dataset_native_wind_direction",
-    past_covariate_stage="task_bundle.direction_sincos",
+    past_covariate_source="task_bundle.derived_direction_angle",
+    past_covariate_stage="task_bundle.angle_sincos",
 )
 _POWER_WS_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     feature_protocol_id="power_ws_wd_hist_sincos",
@@ -135,14 +162,29 @@ _POWER_WS_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     uses_past_covariates=True,
     uses_target_derived_covariates=False,
     aliases=("power_with_ws_wd_history_sincos",),
-    past_covariate_source="gold_base.dataset_native_wind_speed_direction",
-    past_covariate_stage="task_bundle.direction_sincos",
+    past_covariate_source="task_bundle.wind_speed_plus_direction_angle",
+    past_covariate_stage="task_bundle.angle_sincos",
+)
+_POWER_WD_YAW_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_wd_yaw_hist_sincos",
+    display_name="Power + Wind Direction/Yaw Error History (Sin/Cos)",
+    protocol_kind="past_covariate_combination",
+    summary="Use target power history plus task-derived sine/cosine wind-direction and yaw-error covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_wd_yaw_history_sincos",),
+    past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles",
+    past_covariate_stage="task_bundle.angle_sincos",
 )
 _FEATURE_PROTOCOLS = (
     _POWER_ONLY_PROTOCOL,
     _POWER_WS_HIST_PROTOCOL,
     _POWER_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
+    _POWER_WD_YAW_HIST_SINCOS_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
     protocol.feature_protocol_id: protocol
@@ -165,23 +207,178 @@ def get_feature_protocol_spec(feature_protocol_id: str) -> FeatureProtocolSpec:
         raise ValueError(f"Unknown feature_protocol_id {feature_protocol_id!r}.") from exc
 
 
+def _require_mapping_value(
+    mapping: dict[str, str],
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> str:
+    try:
+        return mapping[dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+        ) from exc
+
+
+def _direct_angle_transform(
+    *,
+    output_sin_column: str,
+    output_cos_column: str,
+    source_column: str,
+    description: str,
+    angle_convention: str | None = None,
+) -> AngleTransformSpec:
+    return AngleTransformSpec(
+        output_sin_column=output_sin_column,
+        output_cos_column=output_cos_column,
+        transform_kind="direct",
+        source_columns=(source_column,),
+        description=description,
+        angle_convention=angle_convention,
+    )
+
+
+def _difference_angle_transform(
+    *,
+    output_sin_column: str,
+    output_cos_column: str,
+    minuend_column: str,
+    subtrahend_column: str,
+    description: str,
+    angle_convention: str | None = None,
+) -> AngleTransformSpec:
+    return AngleTransformSpec(
+        output_sin_column=output_sin_column,
+        output_cos_column=output_cos_column,
+        transform_kind="difference",
+        source_columns=(minuend_column, subtrahend_column),
+        description=description,
+        angle_convention=angle_convention,
+    )
+
+
+def _sum_angle_transform(
+    *,
+    output_sin_column: str,
+    output_cos_column: str,
+    left_column: str,
+    right_column: str,
+    description: str,
+    angle_convention: str | None = None,
+) -> AngleTransformSpec:
+    return AngleTransformSpec(
+        output_sin_column=output_sin_column,
+        output_cos_column=output_cos_column,
+        transform_kind="sum",
+        source_columns=(left_column, right_column),
+        description=description,
+        angle_convention=angle_convention,
+    )
+
+
+def _angle_transforms_for_protocol(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> tuple[tuple[AngleTransformSpec, ...], str | None, tuple[str, ...]]:
+    transforms: list[AngleTransformSpec] = []
+    notes: list[str] = []
+    angle_convention: str | None = None
+
+    uses_wind_direction = feature_protocol_id in {
+        _POWER_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+    }
+    uses_yaw_error = feature_protocol_id == _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id
+
+    if uses_wind_direction:
+        if dataset_id == "sdwpf_kddcup":
+            transforms.append(
+                _sum_angle_transform(
+                    output_sin_column=_WIND_DIRECTION_SIN_COLUMN,
+                    output_cos_column=_WIND_DIRECTION_COS_COLUMN,
+                    left_column=_require_mapping_value(
+                        _NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET,
+                        dataset_id=dataset_id,
+                        feature_protocol_id=feature_protocol_id,
+                    ),
+                    right_column=_SDWPF_YAW_ERROR_COLUMN,
+                    description="Reconstruct absolute wind direction from nacelle direction plus the documented relative Wdir angle.",
+                    angle_convention=_YAW_ERROR_CONVENTION,
+                )
+            )
+            notes.append(_SDWPF_WIND_DIRECTION_RECONSTRUCTION_NOTE)
+            notes.append(_SDWPF_YAW_ERROR_NOTE)
+            angle_convention = _YAW_ERROR_CONVENTION
+        else:
+            wind_direction_column = _require_mapping_value(
+                _ABSOLUTE_WIND_DIRECTION_COLUMN_BY_DATASET,
+                dataset_id=dataset_id,
+                feature_protocol_id=feature_protocol_id,
+            )
+            transforms.append(
+                _direct_angle_transform(
+                    output_sin_column=_WIND_DIRECTION_SIN_COLUMN,
+                    output_cos_column=_WIND_DIRECTION_COS_COLUMN,
+                    source_column=wind_direction_column,
+                    description="Encode the dataset-native absolute wind direction as sine/cosine covariates.",
+                )
+            )
+
+    if uses_yaw_error:
+        if dataset_id == "sdwpf_kddcup":
+            transforms.append(
+                _direct_angle_transform(
+                    output_sin_column=_YAW_ERROR_SIN_COLUMN,
+                    output_cos_column=_YAW_ERROR_COS_COLUMN,
+                    source_column=_SDWPF_YAW_ERROR_COLUMN,
+                    description="Encode the documented relative Wdir angle directly as yaw error sine/cosine covariates.",
+                    angle_convention=_YAW_ERROR_CONVENTION,
+                )
+            )
+            if _SDWPF_YAW_ERROR_NOTE not in notes:
+                notes.append(_SDWPF_YAW_ERROR_NOTE)
+            angle_convention = _YAW_ERROR_CONVENTION
+        else:
+            wind_direction_column = _require_mapping_value(
+                _ABSOLUTE_WIND_DIRECTION_COLUMN_BY_DATASET,
+                dataset_id=dataset_id,
+                feature_protocol_id=feature_protocol_id,
+            )
+            nacelle_or_yaw_column = _require_mapping_value(
+                _NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET,
+                dataset_id=dataset_id,
+                feature_protocol_id=feature_protocol_id,
+            )
+            transforms.append(
+                _difference_angle_transform(
+                    output_sin_column=_YAW_ERROR_SIN_COLUMN,
+                    output_cos_column=_YAW_ERROR_COS_COLUMN,
+                    minuend_column=wind_direction_column,
+                    subtrahend_column=nacelle_or_yaw_column,
+                    description="Compute yaw error from absolute wind direction minus nacelle/yaw position, then encode as sine/cosine.",
+                    angle_convention=_YAW_ERROR_CONVENTION,
+                )
+            )
+            angle_convention = _YAW_ERROR_CONVENTION
+
+    return tuple(transforms), angle_convention, tuple(dict.fromkeys(notes))
+
+
 def _dataset_native_columns_for_protocol(
     *,
     dataset_id: str,
     available_columns: set[str],
     feature_protocol_id: str,
-) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[AngleTransformSpec, ...], str | None, tuple[str, ...]]:
     uses_wind_speed = feature_protocol_id in {
         _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
-    uses_wind_direction = feature_protocol_id in {
-        _POWER_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
-        _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
-    }
     configured_columns: list[str] = []
     output_past_covariate_columns: list[str] = []
-    wind_direction_source_column: str | None = None
 
     if uses_wind_speed:
         try:
@@ -192,16 +389,14 @@ def _dataset_native_columns_for_protocol(
             ) from exc
         configured_columns.extend(wind_speed_columns)
         output_past_covariate_columns.extend(wind_speed_columns)
-    if uses_wind_direction:
-        try:
-            wind_direction_columns = _POWER_WD_HIST_COLUMNS_BY_DATASET[dataset_id]
-        except KeyError as exc:
-            raise ValueError(
-                f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
-            ) from exc
-        wind_direction_source_column = wind_direction_columns[0]
-        configured_columns.extend(wind_direction_columns)
-        output_past_covariate_columns.extend((_WIND_DIRECTION_SIN_COLUMN, _WIND_DIRECTION_COS_COLUMN))
+
+    derived_angle_transforms, angle_convention, dataset_specific_notes = _angle_transforms_for_protocol(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    )
+    for transform in derived_angle_transforms:
+        configured_columns.extend(transform.source_columns)
+        output_past_covariate_columns.extend((transform.output_sin_column, transform.output_cos_column))
 
     configured_columns = list(dict.fromkeys(configured_columns))
     missing_columns = [column for column in configured_columns if column not in available_columns]
@@ -210,7 +405,24 @@ def _dataset_native_columns_for_protocol(
             f"feature_protocol_id {feature_protocol_id!r} for dataset {dataset_id!r} requires "
             f"missing gold-base columns {missing_columns!r}."
         )
-    return tuple(configured_columns), tuple(output_past_covariate_columns), wind_direction_source_column
+    return (
+        tuple(configured_columns),
+        tuple(output_past_covariate_columns),
+        derived_angle_transforms,
+        angle_convention,
+        dataset_specific_notes,
+    )
+
+
+def _angle_degrees_expr(transform: AngleTransformSpec) -> pl.Expr:
+    source_exprs = [pl.col(column).cast(pl.Float64, strict=False) for column in transform.source_columns]
+    if transform.transform_kind == "direct":
+        return source_exprs[0]
+    if transform.transform_kind == "difference":
+        return source_exprs[0] - source_exprs[1]
+    if transform.transform_kind == "sum":
+        return source_exprs[0] + source_exprs[1]
+    raise ValueError(f"Unsupported angle transform kind {transform.transform_kind!r}.")
 
 
 def materialize_task_series_frame(
@@ -219,14 +431,17 @@ def materialize_task_series_frame(
     selection: TaskSeriesSelection,
 ) -> pl.DataFrame:
     series_frame = source_frame
-    if selection.wind_direction_source_column is not None:
-        wind_direction_radians = pl.col(selection.wind_direction_source_column).cast(pl.Float64, strict=False) * pl.lit(
-            _PI / 180.0
+    derived_columns: list[pl.Expr] = []
+    for transform in selection.derived_angle_transforms:
+        angle_radians = _angle_degrees_expr(transform) * pl.lit(_PI / 180.0)
+        derived_columns.extend(
+            (
+                angle_radians.sin().alias(transform.output_sin_column),
+                angle_radians.cos().alias(transform.output_cos_column),
+            )
         )
-        series_frame = series_frame.with_columns(
-            wind_direction_radians.sin().alias(_WIND_DIRECTION_SIN_COLUMN),
-            wind_direction_radians.cos().alias(_WIND_DIRECTION_COS_COLUMN),
-        )
+    if derived_columns:
+        series_frame = series_frame.with_columns(*derived_columns)
     return series_frame.select(list(selection.all_columns))
 
 
@@ -239,7 +454,13 @@ def select_task_series_columns(
 ) -> TaskSeriesSelection:
     del turbine_static_columns
     get_feature_protocol_spec(feature_protocol_id)
-    source_past_covariate_columns, past_covariate_columns, wind_direction_source_column = _dataset_native_columns_for_protocol(
+    (
+        source_past_covariate_columns,
+        past_covariate_columns,
+        derived_angle_transforms,
+        angle_convention,
+        dataset_specific_notes,
+    ) = _dataset_native_columns_for_protocol(
         dataset_id=dataset_id,
         available_columns=available_columns,
         feature_protocol_id=feature_protocol_id,
@@ -255,7 +476,9 @@ def select_task_series_columns(
         static_columns=(),
         target_derived_columns=(),
         audit_columns=audit_columns,
-        wind_direction_source_column=wind_direction_source_column,
+        derived_angle_transforms=derived_angle_transforms,
+        angle_convention=angle_convention,
+        dataset_specific_notes=dataset_specific_notes,
     )
 
 
@@ -288,6 +511,17 @@ def build_known_future_frame(series_frame: pl.DataFrame) -> pl.DataFrame:
     return timestamps
 
 
+def _angle_transform_context_dict(transform: AngleTransformSpec) -> dict[str, object]:
+    return {
+        "output_sin_column": transform.output_sin_column,
+        "output_cos_column": transform.output_cos_column,
+        "transform_kind": transform.transform_kind,
+        "source_columns": list(transform.source_columns),
+        "description": transform.description,
+        "angle_convention": transform.angle_convention,
+    }
+
+
 def protocol_context_dict(
     *,
     dataset_id: str,
@@ -315,6 +549,12 @@ def protocol_context_dict(
             "aliases": list(protocol.aliases),
             "past_covariate_source": protocol.past_covariate_source,
             "past_covariate_stage": protocol.past_covariate_stage,
+            "angle_convention": selection.angle_convention,
+            "dataset_specific_notes": list(selection.dataset_specific_notes),
+            "derived_angle_features": [
+                _angle_transform_context_dict(transform)
+                for transform in selection.derived_angle_transforms
+            ],
         },
         "task": task,
         "turbine_ids": list(turbine_ids),
@@ -333,6 +573,7 @@ def protocol_context_dict(
 __all__ = [
     "DEFAULT_FEATURE_PROTOCOL_ID",
     "TASK_BUNDLE_SCHEMA_VERSION",
+    "AngleTransformSpec",
     "FeatureProtocolSpec",
     "TaskSeriesSelection",
     "build_known_future_frame",
