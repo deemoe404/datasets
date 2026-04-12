@@ -45,6 +45,7 @@ def test_active_feature_protocols_are_registered() -> None:
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_lrpm_hist_sincos",
     )
 
     power_only = get_feature_protocol_spec("power_only")
@@ -72,6 +73,11 @@ def test_active_feature_protocols_are_registered() -> None:
     assert power_wd_yaw_hist.feature_protocol_id == "power_wd_yaw_hist_sincos"
     assert power_wd_yaw_hist.uses_target_history is True
     assert power_wd_yaw_hist.uses_past_covariates is True
+
+    power_wd_yaw_lrpm_hist = get_feature_protocol_spec("power_wd_yaw_lrpm_hist_sincos")
+    assert power_wd_yaw_lrpm_hist.feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos"
+    assert power_wd_yaw_lrpm_hist.uses_target_history is True
+    assert power_wd_yaw_lrpm_hist.uses_past_covariates is True
 
 
 def test_unknown_feature_protocol_is_rejected() -> None:
@@ -274,6 +280,59 @@ def test_power_wd_yaw_hist_sincos_selection_emits_four_cyclic_covariates(
     assert selection.angle_convention == "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
 
 
+@pytest.mark.parametrize(
+    ("dataset_id", "source_columns", "lrpm_column"),
+    [
+        ("kelmarsh", ("Wind direction (°)", "Nacelle position (°)"), "Rotor speed (RPM)"),
+        ("penmanshiel", ("Wind direction (°)", "Nacelle position (°)"), "Rotor speed (RPM)"),
+        ("hill_of_towie", ("wtc_ActualWindDirection_mean", "wtc_YawPos_mean"), "wtc_MainSRpm_mean"),
+    ],
+)
+def test_power_wd_yaw_lrpm_hist_sincos_selection_orders_lrpm_after_cyclic_covariates(
+    dataset_id: str,
+    source_columns: tuple[str, ...],
+    lrpm_column: str,
+) -> None:
+    selection = _selection(dataset_id, "power_wd_yaw_lrpm_hist_sincos", *source_columns, lrpm_column)
+
+    assert selection.source_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        *source_columns,
+        lrpm_column,
+        "farm_turbines_expected",
+    )
+    assert selection.past_covariate_columns == (
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        lrpm_column,
+    )
+    assert selection.all_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        lrpm_column,
+        "farm_turbines_expected",
+    )
+    assert len(selection.derived_angle_transforms) == 2
+    assert selection.angle_convention == "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
+
+
 def test_materialize_task_series_frame_builds_direction_sincos_from_dataset_native_angle() -> None:
     selection = _selection("kelmarsh", "power_wd_hist_sincos", "Wind direction (°)")
 
@@ -331,6 +390,41 @@ def test_materialize_task_series_frame_wraps_yaw_error_through_zero_and_360() ->
 
     assert frame["yaw_error_sin"].to_list() == [pytest.approx(sin_2), pytest.approx(-sin_2)]
     assert frame["yaw_error_cos"].to_list() == [pytest.approx(cos_2), pytest.approx(cos_2)]
+
+
+def test_materialize_task_series_frame_appends_lrpm_after_derived_direction_and_yaw_error() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "power_wd_yaw_lrpm_hist_sincos",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Rotor speed (RPM)",
+    )
+
+    frame = materialize_task_series_frame(
+        pl.DataFrame(
+            {
+                "dataset": ["kelmarsh"],
+                "turbine_id": ["T01"],
+                "timestamp": [datetime(2024, 1, 1, 0, 0)],
+                "target_kw": [100.0],
+                "is_observed": [True],
+                "quality_flags": [""],
+                "feature_quality_flags": [""],
+                "farm_turbines_expected": [6],
+                "Wind direction (°)": [180.0],
+                "Nacelle position (°)": [174.0],
+                "Rotor speed (RPM)": [12.5],
+            }
+        ),
+        selection=selection,
+    )
+
+    assert frame["wind_direction_sin"][0] == pytest.approx(math.sin(math.radians(180.0)))
+    assert frame["wind_direction_cos"][0] == pytest.approx(math.cos(math.radians(180.0)))
+    assert frame["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
+    assert frame["yaw_error_cos"][0] == pytest.approx(math.cos(math.radians(6.0)))
+    assert frame["Rotor speed (RPM)"][0] == pytest.approx(12.5)
 
 
 def test_materialize_task_series_frame_reconstructs_sdwpf_absolute_wind_direction_for_existing_protocol() -> None:
@@ -438,6 +532,30 @@ def test_sdwpf_direction_protocols_require_ndir_for_absolute_wind_direction_reco
         )
 
 
+def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"feature_protocol_id 'power_wd_yaw_lrpm_hist_sincos' is not supported for dataset 'sdwpf_kddcup'\.",
+    ):
+        select_task_series_columns(
+            dataset_id="sdwpf_kddcup",
+            available_columns={
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                "target_kw",
+                "is_observed",
+                "quality_flags",
+                "feature_quality_flags",
+                "farm_turbines_expected",
+                "Ndir",
+                "Wdir",
+            },
+            feature_protocol_id="power_wd_yaw_lrpm_hist_sincos",
+            turbine_static_columns={"coord_x", "coord_y"},
+        )
+
+
 @pytest.mark.parametrize(
     "feature_protocol_id",
     [
@@ -445,6 +563,7 @@ def test_sdwpf_direction_protocols_require_ndir_for_absolute_wind_direction_reco
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_lrpm_hist_sincos",
     ],
 )
 def test_protocol_selection_rejects_missing_mapped_columns(feature_protocol_id: str) -> None:

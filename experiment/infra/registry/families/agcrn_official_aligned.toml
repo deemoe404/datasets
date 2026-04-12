@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "agcrn_official_aligned"
 display_name = "AGCRN Official-Aligned"
 status = "pilot"
-summary = "Official-aligned AGCRN baseline on the Kelmarsh farm-synchronous power-only, wind-speed-history, wind-direction-sincos, and yaw-aware wind-direction tasks."
+summary = "Official-aligned AGCRN baseline on the Kelmarsh farm-synchronous power-only, wind-speed-history, wind-direction-sincos, yaw-aware wind-direction, and yaw-aware low-speed-rotor-RPM tasks."
 model_family = "agcrn"
 training_mode = "trainable"
 implementation_root = "experiment/families/agcrn"
@@ -13,13 +13,14 @@ default_output_schema_version = "agcrn_official_aligned.long_metrics.v1"
 dataset_scope = ["kelmarsh"]
 supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
 supported_result_splits = ["val", "test"]
-supported_feature_protocols = ["power_only", "power_ws_hist", "power_wd_hist_sincos", "power_wd_yaw_hist_sincos", "power_ws_wd_hist_sincos"]
+supported_feature_protocols = ["power_only", "power_ws_hist", "power_wd_hist_sincos", "power_wd_yaw_hist_sincos", "power_wd_yaw_lrpm_hist_sincos", "power_ws_wd_hist_sincos"]
 implementation_label_kind = "model_variant"
 implementation_labels = [
   "official_aligned_power_only_farm_sync",
   "official_aligned_power_ws_hist_farm_sync",
   "official_aligned_power_wd_hist_sincos_farm_sync",
   "official_aligned_power_wd_yaw_hist_sincos_farm_sync",
+  "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync",
   "official_aligned_power_ws_wd_hist_sincos_farm_sync",
 ]
 model_variants = [
@@ -27,6 +28,7 @@ model_variants = [
   "official_aligned_power_ws_hist_farm_sync",
   "official_aligned_power_wd_hist_sincos_farm_sync",
   "official_aligned_power_wd_yaw_hist_sincos_farm_sync",
+  "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync",
   "official_aligned_power_ws_wd_hist_sincos_farm_sync",
 ]
 notes = [
@@ -46,4 +48,5 @@ official_aligned_power_only_farm_sync = "power_only"
 official_aligned_power_ws_hist_farm_sync = "power_ws_hist"
 official_aligned_power_wd_hist_sincos_farm_sync = "power_wd_hist_sincos"
 official_aligned_power_wd_yaw_hist_sincos_farm_sync = "power_wd_yaw_hist_sincos"
+official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync = "power_wd_yaw_lrpm_hist_sincos"
 official_aligned_power_ws_wd_hist_sincos_farm_sync = "power_ws_wd_hist_sincos"

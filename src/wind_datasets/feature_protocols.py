@@ -7,6 +7,7 @@ import polars as pl
 
 TASK_BUNDLE_SCHEMA_VERSION = "task_bundle.v1"
 DEFAULT_FEATURE_PROTOCOL_ID = "power_only"
+BLOCKED_BY_UNSUPPORTED_FEATURE_PROTOCOL = "blocked_by_unsupported_feature_protocol"
 _PI = 3.141592653589793
 _WIND_DIRECTION_SIN_COLUMN = "wind_direction_sin"
 _WIND_DIRECTION_COS_COLUMN = "wind_direction_cos"
@@ -56,6 +57,11 @@ _POWER_WS_HIST_COLUMNS_BY_DATASET = {
     "hill_of_towie": ("wtc_AcWindSp_mean",),
     "sdwpf_kddcup": ("Wspd",),
 }
+_LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET = {
+    "kelmarsh": "Rotor speed (RPM)",
+    "penmanshiel": "Rotor speed (RPM)",
+    "hill_of_towie": "wtc_MainSRpm_mean",
+}
 _ABSOLUTE_WIND_DIRECTION_COLUMN_BY_DATASET = {
     "kelmarsh": "Wind direction (°)",
     "penmanshiel": "Wind direction (°)",
@@ -68,6 +74,9 @@ _NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET = {
     "sdwpf_kddcup": "Ndir",
 }
 _SDWPF_YAW_ERROR_COLUMN = "Wdir"
+_UNSUPPORTED_DATASET_IDS_BY_PROTOCOL = {
+    "power_wd_yaw_lrpm_hist_sincos": ("sdwpf_kddcup",),
+}
 
 
 @dataclass(frozen=True)
@@ -179,12 +188,30 @@ _POWER_WD_YAW_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles",
     past_covariate_stage="task_bundle.angle_sincos",
 )
+_POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_wd_yaw_lrpm_hist_sincos",
+    display_name="Power + Wind Direction/Yaw Error/LS RPM History (Sin/Cos)",
+    protocol_kind="past_covariate_combination",
+    summary=(
+        "Use target power history plus task-derived sine/cosine wind-direction and yaw-error covariates "
+        "and dataset-native low-speed rotor RPM history."
+    ),
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_wd_yaw_lrpm_history_sincos",),
+    past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles_plus_low_speed_rotor_rpm",
+    past_covariate_stage="task_bundle.angle_sincos_plus_native_covariate",
+)
 _FEATURE_PROTOCOLS = (
     _POWER_ONLY_PROTOCOL,
     _POWER_WS_HIST_PROTOCOL,
     _POWER_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_HIST_SINCOS_PROTOCOL,
+    _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
     protocol.feature_protocol_id: protocol
@@ -205,6 +232,44 @@ def get_feature_protocol_spec(feature_protocol_id: str) -> FeatureProtocolSpec:
         return _FEATURE_PROTOCOLS_BY_ID[feature_protocol_id]
     except KeyError as exc:
         raise ValueError(f"Unknown feature_protocol_id {feature_protocol_id!r}.") from exc
+
+
+def _unsupported_feature_protocol_message(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> str | None:
+    get_feature_protocol_spec(feature_protocol_id)
+    unsupported_dataset_ids = _UNSUPPORTED_DATASET_IDS_BY_PROTOCOL.get(feature_protocol_id, ())
+    if dataset_id in unsupported_dataset_ids:
+        return f"feature_protocol_id {feature_protocol_id!r} is not supported for dataset {dataset_id!r}."
+    return None
+
+
+def validate_feature_protocol_for_dataset(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> None:
+    message = _unsupported_feature_protocol_message(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    )
+    if message is not None:
+        raise ValueError(message)
+
+
+def feature_protocol_task_blocked_reason(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> str | None:
+    if _unsupported_feature_protocol_message(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    ) is not None:
+        return BLOCKED_BY_UNSUPPORTED_FEATURE_PROTOCOL
+    return None
 
 
 def _require_mapping_value(
@@ -290,8 +355,12 @@ def _angle_transforms_for_protocol(
         _POWER_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
-    uses_yaw_error = feature_protocol_id == _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id
+    uses_yaw_error = feature_protocol_id in {
+        _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+    }
 
     if uses_wind_direction:
         if dataset_id == "sdwpf_kddcup":
@@ -377,6 +446,7 @@ def _dataset_native_columns_for_protocol(
         _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
+    uses_low_speed_rotor_rpm = feature_protocol_id == _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id
     configured_columns: list[str] = []
     output_past_covariate_columns: list[str] = []
 
@@ -397,6 +467,16 @@ def _dataset_native_columns_for_protocol(
     for transform in derived_angle_transforms:
         configured_columns.extend(transform.source_columns)
         output_past_covariate_columns.extend((transform.output_sin_column, transform.output_cos_column))
+
+    if uses_low_speed_rotor_rpm:
+        configured_columns.append(
+            _require_mapping_value(
+                _LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET,
+                dataset_id=dataset_id,
+                feature_protocol_id=feature_protocol_id,
+            )
+        )
+        output_past_covariate_columns.append(configured_columns[-1])
 
     configured_columns = list(dict.fromkeys(configured_columns))
     missing_columns = [column for column in configured_columns if column not in available_columns]
@@ -453,7 +533,10 @@ def select_task_series_columns(
     turbine_static_columns: set[str] | None = None,
 ) -> TaskSeriesSelection:
     del turbine_static_columns
-    get_feature_protocol_spec(feature_protocol_id)
+    validate_feature_protocol_for_dataset(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    )
     (
         source_past_covariate_columns,
         past_covariate_columns,
@@ -571,16 +654,19 @@ def protocol_context_dict(
 
 
 __all__ = [
+    "BLOCKED_BY_UNSUPPORTED_FEATURE_PROTOCOL",
     "DEFAULT_FEATURE_PROTOCOL_ID",
     "TASK_BUNDLE_SCHEMA_VERSION",
     "AngleTransformSpec",
     "FeatureProtocolSpec",
     "TaskSeriesSelection",
     "build_known_future_frame",
+    "feature_protocol_task_blocked_reason",
     "get_feature_protocol_spec",
     "list_feature_protocol_ids",
     "list_feature_protocol_specs",
     "materialize_task_series_frame",
     "protocol_context_dict",
     "select_task_series_columns",
+    "validate_feature_protocol_for_dataset",
 ]

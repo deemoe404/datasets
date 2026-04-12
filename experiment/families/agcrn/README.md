@@ -7,7 +7,7 @@ This experiment runs an official-aligned AGCRN baseline on:
 The scope is intentionally narrow:
 
 - `24h look back -> 6h ahead`
-- `power_only`, `power_ws_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, and `power_ws_wd_hist_sincos`
+- `power_only`, `power_ws_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, and `power_ws_wd_hist_sincos`
 - `farm-synchronous` turbine panel with stable task-local `turbine_index`
 - official AGCRN core architecture (`AVWGCN` + `AGCRNCell` + encoder + `end_conv`)
 - train on `train`
@@ -40,6 +40,10 @@ cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/static.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/task_context.json
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/static.parquet
@@ -90,9 +94,9 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-The default invocation now runs all five active variants. The tuned 2026-04-12
+The default invocation now runs all six active variants. The tuned 2026-04-12
 full-run profiles are still used for the original two searched variants, and
-the three wind-direction variants currently reuse the `power_ws_hist`
+the four wind-direction variants currently reuse the `power_ws_hist`
 hyperparameter profile until they are tuned separately:
 
 - `official_aligned_power_only_farm_sync`
@@ -116,6 +120,8 @@ hyperparameter profile until they are tuned separately:
 - `official_aligned_power_wd_hist_sincos_farm_sync`
   - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
 - `official_aligned_power_wd_yaw_hist_sincos_farm_sync`
+  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+- `official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync`
   - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
 - `official_aligned_power_ws_wd_hist_sincos_farm_sync`
   - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
@@ -144,6 +150,7 @@ Useful smoke-test options:
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
 
 ## Hyperparameter Search
@@ -154,7 +161,7 @@ variants separately without falling back to mismatched window sets.
 The search script always prepares `power_only` and `power_ws_hist` together,
 intersects their strict `train`/`val`/`test` windows, and only then tunes each
 variant on that shared split surface. It does not yet tune
-`power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, or `power_ws_wd_hist_sincos`.
+`power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, or `power_ws_wd_hist_sincos`.
 
 ### Search Setup
 
@@ -282,4 +289,4 @@ report matching window counts across all selected feature protocols after
 alignment.
 
 That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
-Running all five active variants by default yields `5 * 148 = 740` rows.
+Running all six active variants by default yields `6 * 148 = 888` rows.

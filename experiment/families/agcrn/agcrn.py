@@ -79,6 +79,7 @@ MODEL_VARIANT = "official_aligned_power_only_farm_sync"
 POWER_WS_HIST_MODEL_VARIANT = "official_aligned_power_ws_hist_farm_sync"
 POWER_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_hist_sincos_farm_sync"
 POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_yaw_hist_sincos_farm_sync"
+POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync"
 POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_ws_wd_hist_sincos_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
@@ -91,6 +92,7 @@ FEATURE_PROTOCOL_ID = "power_only"
 POWER_WS_HIST_FEATURE_PROTOCOL_ID = "power_ws_hist"
 POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_hist_sincos"
 POWER_WD_YAW_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_yaw_hist_sincos"
+POWER_WD_YAW_LRPM_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_yaw_lrpm_hist_sincos"
 POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_ws_wd_hist_sincos"
 GRAPH_MODE = "adaptive"
 GRAPH_SOURCE = "learned_node_embeddings"
@@ -179,7 +181,8 @@ _MODEL_VARIANT_ORDER = {
     POWER_WS_HIST_MODEL_VARIANT: 1,
     POWER_WD_HIST_SINCOS_MODEL_VARIANT: 2,
     POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: 3,
-    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: 4,
+    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: 4,
+    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: 5,
 }
 _SPLIT_NAMES = ("train", "val", "test")
 _WINDOW_KEY_COLUMNS = ("output_start_ts", "output_end_ts")
@@ -222,6 +225,10 @@ VARIANT_SPECS = (
         feature_protocol_id=POWER_WD_YAW_HIST_SINCOS_FEATURE_PROTOCOL_ID,
     ),
     ExperimentVariant(
+        model_variant=POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT,
+        feature_protocol_id=POWER_WD_YAW_LRPM_HIST_SINCOS_FEATURE_PROTOCOL_ID,
+    ),
+    ExperimentVariant(
         model_variant=POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
         feature_protocol_id=POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID,
     ),
@@ -261,6 +268,7 @@ TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
     POWER_WS_HIST_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
     POWER_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
     POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
+    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
     POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
 }
 
@@ -2136,7 +2144,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(DEFAULT_VARIANTS),
         dest="variants",
-        help="Limit execution to one or more model variants. Defaults to running all five active variants.",
+        help="Limit execution to one or more model variants. Defaults to running all six active variants.",
     )
     parser.add_argument(
         "--epochs",

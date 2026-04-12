@@ -37,6 +37,7 @@ def test_resolve_family_feature_protocol_ids_maps_active_labels_to_registry_ids(
             "official_aligned_power_ws_hist_farm_sync",
             "official_aligned_power_wd_hist_sincos_farm_sync",
             "official_aligned_power_wd_yaw_hist_sincos_farm_sync",
+            "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync",
             "official_aligned_power_ws_wd_hist_sincos_farm_sync",
         ),
         repo_root=repo_root,
@@ -45,6 +46,7 @@ def test_resolve_family_feature_protocol_ids_maps_active_labels_to_registry_ids(
         "power_ws_hist",
         "power_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_lrpm_hist_sincos",
         "power_ws_wd_hist_sincos",
     )
 
@@ -71,6 +73,7 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
             "power_ws_hist",
             "power_wd_hist_sincos",
             "power_wd_yaw_hist_sincos",
+            "power_wd_yaw_lrpm_hist_sincos",
             "power_ws_wd_hist_sincos",
         ),
         model_variants=(
@@ -78,6 +81,7 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
             "official_aligned_power_ws_hist_farm_sync",
             "official_aligned_power_wd_hist_sincos_farm_sync",
             "official_aligned_power_wd_yaw_hist_sincos_farm_sync",
+            "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync",
             "official_aligned_power_ws_wd_hist_sincos_farm_sync",
         ),
         eval_protocols=("rolling_origin_no_refit", "non_overlap"),
@@ -95,6 +99,7 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
         "power_ws_hist",
         "power_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_lrpm_hist_sincos",
         "power_ws_wd_hist_sincos",
     ]
     assert payload["selection"]["model_variants"] == [
@@ -102,6 +107,7 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
         "official_aligned_power_ws_hist_farm_sync",
         "official_aligned_power_wd_hist_sincos_farm_sync",
         "official_aligned_power_wd_yaw_hist_sincos_farm_sync",
+        "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync",
         "official_aligned_power_ws_wd_hist_sincos_farm_sync",
     ]
     assert payload["result"]["row_count"] == 1

@@ -19,6 +19,7 @@ from ..cache_state import (
 from ..feature_protocols import (
     DEFAULT_FEATURE_PROTOCOL_ID,
     build_known_future_frame,
+    feature_protocol_task_blocked_reason,
     materialize_task_series_frame,
     protocol_context_dict,
     select_task_series_columns,
@@ -126,8 +127,11 @@ class BaseDatasetBuilder:
         task: ResolvedTaskSpec,
         feature_protocol_id: str,
     ) -> str | None:
-        del task, feature_protocol_id
-        return None
+        del task
+        return feature_protocol_task_blocked_reason(
+            dataset_id=self.spec.dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
 
     def ensure_silver_fresh(self) -> None:
         if self.silver_status().status != "fresh":

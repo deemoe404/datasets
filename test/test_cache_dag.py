@@ -305,6 +305,19 @@ def test_sdwpf_gold_and_task_status_blocked_when_manifest_time_semantics_invalid
     assert builder.task_cache_status(task).reason == "blocked_by_manifest_time_semantics"
 
 
+def test_sdwpf_lrpm_protocol_task_status_is_blocked_as_unsupported(tmp_path) -> None:
+    spec = build_sdwpf_kddcup_fixture(tmp_path / "raw" / "sdwpf")
+    builder = SDWPFKDDCupDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec.next_6h_from_24h()
+
+    build_manifest_for_spec(spec, tmp_path / "cache")
+
+    status = builder.task_cache_status(task, feature_protocol_id="power_wd_yaw_lrpm_hist_sincos")
+
+    assert status.status == "stale"
+    assert status.reason == "blocked_by_unsupported_feature_protocol"
+
+
 def test_rebuild_cli_check_reports_fresh_and_stale_layers(monkeypatch, capsys) -> None:
     class _FakeBuilder:
         def manifest_status(self) -> LayerStatus:

@@ -11,7 +11,7 @@ from typing import Callable, Sequence
 from .api import build_gold_base, build_manifest, build_silver, build_task_cache
 from .config import ProjectConfigError
 from .datasets import get_builder
-from .feature_protocols import list_feature_protocol_ids
+from .feature_protocols import BLOCKED_BY_UNSUPPORTED_FEATURE_PROTOCOL, list_feature_protocol_ids
 from .models import TaskSpec
 from .registry import get_dataset_spec, list_dataset_ids
 
@@ -25,6 +25,8 @@ _TASK_FEATURE_PROTOCOL_IDS = list_feature_protocol_ids()
 class RebuildStage:
     name: str
     run: Callable[[str, Path], Path]
+    task_spec: TaskSpec | None = None
+    feature_protocol_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,8 @@ def rebuild_stages(include_turbine: bool) -> tuple[RebuildStage, ...]:
                     cache_root=cache_root,
                     feature_protocol_id=protocol_id,
                 ),
+                task_spec=_FARM_TASK,
+                feature_protocol_id=feature_protocol_id,
             )
         )
     return tuple(stages)
@@ -167,8 +171,18 @@ def run_rebuild(
 
     failures: list[RebuildFailure] = []
     for dataset in datasets:
+        spec = get_dataset_spec(dataset)
+        builder = get_builder(spec, cache_root)
         for stage in rebuild_stages(include_turbine):
             _log_stage(dataset, stage.name)
+            if stage.task_spec is not None and stage.feature_protocol_id is not None:
+                status = builder.task_cache_status(stage.task_spec, feature_protocol_id=stage.feature_protocol_id)
+                if status.reason == BLOCKED_BY_UNSUPPORTED_FEATURE_PROTOCOL:
+                    print(
+                        f"[rebuild] dataset={dataset} stage={stage.name} skipped: {status.reason}",
+                        flush=True,
+                    )
+                    continue
             try:
                 result = stage.run(dataset, cache_root)
             except ProjectConfigError:

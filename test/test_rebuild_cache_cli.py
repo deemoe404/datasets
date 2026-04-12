@@ -8,6 +8,7 @@ import subprocess
 import pytest
 
 from wind_datasets import rebuild_cache as rebuild_module
+from wind_datasets.cache_state import LayerStatus
 from wind_datasets.config import ProjectConfigError
 
 
@@ -73,19 +74,22 @@ def test_rebuild_cli_defaults_to_all_datasets_and_farm_only(monkeypatch, capsys)
     code = rebuild_module.main([])
 
     assert code == 0
-    expected_stages = [
-        "manifest",
-        "silver",
-        "gold_base",
-        *[
-            _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
-            for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
-        ],
-    ]
     assert calls == [
         (dataset, stage)
         for dataset in rebuild_module.SUPPORTED_DATASETS
-        for stage in expected_stages
+        for stage in (
+            "manifest",
+            "silver",
+            "gold_base",
+            *[
+                _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
+                for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+                if not (
+                    dataset == "sdwpf_kddcup"
+                    and feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos"
+                )
+            ],
+        )
     ]
     captured = capsys.readouterr()
     assert "completed successfully" in captured.out
@@ -224,6 +228,44 @@ def test_rebuild_cli_summarizes_sdwpf_gold_block_without_running_tasks(monkeypat
     captured = capsys.readouterr()
     assert "sdwpf_kddcup" in captured.err
     assert "blocked by audit" in captured.err
+
+
+def test_rebuild_cli_skips_sdwpf_lrpm_task_stage_when_protocol_is_unsupported(monkeypatch, capsys) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(rebuild_module, "SUPPORTED_DATASETS", ("sdwpf_kddcup",))
+    _patch_rebuild_api(monkeypatch, calls)
+
+    class _FakeBuilder:
+        def task_cache_status(self, task_spec, feature_protocol_id="power_only", quality_profile=None) -> LayerStatus:
+            del task_spec, quality_profile
+            if feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos":
+                return LayerStatus(
+                    status="stale",
+                    reason="blocked_by_unsupported_feature_protocol",
+                    fingerprint="blocked",
+                )
+            return LayerStatus(status="missing", reason="missing_output", fingerprint="task")
+
+    monkeypatch.setattr(rebuild_module, "get_dataset_spec", lambda dataset: object())
+    monkeypatch.setattr(rebuild_module, "get_builder", lambda spec, cache_root: _FakeBuilder())
+
+    code = rebuild_module.main(["sdwpf_kddcup"])
+
+    assert code == 0
+    blocked_stage = _stage_name_for_task("next_6h_from_24h", "power_wd_yaw_lrpm_hist_sincos")
+    assert ("sdwpf_kddcup", blocked_stage) not in calls
+    assert calls == [
+        ("sdwpf_kddcup", "manifest"),
+        ("sdwpf_kddcup", "silver"),
+        ("sdwpf_kddcup", "gold_base"),
+        *[
+            ("sdwpf_kddcup", _stage_name_for_task("next_6h_from_24h", feature_protocol_id))
+            for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+            if feature_protocol_id != "power_wd_yaw_lrpm_hist_sincos"
+        ],
+    ]
+    captured = capsys.readouterr()
+    assert "skipped: blocked_by_unsupported_feature_protocol" in captured.out
 
 
 def test_rebuild_shell_wrapper_reports_missing_python_path(tmp_path) -> None:

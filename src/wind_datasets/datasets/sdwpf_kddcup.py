@@ -153,7 +153,9 @@ class SDWPFKDDCupDatasetBuilder(BaseDatasetBuilder):
         task,
         feature_protocol_id: str,
     ) -> str | None:
-        del task, feature_protocol_id
+        unsupported_reason = super().task_cache_blocked_reason(task, feature_protocol_id)
+        if unsupported_reason is not None:
+            return unsupported_reason
         return self.gold_base_blocked_reason()
 
     def build_gold_base(
