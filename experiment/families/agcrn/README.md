@@ -98,10 +98,8 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-The default invocation now runs all seven active variants. The tuned 2026-04-12
-full-run profiles are still used for the original two searched variants, and
-the five non-searched variants currently reuse the `power_ws_hist`
-hyperparameter profile until they are tuned separately:
+The default invocation now runs all seven active variants with the tuned
+2026-04-13 defaults:
 
 - `official_aligned_power_only_farm_sync`
   - `batch_size=512`
@@ -122,15 +120,50 @@ hyperparameter profile until they are tuned separately:
   - `num_layers=2`
   - `cheb_k=3`
 - `official_aligned_power_wd_hist_sincos_farm_sync`
-  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+  - `batch_size=512`
+  - `learning_rate=5e-4`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 - `official_aligned_power_wd_yaw_hist_sincos_farm_sync`
-  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+  - `batch_size=512`
+  - `learning_rate=5e-4`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 - `official_aligned_power_wd_yaw_pitchmean_hist_sincos_farm_sync`
-  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 - `official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync`
-  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 - `official_aligned_power_ws_wd_hist_sincos_farm_sync`
-  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 
 Explicit CLI flags such as `--batch-size`, `--learning-rate`, `--epochs`,
 `--patience`, `--embed-dim`, or `--cheb-k` still override these tuned defaults
@@ -145,10 +178,6 @@ This writes:
 For ad hoc smoke/debug runs, prefer an explicit `--output-path` under
 `../../artifacts/scratch/agcrn_official_aligned/`.
 
-This repository change only updates code, docs, and tests. The checked-in
-`../../artifacts/published/agcrn_official_aligned/latest.csv` has not been
-refreshed for the new variant yet.
-
 Useful smoke-test options:
 
 ```bash
@@ -158,108 +187,78 @@ Useful smoke-test options:
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_pitchmean_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
 
 ## Hyperparameter Search
 
-Use the aligned search harness when you want to tune the two already-searched
-variants separately without falling back to mismatched window sets.
+Use the aligned search harness when you want to tune any subset of the active
+variants without falling back to mismatched window sets.
 
-The search script always prepares `power_only` and `power_ws_hist` together,
-intersects their strict `train`/`val`/`test` windows, and only then tunes each
-variant on that shared split surface. It does not yet tune
-`power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_pitchmean_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, or `power_ws_wd_hist_sincos`.
+The search script always prepares all seven active variants together,
+intersects their strict `train`/`val`/`test` windows, and only then tunes the
+requested variants on that shared split surface. This keeps search-time window
+counts aligned with the default full-family rerun.
 
 ### Search Setup
 
-The 2026-04-12 search used the aligned window fix now present on `HEAD`. With
-that fix, both feature protocols share exactly the same full-window split sizes
-for Kelmarsh:
+The 2026-04-13 full-family tuning pass used these shared Kelmarsh split sizes:
 
-- `train=292161`
-- `val_rolling=43473`
-- `val_non_overlap=1208`
-- `test_rolling=82597`
-- `test_non_overlap=2295`
+- `train=275587`
+- `val_rolling=43287`
+- `val_non_overlap=1203`
+- `test_rolling=82024`
+- `test_non_overlap=2279`
 
-The screening and confirmation budgets were:
+The quick screening budget used for the seven-variant pass was:
 
-- screen: `train_origins=65536`, `eval_origins=8192`, `epochs=10`, `patience=3`
-- final confirm: `epochs=20`, `patience=5`
+- `train_origins=32768`
+- `eval_origins=4096`
+- `epochs=4`
+- `patience=2`
 
-The search covered these candidate families:
+The 2026-04-13 screen compared these three high-value candidates for every
+variant:
 
-- `power_only`
-  - `baseline_bs1024_h64_e10_l2_k2_lr1e-3`
-  - `baseline_bs512_h64_e10_l2_k2_lr1e-3`
-  - `compact_bs1024_h48_e8_l1_k2_lr2e-3`
-  - `larger_bs512_h96_e16_l2_k2_lr1e-3`
-  - `graph_bs512_h64_e16_l2_k3_lr5e-4`
-- `power_ws_hist`
-  - `baseline_bs1024_h64_e10_l2_k2_lr1e-3`
-  - `baseline_bs512_h64_e10_l2_k2_lr1e-3`
-  - `baseline_bs512_h64_e10_l2_k2_lr5e-4`
-  - `compact_bs1024_h48_e8_l1_k2_lr2e-3`
-  - `compact_bs512_h48_e8_l1_k2_lr1e-3`
-  - `larger_bs512_h96_e16_l2_k2_lr1e-3`
-  - `larger_bs512_h96_e16_l2_k2_lr5e-4`
-  - `graph_bs512_h64_e16_l2_k3_lr5e-4`
+- `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+- `baseline_bs512_h64_e10_l2_k2_lr5e-4`
+- `graph_bs512_h64_e16_l2_k3_lr5e-4`
 
 ### Search Outcome
 
-The alignment fix alone removed the earlier anomaly where adding wind-speed
-history looked harmful. Under the same default baseline hyperparameters,
-`power_ws_hist` already beats `power_only` on the full aligned windows:
+The practical outcome was:
 
-| Variant | Config | Test Rolling RMSE PU | Test Non-Overlap RMSE PU |
-| --- | --- | ---: | ---: |
-| `power_only` | `baseline_bs1024_h64_e10_l2_k2_lr1e-3` | `0.170926449` | `0.172388097` |
-| `power_ws_hist` | `baseline_bs1024_h64_e10_l2_k2_lr1e-3` | `0.170529890` | `0.171792055` |
+- `power_only`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+- `power_ws_hist`: kept the previously confirmed 2026-04-12 full-window graph profile `graph_bs512_h64_e16_l2_k3_lr5e-4`
+- `power_wd_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr5e-4`
+- `power_wd_yaw_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr5e-4`
+- `power_wd_yaw_pitchmean_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+- `power_wd_yaw_lrpm_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+- `power_ws_wd_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 
-After tuning, the strongest confirmed full-window configs were:
-
-| Variant | Best Config | Test Rolling RMSE PU | Test Non-Overlap RMSE PU |
-| --- | --- | ---: | ---: |
-| `power_only` | `baseline_bs512_h64_e10_l2_k2_lr1e-3` | `0.170218769` | `0.171469075` |
-| `power_ws_hist` | `graph_bs512_h64_e16_l2_k3_lr5e-4` | `0.169534975` | `0.171100681` |
-
-Relative to the best tuned `power_only` run, the best tuned `power_ws_hist` run
-improves:
-
-- rolling RMSE PU by `0.000683795`
-- non-overlap RMSE PU by `0.000368394`
-
-The main practical conclusions from this search are:
-
-- the earlier regression was primarily a window-alignment artifact
-- `power_ws_hist` benefits from a different hyperparameter profile than `power_only`
-- the strongest `power_ws_hist` setting uses `cheb_k=3` and `embed_dim=16`
-- simply increasing hidden size to `96` did not help either protocol
+In the seven-variant aligned screen, the graph-style candidate did not beat the
+baseline-style candidate for the five newly tuned protocols. The one retained
+graph exception is `power_ws_hist`, where the earlier 2026-04-12 full-window
+confirmation remained stronger evidence than a short 4-epoch screen.
 
 ### Search Artifacts
 
-All outputs live under:
+The most relevant outputs now live under:
 
 ```text
-../../artifacts/scratch/agcrn_official_aligned/search_20260412/
+../../artifacts/scratch/agcrn_official_aligned/search_20260413/
 ```
 
-The most useful result files from this search are:
+Useful result files:
 
-- `full_baseline_compare_v1/final_summary.csv`
-  - aligned full-window comparison for the old shared baseline config
-- `po_bs512_full_v1/final_summary.csv`
-  - full-window confirmation for the best `power_only` config
-- `po_remaining_screen_v1/screen_summary.csv`
-  - remaining `power_only` screening candidates
-- `ws_bs512_full_v1/final_summary.csv`
-  - full-window confirmations for the strongest baseline-style `power_ws_hist` configs
-- `ws_focus_screen_v1/screen_summary.csv`
-  - focused `power_ws_hist` baseline-style screening results
-- `ws_remaining_screen_v1/screen_summary.csv`
-  - remaining `power_ws_hist` screening candidates, including the winning graph config
-- `ws_remaining_screen_v1/final_summary.csv`
-  - full-window confirmation for the winning `power_ws_hist` graph config
+- `full_family_screen_v1/screen_summary.csv`
+  - seven-variant aligned screen results for the 2026-04-13 pass
+- `full_family_screen_v1/search_plan.json`
+  - exact screen budget and candidate list used for the seven-variant pass
+- `search_20260412/po_bs512_full_v1/final_summary.csv`
+  - full-window confirmation for the `power_only` default
+- `search_20260412/ws_remaining_screen_v1/final_summary.csv`
+  - full-window confirmation for the retained `power_ws_hist` graph default
 
 Typical invocation:
 
@@ -270,7 +269,7 @@ Typical invocation:
 This writes stage summaries under:
 
 ```text
-../../artifacts/scratch/agcrn_official_aligned/search_20260412/
+../../artifacts/scratch/agcrn_official_aligned/search_20260413/
 ```
 
 Key outputs:

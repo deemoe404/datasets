@@ -243,15 +243,34 @@ VARIANT_SPECS = (
     ),
 )
 DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
-SEARCH_VARIANTS = (
-    MODEL_VARIANT,
-    POWER_WS_HIST_MODEL_VARIANT,
-)
+SEARCH_VARIANTS = DEFAULT_VARIANTS
 _VARIANT_SPECS_BY_NAME = {
     spec.model_variant: spec
     for spec in VARIANT_SPECS
 }
-_POWER_WS_STYLE_HYPERPARAMETERS = HyperparameterProfile(
+_BASELINE_BS512_LR1E3_HYPERPARAMETERS = HyperparameterProfile(
+    batch_size=512,
+    learning_rate=1e-3,
+    max_epochs=20,
+    early_stopping_patience=5,
+    hidden_dim=64,
+    embed_dim=10,
+    num_layers=2,
+    cheb_k=2,
+    grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+)
+_BASELINE_BS512_LR5E4_HYPERPARAMETERS = HyperparameterProfile(
+    batch_size=512,
+    learning_rate=5e-4,
+    max_epochs=20,
+    early_stopping_patience=5,
+    hidden_dim=64,
+    embed_dim=10,
+    num_layers=2,
+    cheb_k=2,
+    grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+)
+_GRAPH_BS512_LR5E4_HYPERPARAMETERS = HyperparameterProfile(
     batch_size=512,
     learning_rate=5e-4,
     max_epochs=20,
@@ -263,23 +282,13 @@ _POWER_WS_STYLE_HYPERPARAMETERS = HyperparameterProfile(
     grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
 )
 TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
-    MODEL_VARIANT: HyperparameterProfile(
-        batch_size=512,
-        learning_rate=1e-3,
-        max_epochs=20,
-        early_stopping_patience=5,
-        hidden_dim=64,
-        embed_dim=10,
-        num_layers=2,
-        cheb_k=2,
-        grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
-    ),
-    POWER_WS_HIST_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
-    POWER_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
-    POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
-    POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
-    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
-    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
+    MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
+    POWER_WS_HIST_MODEL_VARIANT: _GRAPH_BS512_LR5E4_HYPERPARAMETERS,
+    POWER_WD_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR5E4_HYPERPARAMETERS,
+    POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR5E4_HYPERPARAMETERS,
+    POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
+    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
+    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
 }
 
 
@@ -2154,7 +2163,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(DEFAULT_VARIANTS),
         dest="variants",
-        help="Limit execution to one or more model variants. Defaults to running all six active variants.",
+        help="Limit execution to one or more model variants. Defaults to running all seven active variants.",
     )
     parser.add_argument(
         "--epochs",

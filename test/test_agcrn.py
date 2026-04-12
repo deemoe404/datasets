@@ -1613,20 +1613,8 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
         job_runner=_fake_runner,
     )
 
-    power_only_profile = module.resolve_hyperparameter_profile(module.MODEL_VARIANT)
-    power_ws_hist_profile = module.resolve_hyperparameter_profile(module.POWER_WS_HIST_MODEL_VARIANT)
-
-    assert observed_kwargs[module.MODEL_VARIANT]["batch_size"] == power_only_profile.batch_size
-    assert observed_kwargs[module.MODEL_VARIANT]["learning_rate"] == power_only_profile.learning_rate
-    assert observed_kwargs[module.MODEL_VARIANT]["max_epochs"] == power_only_profile.max_epochs
-    assert observed_kwargs[module.MODEL_VARIANT]["early_stopping_patience"] == power_only_profile.early_stopping_patience
-    assert observed_kwargs[module.MODEL_VARIANT]["hidden_dim"] == power_only_profile.hidden_dim
-    assert observed_kwargs[module.MODEL_VARIANT]["embed_dim"] == power_only_profile.embed_dim
-    assert observed_kwargs[module.MODEL_VARIANT]["num_layers"] == power_only_profile.num_layers
-    assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == power_only_profile.cheb_k
-    assert observed_kwargs[module.MODEL_VARIANT]["grad_clip_norm"] == power_only_profile.grad_clip_norm
-
     for variant_name in (
+        module.MODEL_VARIANT,
         module.POWER_WS_HIST_MODEL_VARIANT,
         module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT,
@@ -1634,15 +1622,16 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
         module.POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
     ):
-        assert observed_kwargs[variant_name]["batch_size"] == power_ws_hist_profile.batch_size
-        assert observed_kwargs[variant_name]["learning_rate"] == power_ws_hist_profile.learning_rate
-        assert observed_kwargs[variant_name]["max_epochs"] == power_ws_hist_profile.max_epochs
-        assert observed_kwargs[variant_name]["early_stopping_patience"] == power_ws_hist_profile.early_stopping_patience
-        assert observed_kwargs[variant_name]["hidden_dim"] == power_ws_hist_profile.hidden_dim
-        assert observed_kwargs[variant_name]["embed_dim"] == power_ws_hist_profile.embed_dim
-        assert observed_kwargs[variant_name]["num_layers"] == power_ws_hist_profile.num_layers
-        assert observed_kwargs[variant_name]["cheb_k"] == power_ws_hist_profile.cheb_k
-        assert observed_kwargs[variant_name]["grad_clip_norm"] == power_ws_hist_profile.grad_clip_norm
+        profile = module.resolve_hyperparameter_profile(variant_name)
+        assert observed_kwargs[variant_name]["batch_size"] == profile.batch_size
+        assert observed_kwargs[variant_name]["learning_rate"] == profile.learning_rate
+        assert observed_kwargs[variant_name]["max_epochs"] == profile.max_epochs
+        assert observed_kwargs[variant_name]["early_stopping_patience"] == profile.early_stopping_patience
+        assert observed_kwargs[variant_name]["hidden_dim"] == profile.hidden_dim
+        assert observed_kwargs[variant_name]["embed_dim"] == profile.embed_dim
+        assert observed_kwargs[variant_name]["num_layers"] == profile.num_layers
+        assert observed_kwargs[variant_name]["cheb_k"] == profile.cheb_k
+        assert observed_kwargs[variant_name]["grad_clip_norm"] == profile.grad_clip_norm
 
 
 def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> None:
@@ -1687,15 +1676,7 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
         assert observed_kwargs[variant_name]["batch_size"] == 256
         assert observed_kwargs[variant_name]["max_epochs"] == 7
 
-    assert observed_kwargs[module.MODEL_VARIANT]["embed_dim"] == 10
-    assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == 2
-    for variant_name in (
-        module.POWER_WS_HIST_MODEL_VARIANT,
-        module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
-        module.POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT,
-        module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT,
-        module.POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT,
-        module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
-    ):
-        assert observed_kwargs[variant_name]["embed_dim"] == 16
-        assert observed_kwargs[variant_name]["cheb_k"] == 3
+    for variant_name in module.DEFAULT_VARIANTS:
+        profile = module.resolve_hyperparameter_profile(variant_name)
+        assert observed_kwargs[variant_name]["embed_dim"] == profile.embed_dim
+        assert observed_kwargs[variant_name]["cheb_k"] == profile.cheb_k

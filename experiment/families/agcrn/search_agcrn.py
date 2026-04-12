@@ -17,7 +17,7 @@ DEFAULT_OUTPUT_DIR = (
     / "artifacts"
     / "scratch"
     / agcrn.FAMILY_ID
-    / "search_20260412"
+    / "search_20260413"
 )
 ALIGNMENT_VARIANTS = agcrn.resolve_variant_specs(agcrn.SEARCH_VARIANTS)
 
@@ -33,55 +33,7 @@ class SearchConfig:
     cheb_k: int
 
 
-POWER_ONLY_SCREEN_CONFIGS = (
-    SearchConfig(
-        name="baseline_bs1024_h64_e10_l2_k2_lr1e-3",
-        batch_size=1024,
-        learning_rate=1e-3,
-        hidden_dim=64,
-        embed_dim=10,
-        num_layers=2,
-        cheb_k=2,
-    ),
-    SearchConfig(
-        name="baseline_bs512_h64_e10_l2_k2_lr1e-3",
-        batch_size=512,
-        learning_rate=1e-3,
-        hidden_dim=64,
-        embed_dim=10,
-        num_layers=2,
-        cheb_k=2,
-    ),
-    SearchConfig(
-        name="compact_bs1024_h48_e8_l1_k2_lr2e-3",
-        batch_size=1024,
-        learning_rate=2e-3,
-        hidden_dim=48,
-        embed_dim=8,
-        num_layers=1,
-        cheb_k=2,
-    ),
-    SearchConfig(
-        name="larger_bs512_h96_e16_l2_k2_lr1e-3",
-        batch_size=512,
-        learning_rate=1e-3,
-        hidden_dim=96,
-        embed_dim=16,
-        num_layers=2,
-        cheb_k=2,
-    ),
-    SearchConfig(
-        name="graph_bs512_h64_e16_l2_k3_lr5e-4",
-        batch_size=512,
-        learning_rate=5e-4,
-        hidden_dim=64,
-        embed_dim=16,
-        num_layers=2,
-        cheb_k=3,
-    ),
-)
-
-POWER_WS_HIST_SCREEN_CONFIGS = (
+COMMON_SCREEN_CONFIGS = (
     SearchConfig(
         name="baseline_bs1024_h64_e10_l2_k2_lr1e-3",
         batch_size=1024,
@@ -110,18 +62,18 @@ POWER_WS_HIST_SCREEN_CONFIGS = (
         cheb_k=2,
     ),
     SearchConfig(
-        name="compact_bs1024_h48_e8_l1_k2_lr2e-3",
-        batch_size=1024,
-        learning_rate=2e-3,
+        name="compact_bs512_h48_e8_l1_k2_lr1e-3",
+        batch_size=512,
+        learning_rate=1e-3,
         hidden_dim=48,
         embed_dim=8,
         num_layers=1,
         cheb_k=2,
     ),
     SearchConfig(
-        name="compact_bs512_h48_e8_l1_k2_lr1e-3",
-        batch_size=512,
-        learning_rate=1e-3,
+        name="compact_bs1024_h48_e8_l1_k2_lr2e-3",
+        batch_size=1024,
+        learning_rate=2e-3,
         hidden_dim=48,
         embed_dim=8,
         num_layers=1,
@@ -157,8 +109,8 @@ POWER_WS_HIST_SCREEN_CONFIGS = (
 )
 
 SCREEN_CONFIGS_BY_VARIANT = {
-    agcrn.MODEL_VARIANT: POWER_ONLY_SCREEN_CONFIGS,
-    agcrn.POWER_WS_HIST_MODEL_VARIANT: POWER_WS_HIST_SCREEN_CONFIGS,
+    variant_name: COMMON_SCREEN_CONFIGS
+    for variant_name in agcrn.SEARCH_VARIANTS
 }
 
 
@@ -197,7 +149,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(agcrn.SEARCH_VARIANTS),
         dest="variants",
-        help="Limit the tuned variants. Alignment remains fixed to the tuned power_only/power_ws_hist pair.",
+        help="Limit the tuned variants. Alignment remains fixed to the full active seven-variant family surface.",
     )
     parser.add_argument(
         "--config-name",
