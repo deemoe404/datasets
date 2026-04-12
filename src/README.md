@@ -161,11 +161,15 @@ The active protocol IDs today are:
 
 - `power_only`
 - `power_ws_hist`
+- `power_wd_hist_sincos`
+- `power_ws_wd_hist_sincos`
 
 Protocol semantics:
 
 - `power_only`: target history only
 - `power_ws_hist`: target history plus dataset-native past wind-speed covariates
+- `power_wd_hist_sincos`: target history plus task-derived wind-direction `sin/cos` covariates
+- `power_ws_wd_hist_sincos`: target history plus dataset-native wind speed and task-derived wind-direction `sin/cos` covariates
 
 The default feature protocol is `power_only`.
 

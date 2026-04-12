@@ -7,7 +7,7 @@ This experiment runs an official-aligned AGCRN baseline on:
 The scope is intentionally narrow:
 
 - `24h look back -> 6h ahead`
-- `power_only` and `power_ws_hist`
+- `power_only`, `power_ws_hist`, `power_wd_hist_sincos`, and `power_ws_wd_hist_sincos`
 - `farm-synchronous` turbine panel with stable task-local `turbine_index`
 - official AGCRN core architecture (`AVWGCN` + `AGCRNCell` + encoder + `end_conv`)
 - train on `train`
@@ -32,6 +32,14 @@ cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/static.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/task_context.json
 ```
 
 `static.parquet` is treated as the complete experiment-facing static sidecar; the
@@ -73,8 +81,10 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-The default invocation now applies the best aligned full-run profile found in the
-2026-04-12 search, separately for each active variant:
+The default invocation now runs all four active variants. The tuned 2026-04-12
+full-run profiles are still used for the original two searched variants, and
+the two new wind-direction variants currently reuse the `power_ws_hist`
+hyperparameter profile until they are tuned separately:
 
 - `official_aligned_power_only_farm_sync`
   - `batch_size=512`
@@ -94,6 +104,10 @@ The default invocation now applies the best aligned full-run profile found in th
   - `embed_dim=16`
   - `num_layers=2`
   - `cheb_k=3`
+- `official_aligned_power_wd_hist_sincos_farm_sync`
+  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
+- `official_aligned_power_ws_wd_hist_sincos_farm_sync`
+  - currently reuses the `official_aligned_power_ws_hist_farm_sync` profile
 
 Explicit CLI flags such as `--batch-size`, `--learning-rate`, `--epochs`,
 `--patience`, `--embed-dim`, or `--cheb-k` still override these tuned defaults
@@ -113,16 +127,18 @@ Useful smoke-test options:
 ```bash
 ./.conda/bin/python run_agcrn.py --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
 
 ## Hyperparameter Search
 
-Use the aligned search harness when you want to tune the two active variants
-separately without falling back to mismatched window sets.
+Use the aligned search harness when you want to tune the two already-searched
+variants separately without falling back to mismatched window sets.
 
 The search script always prepares `power_only` and `power_ws_hist` together,
 intersects their strict `train`/`val`/`test` windows, and only then tunes each
-variant on that shared split surface.
+variant on that shared split surface. It does not yet tune
+`power_wd_hist_sincos` or `power_ws_wd_hist_sincos`.
 
 ### Search Setup
 
@@ -245,9 +261,9 @@ For faster iterations, use `--skip-final` or lower `--screen-train-origins` /
 - `eval_protocol in {rolling_origin_no_refit, non_overlap}`
 - `metric_scope in {overall, horizon}`
 
-For one dataset and one eval view, runs that include both active variants should
-now report matching window counts across `official_aligned_power_only_farm_sync`
-and `official_aligned_power_ws_hist_farm_sync`.
+For one dataset and one eval view, runs that include multiple variants should
+report matching window counts across all selected feature protocols after
+alignment.
 
 That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
-Running both active variants by default yields `2 * 148 = 296` rows.
+Running all four active variants by default yields `4 * 148 = 592` rows.

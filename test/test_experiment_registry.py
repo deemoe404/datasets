@@ -38,10 +38,17 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
 
     assert agcrn.status == "pilot"
     assert agcrn.task_contract.granularity == "farm"
-    assert agcrn.supported_feature_protocols == ("power_only", "power_ws_hist")
+    assert agcrn.supported_feature_protocols == (
+        "power_only",
+        "power_ws_hist",
+        "power_wd_hist_sincos",
+        "power_ws_wd_hist_sincos",
+    )
     assert agcrn.implementation_bindings == {
         "official_aligned_power_only_farm_sync": "power_only",
         "official_aligned_power_ws_hist_farm_sync": "power_ws_hist",
+        "official_aligned_power_wd_hist_sincos_farm_sync": "power_wd_hist_sincos",
+        "official_aligned_power_ws_wd_hist_sincos_farm_sync": "power_ws_wd_hist_sincos",
     }
 
 
@@ -51,10 +58,20 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     snapshot = module.load_registry_snapshot()
     rows = module.build_dataset_family_feature_matrix(snapshot)
 
-    assert len(rows) == 2
-    assert [row.dataset_id for row in rows] == ["kelmarsh", "kelmarsh"]
-    assert [row.family_id for row in rows] == ["agcrn_official_aligned", "agcrn_official_aligned"]
-    assert [row.feature_protocol_id for row in rows] == ["power_only", "power_ws_hist"]
+    assert len(rows) == 4
+    assert [row.dataset_id for row in rows] == ["kelmarsh", "kelmarsh", "kelmarsh", "kelmarsh"]
+    assert [row.family_id for row in rows] == [
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+    ]
+    assert [row.feature_protocol_id for row in rows] == [
+        "power_only",
+        "power_ws_hist",
+        "power_wd_hist_sincos",
+        "power_ws_wd_hist_sincos",
+    ]
     assert all(row.family_status == "pilot" for row in rows)
 
 
@@ -68,5 +85,9 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "agcrn_official_aligned" in rendered
     assert "official_aligned_power_only_farm_sync" in rendered
     assert "official_aligned_power_ws_hist_farm_sync" in rendered
+    assert "official_aligned_power_wd_hist_sincos_farm_sync" in rendered
+    assert "official_aligned_power_ws_wd_hist_sincos_farm_sync" in rendered
     assert "power_only" in rendered
     assert "power_ws_hist" in rendered
+    assert "power_wd_hist_sincos" in rendered
+    assert "power_ws_wd_hist_sincos" in rendered

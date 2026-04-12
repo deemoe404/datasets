@@ -92,7 +92,7 @@ wtc_BoostAct_mean,drop,,Out of scope for the current graph forecasting feature p
 wtc_BoostAct_stddev,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 wtc_ActualWindDirection_min,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 wtc_ActualWindDirection_max,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
-wtc_ActualWindDirection_mean,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
+wtc_ActualWindDirection_mean,keep,,Retained because it now feeds the wind-direction sin/cos task bundles.,
 wtc_ActualWindDirection_stddev,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 wtc_WTOperSt_min,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 wtc_WTOperSt_max,drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,

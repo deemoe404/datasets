@@ -334,6 +334,19 @@ def _small_prepared_dataset(
     )
 
 
+def _input_channels_for_feature_protocol(module, feature_protocol_id: str) -> int:
+    covariate_count_by_protocol = {
+        module.FEATURE_PROTOCOL_ID: 0,
+        module.POWER_WS_HIST_FEATURE_PROTOCOL_ID: 1,
+        module.POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID: 2,
+        module.POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID: 3,
+    }
+    try:
+        return 1 + covariate_count_by_protocol[feature_protocol_id]
+    except KeyError as exc:
+        raise ValueError(f"Unexpected feature_protocol_id {feature_protocol_id!r}.") from exc
+
+
 def _evaluation_metrics(module, *, window_count: int, forecast_steps: int, node_count: int, base: float) -> object:
     horizon_window_count = np.full((forecast_steps,), window_count, dtype=np.int64)
     horizon_prediction_count = np.full((forecast_steps,), window_count * node_count, dtype=np.int64)
@@ -681,6 +694,57 @@ def test_prepare_dataset_builds_multichannel_source_tensor_for_power_ws_hist(tmp
     assert prepared.source_tensor.shape == (2000, 3, 2)
 
 
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_hist_sincos(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_wd_hist_sincos",
+        past_covariate_columns=("wind_direction_sin", "wind_direction_cos"),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_wd_hist_sincos")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_WD_HIST_SINCOS_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == ("target_pu", "wind_direction_sin", "wind_direction_cos")
+    assert prepared.input_channels == 3
+    assert prepared.source_tensor.shape == (2000, 3, 3)
+
+
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_ws_wd_hist_sincos(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_wd_hist_sincos",
+        past_covariate_columns=("Wind speed (m/s)", "wind_direction_sin", "wind_direction_cos"),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_ws_wd_hist_sincos")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == (
+        "target_pu",
+        "Wind speed (m/s)",
+        "wind_direction_sin",
+        "wind_direction_cos",
+    )
+    assert prepared.input_channels == 4
+    assert prepared.source_tensor.shape == (2000, 3, 4)
+
+
 def test_prepare_dataset_drops_windows_with_input_feature_quality_issues(tmp_path, monkeypatch) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"
@@ -759,9 +823,12 @@ def test_prepare_variant_datasets_aligns_multi_variant_windows_to_shared_strict_
         variant_spec=module.resolve_variant_specs((module.POWER_WS_HIST_MODEL_VARIANT,))[0],
         cache_root=cache_root,
     )
+    aligned_variant_specs = module.resolve_variant_specs(
+        (module.MODEL_VARIANT, module.POWER_WS_HIST_MODEL_VARIANT)
+    )
     power_only_aligned, power_ws_aligned = module._prepare_datasets_for_variants(
         "toy_dataset",
-        variant_specs=module.resolve_variant_specs(),
+        variant_specs=aligned_variant_specs,
         cache_root=cache_root,
     )
 
@@ -812,7 +879,7 @@ def test_prepare_variant_datasets_requires_shared_panel_axis(tmp_path, monkeypat
     with pytest.raises(ValueError, match="do not share raw_timestamps"):
         module._prepare_datasets_for_variants(
             "toy_dataset",
-            variant_specs=module.resolve_variant_specs(),
+            variant_specs=module.resolve_variant_specs((module.MODEL_VARIANT, module.POWER_WS_HIST_MODEL_VARIANT)),
             cache_root=cache_root,
         )
 
@@ -859,7 +926,7 @@ def test_prepare_variant_datasets_rejects_empty_shared_split(tmp_path, monkeypat
     with pytest.raises(ValueError, match="no shared strict windows for split 'val'.*power_only.*power_ws_hist"):
         module._prepare_datasets_for_variants(
             "toy_dataset",
-            variant_specs=module.resolve_variant_specs(),
+            variant_specs=module.resolve_variant_specs((module.MODEL_VARIANT, module.POWER_WS_HIST_MODEL_VARIANT)),
             cache_root=cache_root,
         )
 
@@ -1097,7 +1164,7 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
             dataset_id=dataset_id,
             model_variant=variant_spec.model_variant,
             feature_protocol_id=variant_spec.feature_protocol_id,
-            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
         )
 
     def _fake_runner(prepared, **kwargs):
@@ -1133,7 +1200,7 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
         job_runner=_fake_runner,
     )
 
-    assert results.height == 4
+    assert results.height == len(module.DEFAULT_VARIANTS) * 2
     assert output_path.exists()
     assert list(
         zip(
@@ -1143,10 +1210,12 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
             strict=True,
         )
     ) == [
-        (module.MODEL_VARIANT, "val", module.OVERALL_METRIC_SCOPE),
-        (module.MODEL_VARIANT, "test", module.HORIZON_METRIC_SCOPE),
-        (module.POWER_WS_HIST_MODEL_VARIANT, "val", module.OVERALL_METRIC_SCOPE),
-        (module.POWER_WS_HIST_MODEL_VARIANT, "test", module.HORIZON_METRIC_SCOPE),
+        item
+        for variant_name in module.DEFAULT_VARIANTS
+        for item in (
+            (variant_name, "val", module.OVERALL_METRIC_SCOPE),
+            (variant_name, "test", module.HORIZON_METRIC_SCOPE),
+        )
     ]
 
 
@@ -1160,11 +1229,28 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
         past_covariate_columns=("Wind speed (m/s)",),
         missing_past_covariate_indices=(200, 1563, 1963),
     )
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_wd_hist_sincos",
+        past_covariate_columns=("wind_direction_sin", "wind_direction_cos"),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_ws_wd_hist_sincos",
+        past_covariate_columns=("Wind speed (m/s)", "wind_direction_sin", "wind_direction_cos"),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
     _patch_temp_bundle_loader_for_protocols(
         monkeypatch,
         module,
         cache_root,
-        feature_protocol_ids=("power_only", "power_ws_hist"),
+        feature_protocol_ids=(
+            "power_only",
+            "power_ws_hist",
+            "power_wd_hist_sincos",
+            "power_ws_wd_hist_sincos",
+        ),
     )
 
     def _fake_runner(prepared, **kwargs):
@@ -1216,7 +1302,7 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
         job_runner=_fake_runner,
     )
 
-    assert results.height == 4
+    assert results.height == len(module.DEFAULT_VARIANTS) * 2
     assert results["train_window_count"].n_unique() == 1
     assert results["val_window_count"].n_unique() == 1
     assert results["test_window_count"].n_unique() == 1
@@ -1228,11 +1314,18 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
         (pl.col("split_name") == "test")
         & (pl.col("eval_protocol") == module.NON_OVERLAP_EVAL_PROTOCOL)
     )
-    assert val_rows.height == 2
-    assert test_rows.height == 2
+    assert val_rows.height == len(module.DEFAULT_VARIANTS)
+    assert test_rows.height == len(module.DEFAULT_VARIANTS)
     assert val_rows["window_count"].n_unique() == 1
     assert test_rows["window_count"].n_unique() == 1
-    assert results["input_channels"].to_list() == [1, 1, 2, 2]
+    assert results["input_channels"].to_list() == [
+        value
+        for spec in module.resolve_variant_specs()
+        for value in (
+            _input_channels_for_feature_protocol(module, spec.feature_protocol_id),
+            _input_channels_for_feature_protocol(module, spec.feature_protocol_id),
+        )
+    ]
 
 
 def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
@@ -1246,7 +1339,7 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
             dataset_id=dataset_id,
             model_variant=variant_spec.model_variant,
             feature_protocol_id=variant_spec.feature_protocol_id,
-            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
         )
 
     def _fake_runner(prepared, **kwargs):
@@ -1276,12 +1369,13 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
 
     assert len(_TqdmRecorder.instances) == 1
     progress = _TqdmRecorder.instances[0]
-    assert progress.total == 2
-    assert progress.n == 2
+    assert progress.total == len(module.DEFAULT_VARIANTS)
+    assert progress.n == len(module.DEFAULT_VARIANTS)
     assert progress.closed is True
     assert progress.desc == "agcrn jobs"
     assert any("kelmarsh" in value for value in progress.postfixes)
-    assert any(module.POWER_WS_HIST_MODEL_VARIANT in value for value in progress.postfixes)
+    for variant_name in module.DEFAULT_VARIANTS:
+        assert any(variant_name in value for value in progress.postfixes)
 
 
 def test_run_experiment_can_limit_variants(tmp_path) -> None:
@@ -1294,7 +1388,7 @@ def test_run_experiment_can_limit_variants(tmp_path) -> None:
             dataset_id=dataset_id,
             model_variant=variant_spec.model_variant,
             feature_protocol_id=variant_spec.feature_protocol_id,
-            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
         )
 
     def _fake_runner(prepared, **kwargs):
@@ -1336,7 +1430,7 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
             dataset_id=dataset_id,
             model_variant=variant_spec.model_variant,
             feature_protocol_id=variant_spec.feature_protocol_id,
-            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
         )
 
     def _fake_runner(prepared, **kwargs):
@@ -1374,18 +1468,20 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
     assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == power_only_profile.cheb_k
     assert observed_kwargs[module.MODEL_VARIANT]["grad_clip_norm"] == power_only_profile.grad_clip_norm
 
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["batch_size"] == power_ws_hist_profile.batch_size
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["learning_rate"] == power_ws_hist_profile.learning_rate
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["max_epochs"] == power_ws_hist_profile.max_epochs
-    assert (
-        observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["early_stopping_patience"]
-        == power_ws_hist_profile.early_stopping_patience
-    )
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["hidden_dim"] == power_ws_hist_profile.hidden_dim
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["embed_dim"] == power_ws_hist_profile.embed_dim
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["num_layers"] == power_ws_hist_profile.num_layers
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["cheb_k"] == power_ws_hist_profile.cheb_k
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["grad_clip_norm"] == power_ws_hist_profile.grad_clip_norm
+    for variant_name in (
+        module.POWER_WS_HIST_MODEL_VARIANT,
+        module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
+        module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
+    ):
+        assert observed_kwargs[variant_name]["batch_size"] == power_ws_hist_profile.batch_size
+        assert observed_kwargs[variant_name]["learning_rate"] == power_ws_hist_profile.learning_rate
+        assert observed_kwargs[variant_name]["max_epochs"] == power_ws_hist_profile.max_epochs
+        assert observed_kwargs[variant_name]["early_stopping_patience"] == power_ws_hist_profile.early_stopping_patience
+        assert observed_kwargs[variant_name]["hidden_dim"] == power_ws_hist_profile.hidden_dim
+        assert observed_kwargs[variant_name]["embed_dim"] == power_ws_hist_profile.embed_dim
+        assert observed_kwargs[variant_name]["num_layers"] == power_ws_hist_profile.num_layers
+        assert observed_kwargs[variant_name]["cheb_k"] == power_ws_hist_profile.cheb_k
+        assert observed_kwargs[variant_name]["grad_clip_norm"] == power_ws_hist_profile.grad_clip_norm
 
 
 def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> None:
@@ -1399,7 +1495,7 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
             dataset_id=dataset_id,
             model_variant=variant_spec.model_variant,
             feature_protocol_id=variant_spec.feature_protocol_id,
-            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
         )
 
     def _fake_runner(prepared, **kwargs):
@@ -1426,12 +1522,16 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
         job_runner=_fake_runner,
     )
 
-    assert observed_kwargs[module.MODEL_VARIANT]["batch_size"] == 256
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["batch_size"] == 256
-    assert observed_kwargs[module.MODEL_VARIANT]["max_epochs"] == 7
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["max_epochs"] == 7
+    for variant_name in module.DEFAULT_VARIANTS:
+        assert observed_kwargs[variant_name]["batch_size"] == 256
+        assert observed_kwargs[variant_name]["max_epochs"] == 7
 
     assert observed_kwargs[module.MODEL_VARIANT]["embed_dim"] == 10
     assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == 2
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["embed_dim"] == 16
-    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["cheb_k"] == 3
+    for variant_name in (
+        module.POWER_WS_HIST_MODEL_VARIANT,
+        module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
+        module.POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
+    ):
+        assert observed_kwargs[variant_name]["embed_dim"] == 16
+        assert observed_kwargs[variant_name]["cheb_k"] == 3

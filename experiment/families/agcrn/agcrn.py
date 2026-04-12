@@ -77,6 +77,8 @@ MODEL_ID = "AGCRN"
 FAMILY_ID = "agcrn_official_aligned"
 MODEL_VARIANT = "official_aligned_power_only_farm_sync"
 POWER_WS_HIST_MODEL_VARIANT = "official_aligned_power_ws_hist_farm_sync"
+POWER_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_hist_sincos_farm_sync"
+POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_ws_wd_hist_sincos_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -86,6 +88,8 @@ FORECAST_STEPS = 36
 STRIDE_STEPS = 1
 FEATURE_PROTOCOL_ID = "power_only"
 POWER_WS_HIST_FEATURE_PROTOCOL_ID = "power_ws_hist"
+POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_hist_sincos"
+POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_ws_wd_hist_sincos"
 GRAPH_MODE = "adaptive"
 GRAPH_SOURCE = "learned_node_embeddings"
 INPUT_CHANNELS = 1
@@ -171,6 +175,8 @@ _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_D
 _MODEL_VARIANT_ORDER = {
     MODEL_VARIANT: 0,
     POWER_WS_HIST_MODEL_VARIANT: 1,
+    POWER_WD_HIST_SINCOS_MODEL_VARIANT: 2,
+    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: 3,
 }
 _SPLIT_NAMES = ("train", "val", "test")
 _WINDOW_KEY_COLUMNS = ("output_start_ts", "output_end_ts")
@@ -204,12 +210,35 @@ VARIANT_SPECS = (
         model_variant=POWER_WS_HIST_MODEL_VARIANT,
         feature_protocol_id=POWER_WS_HIST_FEATURE_PROTOCOL_ID,
     ),
+    ExperimentVariant(
+        model_variant=POWER_WD_HIST_SINCOS_MODEL_VARIANT,
+        feature_protocol_id=POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID,
+    ),
+    ExperimentVariant(
+        model_variant=POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT,
+        feature_protocol_id=POWER_WS_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID,
+    ),
 )
 DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
+SEARCH_VARIANTS = (
+    MODEL_VARIANT,
+    POWER_WS_HIST_MODEL_VARIANT,
+)
 _VARIANT_SPECS_BY_NAME = {
     spec.model_variant: spec
     for spec in VARIANT_SPECS
 }
+_POWER_WS_STYLE_HYPERPARAMETERS = HyperparameterProfile(
+    batch_size=512,
+    learning_rate=5e-4,
+    max_epochs=20,
+    early_stopping_patience=5,
+    hidden_dim=64,
+    embed_dim=16,
+    num_layers=2,
+    cheb_k=3,
+    grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+)
 TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
     MODEL_VARIANT: HyperparameterProfile(
         batch_size=512,
@@ -222,17 +251,9 @@ TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
         cheb_k=2,
         grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
     ),
-    POWER_WS_HIST_MODEL_VARIANT: HyperparameterProfile(
-        batch_size=512,
-        learning_rate=5e-4,
-        max_epochs=20,
-        early_stopping_patience=5,
-        hidden_dim=64,
-        embed_dim=16,
-        num_layers=2,
-        cheb_k=3,
-        grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
-    ),
+    POWER_WS_HIST_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
+    POWER_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
+    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: _POWER_WS_STYLE_HYPERPARAMETERS,
 }
 
 
@@ -2107,7 +2128,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(DEFAULT_VARIANTS),
         dest="variants",
-        help="Limit execution to one or more model variants. Defaults to running both active variants.",
+        help="Limit execution to one or more model variants. Defaults to running all four active variants.",
     )
     parser.add_argument(
         "--epochs",

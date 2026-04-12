@@ -922,11 +922,11 @@ tblSCTurbine,tblSCTurbine,StationId,keep,,,,Retained by the current dataset-side
 tblSCTurbine,tblSCTurbine,TimeStamp,keep,,,,Retained by the current dataset-side processing pipeline or core row alignment.,
 tblSCTurbine,tblSCTurbine,dup_label,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,Synthetic fixture-only duplicate label column.
 tblSCTurbine,tblSCTurbine,wtc_AcWindSp_max,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
-tblSCTurbine,tblSCTurbine,wtc_AcWindSp_mean,keep,,wtc_AcWindSp_mean,power_ws_hist,Retained to support the active wind-speed history task bundle.,
+tblSCTurbine,tblSCTurbine,wtc_AcWindSp_mean,keep,,wtc_AcWindSp_mean,power_ws_hist|power_ws_wd_hist_sincos,Retained to support the active wind-speed history task bundles.,
 tblSCTurbine,tblSCTurbine,wtc_AcWindSp_min,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
 tblSCTurbine,tblSCTurbine,wtc_AcWindSp_stddev,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
 tblSCTurbine,tblSCTurbine,wtc_ActualWindDirection_max,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
-tblSCTurbine,tblSCTurbine,wtc_ActualWindDirection_mean,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
+tblSCTurbine,tblSCTurbine,wtc_ActualWindDirection_mean,keep,,wtc_ActualWindDirection_mean,power_wd_hist_sincos|power_ws_wd_hist_sincos,Retained to support the active wind-direction history task bundles.,
 tblSCTurbine,tblSCTurbine,wtc_ActualWindDirection_min,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
 tblSCTurbine,tblSCTurbine,wtc_ActualWindDirection_stddev,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,
 tblSCTurbine,tblSCTurbine,wtc_BoostAct_max,drop,,,,Dropped before silver to avoid rebuilding unused raw columns.,

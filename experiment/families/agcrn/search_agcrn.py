@@ -19,7 +19,7 @@ DEFAULT_OUTPUT_DIR = (
     / agcrn.FAMILY_ID
     / "search_20260412"
 )
-ALIGNMENT_VARIANTS = agcrn.resolve_variant_specs()
+ALIGNMENT_VARIANTS = agcrn.resolve_variant_specs(agcrn.SEARCH_VARIANTS)
 
 
 @dataclass(frozen=True)
@@ -195,9 +195,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variant",
         action="append",
-        choices=list(agcrn.DEFAULT_VARIANTS),
+        choices=list(agcrn.SEARCH_VARIANTS),
         dest="variants",
-        help="Limit the tuned variants. Alignment still uses both active variants.",
+        help="Limit the tuned variants. Alignment remains fixed to the tuned power_only/power_ws_hist pair.",
     )
     parser.add_argument(
         "--config-name",
@@ -634,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     dataset_ids = tuple(args.datasets) if args.datasets else agcrn.DEFAULT_DATASETS
-    tuned_variants = tuple(args.variants) if args.variants else agcrn.DEFAULT_VARIANTS
+    tuned_variants = tuple(args.variants) if args.variants else agcrn.SEARCH_VARIANTS
     run_search(
         dataset_ids=dataset_ids,
         tuned_variants=tuned_variants,

@@ -35,9 +35,16 @@ def test_resolve_family_feature_protocol_ids_maps_active_labels_to_registry_ids(
         (
             "official_aligned_power_only_farm_sync",
             "official_aligned_power_ws_hist_farm_sync",
+            "official_aligned_power_wd_hist_sincos_farm_sync",
+            "official_aligned_power_ws_wd_hist_sincos_farm_sync",
         ),
         repo_root=repo_root,
-    ) == ("power_only", "power_ws_hist")
+    ) == (
+        "power_only",
+        "power_ws_hist",
+        "power_wd_hist_sincos",
+        "power_ws_wd_hist_sincos",
+    )
 
 
 def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
@@ -57,10 +64,17 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
         output_path=output_path,
         result_row_count=1,
         dataset_ids=("kelmarsh",),
-        feature_protocol_ids=("power_only", "power_ws_hist"),
+        feature_protocol_ids=(
+            "power_only",
+            "power_ws_hist",
+            "power_wd_hist_sincos",
+            "power_ws_wd_hist_sincos",
+        ),
         model_variants=(
             "official_aligned_power_only_farm_sync",
             "official_aligned_power_ws_hist_farm_sync",
+            "official_aligned_power_wd_hist_sincos_farm_sync",
+            "official_aligned_power_ws_wd_hist_sincos_farm_sync",
         ),
         eval_protocols=("rolling_origin_no_refit", "non_overlap"),
         result_splits=("val", "test"),
@@ -72,10 +86,17 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert payload["family"]["family_id"] == "agcrn_official_aligned"
     assert payload["selection"]["dataset_ids"] == ["kelmarsh"]
-    assert payload["selection"]["feature_protocol_ids"] == ["power_only", "power_ws_hist"]
+    assert payload["selection"]["feature_protocol_ids"] == [
+        "power_only",
+        "power_ws_hist",
+        "power_wd_hist_sincos",
+        "power_ws_wd_hist_sincos",
+    ]
     assert payload["selection"]["model_variants"] == [
         "official_aligned_power_only_farm_sync",
         "official_aligned_power_ws_hist_farm_sync",
+        "official_aligned_power_wd_hist_sincos_farm_sync",
+        "official_aligned_power_ws_wd_hist_sincos_farm_sync",
     ]
     assert payload["result"]["row_count"] == 1
     assert payload["artifacts"]["primary_output"]["exists"] is True

@@ -77,8 +77,10 @@ def test_rebuild_cli_defaults_to_all_datasets_and_farm_only(monkeypatch, capsys)
         "manifest",
         "silver",
         "gold_base",
-        "tasks/next_6h_from_24h/power_only",
-        "tasks/next_6h_from_24h/power_ws_hist",
+        *[
+            _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
+            for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+        ],
     ]
     assert calls == [
         (dataset, stage)
@@ -99,11 +101,16 @@ def test_rebuild_cli_include_turbine_is_accepted_but_noop(monkeypatch, capsys) -
 
     assert code == 0
     assert calls == [
-        ("kelmarsh", "manifest"),
-        ("kelmarsh", "silver"),
-        ("kelmarsh", "gold_base"),
-        ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
-        ("kelmarsh", "tasks/next_6h_from_24h/power_ws_hist"),
+        ("kelmarsh", stage)
+        for stage in (
+            "manifest",
+            "silver",
+            "gold_base",
+            *[
+                _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
+                for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+            ],
+        )
     ]
     captured = capsys.readouterr()
     assert "--include-turbine is deprecated and is currently a no-op" in captured.err
@@ -168,11 +175,16 @@ def test_rebuild_cli_records_failure_and_continues_next_dataset(monkeypatch, cap
 
     assert code == 1
     assert ("kelmarsh", "gold_base") not in calls
-    assert calls[-4:] == [
-        ("penmanshiel", "silver"),
-        ("penmanshiel", "gold_base"),
-        ("penmanshiel", "tasks/next_6h_from_24h/power_only"),
-        ("penmanshiel", "tasks/next_6h_from_24h/power_ws_hist"),
+    assert calls[-(2 + len(rebuild_module._TASK_FEATURE_PROTOCOL_IDS)):] == [
+        ("penmanshiel", stage)
+        for stage in (
+            "silver",
+            "gold_base",
+            *[
+                _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
+                for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+            ],
+        )
     ]
     captured = capsys.readouterr()
     assert "completed with 1 failed dataset" in captured.err
@@ -195,14 +207,19 @@ def test_rebuild_cli_summarizes_sdwpf_gold_block_without_running_tasks(monkeypat
     assert code == 1
     assert ("sdwpf_kddcup", "manifest") in calls
     assert ("sdwpf_kddcup", "silver") in calls
-    assert ("sdwpf_kddcup", "tasks/next_6h_from_24h/power_only") not in calls
-    assert ("sdwpf_kddcup", "tasks/next_6h_from_24h/power_ws_hist") not in calls
-    assert calls[-5:] == [
-        ("kelmarsh", "manifest"),
-        ("kelmarsh", "silver"),
-        ("kelmarsh", "gold_base"),
-        ("kelmarsh", "tasks/next_6h_from_24h/power_only"),
-        ("kelmarsh", "tasks/next_6h_from_24h/power_ws_hist"),
+    for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS:
+        assert ("sdwpf_kddcup", _stage_name_for_task("next_6h_from_24h", feature_protocol_id)) not in calls
+    assert calls[-(3 + len(rebuild_module._TASK_FEATURE_PROTOCOL_IDS)):] == [
+        ("kelmarsh", stage)
+        for stage in (
+            "manifest",
+            "silver",
+            "gold_base",
+            *[
+                _stage_name_for_task("next_6h_from_24h", feature_protocol_id)
+                for feature_protocol_id in rebuild_module._TASK_FEATURE_PROTOCOL_IDS
+            ],
+        )
     ]
     captured = capsys.readouterr()
     assert "sdwpf_kddcup" in captured.err

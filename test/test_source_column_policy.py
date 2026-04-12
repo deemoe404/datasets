@@ -4,7 +4,13 @@ from wind_datasets.source_column_policy import load_source_column_policy
 
 
 def test_source_column_policies_do_not_reference_removed_feature_protocols() -> None:
-    allowed_protocol_tags = {"all", "power_only", "power_ws_hist"}
+    allowed_protocol_tags = {
+        "all",
+        "power_only",
+        "power_ws_hist",
+        "power_wd_hist_sincos",
+        "power_ws_wd_hist_sincos",
+    }
     removed_protocol_tags = {
         "power_stats_history",
         "staged_past_covariates.stage1_core",

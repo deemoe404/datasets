@@ -19,6 +19,7 @@ from ..cache_state import (
 from ..feature_protocols import (
     DEFAULT_FEATURE_PROTOCOL_ID,
     build_known_future_frame,
+    materialize_task_series_frame,
     protocol_context_dict,
     select_task_series_columns,
 )
@@ -250,12 +251,13 @@ class BaseDatasetBuilder:
             turbine_static_columns=static_columns,
         )
 
-        series_frame = (
+        source_frame = (
             pl.scan_parquet(self.cache_paths.gold_base_series_path)
-            .select(list(selection.all_columns))
+            .select(list(selection.source_columns))
             .sort(["turbine_id", "timestamp"])
             .collect()
         )
+        series_frame = materialize_task_series_frame(source_frame, selection=selection)
         if selection.past_covariate_columns:
             missing_past_covariate_expr = pl.any_horizontal(
                 [pl.col(column).is_null() for column in selection.past_covariate_columns]

@@ -213,6 +213,10 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     power_only_bundle = builder.load_task_bundle(farm_task)
     builder.build_task_cache(farm_task, feature_protocol_id="power_ws_hist")
     power_ws_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_ws_hist")
+    builder.build_task_cache(farm_task, feature_protocol_id="power_wd_hist_sincos")
+    power_wd_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_wd_hist_sincos")
+    builder.build_task_cache(farm_task, feature_protocol_id="power_ws_wd_hist_sincos")
+    power_ws_wd_bundle = builder.load_task_bundle(farm_task, feature_protocol_id="power_ws_wd_hist_sincos")
     farm_task_report = json.loads(builder.task_bundle_paths(farm_task).task_report_path.read_text())
     turbine_task = TaskSpec(
         history_duration="20m",
@@ -237,8 +241,33 @@ def test_end_to_end_hill_pipeline(tmp_path) -> None:
     assert farm_task_report["granularity"] == "farm"
     assert "wtc_AcWindSp_mean" not in power_only_bundle.series.columns
     assert "wtc_AcWindSp_mean" in power_ws_bundle.series.columns
+    assert "wind_direction_sin" not in power_only_bundle.series.columns
     assert power_ws_bundle.task_context["column_groups"]["past_covariates"] == ["wtc_AcWindSp_mean"]
+    assert "wtc_ActualWindDirection_mean" not in power_wd_bundle.series.columns
+    assert power_wd_bundle.task_context["column_groups"]["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+    ]
+    assert power_ws_wd_bundle.task_context["column_groups"]["past_covariates"] == [
+        "wtc_AcWindSp_mean",
+        "wind_direction_sin",
+        "wind_direction_cos",
+    ]
+    wd_row = power_wd_bundle.series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 17:10:00")
+    )
+    assert wd_row["wind_direction_sin"][0] == pytest.approx(1.0)
+    assert wd_row["wind_direction_cos"][0] == pytest.approx(0.0, abs=1e-12)
     assert power_ws_bundle.series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert power_wd_bundle.series.filter(
+        (pl.col("turbine_id") == "T01")
+        & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
+    )["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert power_ws_wd_bundle.series.filter(
         (pl.col("turbine_id") == "T01")
         & (pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-03-14 18:10:00")
     )["feature_quality_flags"][0].endswith("missing_past_covariates")

@@ -7,6 +7,9 @@ import polars as pl
 
 TASK_BUNDLE_SCHEMA_VERSION = "task_bundle.v1"
 DEFAULT_FEATURE_PROTOCOL_ID = "power_only"
+_PI = 3.141592653589793
+_WIND_DIRECTION_SIN_COLUMN = "wind_direction_sin"
+_WIND_DIRECTION_COS_COLUMN = "wind_direction_cos"
 
 _SERIES_BASE_COLUMNS = (
     "dataset",
@@ -44,6 +47,12 @@ _POWER_WS_HIST_COLUMNS_BY_DATASET = {
     "hill_of_towie": ("wtc_AcWindSp_mean",),
     "sdwpf_kddcup": ("Wspd",),
 }
+_POWER_WD_HIST_COLUMNS_BY_DATASET = {
+    "kelmarsh": ("Wind direction (°)",),
+    "penmanshiel": ("Wind direction (°)",),
+    "hill_of_towie": ("wtc_ActualWindDirection_mean",),
+    "sdwpf_kddcup": ("Wdir",),
+}
 
 
 @dataclass(frozen=True)
@@ -65,12 +74,14 @@ class FeatureProtocolSpec:
 @dataclass(frozen=True)
 class TaskSeriesSelection:
     feature_protocol_id: str
+    source_columns: tuple[str, ...]
     all_columns: tuple[str, ...]
     past_covariate_columns: tuple[str, ...]
     known_future_columns: tuple[str, ...]
     static_columns: tuple[str, ...]
     target_derived_columns: tuple[str, ...]
     audit_columns: tuple[str, ...]
+    wind_direction_source_column: str | None = None
 
 
 _POWER_ONLY_PROTOCOL = FeatureProtocolSpec(
@@ -96,10 +107,42 @@ _POWER_WS_HIST_PROTOCOL = FeatureProtocolSpec(
     uses_past_covariates=True,
     uses_target_derived_covariates=False,
     aliases=("power_with_ws_history",),
+    past_covariate_source="gold_base.dataset_native_wind_speed",
+    past_covariate_stage="task_bundle.select",
+)
+_POWER_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_wd_hist_sincos",
+    display_name="Power + Wind Direction History (Sin/Cos)",
+    protocol_kind="past_covariate_ablation",
+    summary="Use target power history plus task-derived sine/cosine wind-direction covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_wd_history_sincos",),
+    past_covariate_source="gold_base.dataset_native_wind_direction",
+    past_covariate_stage="task_bundle.direction_sincos",
+)
+_POWER_WS_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_ws_wd_hist_sincos",
+    display_name="Power + Wind Speed/Direction History (Sin/Cos)",
+    protocol_kind="past_covariate_combination",
+    summary="Use target power history, dataset-native wind speed, and task-derived sine/cosine wind-direction covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_ws_wd_history_sincos",),
+    past_covariate_source="gold_base.dataset_native_wind_speed_direction",
+    past_covariate_stage="task_bundle.direction_sincos",
 )
 _FEATURE_PROTOCOLS = (
     _POWER_ONLY_PROTOCOL,
     _POWER_WS_HIST_PROTOCOL,
+    _POWER_WD_HIST_SINCOS_PROTOCOL,
+    _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
     protocol.feature_protocol_id: protocol
@@ -122,27 +165,69 @@ def get_feature_protocol_spec(feature_protocol_id: str) -> FeatureProtocolSpec:
         raise ValueError(f"Unknown feature_protocol_id {feature_protocol_id!r}.") from exc
 
 
-def _past_covariate_columns_for_protocol(
+def _dataset_native_columns_for_protocol(
     *,
     dataset_id: str,
     available_columns: set[str],
     feature_protocol_id: str,
-) -> tuple[str, ...]:
-    if feature_protocol_id != _POWER_WS_HIST_PROTOCOL.feature_protocol_id:
-        return ()
-    try:
-        configured_columns = _POWER_WS_HIST_COLUMNS_BY_DATASET[dataset_id]
-    except KeyError as exc:
-        raise ValueError(
-            f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
-        ) from exc
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    uses_wind_speed = feature_protocol_id in {
+        _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
+        _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+    }
+    uses_wind_direction = feature_protocol_id in {
+        _POWER_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+    }
+    configured_columns: list[str] = []
+    output_past_covariate_columns: list[str] = []
+    wind_direction_source_column: str | None = None
+
+    if uses_wind_speed:
+        try:
+            wind_speed_columns = _POWER_WS_HIST_COLUMNS_BY_DATASET[dataset_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+            ) from exc
+        configured_columns.extend(wind_speed_columns)
+        output_past_covariate_columns.extend(wind_speed_columns)
+    if uses_wind_direction:
+        try:
+            wind_direction_columns = _POWER_WD_HIST_COLUMNS_BY_DATASET[dataset_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+            ) from exc
+        wind_direction_source_column = wind_direction_columns[0]
+        configured_columns.extend(wind_direction_columns)
+        output_past_covariate_columns.extend((_WIND_DIRECTION_SIN_COLUMN, _WIND_DIRECTION_COS_COLUMN))
+
+    configured_columns = list(dict.fromkeys(configured_columns))
     missing_columns = [column for column in configured_columns if column not in available_columns]
     if missing_columns:
         raise ValueError(
             f"feature_protocol_id {feature_protocol_id!r} for dataset {dataset_id!r} requires "
             f"missing gold-base columns {missing_columns!r}."
         )
-    return configured_columns
+    return tuple(configured_columns), tuple(output_past_covariate_columns), wind_direction_source_column
+
+
+def materialize_task_series_frame(
+    source_frame: pl.DataFrame,
+    *,
+    selection: TaskSeriesSelection,
+) -> pl.DataFrame:
+    series_frame = source_frame
+    if selection.wind_direction_source_column is not None:
+        wind_direction_radians = pl.col(selection.wind_direction_source_column).cast(pl.Float64, strict=False) * pl.lit(
+            _PI / 180.0
+        )
+        series_frame = series_frame.with_columns(
+            wind_direction_radians.sin().alias(_WIND_DIRECTION_SIN_COLUMN),
+            wind_direction_radians.cos().alias(_WIND_DIRECTION_COS_COLUMN),
+        )
+    return series_frame.select(list(selection.all_columns))
 
 
 def select_task_series_columns(
@@ -154,20 +239,23 @@ def select_task_series_columns(
 ) -> TaskSeriesSelection:
     del turbine_static_columns
     get_feature_protocol_spec(feature_protocol_id)
-    past_covariate_columns = _past_covariate_columns_for_protocol(
+    source_past_covariate_columns, past_covariate_columns, wind_direction_source_column = _dataset_native_columns_for_protocol(
         dataset_id=dataset_id,
         available_columns=available_columns,
         feature_protocol_id=feature_protocol_id,
     )
     audit_columns = tuple(column for column in _SERIES_OPTIONAL_AUDIT_COLUMNS if column in available_columns)
+    source_columns = tuple((*_SERIES_BASE_COLUMNS, *source_past_covariate_columns, *audit_columns))
     return TaskSeriesSelection(
         feature_protocol_id=feature_protocol_id,
+        source_columns=source_columns,
         all_columns=tuple((*_SERIES_BASE_COLUMNS, *past_covariate_columns, *audit_columns)),
         past_covariate_columns=past_covariate_columns,
         known_future_columns=("dataset", "timestamp"),
         static_columns=(),
         target_derived_columns=(),
         audit_columns=audit_columns,
+        wind_direction_source_column=wind_direction_source_column,
     )
 
 
@@ -187,12 +275,12 @@ def build_known_future_frame(series_frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("timestamp").dt.month().alias("__month"),
         )
         .with_columns(
-            (2 * pl.lit(3.141592653589793) * pl.col("__minute_of_day") / pl.lit(24 * 60)).sin().alias("calendar_hour_sin"),
-            (2 * pl.lit(3.141592653589793) * pl.col("__minute_of_day") / pl.lit(24 * 60)).cos().alias("calendar_hour_cos"),
-            (2 * pl.lit(3.141592653589793) * pl.col("__weekday") / pl.lit(7)).sin().alias("calendar_weekday_sin"),
-            (2 * pl.lit(3.141592653589793) * pl.col("__weekday") / pl.lit(7)).cos().alias("calendar_weekday_cos"),
-            (2 * pl.lit(3.141592653589793) * (pl.col("__month") - 1) / pl.lit(12)).sin().alias("calendar_month_sin"),
-            (2 * pl.lit(3.141592653589793) * (pl.col("__month") - 1) / pl.lit(12)).cos().alias("calendar_month_cos"),
+            (2 * pl.lit(_PI) * pl.col("__minute_of_day") / pl.lit(24 * 60)).sin().alias("calendar_hour_sin"),
+            (2 * pl.lit(_PI) * pl.col("__minute_of_day") / pl.lit(24 * 60)).cos().alias("calendar_hour_cos"),
+            (2 * pl.lit(_PI) * pl.col("__weekday") / pl.lit(7)).sin().alias("calendar_weekday_sin"),
+            (2 * pl.lit(_PI) * pl.col("__weekday") / pl.lit(7)).cos().alias("calendar_weekday_cos"),
+            (2 * pl.lit(_PI) * (pl.col("__month") - 1) / pl.lit(12)).sin().alias("calendar_month_sin"),
+            (2 * pl.lit(_PI) * (pl.col("__month") - 1) / pl.lit(12)).cos().alias("calendar_month_cos"),
             (pl.col("__weekday") >= 5).cast(pl.Int8).alias("calendar_is_weekend"),
         )
         .select(list(_KNOWN_FUTURE_COLUMNS))
@@ -251,6 +339,7 @@ __all__ = [
     "get_feature_protocol_spec",
     "list_feature_protocol_ids",
     "list_feature_protocol_specs",
+    "materialize_task_series_frame",
     "protocol_context_dict",
     "select_task_series_columns",
 ]
