@@ -1323,3 +1323,115 @@ def test_run_experiment_can_limit_variants(tmp_path) -> None:
     assert results.height == 1
     assert results["model_variant"].to_list() == [module.POWER_WS_HIST_MODEL_VARIANT]
     assert results["input_channels"].to_list() == [2]
+
+
+def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
+    module = _load_module()
+    observed_kwargs: dict[str, dict[str, object]] = {}
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+        )
+
+    def _fake_runner(prepared, **kwargs):
+        observed_kwargs[prepared.model_variant] = kwargs
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
+            ),
+        ]
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        output_path=tmp_path / "agcrn-official-aligned.csv",
+        dataset_loader=_fake_loader,
+        job_runner=_fake_runner,
+    )
+
+    power_only_profile = module.resolve_hyperparameter_profile(module.MODEL_VARIANT)
+    power_ws_hist_profile = module.resolve_hyperparameter_profile(module.POWER_WS_HIST_MODEL_VARIANT)
+
+    assert observed_kwargs[module.MODEL_VARIANT]["batch_size"] == power_only_profile.batch_size
+    assert observed_kwargs[module.MODEL_VARIANT]["learning_rate"] == power_only_profile.learning_rate
+    assert observed_kwargs[module.MODEL_VARIANT]["max_epochs"] == power_only_profile.max_epochs
+    assert observed_kwargs[module.MODEL_VARIANT]["early_stopping_patience"] == power_only_profile.early_stopping_patience
+    assert observed_kwargs[module.MODEL_VARIANT]["hidden_dim"] == power_only_profile.hidden_dim
+    assert observed_kwargs[module.MODEL_VARIANT]["embed_dim"] == power_only_profile.embed_dim
+    assert observed_kwargs[module.MODEL_VARIANT]["num_layers"] == power_only_profile.num_layers
+    assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == power_only_profile.cheb_k
+    assert observed_kwargs[module.MODEL_VARIANT]["grad_clip_norm"] == power_only_profile.grad_clip_norm
+
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["batch_size"] == power_ws_hist_profile.batch_size
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["learning_rate"] == power_ws_hist_profile.learning_rate
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["max_epochs"] == power_ws_hist_profile.max_epochs
+    assert (
+        observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["early_stopping_patience"]
+        == power_ws_hist_profile.early_stopping_patience
+    )
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["hidden_dim"] == power_ws_hist_profile.hidden_dim
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["embed_dim"] == power_ws_hist_profile.embed_dim
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["num_layers"] == power_ws_hist_profile.num_layers
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["cheb_k"] == power_ws_hist_profile.cheb_k
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["grad_clip_norm"] == power_ws_hist_profile.grad_clip_norm
+
+
+def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> None:
+    module = _load_module()
+    observed_kwargs: dict[str, dict[str, object]] = {}
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=2 if variant_spec.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID else 1,
+        )
+
+    def _fake_runner(prepared, **kwargs):
+        observed_kwargs[prepared.model_variant] = kwargs
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
+            ),
+        ]
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        output_path=tmp_path / "agcrn-official-aligned.csv",
+        batch_size=256,
+        max_epochs=7,
+        dataset_loader=_fake_loader,
+        job_runner=_fake_runner,
+    )
+
+    assert observed_kwargs[module.MODEL_VARIANT]["batch_size"] == 256
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["batch_size"] == 256
+    assert observed_kwargs[module.MODEL_VARIANT]["max_epochs"] == 7
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["max_epochs"] == 7
+
+    assert observed_kwargs[module.MODEL_VARIANT]["embed_dim"] == 10
+    assert observed_kwargs[module.MODEL_VARIANT]["cheb_k"] == 2
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["embed_dim"] == 16
+    assert observed_kwargs[module.POWER_WS_HIST_MODEL_VARIANT]["cheb_k"] == 3

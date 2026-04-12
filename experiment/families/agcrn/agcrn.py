@@ -185,6 +185,19 @@ class ExperimentVariant:
     feature_protocol_id: str
 
 
+@dataclass(frozen=True)
+class HyperparameterProfile:
+    batch_size: int
+    learning_rate: float
+    max_epochs: int
+    early_stopping_patience: int
+    hidden_dim: int
+    embed_dim: int
+    num_layers: int
+    cheb_k: int
+    grad_clip_norm: float
+
+
 VARIANT_SPECS = (
     ExperimentVariant(model_variant=MODEL_VARIANT, feature_protocol_id=FEATURE_PROTOCOL_ID),
     ExperimentVariant(
@@ -197,6 +210,64 @@ _VARIANT_SPECS_BY_NAME = {
     spec.model_variant: spec
     for spec in VARIANT_SPECS
 }
+TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
+    MODEL_VARIANT: HyperparameterProfile(
+        batch_size=512,
+        learning_rate=1e-3,
+        max_epochs=20,
+        early_stopping_patience=5,
+        hidden_dim=64,
+        embed_dim=10,
+        num_layers=2,
+        cheb_k=2,
+        grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+    ),
+    POWER_WS_HIST_MODEL_VARIANT: HyperparameterProfile(
+        batch_size=512,
+        learning_rate=5e-4,
+        max_epochs=20,
+        early_stopping_patience=5,
+        hidden_dim=64,
+        embed_dim=16,
+        num_layers=2,
+        cheb_k=3,
+        grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+    ),
+}
+
+
+def resolve_hyperparameter_profile(
+    variant_name: str,
+    *,
+    batch_size: int | None = None,
+    learning_rate: float | None = None,
+    max_epochs: int | None = None,
+    early_stopping_patience: int | None = None,
+    hidden_dim: int | None = None,
+    embed_dim: int | None = None,
+    num_layers: int | None = None,
+    cheb_k: int | None = None,
+    grad_clip_norm: float | None = None,
+) -> HyperparameterProfile:
+    try:
+        defaults = TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT[variant_name]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported AGCRN variant {variant_name!r}.") from exc
+    return HyperparameterProfile(
+        batch_size=defaults.batch_size if batch_size is None else batch_size,
+        learning_rate=defaults.learning_rate if learning_rate is None else learning_rate,
+        max_epochs=defaults.max_epochs if max_epochs is None else max_epochs,
+        early_stopping_patience=(
+            defaults.early_stopping_patience
+            if early_stopping_patience is None
+            else early_stopping_patience
+        ),
+        hidden_dim=defaults.hidden_dim if hidden_dim is None else hidden_dim,
+        embed_dim=defaults.embed_dim if embed_dim is None else embed_dim,
+        num_layers=defaults.num_layers if num_layers is None else num_layers,
+        cheb_k=defaults.cheb_k if cheb_k is None else cheb_k,
+        grad_clip_norm=defaults.grad_clip_norm if grad_clip_norm is None else grad_clip_norm,
+    )
 
 
 @dataclass(frozen=True)
@@ -1932,18 +2003,18 @@ def run_experiment(
     cache_root: str | Path = _CACHE_ROOT,
     output_path: str | Path = _OUTPUT_PATH,
     device: str | None = None,
-    max_epochs: int = DEFAULT_MAX_EPOCHS,
+    max_epochs: int | None = None,
     max_train_origins: int | None = None,
     max_eval_origins: int | None = None,
     seed: int = DEFAULT_SEED,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    learning_rate: float = DEFAULT_LEARNING_RATE,
-    early_stopping_patience: int = DEFAULT_EARLY_STOPPING_PATIENCE,
-    hidden_dim: int = DEFAULT_HIDDEN_DIM,
-    embed_dim: int = DEFAULT_EMBED_DIM,
-    num_layers: int = DEFAULT_NUM_LAYERS,
-    cheb_k: int = DEFAULT_CHEB_K,
-    grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
+    batch_size: int | None = None,
+    learning_rate: float | None = None,
+    early_stopping_patience: int | None = None,
+    hidden_dim: int | None = None,
+    embed_dim: int | None = None,
+    num_layers: int | None = None,
+    cheb_k: int | None = None,
+    grad_clip_norm: float | None = None,
     dataset_loader: Callable[..., PreparedDataset] | None = None,
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
@@ -1974,21 +2045,33 @@ def run_experiment(
                 )
             )
             for prepared in prepared_datasets:
+                resolved_profile = resolve_hyperparameter_profile(
+                    prepared.model_variant,
+                    batch_size=batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    early_stopping_patience=early_stopping_patience,
+                    hidden_dim=hidden_dim,
+                    embed_dim=embed_dim,
+                    num_layers=num_layers,
+                    cheb_k=cheb_k,
+                    grad_clip_norm=grad_clip_norm,
+                )
                 job_progress.set_postfix_str(f"{prepared.dataset_id}/{prepared.model_variant}")
                 rows.extend(
                     runner(
                         prepared,
                         device=device,
                         seed=seed,
-                        batch_size=batch_size,
-                        learning_rate=learning_rate,
-                        max_epochs=max_epochs,
-                        early_stopping_patience=early_stopping_patience,
-                        hidden_dim=hidden_dim,
-                        embed_dim=embed_dim,
-                        num_layers=num_layers,
-                        cheb_k=cheb_k,
-                        grad_clip_norm=grad_clip_norm,
+                        batch_size=resolved_profile.batch_size,
+                        learning_rate=resolved_profile.learning_rate,
+                        max_epochs=resolved_profile.max_epochs,
+                        early_stopping_patience=resolved_profile.early_stopping_patience,
+                        hidden_dim=resolved_profile.hidden_dim,
+                        embed_dim=resolved_profile.embed_dim,
+                        num_layers=resolved_profile.num_layers,
+                        cheb_k=resolved_profile.cheb_k,
+                        grad_clip_norm=resolved_profile.grad_clip_norm,
                     )
                 )
                 job_progress.update(1)
@@ -2029,8 +2112,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=DEFAULT_MAX_EPOCHS,
-        help="Maximum training epochs.",
+        default=None,
+        help="Maximum training epochs. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--output-path",
@@ -2053,14 +2136,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=DEFAULT_BATCH_SIZE,
-        help="Training and evaluation batch size.",
+        default=None,
+        help="Training and evaluation batch size. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=DEFAULT_LEARNING_RATE,
-        help="Adam learning rate.",
+        default=None,
+        help="Adam learning rate. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--seed",
@@ -2071,38 +2154,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patience",
         type=int,
-        default=DEFAULT_EARLY_STOPPING_PATIENCE,
-        help="Early stopping patience in epochs.",
+        default=None,
+        help="Early stopping patience in epochs. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--hidden-dim",
         type=int,
-        default=DEFAULT_HIDDEN_DIM,
-        help="Hidden dimension for the recurrent state.",
+        default=None,
+        help="Hidden dimension for the recurrent state. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--embed-dim",
         type=int,
-        default=DEFAULT_EMBED_DIM,
-        help="Learned node-embedding dimension for the adaptive graph.",
+        default=None,
+        help="Learned node-embedding dimension for the adaptive graph. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--num-layers",
         type=int,
-        default=DEFAULT_NUM_LAYERS,
-        help="Number of stacked AGCRN recurrent layers.",
+        default=None,
+        help="Number of stacked AGCRN recurrent layers. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--cheb-k",
         type=int,
-        default=DEFAULT_CHEB_K,
-        help="Adaptive graph convolution support order.",
+        default=None,
+        help="Adaptive graph convolution support order. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--grad-clip-norm",
         type=float,
-        default=DEFAULT_GRAD_CLIP_NORM,
-        help="Gradient clipping max norm. Use 0 to disable clipping.",
+        default=None,
+        help="Gradient clipping max norm. Use 0 to disable clipping. Defaults to the tuned per-variant profile when omitted.",
     )
     parser.add_argument(
         "--run-label",
@@ -2122,6 +2205,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
+    resolved_variant_hyperparameters = {
+        spec.model_variant: {
+            "feature_protocol_id": spec.feature_protocol_id,
+            **resolve_hyperparameter_profile(
+                spec.model_variant,
+                batch_size=args.batch_size,
+                learning_rate=args.learning_rate,
+                max_epochs=args.epochs,
+                early_stopping_patience=args.patience,
+                hidden_dim=args.hidden_dim,
+                embed_dim=args.embed_dim,
+                num_layers=args.num_layers,
+                cheb_k=args.cheb_k,
+                grad_clip_norm=args.grad_clip_norm,
+            ).__dict__,
+        }
+        for spec in variant_specs
+    }
     results = run_experiment(
         dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
         variant_names=tuple(spec.model_variant for spec in variant_specs),
@@ -2141,12 +2242,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         grad_clip_norm=args.grad_clip_norm,
     )
     if not args.no_record_run:
+        recorded_args = vars(args).copy()
+        recorded_args["resolved_variant_hyperparameters"] = resolved_variant_hyperparameters
         record_cli_run(
             family_id=FAMILY_ID,
             repo_root=_REPO_ROOT,
             invocation_kind="family_runner",
             entrypoint="experiment/families/agcrn/run_agcrn.py",
-            args=vars(args),
+            args=recorded_args,
             output_path=args.output_path,
             result_row_count=results.height,
             dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,

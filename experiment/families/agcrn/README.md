@@ -73,12 +73,31 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-Current tuned defaults favor faster full runs on this workspace:
+The default invocation now applies the best aligned full-run profile found in the
+2026-04-12 search, separately for each active variant:
 
-- `--device auto` (prefers CUDA when available)
-- `--batch-size 1024`
-- `--epochs 15`
-- `--patience 4`
+- `official_aligned_power_only_farm_sync`
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
+- `official_aligned_power_ws_hist_farm_sync`
+  - `batch_size=512`
+  - `learning_rate=5e-4`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=16`
+  - `num_layers=2`
+  - `cheb_k=3`
+
+Explicit CLI flags such as `--batch-size`, `--learning-rate`, `--epochs`,
+`--patience`, `--embed-dim`, or `--cheb-k` still override these tuned defaults
+for all selected variants.
 
 This writes:
 
@@ -95,6 +114,128 @@ Useful smoke-test options:
 ./.conda/bin/python run_agcrn.py --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
+
+## Hyperparameter Search
+
+Use the aligned search harness when you want to tune the two active variants
+separately without falling back to mismatched window sets.
+
+The search script always prepares `power_only` and `power_ws_hist` together,
+intersects their strict `train`/`val`/`test` windows, and only then tunes each
+variant on that shared split surface.
+
+### Search Setup
+
+The 2026-04-12 search used the aligned window fix now present on `HEAD`. With
+that fix, both feature protocols share exactly the same full-window split sizes
+for Kelmarsh:
+
+- `train=292161`
+- `val_rolling=43473`
+- `val_non_overlap=1208`
+- `test_rolling=82597`
+- `test_non_overlap=2295`
+
+The screening and confirmation budgets were:
+
+- screen: `train_origins=65536`, `eval_origins=8192`, `epochs=10`, `patience=3`
+- final confirm: `epochs=20`, `patience=5`
+
+The search covered these candidate families:
+
+- `power_only`
+  - `baseline_bs1024_h64_e10_l2_k2_lr1e-3`
+  - `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+  - `compact_bs1024_h48_e8_l1_k2_lr2e-3`
+  - `larger_bs512_h96_e16_l2_k2_lr1e-3`
+  - `graph_bs512_h64_e16_l2_k3_lr5e-4`
+- `power_ws_hist`
+  - `baseline_bs1024_h64_e10_l2_k2_lr1e-3`
+  - `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+  - `baseline_bs512_h64_e10_l2_k2_lr5e-4`
+  - `compact_bs1024_h48_e8_l1_k2_lr2e-3`
+  - `compact_bs512_h48_e8_l1_k2_lr1e-3`
+  - `larger_bs512_h96_e16_l2_k2_lr1e-3`
+  - `larger_bs512_h96_e16_l2_k2_lr5e-4`
+  - `graph_bs512_h64_e16_l2_k3_lr5e-4`
+
+### Search Outcome
+
+The alignment fix alone removed the earlier anomaly where adding wind-speed
+history looked harmful. Under the same default baseline hyperparameters,
+`power_ws_hist` already beats `power_only` on the full aligned windows:
+
+| Variant | Config | Test Rolling RMSE PU | Test Non-Overlap RMSE PU |
+| --- | --- | ---: | ---: |
+| `power_only` | `baseline_bs1024_h64_e10_l2_k2_lr1e-3` | `0.170926449` | `0.172388097` |
+| `power_ws_hist` | `baseline_bs1024_h64_e10_l2_k2_lr1e-3` | `0.170529890` | `0.171792055` |
+
+After tuning, the strongest confirmed full-window configs were:
+
+| Variant | Best Config | Test Rolling RMSE PU | Test Non-Overlap RMSE PU |
+| --- | --- | ---: | ---: |
+| `power_only` | `baseline_bs512_h64_e10_l2_k2_lr1e-3` | `0.170218769` | `0.171469075` |
+| `power_ws_hist` | `graph_bs512_h64_e16_l2_k3_lr5e-4` | `0.169534975` | `0.171100681` |
+
+Relative to the best tuned `power_only` run, the best tuned `power_ws_hist` run
+improves:
+
+- rolling RMSE PU by `0.000683795`
+- non-overlap RMSE PU by `0.000368394`
+
+The main practical conclusions from this search are:
+
+- the earlier regression was primarily a window-alignment artifact
+- `power_ws_hist` benefits from a different hyperparameter profile than `power_only`
+- the strongest `power_ws_hist` setting uses `cheb_k=3` and `embed_dim=16`
+- simply increasing hidden size to `96` did not help either protocol
+
+### Search Artifacts
+
+All outputs live under:
+
+```text
+../../artifacts/scratch/agcrn_official_aligned/search_20260412/
+```
+
+The most useful result files from this search are:
+
+- `full_baseline_compare_v1/final_summary.csv`
+  - aligned full-window comparison for the old shared baseline config
+- `po_bs512_full_v1/final_summary.csv`
+  - full-window confirmation for the best `power_only` config
+- `po_remaining_screen_v1/screen_summary.csv`
+  - remaining `power_only` screening candidates
+- `ws_bs512_full_v1/final_summary.csv`
+  - full-window confirmations for the strongest baseline-style `power_ws_hist` configs
+- `ws_focus_screen_v1/screen_summary.csv`
+  - focused `power_ws_hist` baseline-style screening results
+- `ws_remaining_screen_v1/screen_summary.csv`
+  - remaining `power_ws_hist` screening candidates, including the winning graph config
+- `ws_remaining_screen_v1/final_summary.csv`
+  - full-window confirmation for the winning `power_ws_hist` graph config
+
+Typical invocation:
+
+```bash
+./.conda/bin/python search_agcrn.py --device cuda
+```
+
+This writes stage summaries under:
+
+```text
+../../artifacts/scratch/agcrn_official_aligned/search_20260412/
+```
+
+Key outputs:
+
+- `screen_summary.csv`: validation-only screening results used for shortlist selection
+- `final_summary.csv`: full-window confirmatory runs for the top screened configs
+- `final_detailed_rows.csv`: long result rows matching the family output schema
+- `search_plan.json`: search budget, candidate list, and stage settings
+
+For faster iterations, use `--skip-final` or lower `--screen-train-origins` /
+`--screen-eval-origins`.
 
 ## Output Schema
 
