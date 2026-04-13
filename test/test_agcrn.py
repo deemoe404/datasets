@@ -437,6 +437,14 @@ def _require_torch(module):
     return module.torch
 
 
+def _work_root(tmp_path: Path) -> Path:
+    return tmp_path / ".work"
+
+
+def _resume_paths(module, *, output_path: Path, work_root: Path):
+    return module._resume_paths_for_output(output_path=output_path, work_root=work_root)
+
+
 def _build_reference_classes(torch_module):
     nn_module = torch_module.nn
     functional = torch_module.nn.functional
@@ -1364,6 +1372,7 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
     results = module.run_experiment(
         dataset_ids=("kelmarsh",),
         output_path=output_path,
+        work_root=_work_root(tmp_path),
         dataset_loader=_fake_loader,
         job_runner=_fake_runner,
     )
@@ -1519,6 +1528,7 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
         dataset_ids=("toy_dataset",),
         cache_root=cache_root,
         output_path=tmp_path / "agcrn-official-aligned.csv",
+        work_root=_work_root(tmp_path),
         job_runner=_fake_runner,
     )
 
@@ -1583,6 +1593,7 @@ def test_run_experiment_updates_job_progress_bar(monkeypatch, tmp_path) -> None:
     module.run_experiment(
         dataset_ids=("kelmarsh",),
         output_path=tmp_path / "agcrn-official-aligned.csv",
+        work_root=_work_root(tmp_path),
         dataset_loader=_fake_loader,
         job_runner=_fake_runner,
     )
@@ -1630,6 +1641,7 @@ def test_run_experiment_can_limit_variants(tmp_path) -> None:
         dataset_ids=("kelmarsh",),
         variant_names=(module.POWER_WS_HIST_MODEL_VARIANT,),
         output_path=tmp_path / "agcrn-official-aligned.csv",
+        work_root=_work_root(tmp_path),
         dataset_loader=_fake_loader,
         job_runner=_fake_runner,
     )
@@ -1671,6 +1683,7 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
     module.run_experiment(
         dataset_ids=("kelmarsh",),
         output_path=tmp_path / "agcrn-official-aligned.csv",
+        work_root=_work_root(tmp_path),
         dataset_loader=_fake_loader,
         job_runner=_fake_runner,
     )
@@ -1732,6 +1745,7 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
         output_path=tmp_path / "agcrn-official-aligned.csv",
         batch_size=256,
         max_epochs=7,
+        work_root=_work_root(tmp_path),
         dataset_loader=_fake_loader,
         job_runner=_fake_runner,
     )
@@ -1744,3 +1758,416 @@ def test_run_experiment_overrides_tuned_defaults_field_by_field(tmp_path) -> Non
         profile = module.resolve_hyperparameter_profile(variant_name)
         assert observed_kwargs[variant_name]["embed_dim"] == profile.embed_dim
         assert observed_kwargs[variant_name]["cheb_k"] == profile.cheb_k
+
+
+def test_run_experiment_rejects_running_state_without_resume(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _crashing_runner(prepared, **kwargs):
+        checkpoint_path = Path(kwargs["checkpoint_path"])
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_text("checkpoint", encoding="utf-8")
+        raise RuntimeError(f"simulated crash for {prepared.model_variant}")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_crashing_runner,
+        )
+
+    with pytest.raises(ValueError, match="marked running"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_crashing_runner,
+        )
+
+
+def test_run_experiment_can_resume_interrupted_job_and_skip_completed_variants(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+    variant_names = (
+        module.MODEL_VARIANT,
+        module.POWER_WS_HIST_MODEL_VARIANT,
+        module.POWER_ATEMP_HIST_MODEL_VARIANT,
+    )
+    call_log: list[tuple[str, bool]] = []
+    crash_pending = True
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
+        )
+
+    def _runner(prepared, **kwargs):
+        nonlocal crash_pending
+        call_log.append((prepared.model_variant, bool(kwargs["resume_from_checkpoint"])))
+        if prepared.model_variant == module.POWER_WS_HIST_MODEL_VARIANT and crash_pending:
+            crash_pending = False
+            checkpoint_path = Path(kwargs["checkpoint_path"])
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_path.write_text("checkpoint", encoding="utf-8")
+            raise RuntimeError("simulated power loss")
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
+            ),
+        ]
+
+    with pytest.raises(RuntimeError, match="simulated power loss"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=variant_names,
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_runner,
+        )
+
+    results = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=variant_names,
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+        resume=True,
+    )
+
+    assert results["model_variant"].to_list() == list(variant_names)
+    assert call_log == [
+        (module.MODEL_VARIANT, False),
+        (module.POWER_WS_HIST_MODEL_VARIANT, False),
+        (module.POWER_WS_HIST_MODEL_VARIANT, True),
+        (module.POWER_ATEMP_HIST_MODEL_VARIANT, False),
+    ]
+    resume_paths = _resume_paths(module, output_path=output_path, work_root=work_root)
+    state = module._load_resume_state(resume_paths)
+    assert state["status"] == "complete"
+    assert output_path.exists()
+
+
+def test_run_experiment_restarts_interrupted_job_when_checkpoint_is_missing(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+    resume_flags: list[bool] = []
+    crash_pending = True
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _runner(prepared, **kwargs):
+        nonlocal crash_pending
+        resume_flags.append(bool(kwargs["resume_from_checkpoint"]))
+        if crash_pending:
+            crash_pending = False
+            raise RuntimeError("simulated crash without checkpoint")
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+            ),
+        ]
+
+    with pytest.raises(RuntimeError, match="simulated crash without checkpoint"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_runner,
+        )
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+        resume=True,
+    )
+
+    assert resume_flags == [False, False]
+
+
+def test_run_experiment_rejects_resume_config_mismatch(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _runner(prepared, **kwargs):
+        del kwargs
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+            ),
+        ]
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+    )
+
+    with pytest.raises(ValueError, match="does not match the requested run configuration"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_runner,
+            resume=True,
+            seed=999,
+        )
+
+
+def test_run_experiment_reinitializes_complete_state_on_fresh_run(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+    run_markers: list[str] = []
+    marker = "first"
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _runner(prepared, **kwargs):
+        del kwargs
+        run_markers.append(marker)
+        row = _result_row(
+            module,
+            dataset_id=prepared.dataset_id,
+            split_name="val",
+            eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+            metric_scope=module.OVERALL_METRIC_SCOPE,
+            lead_step=None,
+            model_variant=prepared.model_variant,
+        )
+        row["mae_kw"] = 1.0 if marker == "first" else 2.0
+        return [row]
+
+    first = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+    )
+    assert first["mae_kw"].to_list() == [1.0]
+
+    marker = "second"
+    second = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+    )
+    assert second["mae_kw"].to_list() == [2.0]
+    assert run_markers == ["first", "second"]
+    partial_results = module._read_partial_results(_resume_paths(module, output_path=output_path, work_root=work_root))
+    assert partial_results["mae_kw"].to_list() == [2.0]
+
+
+def test_run_experiment_rebuilds_final_output_from_completed_partial_results(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+    call_count = 0
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _runner(prepared, **kwargs):
+        nonlocal call_count
+        del kwargs
+        call_count += 1
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+            ),
+        ]
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+    )
+    output_path.unlink()
+
+    module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_runner,
+        resume=True,
+    )
+
+    assert call_count == 1
+    assert output_path.exists()
+
+
+def test_train_model_resume_matches_continuous_training(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    monkeypatch.setattr(module, "progress_is_enabled", lambda: False)
+    prepared = _small_prepared_dataset(module)
+    checkpoint_path = tmp_path / "resume.pt"
+    common_kwargs = {
+        "device": "cpu",
+        "seed": 123,
+        "batch_size": 2,
+        "learning_rate": 1e-3,
+        "max_epochs": 4,
+        "early_stopping_patience": 10,
+        "hidden_dim": 8,
+        "embed_dim": 4,
+        "num_layers": 1,
+        "cheb_k": 2,
+        "grad_clip_norm": module.DEFAULT_GRAD_CLIP_NORM,
+    }
+
+    class _PlannedInterrupt(RuntimeError):
+        pass
+
+    full = module.train_model(prepared, **common_kwargs)
+
+    original_save = module._save_training_checkpoint
+
+    def _interrupting_save(path, payload):
+        original_save(path, payload)
+        if payload["epochs_ran"] == 2:
+            raise _PlannedInterrupt("simulated interrupt")
+
+    monkeypatch.setattr(module, "_save_training_checkpoint", _interrupting_save)
+    with pytest.raises(_PlannedInterrupt, match="simulated interrupt"):
+        module.train_model(prepared, checkpoint_path=checkpoint_path, **common_kwargs)
+
+    monkeypatch.setattr(module, "_save_training_checkpoint", original_save)
+    resumed = module.train_model(
+        prepared,
+        checkpoint_path=checkpoint_path,
+        resume_from_checkpoint=True,
+        **common_kwargs,
+    )
+
+    assert resumed.best_epoch == full.best_epoch
+    assert resumed.epochs_ran == full.epochs_ran
+    assert resumed.best_val_rmse_pu == pytest.approx(full.best_val_rmse_pu)
+    for key, value in full.model.state_dict().items():
+        torch_module.testing.assert_close(value, resumed.model.state_dict()[key], rtol=1e-6, atol=1e-6)
+
+
+def test_train_model_resume_raises_for_corrupt_checkpoint(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    monkeypatch.setattr(module, "progress_is_enabled", lambda: False)
+    checkpoint_path = tmp_path / "corrupt.pt"
+    checkpoint_path.write_text("not a checkpoint", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Failed to load AGCRN checkpoint"):
+        module.train_model(
+            _small_prepared_dataset(module),
+            device="cpu",
+            seed=123,
+            batch_size=2,
+            learning_rate=1e-3,
+            max_epochs=4,
+            early_stopping_patience=10,
+            hidden_dim=8,
+            embed_dim=4,
+            num_layers=1,
+            cheb_k=2,
+            grad_clip_norm=module.DEFAULT_GRAD_CLIP_NORM,
+            checkpoint_path=checkpoint_path,
+            resume_from_checkpoint=True,
+        )

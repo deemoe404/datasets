@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 from pathlib import Path
 import random
+import shutil
 import sys
 import time
 from typing import Any, Callable, Sequence
@@ -121,6 +123,9 @@ PROFILE_LOG_PREFIX = "[agcrn] "
 _REPO_ROOT = EXPERIMENT_ROOT.parent
 _CACHE_ROOT = _REPO_ROOT / "cache"
 _OUTPUT_PATH = default_family_output_path(repo_root=_REPO_ROOT, family_id=FAMILY_ID)
+_RUN_AGCRN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_agcrn"
+_RUN_STATE_SCHEMA_VERSION = "agcrn.run_agcrn.resume.v1"
+_TRAINING_CHECKPOINT_SCHEMA_VERSION = "agcrn.training_checkpoint.v1"
 _TASK_WINDOW_COLUMNS = (
     "dataset",
     "output_start_ts",
@@ -423,6 +428,14 @@ class TrainingOutcome:
 
 
 @dataclass(frozen=True)
+class ResumePaths:
+    slot_dir: Path
+    state_path: Path
+    partial_results_path: Path
+    checkpoints_dir: Path
+
+
+@dataclass(frozen=True)
 class EvaluationMetrics:
     window_count: int
     prediction_count: int
@@ -436,6 +449,230 @@ class EvaluationMetrics:
     horizon_rmse_kw: np.ndarray
     horizon_mae_pu: np.ndarray
     horizon_rmse_pu: np.ndarray
+
+
+def _empty_result_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_RESULT_COLUMNS)
+
+
+def _temporary_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = _temporary_path(path)
+    temporary_path.write_text(content, encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_csv(path: Path, frame: pl.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = _temporary_path(path)
+    frame.write_csv(temporary_path)
+    temporary_path.replace(path)
+
+
+def _normalize_output_path(output_path: str | Path) -> Path:
+    return Path(output_path).expanduser().resolve()
+
+
+def _resume_paths_for_output(*, output_path: str | Path, work_root: str | Path) -> ResumePaths:
+    normalized_output_path = _normalize_output_path(output_path)
+    slot_name = hashlib.sha256(str(normalized_output_path).encode("utf-8")).hexdigest()
+    slot_dir = Path(work_root) / slot_name
+    return ResumePaths(
+        slot_dir=slot_dir,
+        state_path=slot_dir / "run_state.json",
+        partial_results_path=slot_dir / "partial_results.csv",
+        checkpoints_dir=slot_dir / "checkpoints",
+    )
+
+
+def _job_key(dataset_id: str, model_variant: str) -> tuple[str, str]:
+    return dataset_id, model_variant
+
+
+def _job_identity(
+    *,
+    dataset_id: str,
+    model_variant: str,
+    feature_protocol_id: str,
+) -> dict[str, str]:
+    return {
+        "dataset_id": dataset_id,
+        "model_variant": model_variant,
+        "feature_protocol_id": feature_protocol_id,
+    }
+
+
+def _job_identity_for_prepared_dataset(prepared_dataset: PreparedDataset) -> dict[str, str]:
+    return _job_identity(
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=prepared_dataset.model_variant,
+        feature_protocol_id=prepared_dataset.feature_protocol_id,
+    )
+
+
+def _job_checkpoint_path(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> Path:
+    return paths.checkpoints_dir / f"{dataset_id}__{model_variant}.pt"
+
+
+def _build_effective_config(
+    *,
+    dataset_ids: Sequence[str],
+    variant_specs: Sequence[ExperimentVariant],
+    seed: int,
+    max_train_origins: int | None,
+    max_eval_origins: int | None,
+    batch_size: int | None,
+    learning_rate: float | None,
+    max_epochs: int | None,
+    early_stopping_patience: int | None,
+    hidden_dim: int | None,
+    embed_dim: int | None,
+    num_layers: int | None,
+    cheb_k: int | None,
+    grad_clip_norm: float | None,
+) -> dict[str, object]:
+    return {
+        "dataset_ids": list(dataset_ids),
+        "variant_names": [spec.model_variant for spec in variant_specs],
+        "seed": seed,
+        "max_train_origins": max_train_origins,
+        "max_eval_origins": max_eval_origins,
+        "resolved_variant_hyperparameters": {
+            spec.model_variant: {
+                "feature_protocol_id": spec.feature_protocol_id,
+                **asdict(
+                    resolve_hyperparameter_profile(
+                        spec.model_variant,
+                        batch_size=batch_size,
+                        learning_rate=learning_rate,
+                        max_epochs=max_epochs,
+                        early_stopping_patience=early_stopping_patience,
+                        hidden_dim=hidden_dim,
+                        embed_dim=embed_dim,
+                        num_layers=num_layers,
+                        cheb_k=cheb_k,
+                        grad_clip_norm=grad_clip_norm,
+                    )
+                ),
+            }
+            for spec in variant_specs
+        },
+    }
+
+
+def _load_resume_state(paths: ResumePaths) -> dict[str, object]:
+    payload = json.loads(paths.state_path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != _RUN_STATE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported AGCRN resume state schema at {paths.state_path}: {payload.get('schema_version')!r}."
+        )
+    status = payload.get("status")
+    if status not in {"running", "complete"}:
+        raise ValueError(f"Unsupported AGCRN resume state status at {paths.state_path}: {status!r}.")
+    return payload
+
+
+def _load_resume_state_if_exists(paths: ResumePaths) -> dict[str, object] | None:
+    if not paths.state_path.exists():
+        return None
+    return _load_resume_state(paths)
+
+
+def _write_resume_state(
+    paths: ResumePaths,
+    *,
+    status: str,
+    effective_config: dict[str, object],
+    active_job: dict[str, str] | None,
+) -> None:
+    _atomic_write_json(
+        paths.state_path,
+        {
+            "schema_version": _RUN_STATE_SCHEMA_VERSION,
+            "status": status,
+            "effective_config": effective_config,
+            "active_job": active_job,
+        },
+    )
+
+
+def _read_partial_results(paths: ResumePaths) -> pl.DataFrame:
+    if not paths.partial_results_path.exists():
+        return _empty_result_frame()
+    frame = pl.read_csv(paths.partial_results_path, infer_schema_length=None)
+    if not frame.columns:
+        return _empty_result_frame()
+    missing_columns = [column for column in _RESULT_COLUMNS if column not in frame.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Partial results at {paths.partial_results_path} are missing expected columns: {missing_columns!r}."
+        )
+    frame = frame.select(_RESULT_COLUMNS)
+    if frame.is_empty():
+        return frame
+    return sort_result_frame(frame)
+
+
+def _write_partial_results(paths: ResumePaths, frame: pl.DataFrame) -> None:
+    _atomic_write_csv(paths.partial_results_path, frame)
+
+
+def _reset_resume_slot(paths: ResumePaths, *, effective_config: dict[str, object]) -> None:
+    if paths.slot_dir.exists():
+        shutil.rmtree(paths.slot_dir)
+    paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    _write_partial_results(paths, _empty_result_frame())
+    _write_resume_state(paths, status="running", effective_config=effective_config, active_job=None)
+
+
+def _delete_job_checkpoint(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> None:
+    checkpoint_path = _job_checkpoint_path(paths, dataset_id=dataset_id, model_variant=model_variant)
+    checkpoint_path.unlink(missing_ok=True)
+
+
+def _clear_checkpoint_dir(paths: ResumePaths) -> None:
+    if paths.checkpoints_dir.exists():
+        shutil.rmtree(paths.checkpoints_dir)
+    paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _completed_job_keys(frame: pl.DataFrame) -> set[tuple[str, str]]:
+    if frame.is_empty():
+        return set()
+    return {
+        _job_key(dataset_id, model_variant)
+        for dataset_id, model_variant in frame.select(["dataset_id", "model_variant"]).unique().iter_rows()
+    }
+
+
+def _result_frame_from_rows(rows: Sequence[dict[str, object]]) -> pl.DataFrame:
+    if not rows:
+        return _empty_result_frame()
+    return sort_result_frame(pl.DataFrame(rows, infer_schema_length=None).select(_RESULT_COLUMNS))
+
+
+def _torch_load_checkpoint(path: Path, *, map_location: str):
+    resolved_torch, _, _, _, _ = require_torch()
+    try:
+        return resolved_torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return resolved_torch.load(path, map_location=map_location)
+
+
+def _save_training_checkpoint(path: Path, payload: dict[str, object]) -> None:
+    resolved_torch, _, _, _, _ = require_torch()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = _temporary_path(path)
+    resolved_torch.save(payload, temporary_path)
+    temporary_path.replace(path)
 
 
 def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
@@ -1707,6 +1944,8 @@ def train_model(
     num_layers: int = DEFAULT_NUM_LAYERS,
     cheb_k: int = DEFAULT_CHEB_K,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
+    checkpoint_path: str | Path | None = None,
+    resume_from_checkpoint: bool = False,
     progress_label: str | None = None,
 ) -> TrainingOutcome:
     resolved_torch, _, _, _, _ = require_torch()
@@ -1724,13 +1963,6 @@ def train_model(
     initialize_official_aligned_parameters(model)
     optimizer = resolved_torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = resolved_torch.nn.MSELoss()
-    train_loader = _build_dataloader(
-        prepared_dataset,
-        windows=prepared_dataset.train_windows,
-        batch_size=batch_size,
-        shuffle=True,
-        seed=seed,
-    )
     val_loader = _build_dataloader(
         prepared_dataset,
         windows=prepared_dataset.val_rolling_windows,
@@ -1739,19 +1971,82 @@ def train_model(
         seed=seed,
     )
 
+    resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_rmse_pu = float("inf")
     epochs_without_improvement = 0
     epochs_ran = 0
+    start_epoch = 1
+    if resume_from_checkpoint:
+        if resolved_checkpoint_path is None:
+            raise ValueError("resume_from_checkpoint=True requires checkpoint_path to be set.")
+        if resolved_checkpoint_path.exists():
+            try:
+                checkpoint_payload = _torch_load_checkpoint(resolved_checkpoint_path, map_location=resolved_device)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load AGCRN checkpoint from {resolved_checkpoint_path}: {exc}"
+                ) from exc
+            if checkpoint_payload.get("schema_version") != _TRAINING_CHECKPOINT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Unsupported AGCRN checkpoint schema at {resolved_checkpoint_path}: "
+                    f"{checkpoint_payload.get('schema_version')!r}."
+                )
+            if checkpoint_payload.get("job") != checkpoint_job_identity:
+                raise RuntimeError(
+                    f"AGCRN checkpoint at {resolved_checkpoint_path} does not match "
+                    f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}."
+                )
+            if int(checkpoint_payload.get("seed", seed)) != seed:
+                raise RuntimeError(
+                    f"AGCRN checkpoint at {resolved_checkpoint_path} was created with seed "
+                    f"{checkpoint_payload.get('seed')!r}, expected {seed!r}."
+                )
+            try:
+                model.load_state_dict(checkpoint_payload["model_state_dict"])
+                optimizer.load_state_dict(checkpoint_payload["optimizer_state_dict"])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to restore AGCRN model or optimizer state from {resolved_checkpoint_path}: {exc}"
+                ) from exc
+            best_state = checkpoint_payload.get("best_state_dict")
+            best_epoch = int(checkpoint_payload["best_epoch"])
+            best_val_rmse_pu = float(checkpoint_payload["best_val_rmse_pu"])
+            epochs_without_improvement = int(checkpoint_payload["epochs_without_improvement"])
+            epochs_ran = int(checkpoint_payload["epochs_ran"])
+            start_epoch = int(checkpoint_payload["next_epoch"])
+            if bool(checkpoint_payload.get("training_complete", False)):
+                if best_state is None:
+                    raise RuntimeError(
+                        f"AGCRN checkpoint at {resolved_checkpoint_path} marks training complete but has no best state."
+                    )
+                model.load_state_dict(best_state)
+                return TrainingOutcome(
+                    best_epoch=best_epoch,
+                    epochs_ran=epochs_ran,
+                    best_val_rmse_pu=best_val_rmse_pu,
+                    device=resolved_device,
+                    model=model,
+                )
     epoch_progress = _create_progress_bar(
         total=max_epochs,
         desc=f"{progress_label or prepared_dataset.dataset_id} epochs",
         leave=True,
     )
     try:
-        for epoch_index in range(1, max_epochs + 1):
+        if start_epoch > 1:
+            epoch_progress.update(start_epoch - 1)
+        for epoch_index in range(start_epoch, max_epochs + 1):
             model.train()
+            train_loader = _build_dataloader(
+                prepared_dataset,
+                windows=prepared_dataset.train_windows,
+                batch_size=batch_size,
+                shuffle=True,
+                seed=seed + epoch_index,
+            )
             batch_progress = _create_progress_bar(
                 total=_loader_batch_total(train_loader),
                 desc=f"{progress_label or prepared_dataset.dataset_id} train e{epoch_index}",
@@ -1797,7 +2092,26 @@ def train_model(
             if last_loss_value is not None:
                 postfix_parts.insert(0, f"loss={last_loss_value:.4f}")
             epoch_progress.set_postfix_str(" ".join(postfix_parts))
-            if epochs_without_improvement >= early_stopping_patience:
+            should_stop = epochs_without_improvement >= early_stopping_patience or epoch_index >= max_epochs
+            if resolved_checkpoint_path is not None:
+                _save_training_checkpoint(
+                    resolved_checkpoint_path,
+                    {
+                        "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
+                        "job": checkpoint_job_identity,
+                        "seed": seed,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "best_state_dict": best_state,
+                        "best_epoch": best_epoch,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "epochs_ran": epochs_ran,
+                        "next_epoch": epoch_index + 1,
+                        "training_complete": should_stop,
+                    },
+                )
+            if should_stop:
                 break
     finally:
         epoch_progress.close()
@@ -1948,6 +2262,8 @@ def execute_training_job(
     num_layers: int = DEFAULT_NUM_LAYERS,
     cheb_k: int = DEFAULT_CHEB_K,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
+    checkpoint_path: str | Path | None = None,
+    resume_from_checkpoint: bool = False,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     progress_label = f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}"
@@ -1964,6 +2280,8 @@ def execute_training_job(
         num_layers=num_layers,
         cheb_k=cheb_k,
         grad_clip_norm=grad_clip_norm,
+        checkpoint_path=checkpoint_path,
+        resume_from_checkpoint=resume_from_checkpoint,
         progress_label=progress_label,
     )
     evaluation_results: list[tuple[str, str, FarmWindowDescriptorIndex, EvaluationMetrics]] = []
@@ -2087,15 +2405,78 @@ def run_experiment(
     num_layers: int | None = None,
     cheb_k: int | None = None,
     grad_clip_norm: float | None = None,
+    resume: bool = False,
+    work_root: str | Path = _RUN_AGCRN_WORK_ROOT,
     dataset_loader: Callable[..., PreparedDataset] | None = None,
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
 ) -> pl.DataFrame:
     variant_specs = resolve_variant_specs(variant_names)
     runner = job_runner or execute_training_job
-    rows: list[dict[str, object]] = []
-    job_progress = _create_progress_bar(total=len(dataset_ids) * len(variant_specs), desc="agcrn jobs", leave=True)
+    output = _normalize_output_path(output_path)
+    resume_paths = _resume_paths_for_output(output_path=output, work_root=work_root)
+    effective_config = _build_effective_config(
+        dataset_ids=dataset_ids,
+        variant_specs=variant_specs,
+        seed=seed,
+        max_train_origins=max_train_origins,
+        max_eval_origins=max_eval_origins,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        max_epochs=max_epochs,
+        early_stopping_patience=early_stopping_patience,
+        hidden_dim=hidden_dim,
+        embed_dim=embed_dim,
+        num_layers=num_layers,
+        cheb_k=cheb_k,
+        grad_clip_norm=grad_clip_norm,
+    )
+    existing_state = _load_resume_state_if_exists(resume_paths)
+    if resume:
+        if existing_state is None:
+            raise ValueError(
+                f"No AGCRN resume state exists for output path {output}. Expected {resume_paths.state_path}."
+            )
+        if existing_state.get("effective_config") != effective_config:
+            raise ValueError(
+                f"AGCRN resume state at {resume_paths.state_path} does not match the requested run configuration."
+            )
+    else:
+        if existing_state is None:
+            _reset_resume_slot(resume_paths, effective_config=effective_config)
+        elif existing_state.get("status") == "complete":
+            _reset_resume_slot(resume_paths, effective_config=effective_config)
+            existing_state = None
+        else:
+            raise ValueError(
+                f"AGCRN resume state at {resume_paths.state_path} is still marked running. "
+                f"Re-run with --resume or remove {resume_paths.slot_dir}."
+            )
+    partial_results = _read_partial_results(resume_paths)
+    rows: list[dict[str, object]] = partial_results.to_dicts()
+    completed_job_keys = _completed_job_keys(partial_results)
+    total_jobs = len(dataset_ids) * len(variant_specs)
+    if existing_state is not None and existing_state.get("status") == "complete" and len(completed_job_keys) != total_jobs:
+        raise ValueError(
+            f"AGCRN resume state at {resume_paths.state_path} is marked complete, but "
+            f"only {len(completed_job_keys)} of {total_jobs} jobs are present in partial results."
+        )
+    if len(completed_job_keys) == total_jobs:
+        results = _result_frame_from_rows(rows)
+        _atomic_write_csv(output, results)
+        _clear_checkpoint_dir(resume_paths)
+        _write_resume_state(resume_paths, status="complete", effective_config=effective_config, active_job=None)
+        return results
+
+    resume_active_job = None if existing_state is None else existing_state.get("active_job")
+    job_progress = _create_progress_bar(total=total_jobs, desc="agcrn jobs", leave=True)
     try:
         for dataset_id in dataset_ids:
+            dataset_job_keys = [_job_key(dataset_id, spec.model_variant) for spec in variant_specs]
+            if all(job_key in completed_job_keys for job_key in dataset_job_keys):
+                for _, model_variant in dataset_job_keys:
+                    job_progress.set_postfix_str(f"{dataset_id}/{model_variant}")
+                    job_progress.update(1)
+                continue
             prepared_datasets = (
                 _prepare_datasets_for_variants(
                     dataset_id,
@@ -2117,6 +2498,8 @@ def run_experiment(
                 )
             )
             for prepared in prepared_datasets:
+                current_job_key = _job_key(prepared.dataset_id, prepared.model_variant)
+                current_job_identity = _job_identity_for_prepared_dataset(prepared)
                 resolved_profile = resolve_hyperparameter_profile(
                     prepared.model_variant,
                     batch_size=batch_size,
@@ -2130,6 +2513,28 @@ def run_experiment(
                     grad_clip_norm=grad_clip_norm,
                 )
                 job_progress.set_postfix_str(f"{prepared.dataset_id}/{prepared.model_variant}")
+                if current_job_key in completed_job_keys:
+                    _delete_job_checkpoint(
+                        resume_paths,
+                        dataset_id=prepared.dataset_id,
+                        model_variant=prepared.model_variant,
+                    )
+                    if resume_active_job == current_job_identity:
+                        resume_active_job = None
+                    job_progress.update(1)
+                    continue
+                checkpoint_path = _job_checkpoint_path(
+                    resume_paths,
+                    dataset_id=prepared.dataset_id,
+                    model_variant=prepared.model_variant,
+                )
+                resume_from_checkpoint = resume_active_job == current_job_identity and checkpoint_path.exists()
+                _write_resume_state(
+                    resume_paths,
+                    status="running",
+                    effective_config=effective_config,
+                    active_job=current_job_identity,
+                )
                 rows.extend(
                     runner(
                         prepared,
@@ -2144,16 +2549,28 @@ def run_experiment(
                         num_layers=resolved_profile.num_layers,
                         cheb_k=resolved_profile.cheb_k,
                         grad_clip_norm=resolved_profile.grad_clip_norm,
+                        checkpoint_path=checkpoint_path,
+                        resume_from_checkpoint=resume_from_checkpoint,
                     )
                 )
+                partial_results = _result_frame_from_rows(rows)
+                _write_partial_results(resume_paths, partial_results)
+                completed_job_keys.add(current_job_key)
+                _delete_job_checkpoint(
+                    resume_paths,
+                    dataset_id=prepared.dataset_id,
+                    model_variant=prepared.model_variant,
+                )
+                _write_resume_state(resume_paths, status="running", effective_config=effective_config, active_job=None)
+                resume_active_job = None
                 job_progress.update(1)
     finally:
         job_progress.close()
 
-    results = sort_result_frame(pl.DataFrame(rows, infer_schema_length=None).select(_RESULT_COLUMNS))
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    results.write_csv(output)
+    results = _result_frame_from_rows(rows)
+    _atomic_write_csv(output, results)
+    _clear_checkpoint_dir(resume_paths)
+    _write_resume_state(resume_paths, status="complete", effective_config=effective_config, active_job=None)
     return results
 
 
@@ -2266,6 +2683,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional label suffix for the formal run record under experiment/artifacts/runs/agcrn_official_aligned/.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an interrupted run_agcrn invocation from experiment/families/agcrn/.work/.",
+    )
+    parser.add_argument(
         "--no-record-run",
         action="store_true",
         help="Skip writing a formal run record manifest under experiment/artifacts/runs/.",
@@ -2312,6 +2734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_layers=args.num_layers,
         cheb_k=args.cheb_k,
         grad_clip_norm=args.grad_clip_norm,
+        resume=args.resume,
     )
     if not args.no_record_run:
         recorded_args = vars(args).copy()

@@ -218,6 +218,54 @@ Useful smoke-test options:
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ```
 
+### Resume
+
+`run_agcrn.py` now supports explicit resume for interrupted family runs:
+
+```bash
+./.conda/bin/python run_agcrn.py --resume
+```
+
+Resume state is family-local and keyed by the resolved `--output-path`:
+
+```text
+./.work/run_agcrn/<sha256(output_path)>/
+  run_state.json
+  partial_results.csv
+  checkpoints/<dataset_id>__<model_variant>.pt
+```
+
+Behavior:
+
+- `--resume` is required to continue an interrupted run; the default invocation still starts a fresh run
+- completed `(dataset_id, model_variant)` jobs are skipped based on `partial_results.csv`
+- the interrupted active job resumes from the latest epoch checkpoint when the matching `.pt` file exists
+- if the active job has no checkpoint file, that job restarts from epoch `0`
+- only epoch-boundary recovery is supported; there is no batch-level recovery
+
+Resume is strict about configuration identity. The stored state must match:
+
+- ordered `dataset_ids`
+- ordered `variant_names`
+- `seed`
+- `max_train_origins`
+- `max_eval_origins`
+- each selected variant's resolved hyperparameter profile
+
+Flags such as `--run-label` and `--no-record-run` are intentionally ignored for
+resume matching because they do not change the training definition.
+
+Typical interrupted-run flow:
+
+```bash
+./.conda/bin/python run_agcrn.py --output-path ../../artifacts/scratch/agcrn_official_aligned/debug.csv
+./.conda/bin/python run_agcrn.py --output-path ../../artifacts/scratch/agcrn_official_aligned/debug.csv --resume
+```
+
+If a previous run for the same `--output-path` is still marked `running`, a
+fresh invocation without `--resume` is rejected so the interrupted state is not
+silently overwritten.
+
 ## Hyperparameter Search
 
 Use the aligned search harness when you want to tune any subset of the active
