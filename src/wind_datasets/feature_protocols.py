@@ -58,6 +58,18 @@ _POWER_WS_HIST_COLUMNS_BY_DATASET = {
     "hill_of_towie": ("wtc_AcWindSp_mean",),
     "sdwpf_kddcup": ("Wspd",),
 }
+_POWER_ATEMP_HIST_COLUMN_BY_DATASET = {
+    "kelmarsh": "Nacelle ambient temperature (°C)",
+    "penmanshiel": "Nacelle ambient temperature (°C)",
+    "hill_of_towie": "tur_temp__wtc_ambietmp_mean",
+    "sdwpf_kddcup": "Etmp",
+}
+_POWER_ITEMP_HIST_COLUMN_BY_DATASET = {
+    "kelmarsh": "Nacelle temperature (°C)",
+    "penmanshiel": "Nacelle temperature (°C)",
+    "hill_of_towie": "tur_temp__wtc_naceltmp_mean",
+    "sdwpf_kddcup": "Itmp",
+}
 _LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET = {
     "kelmarsh": "Rotor speed (RPM)",
     "penmanshiel": "Rotor speed (RPM)",
@@ -175,6 +187,34 @@ _POWER_WS_HIST_PROTOCOL = FeatureProtocolSpec(
     past_covariate_source="gold_base.dataset_native_wind_speed",
     past_covariate_stage="task_bundle.select",
 )
+_POWER_ATEMP_HIST_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_atemp_hist",
+    display_name="Power + Ambient Temperature History",
+    protocol_kind="past_covariate_ablation",
+    summary="Use target power history plus dataset-native past ambient-temperature covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_atemp_history",),
+    past_covariate_source="gold_base.dataset_native_ambient_temperature",
+    past_covariate_stage="task_bundle.select",
+)
+_POWER_ITEMP_HIST_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_itemp_hist",
+    display_name="Power + Internal Temperature History",
+    protocol_kind="past_covariate_ablation",
+    summary="Use target power history plus dataset-native past internal-temperature covariates.",
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_itemp_history",),
+    past_covariate_source="gold_base.dataset_native_internal_temperature",
+    past_covariate_stage="task_bundle.select",
+)
 _POWER_WD_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     feature_protocol_id="power_wd_hist_sincos",
     display_name="Power + Wind Direction History (Sin/Cos)",
@@ -254,6 +294,8 @@ _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
 _FEATURE_PROTOCOLS = (
     _POWER_ONLY_PROTOCOL,
     _POWER_WS_HIST_PROTOCOL,
+    _POWER_ATEMP_HIST_PROTOCOL,
+    _POWER_ITEMP_HIST_PROTOCOL,
     _POWER_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_HIST_SINCOS_PROTOCOL,
@@ -541,6 +583,8 @@ def _dataset_native_columns_for_protocol(
         _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
+    uses_ambient_temperature = feature_protocol_id == _POWER_ATEMP_HIST_PROTOCOL.feature_protocol_id
+    uses_internal_temperature = feature_protocol_id == _POWER_ITEMP_HIST_PROTOCOL.feature_protocol_id
     uses_low_speed_rotor_rpm = feature_protocol_id == _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id
     configured_columns: list[str] = []
     output_past_covariate_columns: list[str] = []
@@ -554,6 +598,24 @@ def _dataset_native_columns_for_protocol(
             ) from exc
         configured_columns.extend(wind_speed_columns)
         output_past_covariate_columns.extend(wind_speed_columns)
+
+    if uses_ambient_temperature:
+        ambient_temperature_column = _require_mapping_value(
+            _POWER_ATEMP_HIST_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        configured_columns.append(ambient_temperature_column)
+        output_past_covariate_columns.append(ambient_temperature_column)
+
+    if uses_internal_temperature:
+        internal_temperature_column = _require_mapping_value(
+            _POWER_ITEMP_HIST_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        configured_columns.append(internal_temperature_column)
+        output_past_covariate_columns.append(internal_temperature_column)
 
     derived_angle_transforms, angle_convention, dataset_specific_notes = _angle_transforms_for_protocol(
         dataset_id=dataset_id,

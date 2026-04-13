@@ -195,7 +195,7 @@ def test_hill_packaged_dependency_change_invalidates_silver_and_descendants(tmp_
     greenbyte_builder.build_silver()
     greenbyte_silver_meta = read_build_meta(greenbyte_builder.cache_paths.silver_build_meta_path)
     assert greenbyte_silver_meta is not None
-    assert "packaged_dependency_fingerprint" not in greenbyte_silver_meta.params
+    assert "packaged_dependency_fingerprint" in greenbyte_silver_meta.params
 
     original = cache_state.packaged_dependency_fingerprint_for
 
@@ -280,6 +280,48 @@ def test_gold_base_policy_dependency_change_invalidates_gold_and_task(tmp_path, 
         read_build_meta(builder.cache_paths.task_build_meta_path_for("farm_short", "power_only")).fingerprint
         != task_meta_before.fingerprint
     )
+
+
+def test_greenbyte_silver_rebuild_recomputes_continuous_parts_after_policy_change(tmp_path, monkeypatch) -> None:
+    from wind_datasets import cache_state
+
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh", "Kelmarsh", "Kelmarsh 1")
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="20m",
+        task_id="farm_short",
+        granularity="farm",
+    )
+
+    builder.build_gold_base()
+    initial_series = builder.load_series()
+    assert "Nacelle ambient temperature (°C)" in initial_series.columns
+
+    for path in builder.cache_paths.silver_continuous_dir.glob("*.parquet"):
+        pl.read_parquet(path).drop("Nacelle ambient temperature (°C)").write_parquet(path)
+    mutated_part = pl.read_parquet(next(builder.cache_paths.silver_continuous_dir.glob("*.parquet")))
+    assert "Nacelle ambient temperature (°C)" not in mutated_part.columns
+
+    original = cache_state.packaged_dependency_fingerprint_for
+
+    def _patched(layer: str, spec) -> str | None:
+        fingerprint = original(layer, spec)
+        if layer == "silver" and spec.dataset_id == "kelmarsh":
+            assert fingerprint is not None
+            return f"patched-{fingerprint}"
+        return fingerprint
+
+    monkeypatch.setattr(cache_state, "packaged_dependency_fingerprint_for", _patched)
+
+    assert builder.silver_status().status == "stale"
+    assert builder.gold_base_status().status == "stale"
+
+    builder.build_task_cache(task, feature_protocol_id="power_atemp_hist")
+    bundle = builder.load_task_bundle(task, feature_protocol_id="power_atemp_hist")
+
+    assert "Nacelle ambient temperature (°C)" in bundle.series.columns
+    assert bundle.task_context["column_groups"]["past_covariates"] == ["Nacelle ambient temperature (°C)"]
 
 
 def test_sdwpf_gold_and_task_status_blocked_when_manifest_time_semantics_invalid(tmp_path) -> None:

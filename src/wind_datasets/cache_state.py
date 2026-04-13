@@ -118,6 +118,8 @@ def code_fingerprint_for(layer: str, handler: str) -> str:
 
 def packaged_dependency_fingerprint_for(layer: str, spec: DatasetSpec) -> str | None:
     relative_paths = list(_PACKAGED_LAYER_DEPENDENCIES.get((layer, spec.handler), ()))
+    if layer == "silver":
+        relative_paths.append(f"data/source_column_policy/{spec.dataset_id}.csv")
     if layer == "gold_base":
         relative_paths.append(f"data/source_column_policy/{spec.dataset_id}.csv")
     if not relative_paths:

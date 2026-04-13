@@ -666,6 +666,8 @@ class GreenbyteDatasetBuilder(BaseDatasetBuilder):
     def build_silver(self) -> Path:
         self.ensure_manifest()
         source_policy = self.load_source_column_policy()
+        if self.cache_paths.silver_dir.exists():
+            shutil.rmtree(self.cache_paths.silver_dir)
         ensure_directory(self.cache_paths.silver_continuous_dir)
         ensure_directory(self.cache_paths.silver_events_dir)
         ensure_directory(self.cache_paths.silver_shared_ts_dir)

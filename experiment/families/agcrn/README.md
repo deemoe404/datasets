@@ -7,7 +7,7 @@ This experiment runs an official-aligned AGCRN baseline on:
 The scope is intentionally narrow:
 
 - `24h look back -> 6h ahead`
-- `power_only`, `power_ws_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_pitchmean_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, and `power_ws_wd_hist_sincos`
+- `power_only`, `power_ws_hist`, `power_atemp_hist`, `power_itemp_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_pitchmean_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, and `power_ws_wd_hist_sincos`
 - `farm-synchronous` turbine panel with stable task-local `turbine_index`
 - official AGCRN core architecture (`AVWGCN` + `AGCRNCell` + encoder + `end_conv`)
 - train on `train`
@@ -32,6 +32,14 @@ cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/static.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/task_context.json
+cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/series.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/window_index.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/static.parquet
+cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/task_context.json
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/series.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/window_index.parquet
 cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/static.parquet
@@ -98,7 +106,7 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-The default invocation now runs all seven active variants with the tuned
+The default invocation now runs all nine active variants with the tuned
 2026-04-13 defaults:
 
 - `official_aligned_power_only_farm_sync`
@@ -119,6 +127,24 @@ The default invocation now runs all seven active variants with the tuned
   - `embed_dim=16`
   - `num_layers=2`
   - `cheb_k=3`
+- `official_aligned_power_atemp_hist_farm_sync`
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
+- `official_aligned_power_itemp_hist_farm_sync`
+  - `batch_size=512`
+  - `learning_rate=1e-3`
+  - `max_epochs=20`
+  - `early_stopping_patience=5`
+  - `hidden_dim=64`
+  - `embed_dim=10`
+  - `num_layers=2`
+  - `cheb_k=2`
 - `official_aligned_power_wd_hist_sincos_farm_sync`
   - `batch_size=512`
   - `learning_rate=5e-4`
@@ -183,6 +209,8 @@ Useful smoke-test options:
 ```bash
 ./.conda/bin/python run_agcrn.py --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_atemp_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --variant official_aligned_power_itemp_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_yaw_pitchmean_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
@@ -195,14 +223,15 @@ Useful smoke-test options:
 Use the aligned search harness when you want to tune any subset of the active
 variants without falling back to mismatched window sets.
 
-The search script always prepares all seven active variants together,
+The search script always prepares all nine active variants together,
 intersects their strict `train`/`val`/`test` windows, and only then tunes the
 requested variants on that shared split surface. This keeps search-time window
 counts aligned with the default full-family rerun.
 
 ### Search Setup
 
-The 2026-04-13 full-family tuning pass used these shared Kelmarsh split sizes:
+The recorded 2026-04-13 pre-temperature full-family tuning pass used these
+shared Kelmarsh split sizes:
 
 - `train=275587`
 - `val_rolling=43287`
@@ -210,7 +239,7 @@ The 2026-04-13 full-family tuning pass used these shared Kelmarsh split sizes:
 - `test_rolling=82024`
 - `test_non_overlap=2279`
 
-The quick screening budget used for the seven-variant pass was:
+The quick screening budget used for the recorded seven-variant pre-temperature pass was:
 
 - `train_origins=32768`
 - `eval_origins=4096`
@@ -218,7 +247,7 @@ The quick screening budget used for the seven-variant pass was:
 - `patience=2`
 
 The 2026-04-13 screen compared these three high-value candidates for every
-variant:
+variant in that pass:
 
 - `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 - `baseline_bs512_h64_e10_l2_k2_lr5e-4`
@@ -230,13 +259,17 @@ The practical outcome was:
 
 - `power_only`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 - `power_ws_hist`: kept the previously confirmed 2026-04-12 full-window graph profile `graph_bs512_h64_e16_l2_k3_lr5e-4`
+- `power_atemp_hist`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
+- `power_itemp_hist`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 - `power_wd_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr5e-4`
 - `power_wd_yaw_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr5e-4`
 - `power_wd_yaw_pitchmean_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 - `power_wd_yaw_lrpm_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 - `power_ws_wd_hist_sincos`: `baseline_bs512_h64_e10_l2_k2_lr1e-3`
 
-In the seven-variant aligned screen, the graph-style candidate did not beat the
+The two temperature-history variants are new additions and currently inherit the
+baseline profile pending a dedicated nine-variant rerun. In the recorded
+seven-variant aligned screen, the graph-style candidate did not beat the
 baseline-style candidate for the five newly tuned protocols. The one retained
 graph exception is `power_ws_hist`, where the earlier 2026-04-12 full-window
 confirmation remained stronger evidence than a short 4-epoch screen.
@@ -295,4 +328,4 @@ report matching window counts across all selected feature protocols after
 alignment.
 
 That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
-Running all seven active variants by default yields `7 * 148 = 1036` rows.
+Running all nine active variants by default yields `9 * 148 = 1332` rows.

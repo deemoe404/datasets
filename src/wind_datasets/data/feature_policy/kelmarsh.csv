@@ -90,7 +90,7 @@ Reactive power (kvar),keep,,Retained because it is part of the current graph for
 Front bearing temperature (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 Rear bearing temperature (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 Stator temperature 1 (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
-Nacelle ambient temperature (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
+Nacelle ambient temperature (°C),drop,,Out of scope for the current graph forecasting feature packs beyond the active ambient-temperature history protocol; retained upstream to support that task bundle.,
 Nacelle temperature (°C),keep,,Retained because it is part of the current graph forecasting feature packs.,
 Transformer temperature (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,
 Gear oil inlet temperature (°C),drop,,Out of scope for the current graph forecasting feature packs; keeping it would increase cache and maintenance cost without current downstream use.,

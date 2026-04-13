@@ -77,6 +77,8 @@ MODEL_ID = "AGCRN"
 FAMILY_ID = "agcrn_official_aligned"
 MODEL_VARIANT = "official_aligned_power_only_farm_sync"
 POWER_WS_HIST_MODEL_VARIANT = "official_aligned_power_ws_hist_farm_sync"
+POWER_ATEMP_HIST_MODEL_VARIANT = "official_aligned_power_atemp_hist_farm_sync"
+POWER_ITEMP_HIST_MODEL_VARIANT = "official_aligned_power_itemp_hist_farm_sync"
 POWER_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_hist_sincos_farm_sync"
 POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_wd_yaw_hist_sincos_farm_sync"
 POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT = (
@@ -93,6 +95,8 @@ FORECAST_STEPS = 36
 STRIDE_STEPS = 1
 FEATURE_PROTOCOL_ID = "power_only"
 POWER_WS_HIST_FEATURE_PROTOCOL_ID = "power_ws_hist"
+POWER_ATEMP_HIST_FEATURE_PROTOCOL_ID = "power_atemp_hist"
+POWER_ITEMP_HIST_FEATURE_PROTOCOL_ID = "power_itemp_hist"
 POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_hist_sincos"
 POWER_WD_YAW_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_yaw_hist_sincos"
 POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_FEATURE_PROTOCOL_ID = "power_wd_yaw_pitchmean_hist_sincos"
@@ -183,11 +187,13 @@ _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_D
 _MODEL_VARIANT_ORDER = {
     MODEL_VARIANT: 0,
     POWER_WS_HIST_MODEL_VARIANT: 1,
-    POWER_WD_HIST_SINCOS_MODEL_VARIANT: 2,
-    POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: 3,
-    POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT: 4,
-    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: 5,
-    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: 6,
+    POWER_ATEMP_HIST_MODEL_VARIANT: 2,
+    POWER_ITEMP_HIST_MODEL_VARIANT: 3,
+    POWER_WD_HIST_SINCOS_MODEL_VARIANT: 4,
+    POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: 5,
+    POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT: 6,
+    POWER_WD_YAW_LRPM_HIST_SINCOS_MODEL_VARIANT: 7,
+    POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT: 8,
 }
 _SPLIT_NAMES = ("train", "val", "test")
 _WINDOW_KEY_COLUMNS = ("output_start_ts", "output_end_ts")
@@ -220,6 +226,14 @@ VARIANT_SPECS = (
     ExperimentVariant(
         model_variant=POWER_WS_HIST_MODEL_VARIANT,
         feature_protocol_id=POWER_WS_HIST_FEATURE_PROTOCOL_ID,
+    ),
+    ExperimentVariant(
+        model_variant=POWER_ATEMP_HIST_MODEL_VARIANT,
+        feature_protocol_id=POWER_ATEMP_HIST_FEATURE_PROTOCOL_ID,
+    ),
+    ExperimentVariant(
+        model_variant=POWER_ITEMP_HIST_MODEL_VARIANT,
+        feature_protocol_id=POWER_ITEMP_HIST_FEATURE_PROTOCOL_ID,
     ),
     ExperimentVariant(
         model_variant=POWER_WD_HIST_SINCOS_MODEL_VARIANT,
@@ -284,6 +298,8 @@ _GRAPH_BS512_LR5E4_HYPERPARAMETERS = HyperparameterProfile(
 TUNED_DEFAULT_HYPERPARAMETERS_BY_VARIANT = {
     MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
     POWER_WS_HIST_MODEL_VARIANT: _GRAPH_BS512_LR5E4_HYPERPARAMETERS,
+    POWER_ATEMP_HIST_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
+    POWER_ITEMP_HIST_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
     POWER_WD_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR5E4_HYPERPARAMETERS,
     POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR5E4_HYPERPARAMETERS,
     POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT: _BASELINE_BS512_LR1E3_HYPERPARAMETERS,
@@ -2163,7 +2179,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(DEFAULT_VARIANTS),
         dest="variants",
-        help="Limit execution to one or more model variants. Defaults to running all seven active variants.",
+        help="Limit execution to one or more model variants. Defaults to running all nine active variants.",
     )
     parser.add_argument(
         "--epochs",

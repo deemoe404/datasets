@@ -33,7 +33,7 @@
 
 | 源表/文件 | 当前保留字段 |
 | -------- | ------------ |
-| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
+| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle ambient temperature (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
 | `Device_Data_PMU` | `Date and time`, `GMS Current (A)`, `GMS Power (kW)`, `GMS Reactive power (kvar)` |
 | `Device_Data_Grid_Meter` | `Date and time` |
 | `Status` | `Timestamp start`, `Timestamp end`, `Status`, `Code`, `Service contract category`, `IEC category` |
@@ -43,7 +43,7 @@
 
 | 源表/文件 | 当前保留字段 |
 | -------- | ------------ |
-| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
+| `Turbine_Data` | `Date and time`, `Power (kW)`, `Power, Minimum (kW)`, `Power, Maximum (kW)`, `Power, Standard deviation (kW)`, `Wind speed (m/s)`, `Wind direction (°)`, `Nacelle position (°)`, `Generator RPM (RPM)`, `Rotor speed (RPM)`, `Ambient temperature (converter) (°C)`, `Nacelle ambient temperature (°C)`, `Nacelle temperature (°C)`, `Power factor (cosphi)`, `Reactive power (kvar)`, `Blade angle (pitch position) A (°)`, `Blade angle (pitch position) B (°)`, `Blade angle (pitch position) C (°)` |
 | `Device_Data_PMU` | `Date and time`, `GMS Current (A)`, `GMS Power (kW)`, `GMS Reactive power (kvar)` |
 | `Device_Data_Grid_Meter` | `Date and time` |
 | `Status` | `Timestamp start`, `Timestamp end`, `Status`, `Code`, `Service contract category`, `IEC category` |

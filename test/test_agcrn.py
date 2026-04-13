@@ -338,6 +338,8 @@ def _input_channels_for_feature_protocol(module, feature_protocol_id: str) -> in
     covariate_count_by_protocol = {
         module.FEATURE_PROTOCOL_ID: 0,
         module.POWER_WS_HIST_FEATURE_PROTOCOL_ID: 1,
+        module.POWER_ATEMP_HIST_FEATURE_PROTOCOL_ID: 1,
+        module.POWER_ITEMP_HIST_FEATURE_PROTOCOL_ID: 1,
         module.POWER_WD_HIST_SINCOS_FEATURE_PROTOCOL_ID: 2,
         module.POWER_WD_YAW_HIST_SINCOS_FEATURE_PROTOCOL_ID: 4,
         module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_FEATURE_PROTOCOL_ID: 5,
@@ -693,6 +695,52 @@ def test_prepare_dataset_builds_multichannel_source_tensor_for_power_ws_hist(tmp
     assert prepared.model_variant == module.POWER_WS_HIST_MODEL_VARIANT
     assert prepared.feature_protocol_id == module.POWER_WS_HIST_FEATURE_PROTOCOL_ID
     assert prepared.input_channel_names == ("target_pu", "Wind speed (m/s)")
+    assert prepared.input_channels == 2
+    assert prepared.source_tensor.shape == (2000, 3, 2)
+
+
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_atemp_hist(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_atemp_hist",
+        past_covariate_columns=("Nacelle ambient temperature (°C)",),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_atemp_hist")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_ATEMP_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_ATEMP_HIST_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_ATEMP_HIST_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == ("target_pu", "Nacelle ambient temperature (°C)")
+    assert prepared.input_channels == 2
+    assert prepared.source_tensor.shape == (2000, 3, 2)
+
+
+def test_prepare_dataset_builds_multichannel_source_tensor_for_power_itemp_hist(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_itemp_hist",
+        past_covariate_columns=("Nacelle temperature (°C)",),
+    )
+    _patch_temp_bundle_loader(monkeypatch, module, cache_root, feature_protocol_id="power_itemp_hist")
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.resolve_variant_specs((module.POWER_ITEMP_HIST_MODEL_VARIANT,))[0],
+        cache_root=cache_root,
+    )
+
+    assert prepared.model_variant == module.POWER_ITEMP_HIST_MODEL_VARIANT
+    assert prepared.feature_protocol_id == module.POWER_ITEMP_HIST_FEATURE_PROTOCOL_ID
+    assert prepared.input_channel_names == ("target_pu", "Nacelle temperature (°C)")
     assert prepared.input_channels == 2
     assert prepared.source_tensor.shape == (2000, 3, 2)
 
@@ -1351,6 +1399,18 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
     )
     _build_temp_cache(
         cache_root,
+        feature_protocol_id="power_atemp_hist",
+        past_covariate_columns=("Nacelle ambient temperature (°C)",),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_itemp_hist",
+        past_covariate_columns=("Nacelle temperature (°C)",),
+        missing_past_covariate_indices=(200, 1563, 1963),
+    )
+    _build_temp_cache(
+        cache_root,
         feature_protocol_id="power_wd_hist_sincos",
         past_covariate_columns=("wind_direction_sin", "wind_direction_cos"),
         missing_past_covariate_indices=(200, 1563, 1963),
@@ -1403,6 +1463,8 @@ def test_run_experiment_aligns_default_multi_variant_windows(tmp_path, monkeypat
         feature_protocol_ids=(
             "power_only",
             "power_ws_hist",
+            "power_atemp_hist",
+            "power_itemp_hist",
             "power_wd_hist_sincos",
             "power_wd_yaw_hist_sincos",
             "power_wd_yaw_pitchmean_hist_sincos",
@@ -1616,6 +1678,8 @@ def test_run_experiment_uses_tuned_variant_defaults(tmp_path) -> None:
     for variant_name in (
         module.MODEL_VARIANT,
         module.POWER_WS_HIST_MODEL_VARIANT,
+        module.POWER_ATEMP_HIST_MODEL_VARIANT,
+        module.POWER_ITEMP_HIST_MODEL_VARIANT,
         module.POWER_WD_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_HIST_SINCOS_MODEL_VARIANT,
         module.POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_MODEL_VARIANT,

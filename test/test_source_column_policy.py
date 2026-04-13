@@ -8,6 +8,8 @@ def test_source_column_policies_do_not_reference_removed_feature_protocols() -> 
         "all",
         "power_only",
         "power_ws_hist",
+        "power_atemp_hist",
+        "power_itemp_hist",
         "power_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
         "power_wd_yaw_pitchmean_hist_sincos",

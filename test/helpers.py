@@ -40,16 +40,16 @@ def build_greenbyte_fixture(
         #
         # Turbine: {turbine_name}
         # Time zone: UTC
-        # Date and time,Power (kW),Wind speed (m/s),Wind direction (°),Nacelle position (°),Generator RPM (RPM),Rotor speed (RPM),Ambient temperature (converter) (°C),Nacelle temperature (°C),Grid frequency (Hz),Blade angle (pitch position) A (°),Blade angle (pitch position) B (°),Blade angle (pitch position) C (°)
-        2024-01-01 00:00:00,100,8.0,180,174,1500,12,5,10,50,1,1,
-        2024-01-01 00:00:00,,8.2,,,,,,,,,,0.9
-        2024-01-01 00:10:00,110,8.4,181,175,1510,12.1,5.1,10.2,50,1,1,1
-        2024-01-01 00:20:00,120,8.8,182,176,1520,12.2,5.2,10.4,50,1,1,1
-        2024-01-01 00:30:00,NaN,9.1,183,177,1530,12.3,5.3,10.6,50,1,1,1
-        2024-01-01 00:50:00,140,9.5,184,178,1540,12.4,5.4,10.8,50,1,1,1
-        2024-01-01 01:00:00,150,9.8,185,179,1550,12.5,5.5,11.0,50,1,1,1
-        2024-01-01 01:10:00,160,10.0,186,180,1560,12.6,5.6,11.2,50,1,1,1
-        2024-01-01 01:20:00,170,10.2,187,181,1570,12.7,5.7,11.4,50,1,1,1
+        # Date and time,Power (kW),Wind speed (m/s),Wind direction (°),Nacelle position (°),Generator RPM (RPM),Rotor speed (RPM),Ambient temperature (converter) (°C),Nacelle ambient temperature (°C),Nacelle temperature (°C),Grid frequency (Hz),Blade angle (pitch position) A (°),Blade angle (pitch position) B (°),Blade angle (pitch position) C (°)
+        2024-01-01 00:00:00,100,8.0,180,174,1500,12,5,4.0,10,50,1,1,
+        2024-01-01 00:00:00,,8.2,,,,,,,,,,,0.9
+        2024-01-01 00:10:00,110,8.4,181,175,1510,12.1,5.1,4.1,10.2,50,1,1,1
+        2024-01-01 00:20:00,120,8.8,182,176,1520,12.2,5.2,4.2,10.4,50,1,1,1
+        2024-01-01 00:30:00,NaN,9.1,183,177,1530,12.3,5.3,4.3,10.6,50,1,1,1
+        2024-01-01 00:50:00,140,9.5,184,178,1540,12.4,5.4,4.4,10.8,50,1,1,1
+        2024-01-01 01:00:00,150,9.8,185,179,1550,12.5,5.5,4.5,11.0,50,1,1,1
+        2024-01-01 01:10:00,160,10.0,186,180,1560,12.6,5.6,4.6,11.2,50,1,1,1
+        2024-01-01 01:20:00,170,10.2,187,181,1570,12.7,5.7,4.7,11.4,50,1,1,1
         """,
     )
     _write_text(
@@ -271,7 +271,6 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
         ("tblSCTurDigiOut", "wtc_TurbinOK_counts", 5),
         ("tblSCTurIntern", "wtc_ValSuppV_mean", 230),
         ("tblSCTurPress", "wtc_BrakPres_mean", 20),
-        ("tblSCTurTemp", "wtc_AmbieTmp_mean", 8),
     ):
         _write_text(
             root / "2024" / f"{table_name}_2024_01.csv",
@@ -294,12 +293,32 @@ def build_hill_fixture(root: Path) -> DatasetSpec:
             """,
         )
     _write_text(
+        root / "2024" / "tblSCTurTemp_2024_01.csv",
+        """
+        TimeStamp,StationId,wtc_AmbieTmp_mean,wtc_NacelTmp_mean
+        2024-03-14 17:10:00,1001,8,18
+        2024-03-14 17:10:00,1002,9,19
+        2024-03-14 17:20:00,1001,10,20
+        2024-03-14 17:20:00,1002,11,21
+        2024-03-14 17:30:00,1001,12,22
+        2024-03-14 17:30:00,1002,13,23
+        2024-03-14 17:40:00,1001,14,24
+        2024-03-14 17:40:00,1002,15,25
+        2024-03-14 17:50:00,1001,16,26
+        2024-03-14 17:50:00,1002,17,27
+        2024-03-14 18:00:00,1001,18,28
+        2024-03-14 18:00:00,1002,19,29
+        2024-03-14 18:10:00,1001,20,30
+        2024-03-14 18:10:00,1002,21,31
+        """,
+    )
+    _write_text(
         root / "2024" / "tblSCTurTemp_2024_02.csv",
         """
-        TimeStamp,StationId,wtc_AmbieTmp_mean
-        2024-03-14 18:10:00,1002,22
-        2024-03-14 18:20:00,1001,23
-        2024-03-14 18:20:00,1002,24
+        TimeStamp,StationId,wtc_AmbieTmp_mean,wtc_NacelTmp_mean
+        2024-03-14 18:10:00,1002,22,31
+        2024-03-14 18:20:00,1001,23,33
+        2024-03-14 18:20:00,1002,24,34
         """,
     )
     _write_text(

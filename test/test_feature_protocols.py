@@ -42,6 +42,8 @@ def test_active_feature_protocols_are_registered() -> None:
     assert list_feature_protocol_ids() == (
         "power_only",
         "power_ws_hist",
+        "power_atemp_hist",
+        "power_itemp_hist",
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
@@ -59,6 +61,18 @@ def test_active_feature_protocols_are_registered() -> None:
     assert power_ws_hist.uses_target_history is True
     assert power_ws_hist.uses_past_covariates is True
     assert power_ws_hist.uses_known_future_covariates is False
+
+    power_atemp_hist = get_feature_protocol_spec("power_atemp_hist")
+    assert power_atemp_hist.feature_protocol_id == "power_atemp_hist"
+    assert power_atemp_hist.uses_target_history is True
+    assert power_atemp_hist.uses_past_covariates is True
+    assert power_atemp_hist.uses_known_future_covariates is False
+
+    power_itemp_hist = get_feature_protocol_spec("power_itemp_hist")
+    assert power_itemp_hist.feature_protocol_id == "power_itemp_hist"
+    assert power_itemp_hist.uses_target_history is True
+    assert power_itemp_hist.uses_past_covariates is True
+    assert power_itemp_hist.uses_known_future_covariates is False
 
     power_wd_hist = get_feature_protocol_spec("power_wd_hist_sincos")
     assert power_wd_hist.feature_protocol_id == "power_wd_hist_sincos"
@@ -143,6 +157,70 @@ def test_power_ws_hist_selection_uses_dataset_native_wind_speed(
     )
     assert selection.all_columns == selection.source_columns
     assert selection.derived_angle_transforms == ()
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "feature_column"),
+    [
+        ("kelmarsh", "Nacelle ambient temperature (°C)"),
+        ("penmanshiel", "Nacelle ambient temperature (°C)"),
+        ("hill_of_towie", "tur_temp__wtc_ambietmp_mean"),
+        ("sdwpf_kddcup", "Etmp"),
+    ],
+)
+def test_power_atemp_hist_selection_uses_dataset_native_ambient_temperature(
+    dataset_id: str,
+    feature_column: str,
+) -> None:
+    selection = _selection(dataset_id, "power_atemp_hist", feature_column)
+
+    assert selection.past_covariate_columns == (feature_column,)
+    assert selection.source_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        feature_column,
+        "farm_turbines_expected",
+    )
+    assert selection.all_columns == selection.source_columns
+    assert selection.derived_angle_transforms == ()
+    assert selection.derived_scalar_transforms == ()
+
+
+@pytest.mark.parametrize(
+    ("dataset_id", "feature_column"),
+    [
+        ("kelmarsh", "Nacelle temperature (°C)"),
+        ("penmanshiel", "Nacelle temperature (°C)"),
+        ("hill_of_towie", "tur_temp__wtc_naceltmp_mean"),
+        ("sdwpf_kddcup", "Itmp"),
+    ],
+)
+def test_power_itemp_hist_selection_uses_dataset_native_internal_temperature(
+    dataset_id: str,
+    feature_column: str,
+) -> None:
+    selection = _selection(dataset_id, "power_itemp_hist", feature_column)
+
+    assert selection.past_covariate_columns == (feature_column,)
+    assert selection.source_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        feature_column,
+        "farm_turbines_expected",
+    )
+    assert selection.all_columns == selection.source_columns
+    assert selection.derived_angle_transforms == ()
+    assert selection.derived_scalar_transforms == ()
 
 
 @pytest.mark.parametrize(
@@ -448,6 +526,54 @@ def test_materialize_task_series_frame_builds_direction_sincos_from_dataset_nati
     assert "Wind direction (°)" not in frame.columns
 
 
+def test_materialize_task_series_frame_passes_through_ambient_temperature_history() -> None:
+    selection = _selection("kelmarsh", "power_atemp_hist", "Nacelle ambient temperature (°C)")
+
+    frame = materialize_task_series_frame(
+        pl.DataFrame(
+            {
+                "dataset": ["kelmarsh", "kelmarsh"],
+                "turbine_id": ["T01", "T01"],
+                "timestamp": [datetime(2024, 1, 1, 0, 0), datetime(2024, 1, 1, 0, 10)],
+                "target_kw": [100.0, 110.0],
+                "is_observed": [True, True],
+                "quality_flags": ["", ""],
+                "feature_quality_flags": ["", ""],
+                "farm_turbines_expected": [6, 6],
+                "Nacelle ambient temperature (°C)": [17.5, None],
+            }
+        ),
+        selection=selection,
+    )
+
+    assert frame.columns == list(selection.all_columns)
+    assert frame["Nacelle ambient temperature (°C)"].to_list() == [pytest.approx(17.5), None]
+
+
+def test_materialize_task_series_frame_passes_through_internal_temperature_history() -> None:
+    selection = _selection("hill_of_towie", "power_itemp_hist", "tur_temp__wtc_naceltmp_mean")
+
+    frame = materialize_task_series_frame(
+        pl.DataFrame(
+            {
+                "dataset": ["hill_of_towie", "hill_of_towie"],
+                "turbine_id": ["T01", "T01"],
+                "timestamp": [datetime(2024, 1, 1, 0, 0), datetime(2024, 1, 1, 0, 10)],
+                "target_kw": [100.0, 110.0],
+                "is_observed": [True, True],
+                "quality_flags": ["", ""],
+                "feature_quality_flags": ["", ""],
+                "farm_turbines_expected": [21, 21],
+                "tur_temp__wtc_naceltmp_mean": [28.0, None],
+            }
+        ),
+        selection=selection,
+    )
+
+    assert frame.columns == list(selection.all_columns)
+    assert frame["tur_temp__wtc_naceltmp_mean"].to_list() == [pytest.approx(28.0), None]
+
+
 def test_materialize_task_series_frame_wraps_yaw_error_through_zero_and_360() -> None:
     selection = _selection(
         "kelmarsh",
@@ -667,6 +793,37 @@ def test_protocol_context_records_pitch_mean_scalar_feature() -> None:
 
 
 @pytest.mark.parametrize(
+    ("feature_protocol_id", "source_column"),
+    [
+        ("power_atemp_hist", "Nacelle ambient temperature (°C)"),
+        ("power_itemp_hist", "Nacelle temperature (°C)"),
+    ],
+)
+def test_protocol_context_records_temperature_history_protocol_without_derived_features(
+    feature_protocol_id: str,
+    source_column: str,
+) -> None:
+    selection = _selection("kelmarsh", feature_protocol_id, source_column)
+
+    context = protocol_context_dict(
+        dataset_id="kelmarsh",
+        task={"task_id": "next_6h_from_24h"},
+        feature_protocol_id=feature_protocol_id,
+        turbine_ids=("WT01", "WT02"),
+        selection=selection,
+        static_columns=("dataset", "turbine_id", "turbine_index"),
+    )
+
+    feature_protocol = context["feature_protocol"]
+
+    assert feature_protocol["derived_angle_features"] == []
+    assert feature_protocol["derived_scalar_features"] == []
+    assert feature_protocol["dataset_specific_notes"] == []
+    assert feature_protocol["angle_convention"] is None
+    assert feature_protocol["past_covariate_source"] is not None
+
+
+@pytest.mark.parametrize(
     "feature_protocol_id",
     ["power_wd_hist_sincos", "power_ws_wd_hist_sincos"],
 )
@@ -721,6 +878,8 @@ def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
     "feature_protocol_id",
     [
         "power_ws_hist",
+        "power_atemp_hist",
+        "power_itemp_hist",
         "power_wd_hist_sincos",
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",

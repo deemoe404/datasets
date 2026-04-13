@@ -149,7 +149,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(agcrn.SEARCH_VARIANTS),
         dest="variants",
-        help="Limit the tuned variants. Alignment remains fixed to the full active seven-variant family surface.",
+        help="Limit the tuned variants. Alignment remains fixed to the full active nine-variant family surface.",
     )
     parser.add_argument(
         "--config-name",

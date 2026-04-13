@@ -161,6 +161,8 @@ The active protocol IDs today are:
 
 - `power_only`
 - `power_ws_hist`
+- `power_atemp_hist`
+- `power_itemp_hist`
 - `power_wd_hist_sincos`
 - `power_wd_yaw_hist_sincos`
 - `power_wd_yaw_pitchmean_hist_sincos`
@@ -171,6 +173,8 @@ Protocol semantics:
 
 - `power_only`: target history only
 - `power_ws_hist`: target history plus dataset-native past wind-speed covariates
+- `power_atemp_hist`: target history plus dataset-native ambient-temperature covariates
+- `power_itemp_hist`: target history plus dataset-native internal-temperature covariates
 - `power_wd_hist_sincos`: target history plus task-derived wind-direction `sin/cos` covariates
 - `power_wd_yaw_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates
 - `power_wd_yaw_pitchmean_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates and task-derived `pitch_mean`
