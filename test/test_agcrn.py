@@ -29,6 +29,24 @@ def _load_module():
     return module
 
 
+def _load_search_module():
+    _load_module()
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "experiment"
+        / "families"
+        / "agcrn"
+        / "search_agcrn.py"
+    )
+    spec = spec_from_file_location("search_agcrn", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class _TqdmRecorder:
     instances: list["_TqdmRecorder"] = []
 
@@ -1330,6 +1348,67 @@ def test_sort_result_frame_orders_long_results() -> None:
     ]
 
 
+def test_default_datasets_cover_supported_agcrn_scope() -> None:
+    module = _load_module()
+
+    assert module.DEFAULT_DATASETS == ("kelmarsh", "penmanshiel")
+
+
+def test_build_arg_parser_limits_dataset_choices_to_supported_agcrn_scope() -> None:
+    module = _load_module()
+    parser = module.build_arg_parser()
+
+    dataset_action = next(
+        action
+        for action in parser._actions
+        if "--dataset" in getattr(action, "option_strings", ())
+    )
+
+    assert tuple(dataset_action.choices) == ("kelmarsh", "penmanshiel")
+    assert parser.parse_args(["--force-rerun"]).force_rerun is True
+
+
+def test_search_arg_parser_limits_dataset_choices_to_supported_agcrn_scope() -> None:
+    module = _load_search_module()
+    parser = module.build_arg_parser()
+
+    dataset_action = next(
+        action
+        for action in parser._actions
+        if "--dataset" in getattr(action, "option_strings", ())
+    )
+
+    assert tuple(dataset_action.choices) == ("kelmarsh", "penmanshiel")
+
+
+def test_sort_result_frame_orders_supported_datasets_by_default_scope() -> None:
+    module = _load_module()
+    frame = pl.DataFrame(
+        [
+            _result_row(
+                module,
+                dataset_id="penmanshiel",
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+            ),
+            _result_row(
+                module,
+                dataset_id="kelmarsh",
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+            ),
+        ]
+    )
+
+    sorted_frame = module.sort_result_frame(frame)
+
+    assert sorted_frame["dataset_id"].to_list() == ["kelmarsh", "penmanshiel"]
+
+
 def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
     module = _load_module()
 
@@ -1393,6 +1472,56 @@ def test_run_experiment_aggregates_runner_rows(tmp_path) -> None:
             (variant_name, "val", module.OVERALL_METRIC_SCOPE),
             (variant_name, "test", module.HORIZON_METRIC_SCOPE),
         )
+    ]
+
+
+def test_run_experiment_aggregates_runner_rows_for_supported_datasets_in_default_order(tmp_path) -> None:
+    module = _load_module()
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+            input_channels=_input_channels_for_feature_protocol(module, variant_spec.feature_protocol_id),
+        )
+
+    def _fake_runner(prepared, **kwargs):
+        del kwargs
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+                input_channels=prepared.input_channels,
+            ),
+        ]
+
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    results = module.run_experiment(
+        dataset_ids=("kelmarsh", "penmanshiel"),
+        output_path=output_path,
+        work_root=_work_root(tmp_path),
+        dataset_loader=_fake_loader,
+        job_runner=_fake_runner,
+    )
+
+    assert results.height == len(module.DEFAULT_VARIANTS) * 2
+    assert results["dataset_id"].to_list() == [
+        dataset_id
+        for dataset_id in ("kelmarsh", "penmanshiel")
+        for _variant_name in module.DEFAULT_VARIANTS
+    ]
+    assert results["model_variant"].to_list() == [
+        variant_name
+        for _dataset_id in ("kelmarsh", "penmanshiel")
+        for variant_name in module.DEFAULT_VARIANTS
     ]
 
 
@@ -1798,6 +1927,79 @@ def test_run_experiment_rejects_running_state_without_resume(tmp_path) -> None:
             work_root=work_root,
             dataset_loader=_fake_loader,
             job_runner=_crashing_runner,
+        )
+
+
+def test_run_experiment_force_rerun_discards_running_resume_state(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "agcrn-official-aligned.csv"
+    work_root = _work_root(tmp_path)
+    resume_flags: list[bool] = []
+
+    def _fake_loader(dataset_id, *, variant_spec, cache_root, max_train_origins, max_eval_origins):
+        del cache_root, max_train_origins, max_eval_origins
+        return _small_prepared_dataset(
+            module,
+            dataset_id=dataset_id,
+            model_variant=variant_spec.model_variant,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        )
+
+    def _crashing_runner(prepared, **kwargs):
+        checkpoint_path = Path(kwargs["checkpoint_path"])
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_path.write_text("checkpoint", encoding="utf-8")
+        raise RuntimeError(f"simulated crash for {prepared.model_variant}")
+
+    def _fresh_runner(prepared, **kwargs):
+        resume_flags.append(bool(kwargs["resume_from_checkpoint"]))
+        return [
+            _result_row(
+                module,
+                dataset_id=prepared.dataset_id,
+                split_name="val",
+                eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+                metric_scope=module.OVERALL_METRIC_SCOPE,
+                lead_step=None,
+                model_variant=prepared.model_variant,
+            ),
+        ]
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=output_path,
+            work_root=work_root,
+            dataset_loader=_fake_loader,
+            job_runner=_crashing_runner,
+        )
+
+    results = module.run_experiment(
+        dataset_ids=("kelmarsh",),
+        variant_names=(module.MODEL_VARIANT,),
+        output_path=output_path,
+        work_root=work_root,
+        dataset_loader=_fake_loader,
+        job_runner=_fresh_runner,
+        force_rerun=True,
+    )
+
+    assert results["model_variant"].to_list() == [module.MODEL_VARIANT]
+    assert resume_flags == [False]
+
+
+def test_run_experiment_rejects_force_rerun_with_resume(tmp_path) -> None:
+    module = _load_module()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        module.run_experiment(
+            dataset_ids=("kelmarsh",),
+            variant_names=(module.MODEL_VARIANT,),
+            output_path=tmp_path / "agcrn-official-aligned.csv",
+            work_root=_work_root(tmp_path),
+            resume=True,
+            force_rerun=True,
         )
 
 

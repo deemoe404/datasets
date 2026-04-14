@@ -91,7 +91,7 @@ POWER_WS_WD_HIST_SINCOS_MODEL_VARIANT = "official_aligned_power_ws_wd_hist_sinco
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
-DEFAULT_DATASETS = ("kelmarsh",)
+DEFAULT_DATASETS = ("kelmarsh", "penmanshiel")
 HISTORY_STEPS = 144
 FORECAST_STEPS = 36
 STRIDE_STEPS = 1
@@ -2406,6 +2406,7 @@ def run_experiment(
     cheb_k: int | None = None,
     grad_clip_norm: float | None = None,
     resume: bool = False,
+    force_rerun: bool = False,
     work_root: str | Path = _RUN_AGCRN_WORK_ROOT,
     dataset_loader: Callable[..., PreparedDataset] | None = None,
     job_runner: Callable[..., list[dict[str, object]]] | None = None,
@@ -2431,7 +2432,12 @@ def run_experiment(
         grad_clip_norm=grad_clip_norm,
     )
     existing_state = _load_resume_state_if_exists(resume_paths)
-    if resume:
+    if resume and force_rerun:
+        raise ValueError("AGCRN --resume and --force-rerun are mutually exclusive.")
+    if force_rerun:
+        _reset_resume_slot(resume_paths, effective_config=effective_config)
+        existing_state = None
+    elif resume:
         if existing_state is None:
             raise ValueError(
                 f"No AGCRN resume state exists for output path {output}. Expected {resume_paths.state_path}."
@@ -2449,7 +2455,7 @@ def run_experiment(
         else:
             raise ValueError(
                 f"AGCRN resume state at {resume_paths.state_path} is still marked running. "
-                f"Re-run with --resume or remove {resume_paths.slot_dir}."
+                f"Re-run with --resume, --force-rerun, or remove {resume_paths.slot_dir}."
             )
     partial_results = _read_partial_results(resume_paths)
     rows: list[dict[str, object]] = partial_results.to_dicts()
@@ -2576,14 +2582,14 @@ def run_experiment(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run the official-aligned Kelmarsh farm-synchronous AGCRN variants."
+        description="Run the official-aligned farm-synchronous AGCRN variants on kelmarsh and penmanshiel."
     )
     parser.add_argument(
         "--dataset",
         action="append",
         choices=list(DEFAULT_DATASETS),
         dest="datasets",
-        help="Limit execution to one or more datasets. Defaults to kelmarsh.",
+        help="Limit execution to one or more datasets. Defaults to kelmarsh and penmanshiel.",
     )
     parser.add_argument(
         "--device",
@@ -2688,6 +2694,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Resume an interrupted run_agcrn invocation from experiment/families/agcrn/.work/.",
     )
     parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="Discard any existing resume state for the resolved --output-path and start a fresh run.",
+    )
+    parser.add_argument(
         "--no-record-run",
         action="store_true",
         help="Skip writing a formal run record manifest under experiment/artifacts/runs/.",
@@ -2735,6 +2746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cheb_k=args.cheb_k,
         grad_clip_norm=args.grad_clip_norm,
         resume=args.resume,
+        force_rerun=args.force_rerun,
     )
     if not args.no_record_run:
         recorded_args = vars(args).copy()

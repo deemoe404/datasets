@@ -3,6 +3,7 @@
 This experiment runs an official-aligned AGCRN baseline on:
 
 - `kelmarsh`
+- `penmanshiel`
 
 The scope is intentionally narrow:
 
@@ -15,52 +16,27 @@ The scope is intentionally narrow:
 - report both `rolling_origin_no_refit` and `non_overlap`
 - output one `overall` row and `36` horizon rows per eval view
 
+Current exclusions:
+
+- `sdwpf_kddcup`: the strict `24h -> 6h` farm-synchronous task currently has `0` usable windows
+- `hill_of_towie`: the direction-aware variants currently fail during split selection because the resulting `train` split is empty
+
 The alignment target is the model core only. Data loading, window filtering, split logic, and metrics remain in this repository's unified wind-farm evaluation framework.
 
 ## Data Contract
 
 The runner loads the public task bundle through `wind_datasets.load_task_bundle(...)`.
 
-For the current Kelmarsh run, those bundles are materialized under:
+For each supported dataset and active feature protocol, bundles are materialized under:
 
 ```text
-cache/kelmarsh/tasks/next_6h_from_24h/power_only/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_only/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_only/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_only/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_hist/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_atemp_hist/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_itemp_hist/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_hist_sincos/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_hist_sincos/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_pitchmean_hist_sincos/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_pitchmean_hist_sincos/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_pitchmean_hist_sincos/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_pitchmean_hist_sincos/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_wd_yaw_lrpm_hist_sincos/task_context.json
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/series.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/window_index.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/static.parquet
-cache/kelmarsh/tasks/next_6h_from_24h/power_ws_wd_hist_sincos/task_context.json
+cache/<dataset_id>/tasks/next_6h_from_24h/<feature_protocol_id>/series.parquet
+cache/<dataset_id>/tasks/next_6h_from_24h/<feature_protocol_id>/window_index.parquet
+cache/<dataset_id>/tasks/next_6h_from_24h/<feature_protocol_id>/static.parquet
+cache/<dataset_id>/tasks/next_6h_from_24h/<feature_protocol_id>/task_context.json
 ```
+
+The current supported `dataset_id` values are `kelmarsh` and `penmanshiel`.
 
 `static.parquet` is treated as the complete experiment-facing static sidecar; the
 runner does not read `silver` or `gold_base` artifacts directly.
@@ -106,8 +82,8 @@ From this directory:
 ./.conda/bin/python run_agcrn.py
 ```
 
-The default invocation now runs all nine active variants with the tuned
-2026-04-13 defaults:
+The default invocation now runs all nine active variants on both supported
+datasets (`kelmarsh` and `penmanshiel`) with the tuned 2026-04-13 defaults:
 
 - `official_aligned_power_only_farm_sync`
   - `batch_size=512`
@@ -208,7 +184,9 @@ Useful smoke-test options:
 
 ```bash
 ./.conda/bin/python run_agcrn.py --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --dataset penmanshiel --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
+./.conda/bin/python run_agcrn.py --dataset penmanshiel --variant official_aligned_power_ws_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_atemp_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_itemp_hist_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
 ./.conda/bin/python run_agcrn.py --variant official_aligned_power_wd_hist_sincos_farm_sync --epochs 1 --device cpu --max-train-origins 64 --max-eval-origins 32
@@ -260,11 +238,13 @@ Typical interrupted-run flow:
 ```bash
 ./.conda/bin/python run_agcrn.py --output-path ../../artifacts/scratch/agcrn_official_aligned/debug.csv
 ./.conda/bin/python run_agcrn.py --output-path ../../artifacts/scratch/agcrn_official_aligned/debug.csv --resume
+./.conda/bin/python run_agcrn.py --output-path ../../artifacts/scratch/agcrn_official_aligned/debug.csv --force-rerun
 ```
 
 If a previous run for the same `--output-path` is still marked `running`, a
 fresh invocation without `--resume` is rejected so the interrupted state is not
-silently overwritten.
+silently overwritten. Use `--resume` to continue that run, or `--force-rerun`
+to discard the stored resume slot and start over from epoch `0`.
 
 ## Hyperparameter Search
 
@@ -278,8 +258,8 @@ counts aligned with the default full-family rerun.
 
 ### Search Setup
 
-The recorded 2026-04-13 pre-temperature full-family tuning pass used these
-shared Kelmarsh split sizes:
+The recorded 2026-04-13 pre-temperature full-family tuning pass on `kelmarsh`
+used these shared split sizes:
 
 - `train=275587`
 - `val_rolling=43287`
@@ -345,6 +325,7 @@ Typical invocation:
 
 ```bash
 ./.conda/bin/python search_agcrn.py --device cuda
+./.conda/bin/python search_agcrn.py --dataset penmanshiel --device cuda
 ```
 
 This writes stage summaries under:
@@ -375,5 +356,7 @@ For one dataset and one eval view, runs that include multiple variants should
 report matching window counts across all selected feature protocols after
 alignment.
 
-That yields `2 * 2 * (1 + 36) = 148` rows for the Kelmarsh official-aligned job.
-Running all nine active variants by default yields `9 * 148 = 1332` rows.
+That yields `2 * 2 * (1 + 36) = 148` rows for one dataset/variant job.
+Running all nine active variants on one supported dataset yields `9 * 148 = 1332`
+rows. Running the default two-dataset invocation yields `2 * 9 * 148 = 2664`
+rows.

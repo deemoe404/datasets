@@ -5,7 +5,7 @@ readable registry, and runtime artifact contracts for the forecasting task.
 
 ## Active Family
 
-- [agcrn](./families/agcrn/README.md): Kelmarsh-only, farm-synchronous, 9-protocol AGCRN pilot (`power_only`, `power_ws_hist`, `power_atemp_hist`, `power_itemp_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_pitchmean_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, `power_ws_wd_hist_sincos`)
+- [agcrn](./families/agcrn/README.md): `kelmarsh` + `penmanshiel`, farm-synchronous, 9-protocol AGCRN pilot (`power_only`, `power_ws_hist`, `power_atemp_hist`, `power_itemp_hist`, `power_wd_hist_sincos`, `power_wd_yaw_hist_sincos`, `power_wd_yaw_pitchmean_hist_sincos`, `power_wd_yaw_lrpm_hist_sincos`, `power_ws_wd_hist_sincos`)
 
 Archived experiment families have been removed from the active tree. The
 current experiment surface is intentionally narrow while the dataset/task
@@ -27,5 +27,6 @@ Canonical runtime artifacts:
 ## Notes
 
 - `agcrn_official_aligned` is the only registry-backed family currently intended for use.
+- Its current formal scope is `kelmarsh` + `penmanshiel`; `sdwpf_kddcup` is excluded because the strict `24h -> 6h` task has zero usable windows, and `hill_of_towie` is excluded because the direction-aware variants currently yield empty `train` splits.
 - The active task contract is `24h -> 6h`, dense sliding windows, `farm` granularity.
 - The active dataset-side protocol surface is `power_only` + `power_ws_hist` + `power_atemp_hist` + `power_itemp_hist` + `power_wd_hist_sincos` + `power_wd_yaw_hist_sincos` + `power_wd_yaw_pitchmean_hist_sincos` + `power_wd_yaw_lrpm_hist_sincos` + `power_ws_wd_hist_sincos`, and their semantics live exclusively in `src/wind_datasets/feature_protocols.py`.

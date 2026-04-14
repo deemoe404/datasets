@@ -142,7 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         choices=list(agcrn.DEFAULT_DATASETS),
         dest="datasets",
-        help="Datasets to search. Defaults to kelmarsh.",
+        help="Datasets to search. Defaults to kelmarsh and penmanshiel.",
     )
     parser.add_argument(
         "--variant",

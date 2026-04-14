@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "agcrn_official_aligned"
 display_name = "AGCRN Official-Aligned"
 status = "pilot"
-summary = "Official-aligned AGCRN baseline on the Kelmarsh farm-synchronous power-only, wind-speed-history, ambient-temperature-history, internal-temperature-history, wind-direction-sincos, yaw-aware wind-direction, yaw-aware pitch-mean, and yaw-aware low-speed-rotor-RPM tasks."
+summary = "Official-aligned AGCRN baseline on the kelmarsh and penmanshiel farm-synchronous power-only, wind-speed-history, ambient-temperature-history, internal-temperature-history, wind-direction-sincos, yaw-aware wind-direction, yaw-aware pitch-mean, and yaw-aware low-speed-rotor-RPM tasks."
 model_family = "agcrn"
 training_mode = "trainable"
 implementation_root = "experiment/families/agcrn"
@@ -10,7 +10,7 @@ readme_path = "experiment/families/agcrn/README.md"
 runner_entrypoint = "experiment/families/agcrn/run_agcrn.py"
 default_output_path = "experiment/artifacts/published/agcrn_official_aligned/latest.csv"
 default_output_schema_version = "agcrn_official_aligned.long_metrics.v1"
-dataset_scope = ["kelmarsh"]
+dataset_scope = ["kelmarsh", "penmanshiel"]
 supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
 supported_result_splits = ["val", "test"]
 supported_feature_protocols = ["power_only", "power_ws_hist", "power_atemp_hist", "power_itemp_hist", "power_wd_hist_sincos", "power_wd_yaw_hist_sincos", "power_wd_yaw_pitchmean_hist_sincos", "power_wd_yaw_lrpm_hist_sincos", "power_ws_wd_hist_sincos"]
@@ -38,7 +38,7 @@ model_variants = [
   "official_aligned_power_ws_wd_hist_sincos_farm_sync",
 ]
 notes = [
-  "This family is currently narrower than the other trainable baselines: Kelmarsh only and farm-synchronous only.",
+  "This family currently supports kelmarsh and penmanshiel only. sdwpf_kddcup is excluded because the strict 24h -> 6h farm-synchronous task has zero usable windows, and hill_of_towie is excluded because the direction-aware variants currently yield empty train splits.",
 ]
 
 [task_contract]

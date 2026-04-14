@@ -38,6 +38,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
 
     assert agcrn.status == "pilot"
     assert agcrn.task_contract.granularity == "farm"
+    assert agcrn.dataset_scope == ("kelmarsh", "penmanshiel")
     assert agcrn.supported_feature_protocols == (
         "power_only",
         "power_ws_hist",
@@ -68,7 +69,7 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     snapshot = module.load_registry_snapshot()
     rows = module.build_dataset_family_feature_matrix(snapshot)
 
-    assert len(rows) == 9
+    assert len(rows) == 18
     assert [row.dataset_id for row in rows] == [
         "kelmarsh",
         "kelmarsh",
@@ -79,6 +80,15 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
         "kelmarsh",
         "kelmarsh",
         "kelmarsh",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
+        "penmanshiel",
     ]
     assert [row.family_id for row in rows] == [
         "agcrn_official_aligned",
@@ -90,8 +100,26 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
         "agcrn_official_aligned",
         "agcrn_official_aligned",
         "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
+        "agcrn_official_aligned",
     ]
     assert [row.feature_protocol_id for row in rows] == [
+        "power_only",
+        "power_ws_hist",
+        "power_atemp_hist",
+        "power_itemp_hist",
+        "power_wd_hist_sincos",
+        "power_wd_yaw_hist_sincos",
+        "power_wd_yaw_pitchmean_hist_sincos",
+        "power_wd_yaw_lrpm_hist_sincos",
+        "power_ws_wd_hist_sincos",
         "power_only",
         "power_ws_hist",
         "power_atemp_hist",
