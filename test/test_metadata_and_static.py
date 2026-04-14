@@ -248,6 +248,7 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
 
     farm_pmu = load_shared_timeseries("kelmarsh", "farm_pmu", cache_root=tmp_path / "cache")
     turbine_status = load_event_features("kelmarsh", "turbine_status", cache_root=tmp_path / "cache")
+    farm_status = load_event_features("kelmarsh", "farm_status", cache_root=tmp_path / "cache")
     hill_grid = load_shared_timeseries("hill_of_towie", "farm_grid", cache_root=tmp_path / "cache")
     hill_shutdown = load_shared_timeseries("hill_of_towie", "turbine_shutdown_duration", cache_root=tmp_path / "cache")
     hill_alarm = load_event_features("hill_of_towie", "alarmlog", cache_root=tmp_path / "cache")
@@ -259,6 +260,7 @@ def test_auxiliary_loaders_return_standardized_sidecars(tmp_path, monkeypatch) -
 
     assert "farm_pmu__gms_power_kw" in farm_pmu.columns
     assert "evt_status_code__710" in turbine_status.columns
+    assert "farm_evt_stop_active" in farm_status.columns
     assert "farm_grid__activepower" in hill_grid.columns
     assert hill_builder.cache_paths.hill_default_table_path("tblSCTurbine").exists()
     assert hill_builder.cache_paths.hill_default_table_path("tblSCTurGrid").exists()

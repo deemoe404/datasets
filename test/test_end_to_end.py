@@ -274,6 +274,166 @@ def test_end_to_end_greenbyte_pmean_masked_protocol_reports_mask_diagnostics(tmp
     }
 
 
+def test_end_to_end_greenbyte_world_model_v1_bundle_round_trip(tmp_path) -> None:
+    spec = build_greenbyte_fixture(
+        tmp_path / "raw" / "kelmarsh_world_model",
+        "Kelmarsh",
+        "Kelmarsh 1",
+        include_world_model_covariates=True,
+    )
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="30m",
+        task_id="short_task",
+        granularity="farm",
+    )
+
+    builder.build_task_cache(task, feature_protocol_id="world_model_v1")
+    bundle = builder.load_task_bundle(task, feature_protocol_id="world_model_v1")
+
+    assert bundle.pairwise is not None
+    assert bundle.task_context["column_groups"]["local_observation_values"] == [
+        "Wind speed (m/s)",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "Rotor speed (RPM)",
+        "Generator RPM (RPM)",
+        "Nacelle ambient temperature (°C)",
+        "Nacelle temperature (°C)",
+        "evt_any_active",
+        "evt_active_count",
+        "evt_total_overlap_seconds",
+        "evt_stop_active",
+        "evt_warning_active",
+        "evt_informational_active",
+    ]
+    assert bundle.task_context["column_groups"]["global_observation_values"] == [
+        "farm_pmu__gms_current_a",
+        "farm_pmu__gms_power_kw",
+        "farm_pmu__gms_reactive_power_kvar",
+        "farm_evt_any_active",
+        "farm_evt_active_count",
+        "farm_evt_total_overlap_seconds",
+        "farm_evt_stop_active",
+        "farm_evt_warning_active",
+        "farm_evt_informational_active",
+    ]
+    assert bundle.task_context["column_groups"]["pairwise"] == [
+        "src_turbine_id",
+        "dst_turbine_id",
+        "src_turbine_index",
+        "dst_turbine_index",
+        "delta_x_m",
+        "delta_y_m",
+        "distance_m",
+        "bearing_deg",
+        "elevation_diff_m",
+        "distance_in_rotor_diameters",
+    ]
+    assert bundle.task_report["local_observation_value_columns"] == (
+        bundle.task_context["column_groups"]["local_observation_values"]
+    )
+    assert bundle.task_report["global_observation_value_columns"] == (
+        bundle.task_context["column_groups"]["global_observation_values"]
+    )
+    assert bundle.task_report["pairwise_columns"] == bundle.task_context["column_groups"]["pairwise"]
+    assert bundle.static.columns == [
+        "dataset",
+        "turbine_id",
+        "turbine_index",
+        "latitude",
+        "longitude",
+        "coord_x",
+        "coord_y",
+        "coord_kind",
+        "coord_crs",
+        "elevation_m",
+        "rated_power_kw",
+        "hub_height_m",
+        "rotor_diameter_m",
+    ]
+    assert bundle.pairwise.columns == bundle.task_context["column_groups"]["pairwise"]
+    assert bundle.pairwise.height == 0
+    assert bundle.known_future.columns == [
+        "dataset",
+        "timestamp",
+        "calendar_hour_sin",
+        "calendar_hour_cos",
+        "calendar_weekday_sin",
+        "calendar_weekday_cos",
+        "calendar_month_sin",
+        "calendar_month_cos",
+        "calendar_is_weekend",
+    ]
+
+    row = bundle.series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+    assert row["wind_direction_sin"][0] == pytest.approx(math.sin(math.radians(181.0)))
+    assert row["yaw_error_sin"][0] == pytest.approx(math.sin(math.radians(6.0)))
+    assert row["pitch_mean"][0] == pytest.approx(1.0)
+    assert row["target_kw__mask"][0] == 0
+    assert row["farm_pmu__gms_power_kw__mask"][0] == 0
+    assert row["evt_warning_active__mask"][0] == 0
+    assert row["farm_evt_warning_active__mask"][0] == 0
+
+    missing_row = bundle.series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
+    assert missing_row["farm_pmu__gms_power_kw__mask"][0] == 1
+    assert missing_row["feature_quality_flags"][0].endswith("missing_past_covariates")
+
+
+def test_task_pairwise_frame_builds_directed_full_pairs_with_expected_geometry(tmp_path) -> None:
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh_pairwise", "Kelmarsh", "Kelmarsh 1")
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    pairwise = builder._task_pairwise_frame(
+        static_frame=pl.DataFrame(
+            {
+                "dataset": ["kelmarsh", "kelmarsh"],
+                "turbine_id": ["T01", "T02"],
+                "turbine_index": [0, 1],
+                "latitude": [52.4, 52.5],
+                "longitude": [-0.94, -0.93],
+                "coord_x": [0.0, 300.0],
+                "coord_y": [0.0, 400.0],
+                "coord_kind": ["projected_xy", "projected_xy"],
+                "coord_crs": ["test_crs", "test_crs"],
+                "elevation_m": [100.0, 130.0],
+                "rated_power_kw": [2050.0, 2050.0],
+                "hub_height_m": [78.5, 78.5],
+                "rotor_diameter_m": [100.0, 200.0],
+            }
+        ),
+        pairwise_columns=(
+            "src_turbine_id",
+            "dst_turbine_id",
+            "src_turbine_index",
+            "dst_turbine_index",
+            "delta_x_m",
+            "delta_y_m",
+            "distance_m",
+            "bearing_deg",
+            "elevation_diff_m",
+            "distance_in_rotor_diameters",
+        ),
+    ).sort(["src_turbine_index", "dst_turbine_index"])
+
+    assert pairwise.height == 2
+    assert pairwise["src_turbine_id"].to_list() == ["T01", "T02"]
+    assert pairwise["dst_turbine_id"].to_list() == ["T02", "T01"]
+    assert pairwise["src_turbine_index"].to_list() == [0, 1]
+    assert pairwise["dst_turbine_index"].to_list() == [1, 0]
+    assert pairwise["delta_x_m"].to_list() == pytest.approx([300.0, -300.0])
+    assert pairwise["delta_y_m"].to_list() == pytest.approx([400.0, -400.0])
+    assert pairwise["distance_m"].to_list() == pytest.approx([500.0, 500.0])
+    assert pairwise["bearing_deg"].to_list() == pytest.approx(
+        [float((math.degrees(math.atan2(300.0, 400.0)) + 360.0) % 360.0), 216.86989764584402]
+    )
+    assert pairwise["elevation_diff_m"].to_list() == pytest.approx([30.0, -30.0])
+    assert pairwise["distance_in_rotor_diameters"].to_list() == pytest.approx([500.0 / 150.0, 500.0 / 150.0])
+
+
 def test_end_to_end_hill_pipeline(tmp_path) -> None:
     spec = build_hill_fixture(tmp_path / "raw" / "hill")
     builder = HillOfTowieDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")

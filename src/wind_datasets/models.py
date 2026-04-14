@@ -160,6 +160,7 @@ class TaskBundlePaths:
     task_context_path: Path
     task_report_path: Path
     build_meta_path: Path
+    pairwise_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -171,3 +172,4 @@ class LoadedTaskBundle:
     window_index: pl.DataFrame
     task_context: dict[str, object]
     task_report: dict[str, object] | None
+    pairwise: pl.DataFrame | None = None

@@ -391,6 +391,7 @@ def check_task_status(
         cache_paths.task_series_path_for(task.task_id, feature_protocol_id),
         cache_paths.task_known_future_path_for(task.task_id, feature_protocol_id),
         cache_paths.task_turbine_static_path_for(task.task_id, feature_protocol_id),
+        cache_paths.task_pairwise_path_for(task.task_id, feature_protocol_id),
         cache_paths.task_window_index_path_for(task.task_id, feature_protocol_id),
         cache_paths.task_context_path_for(task.task_id, feature_protocol_id),
     ]

@@ -74,6 +74,11 @@ _POWER_ITEMP_HIST_COLUMN_BY_DATASET = {
     "hill_of_towie": "tur_temp__wtc_naceltmp_mean",
     "sdwpf_kddcup": "Itmp",
 }
+_GENERATOR_RPM_COLUMN_BY_DATASET = {
+    "kelmarsh": "Generator RPM (RPM)",
+    "penmanshiel": "Generator RPM (RPM)",
+    "hill_of_towie": "wtc_GenRpm_mean",
+}
 _LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET = {
     "kelmarsh": "Rotor speed (RPM)",
     "penmanshiel": "Rotor speed (RPM)",
@@ -109,9 +114,56 @@ _NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET = {
     "sdwpf_kddcup": "Ndir",
 }
 _SDWPF_YAW_ERROR_COLUMN = "Wdir"
+_WORLD_MODEL_LOCAL_EVENT_SUMMARY_COLUMNS = (
+    "evt_any_active",
+    "evt_active_count",
+    "evt_total_overlap_seconds",
+    "evt_stop_active",
+    "evt_warning_active",
+    "evt_informational_active",
+)
+_WORLD_MODEL_GLOBAL_OBSERVATION_COLUMNS = (
+    "farm_pmu__gms_current_a",
+    "farm_pmu__gms_power_kw",
+    "farm_pmu__gms_reactive_power_kvar",
+    "farm_evt_any_active",
+    "farm_evt_active_count",
+    "farm_evt_total_overlap_seconds",
+    "farm_evt_stop_active",
+    "farm_evt_warning_active",
+    "farm_evt_informational_active",
+)
+_WORLD_MODEL_STATIC_COLUMNS = (
+    "dataset",
+    "turbine_id",
+    "turbine_index",
+    "latitude",
+    "longitude",
+    "coord_x",
+    "coord_y",
+    "coord_kind",
+    "coord_crs",
+    "elevation_m",
+    "rated_power_kw",
+    "hub_height_m",
+    "rotor_diameter_m",
+)
+_WORLD_MODEL_PAIRWISE_COLUMNS = (
+    "src_turbine_id",
+    "dst_turbine_id",
+    "src_turbine_index",
+    "dst_turbine_index",
+    "delta_x_m",
+    "delta_y_m",
+    "distance_m",
+    "bearing_deg",
+    "elevation_diff_m",
+    "distance_in_rotor_diameters",
+)
 _UNSUPPORTED_DATASET_IDS_BY_PROTOCOL = {
     "power_wd_yaw_lrpm_hist_sincos": ("sdwpf_kddcup",),
     "power_wd_yaw_pmean_hist_sincos_masked": ("hill_of_towie", "sdwpf_kddcup"),
+    "world_model_v1": ("hill_of_towie", "sdwpf_kddcup"),
 }
 
 
@@ -179,6 +231,11 @@ class TaskSeriesSelection:
     static_columns: tuple[str, ...]
     target_derived_columns: tuple[str, ...]
     audit_columns: tuple[str, ...]
+    local_observation_value_columns: tuple[str, ...] = ()
+    local_observation_mask_columns: tuple[str, ...] = ()
+    global_observation_value_columns: tuple[str, ...] = ()
+    global_observation_mask_columns: tuple[str, ...] = ()
+    pairwise_columns: tuple[str, ...] = ()
     derived_angle_transforms: tuple[AngleTransformSpec, ...] = ()
     derived_scalar_transforms: tuple[ScalarTransformSpec, ...] = ()
     raw_source_mask_rules: tuple[RawSourceMaskRuleSpec, ...] = ()
@@ -345,6 +402,22 @@ _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles_plus_low_speed_rotor_rpm",
     past_covariate_stage="task_bundle.angle_sincos_plus_native_covariate",
 )
+_WORLD_MODEL_V1_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="world_model_v1",
+    display_name="World Model V1",
+    protocol_kind="world_model",
+    summary=(
+        "Use target history, masked local and farm-level observations, turbine static covariates, "
+        "calendar known-future covariates, and directed pairwise geometry."
+    ),
+    uses_target_history=True,
+    uses_static_covariates=True,
+    uses_known_future_covariates=True,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    past_covariate_source="task_bundle.world_model_local_and_global_observations",
+    past_covariate_stage="task_bundle.world_model_v1",
+)
 _FEATURE_PROTOCOLS = (
     _POWER_ONLY_PROTOCOL,
     _POWER_WS_HIST_PROTOCOL,
@@ -356,6 +429,7 @@ _FEATURE_PROTOCOLS = (
     _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL,
     _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL,
+    _WORLD_MODEL_V1_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
     protocol.feature_protocol_id: protocol
@@ -522,12 +596,14 @@ def _angle_transforms_for_protocol(
         _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
     }
     uses_yaw_error = feature_protocol_id in {
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
     }
 
     if uses_wind_direction:
@@ -612,6 +688,7 @@ def _scalar_transforms_for_protocol(
     if feature_protocol_id not in {
         _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
     }:
         return ()
     try:
@@ -635,7 +712,10 @@ def _raw_source_mask_rules_for_protocol(
     dataset_id: str,
     feature_protocol_id: str,
 ) -> tuple[RawSourceMaskRuleSpec, ...]:
-    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+    if feature_protocol_id not in {
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
+    }:
         return ()
     try:
         pitch_columns = _PITCH_COLUMNS_BY_DATASET[dataset_id]
@@ -663,7 +743,10 @@ def _companion_mask_pairs_for_protocol(
     feature_protocol_id: str,
     past_covariate_value_columns: tuple[str, ...],
 ) -> tuple[CompanionMaskPair, ...]:
-    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+    if feature_protocol_id not in {
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
+    }:
         return ()
     return tuple(
         CompanionMaskPair(
@@ -678,7 +761,10 @@ def _target_history_mask_pairs_for_protocol(
     *,
     feature_protocol_id: str,
 ) -> tuple[CompanionMaskPair, ...]:
-    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+    if feature_protocol_id not in {
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
+        _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id,
+    }:
         return ()
     return (
         CompanionMaskPair(
@@ -700,7 +786,96 @@ def _dataset_native_columns_for_protocol(
     tuple[ScalarTransformSpec, ...],
     str | None,
     tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
 ]:
+    if feature_protocol_id == _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id:
+        wind_speed_column = _require_mapping_value(
+            {key: value[0] for key, value in _POWER_WS_HIST_COLUMNS_BY_DATASET.items()},
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        rotor_rpm_column = _require_mapping_value(
+            _LOW_SPEED_ROTOR_RPM_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        generator_rpm_column = _require_mapping_value(
+            _GENERATOR_RPM_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        ambient_temperature_column = _require_mapping_value(
+            _POWER_ATEMP_HIST_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        internal_temperature_column = _require_mapping_value(
+            _POWER_ITEMP_HIST_COLUMN_BY_DATASET,
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        derived_angle_transforms, angle_convention, dataset_specific_notes = _angle_transforms_for_protocol(
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        derived_scalar_transforms = _scalar_transforms_for_protocol(
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        configured_columns: list[str] = [wind_speed_column]
+        output_past_covariate_columns: list[str] = [wind_speed_column]
+        local_observation_value_columns: list[str] = [wind_speed_column]
+        global_observation_value_columns = list(_WORLD_MODEL_GLOBAL_OBSERVATION_COLUMNS)
+
+        for transform in derived_angle_transforms:
+            configured_columns.extend(transform.source_columns)
+            output_past_covariate_columns.extend((transform.output_sin_column, transform.output_cos_column))
+            local_observation_value_columns.extend((transform.output_sin_column, transform.output_cos_column))
+
+        for transform in derived_scalar_transforms:
+            configured_columns.extend(transform.source_columns)
+            output_past_covariate_columns.append(transform.output_column)
+            local_observation_value_columns.append(transform.output_column)
+
+        for column in (
+            rotor_rpm_column,
+            generator_rpm_column,
+            ambient_temperature_column,
+            internal_temperature_column,
+            *_WORLD_MODEL_LOCAL_EVENT_SUMMARY_COLUMNS,
+            *_WORLD_MODEL_GLOBAL_OBSERVATION_COLUMNS,
+        ):
+            configured_columns.append(column)
+            output_past_covariate_columns.append(column)
+
+        local_observation_value_columns.extend(
+            (
+                rotor_rpm_column,
+                generator_rpm_column,
+                ambient_temperature_column,
+                internal_temperature_column,
+                *_WORLD_MODEL_LOCAL_EVENT_SUMMARY_COLUMNS,
+            )
+        )
+        configured_columns = list(dict.fromkeys(configured_columns))
+        missing_columns = [column for column in configured_columns if column not in available_columns]
+        if missing_columns:
+            raise ValueError(
+                f"feature_protocol_id {feature_protocol_id!r} for dataset {dataset_id!r} requires "
+                f"missing gold-base columns {missing_columns!r}."
+            )
+        return (
+            tuple(configured_columns),
+            tuple(output_past_covariate_columns),
+            derived_angle_transforms,
+            derived_scalar_transforms,
+            angle_convention,
+            dataset_specific_notes,
+            tuple(local_observation_value_columns),
+            tuple(global_observation_value_columns),
+        )
+
     uses_wind_speed = feature_protocol_id in {
         _POWER_WS_HIST_PROTOCOL.feature_protocol_id,
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
@@ -779,6 +954,8 @@ def _dataset_native_columns_for_protocol(
         derived_scalar_transforms,
         angle_convention,
         dataset_specific_notes,
+        (),
+        (),
     )
 
 
@@ -982,6 +1159,24 @@ def materialize_task_series_frame(
     ).series_frame
 
 
+def _known_future_columns_for_protocol(feature_protocol_id: str) -> tuple[str, ...]:
+    if feature_protocol_id == _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id:
+        return _KNOWN_FUTURE_COLUMNS
+    return ("dataset", "timestamp")
+
+
+def _static_columns_for_protocol(feature_protocol_id: str) -> tuple[str, ...]:
+    if feature_protocol_id == _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id:
+        return _WORLD_MODEL_STATIC_COLUMNS
+    return ()
+
+
+def _pairwise_columns_for_protocol(feature_protocol_id: str) -> tuple[str, ...]:
+    if feature_protocol_id == _WORLD_MODEL_V1_PROTOCOL.feature_protocol_id:
+        return _WORLD_MODEL_PAIRWISE_COLUMNS
+    return ()
+
+
 def select_task_series_columns(
     *,
     dataset_id: str,
@@ -1001,6 +1196,8 @@ def select_task_series_columns(
         derived_scalar_transforms,
         angle_convention,
         dataset_specific_notes,
+        local_observation_value_columns,
+        global_observation_value_columns,
     ) = _dataset_native_columns_for_protocol(
         dataset_id=dataset_id,
         available_columns=available_columns,
@@ -1019,6 +1216,16 @@ def select_task_series_columns(
         past_covariate_value_columns=past_covariate_value_columns,
     )
     past_covariate_mask_columns = tuple(pair.mask_column for pair in companion_mask_pairs)
+    local_observation_mask_columns = tuple(
+        pair.mask_column
+        for pair in companion_mask_pairs
+        if pair.value_column in local_observation_value_columns
+    )
+    global_observation_mask_columns = tuple(
+        pair.mask_column
+        for pair in companion_mask_pairs
+        if pair.value_column in global_observation_value_columns
+    )
     past_covariate_columns = tuple((*past_covariate_value_columns, *past_covariate_mask_columns))
     audit_columns = tuple(column for column in _SERIES_OPTIONAL_AUDIT_COLUMNS if column in available_columns)
     source_columns = tuple((*_SERIES_BASE_COLUMNS, *source_past_covariate_columns, *audit_columns))
@@ -1038,10 +1245,15 @@ def select_task_series_columns(
         past_covariate_columns=past_covariate_columns,
         past_covariate_value_columns=past_covariate_value_columns,
         past_covariate_mask_columns=past_covariate_mask_columns,
-        known_future_columns=("dataset", "timestamp"),
-        static_columns=(),
+        known_future_columns=_known_future_columns_for_protocol(feature_protocol_id),
+        static_columns=_static_columns_for_protocol(feature_protocol_id),
         target_derived_columns=(),
         audit_columns=audit_columns,
+        local_observation_value_columns=local_observation_value_columns,
+        local_observation_mask_columns=local_observation_mask_columns,
+        global_observation_value_columns=global_observation_value_columns,
+        global_observation_mask_columns=global_observation_mask_columns,
+        pairwise_columns=_pairwise_columns_for_protocol(feature_protocol_id),
         derived_angle_transforms=derived_angle_transforms,
         derived_scalar_transforms=derived_scalar_transforms,
         raw_source_mask_rules=raw_source_mask_rules,
@@ -1179,9 +1391,14 @@ def protocol_context_dict(
             "past_covariates": list(selection.past_covariate_columns),
             "past_covariate_values": list(selection.past_covariate_value_columns),
             "past_covariate_masks": list(selection.past_covariate_mask_columns),
+            "local_observation_values": list(selection.local_observation_value_columns),
+            "local_observation_masks": list(selection.local_observation_mask_columns),
+            "global_observation_values": list(selection.global_observation_value_columns),
+            "global_observation_masks": list(selection.global_observation_mask_columns),
             "target_derived_covariates": list(selection.target_derived_columns),
             "known_future": list(selection.known_future_columns),
             "static": list(static_columns),
+            "pairwise": list(selection.pairwise_columns),
             "audit": list(selection.audit_columns),
         },
     }

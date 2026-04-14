@@ -139,6 +139,9 @@ def featureize_interval_events(
         f"{base_prefix}_active_count",
         f"{base_prefix}_total_overlap_seconds",
     ]
+    alias_mapping = {
+        sanitize_feature_name(source): target for source, target in (status_aliases or {}).items()
+    }
     if events.is_empty():
         return pl.DataFrame(
             schema={
@@ -147,6 +150,7 @@ def featureize_interval_events(
                 core_columns[0]: pl.Boolean,
                 core_columns[1]: pl.Int32,
                 core_columns[2]: pl.Int32,
+                **{column: pl.Boolean for column in alias_mapping.values()},
             }
         )
 
@@ -165,9 +169,6 @@ def featureize_interval_events(
         values = normalized.select(pl.col(source_column).drop_nulls().unique()).to_series().to_list()
         value_mappings[source_column] = build_feature_name_mapping(values, prefix)
 
-    alias_mapping = {
-        sanitize_feature_name(source): target for source, target in (status_aliases or {}).items()
-    }
     interval = timedelta(minutes=resolution_minutes)
     output_frames: list[pl.DataFrame] = []
 
@@ -311,6 +312,13 @@ def featureize_interval_events(
             }
         )
     result = pl.concat(output_frames, how="diagonal_relaxed")
+    missing_alias_columns = [
+        pl.lit(False).alias(column)
+        for column in alias_mapping.values()
+        if column not in result.columns
+    ]
+    if missing_alias_columns:
+        result = result.with_columns(missing_alias_columns)
     boolean_columns = [
         column
         for column in [

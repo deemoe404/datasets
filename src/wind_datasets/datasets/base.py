@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import atan2, cos, degrees, radians, sqrt
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from ..utils import ensure_directory, join_flags, read_json, write_json
 from .common import DUPLICATE_AUDIT_SCHEMA, build_window_index_from_series_path
 
 _TASK_MISSING_PAST_COVARIATE_FLAG = "missing_past_covariates"
+_EARTH_RADIUS_M = 6_371_000.0
 
 
 class BaseDatasetBuilder:
@@ -227,6 +229,7 @@ class BaseDatasetBuilder:
             task_context_path=self.cache_paths.task_context_path_for(resolved.task_id, feature_protocol_id),
             task_report_path=self.cache_paths.task_report_path_for(resolved.task_id, feature_protocol_id),
             build_meta_path=self.cache_paths.task_build_meta_path_for(resolved.task_id, feature_protocol_id),
+            pairwise_path=self.cache_paths.task_pairwise_path_for(resolved.task_id, feature_protocol_id),
         )
 
     def build_task_cache(
@@ -293,7 +296,12 @@ class BaseDatasetBuilder:
         known_future = build_known_future_frame(series_frame)
         known_future.write_parquet(task_paths.known_future_path)
 
-        task_static = self._write_task_static(task_paths)
+        task_static = self._write_task_static(task_paths, static_columns=selection.static_columns)
+        task_pairwise = self._write_task_pairwise(
+            task_paths,
+            static_frame=task_static,
+            pairwise_columns=selection.pairwise_columns,
+        )
 
         build_window_index_from_series_path(
             series_path=task_paths.series_path,
@@ -353,6 +361,11 @@ class BaseDatasetBuilder:
             window_index=pl.read_parquet(paths.window_index_path),
             task_context=read_json(paths.task_context_path),
             task_report=read_json(paths.task_report_path) if paths.task_report_path.exists() else None,
+            pairwise=(
+                pl.read_parquet(paths.pairwise_path)
+                if paths.pairwise_path is not None and paths.pairwise_path.exists()
+                else None
+            ),
         )
 
     def load_window_index(
@@ -413,7 +426,7 @@ class BaseDatasetBuilder:
             "source_column_policy_entry_count": len(policy.entries),
         }
 
-    def _task_static_frame(self) -> pl.DataFrame:
+    def _task_static_frame(self, *, selected_columns: tuple[str, ...] = ()) -> pl.DataFrame:
         turbine_static = self.load_turbine_static()
         with_index = turbine_static.join(
             pl.DataFrame(
@@ -429,11 +442,144 @@ class BaseDatasetBuilder:
         metadata_columns = [
             column for column in with_index.columns if column not in {"dataset", "turbine_id", "turbine_index"}
         ]
-        return with_index.select([*base_columns, *metadata_columns])
+        frame = with_index.select([*base_columns, *metadata_columns])
+        if selected_columns:
+            missing_columns = [column for column in selected_columns if column not in frame.columns]
+            if missing_columns:
+                raise ValueError(
+                    f"Task static selection for dataset {self.spec.dataset_id!r} is missing columns {missing_columns!r}."
+                )
+            frame = frame.select(list(selected_columns))
+        return frame
 
-    def _write_task_static(self, task_paths: TaskBundlePaths) -> pl.DataFrame:
-        frame = self._task_static_frame()
+    def _write_task_static(
+        self,
+        task_paths: TaskBundlePaths,
+        *,
+        static_columns: tuple[str, ...] = (),
+    ) -> pl.DataFrame:
+        frame = self._task_static_frame(selected_columns=static_columns)
         frame.write_parquet(task_paths.static_path)
+        return frame
+
+    def _empty_task_pairwise_frame(self, pairwise_columns: tuple[str, ...]) -> pl.DataFrame:
+        if not pairwise_columns:
+            return pl.DataFrame()
+        schema: dict[str, pl.DataType] = {
+            "src_turbine_id": pl.String,
+            "dst_turbine_id": pl.String,
+            "src_turbine_index": pl.Int64,
+            "dst_turbine_index": pl.Int64,
+            "delta_x_m": pl.Float64,
+            "delta_y_m": pl.Float64,
+            "distance_m": pl.Float64,
+            "bearing_deg": pl.Float64,
+            "elevation_diff_m": pl.Float64,
+            "distance_in_rotor_diameters": pl.Float64,
+        }
+        return pl.DataFrame(schema={column: schema[column] for column in pairwise_columns})
+
+    def _resolve_task_pairwise_coordinates(self, static_frame: pl.DataFrame) -> tuple[list[float], list[float]]:
+        if {"coord_x", "coord_y"}.issubset(static_frame.columns):
+            if static_frame["coord_x"].null_count() == 0 and static_frame["coord_y"].null_count() == 0:
+                return (
+                    static_frame["coord_x"].cast(pl.Float64).to_list(),
+                    static_frame["coord_y"].cast(pl.Float64).to_list(),
+                )
+        if "latitude" not in static_frame.columns or "longitude" not in static_frame.columns:
+            raise ValueError(
+                "Pairwise geometry requires either full coord_x/coord_y or full latitude/longitude."
+            )
+        if static_frame["latitude"].null_count() > 0 or static_frame["longitude"].null_count() > 0:
+            raise ValueError(
+                "Pairwise geometry requires either full coord_x/coord_y or full latitude/longitude."
+            )
+        latitudes = [float(value) for value in static_frame["latitude"].cast(pl.Float64).to_list()]
+        longitudes = [float(value) for value in static_frame["longitude"].cast(pl.Float64).to_list()]
+        lat0 = radians(sum(latitudes) / len(latitudes))
+        lon0 = radians(sum(longitudes) / len(longitudes))
+        x = [_EARTH_RADIUS_M * (radians(lon) - lon0) * cos(lat0) for lon in longitudes]
+        lat_mean_rad = radians(sum(latitudes) / len(latitudes))
+        y = [_EARTH_RADIUS_M * (radians(lat) - lat_mean_rad) for lat in latitudes]
+        return x, y
+
+    def _task_pairwise_frame(
+        self,
+        *,
+        static_frame: pl.DataFrame,
+        pairwise_columns: tuple[str, ...],
+    ) -> pl.DataFrame:
+        if not pairwise_columns:
+            return self._empty_task_pairwise_frame(pairwise_columns)
+        required_columns = {
+            "turbine_id",
+            "turbine_index",
+            "coord_kind",
+            "coord_crs",
+            "elevation_m",
+            "rotor_diameter_m",
+        }
+        missing_columns = sorted(required_columns - set(static_frame.columns))
+        if missing_columns:
+            raise ValueError(
+                f"Task pairwise geometry for dataset {self.spec.dataset_id!r} is missing static columns {missing_columns!r}."
+            )
+        for column in ("coord_kind", "coord_crs", "elevation_m", "rotor_diameter_m"):
+            if static_frame[column].null_count() > 0:
+                raise ValueError(
+                    f"Task pairwise geometry for dataset {self.spec.dataset_id!r} requires non-null static column {column!r}."
+                )
+        ordered = static_frame.sort("turbine_index")
+        if ordered.height <= 1:
+            return self._empty_task_pairwise_frame(pairwise_columns)
+        x_coords, y_coords = self._resolve_task_pairwise_coordinates(ordered)
+        turbine_ids = ordered["turbine_id"].cast(pl.String).to_list()
+        turbine_indices = [int(value) for value in ordered["turbine_index"].to_list()]
+        elevations = [float(value) for value in ordered["elevation_m"].cast(pl.Float64).to_list()]
+        rotor_diameters = [float(value) for value in ordered["rotor_diameter_m"].cast(pl.Float64).to_list()]
+        rows: list[dict[str, object]] = []
+        for src_position, src_turbine_id in enumerate(turbine_ids):
+            for dst_position, dst_turbine_id in enumerate(turbine_ids):
+                if src_position == dst_position:
+                    continue
+                mean_rotor_diameter = (rotor_diameters[src_position] + rotor_diameters[dst_position]) / 2.0
+                if mean_rotor_diameter <= 0:
+                    raise ValueError(
+                        f"Task pairwise geometry for dataset {self.spec.dataset_id!r} requires positive rotor diameters."
+                    )
+                delta_x_m = x_coords[dst_position] - x_coords[src_position]
+                delta_y_m = y_coords[dst_position] - y_coords[src_position]
+                distance_m = sqrt((delta_x_m ** 2) + (delta_y_m ** 2))
+                rows.append(
+                    {
+                        "src_turbine_id": src_turbine_id,
+                        "dst_turbine_id": dst_turbine_id,
+                        "src_turbine_index": turbine_indices[src_position],
+                        "dst_turbine_index": turbine_indices[dst_position],
+                        "delta_x_m": delta_x_m,
+                        "delta_y_m": delta_y_m,
+                        "distance_m": distance_m,
+                        "bearing_deg": (degrees(atan2(delta_x_m, delta_y_m)) + 360.0) % 360.0,
+                        "elevation_diff_m": elevations[dst_position] - elevations[src_position],
+                        "distance_in_rotor_diameters": distance_m / mean_rotor_diameter,
+                    }
+                )
+        return pl.DataFrame(rows).select(list(pairwise_columns))
+
+    def _write_task_pairwise(
+        self,
+        task_paths: TaskBundlePaths,
+        *,
+        static_frame: pl.DataFrame,
+        pairwise_columns: tuple[str, ...],
+    ) -> pl.DataFrame:
+        frame = self._task_pairwise_frame(
+            static_frame=static_frame,
+            pairwise_columns=pairwise_columns,
+        )
+        if task_paths.pairwise_path is None:
+            raise ValueError("Task bundle paths are missing pairwise_path.")
+        frame.write_parquet(task_paths.pairwise_path)
         return frame
 
     def _write_task_context(
@@ -487,8 +633,13 @@ class BaseDatasetBuilder:
                 "past_covariate_columns": list(selection.past_covariate_columns),
                 "past_covariate_value_columns": list(selection.past_covariate_value_columns),
                 "past_covariate_mask_columns": list(selection.past_covariate_mask_columns),
+                "local_observation_value_columns": list(selection.local_observation_value_columns),
+                "local_observation_mask_columns": list(selection.local_observation_mask_columns),
+                "global_observation_value_columns": list(selection.global_observation_value_columns),
+                "global_observation_mask_columns": list(selection.global_observation_mask_columns),
                 "target_derived_columns": list(selection.target_derived_columns),
                 "known_future_columns": list(selection.known_future_columns),
+                "pairwise_columns": list(selection.pairwise_columns),
                 "mask_diagnostics": mask_diagnostics,
             }
         )

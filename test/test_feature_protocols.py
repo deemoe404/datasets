@@ -50,6 +50,7 @@ def test_active_feature_protocols_are_registered() -> None:
         "power_wd_yaw_pitchmean_hist_sincos",
         "power_wd_yaw_pmean_hist_sincos_masked",
         "power_wd_yaw_lrpm_hist_sincos",
+        "world_model_v1",
     )
 
     power_only = get_feature_protocol_spec("power_only")
@@ -107,6 +108,13 @@ def test_active_feature_protocols_are_registered() -> None:
     assert power_wd_yaw_lrpm_hist.feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos"
     assert power_wd_yaw_lrpm_hist.uses_target_history is True
     assert power_wd_yaw_lrpm_hist.uses_past_covariates is True
+
+    world_model_v1 = get_feature_protocol_spec("world_model_v1")
+    assert world_model_v1.feature_protocol_id == "world_model_v1"
+    assert world_model_v1.uses_target_history is True
+    assert world_model_v1.uses_past_covariates is True
+    assert world_model_v1.uses_static_covariates is True
+    assert world_model_v1.uses_known_future_covariates is True
 
 
 def test_unknown_feature_protocol_is_rejected() -> None:
@@ -230,6 +238,113 @@ def test_power_itemp_hist_selection_uses_dataset_native_internal_temperature(
     assert selection.all_columns == selection.source_columns
     assert selection.derived_angle_transforms == ()
     assert selection.derived_scalar_transforms == ()
+
+
+def test_world_model_v1_selection_records_local_global_static_and_pairwise_groups() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "world_model_v1",
+        "Wind speed (m/s)",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+        "Rotor speed (RPM)",
+        "Generator RPM (RPM)",
+        "Nacelle ambient temperature (°C)",
+        "Nacelle temperature (°C)",
+        "evt_any_active",
+        "evt_active_count",
+        "evt_total_overlap_seconds",
+        "evt_stop_active",
+        "evt_warning_active",
+        "evt_informational_active",
+        "farm_pmu__gms_current_a",
+        "farm_pmu__gms_power_kw",
+        "farm_pmu__gms_reactive_power_kvar",
+        "farm_evt_any_active",
+        "farm_evt_active_count",
+        "farm_evt_total_overlap_seconds",
+        "farm_evt_stop_active",
+        "farm_evt_warning_active",
+        "farm_evt_informational_active",
+    )
+
+    assert selection.target_history_mask_columns == ("target_kw__mask",)
+    assert selection.local_observation_value_columns == (
+        "Wind speed (m/s)",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "Rotor speed (RPM)",
+        "Generator RPM (RPM)",
+        "Nacelle ambient temperature (°C)",
+        "Nacelle temperature (°C)",
+        "evt_any_active",
+        "evt_active_count",
+        "evt_total_overlap_seconds",
+        "evt_stop_active",
+        "evt_warning_active",
+        "evt_informational_active",
+    )
+    assert selection.global_observation_value_columns == (
+        "farm_pmu__gms_current_a",
+        "farm_pmu__gms_power_kw",
+        "farm_pmu__gms_reactive_power_kvar",
+        "farm_evt_any_active",
+        "farm_evt_active_count",
+        "farm_evt_total_overlap_seconds",
+        "farm_evt_stop_active",
+        "farm_evt_warning_active",
+        "farm_evt_informational_active",
+    )
+    assert selection.local_observation_mask_columns == tuple(
+        f"{column}__mask" for column in selection.local_observation_value_columns
+    )
+    assert selection.global_observation_mask_columns == tuple(
+        f"{column}__mask" for column in selection.global_observation_value_columns
+    )
+    assert selection.known_future_columns == (
+        "dataset",
+        "timestamp",
+        "calendar_hour_sin",
+        "calendar_hour_cos",
+        "calendar_weekday_sin",
+        "calendar_weekday_cos",
+        "calendar_month_sin",
+        "calendar_month_cos",
+        "calendar_is_weekend",
+    )
+    assert selection.static_columns == (
+        "dataset",
+        "turbine_id",
+        "turbine_index",
+        "latitude",
+        "longitude",
+        "coord_x",
+        "coord_y",
+        "coord_kind",
+        "coord_crs",
+        "elevation_m",
+        "rated_power_kw",
+        "hub_height_m",
+        "rotor_diameter_m",
+    )
+    assert selection.pairwise_columns == (
+        "src_turbine_id",
+        "dst_turbine_id",
+        "src_turbine_index",
+        "dst_turbine_index",
+        "delta_x_m",
+        "delta_y_m",
+        "distance_m",
+        "bearing_deg",
+        "elevation_diff_m",
+        "distance_in_rotor_diameters",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1046,6 +1161,62 @@ def test_protocol_context_records_mask_semantics_and_raw_source_mask_rules() -> 
     ]
 
 
+def test_world_model_v1_protocol_context_records_observation_and_pairwise_groups() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "world_model_v1",
+        "Wind speed (m/s)",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+        "Rotor speed (RPM)",
+        "Generator RPM (RPM)",
+        "Nacelle ambient temperature (°C)",
+        "Nacelle temperature (°C)",
+        "evt_any_active",
+        "evt_active_count",
+        "evt_total_overlap_seconds",
+        "evt_stop_active",
+        "evt_warning_active",
+        "evt_informational_active",
+        "farm_pmu__gms_current_a",
+        "farm_pmu__gms_power_kw",
+        "farm_pmu__gms_reactive_power_kvar",
+        "farm_evt_any_active",
+        "farm_evt_active_count",
+        "farm_evt_total_overlap_seconds",
+        "farm_evt_stop_active",
+        "farm_evt_warning_active",
+        "farm_evt_informational_active",
+    )
+
+    context = protocol_context_dict(
+        dataset_id="kelmarsh",
+        task={"task_id": "next_6h_from_24h"},
+        feature_protocol_id="world_model_v1",
+        turbine_ids=("WT01", "WT02"),
+        selection=selection,
+        static_columns=selection.static_columns,
+    )
+
+    feature_protocol = context["feature_protocol"]
+    column_groups = context["column_groups"]
+
+    assert feature_protocol["uses_static_covariates"] is True
+    assert feature_protocol["uses_known_future_covariates"] is True
+    assert feature_protocol["mask_polarity"] == "1_means_unavailable"
+    assert column_groups["target_history_masks"] == ["target_kw__mask"]
+    assert column_groups["local_observation_values"] == list(selection.local_observation_value_columns)
+    assert column_groups["local_observation_masks"] == list(selection.local_observation_mask_columns)
+    assert column_groups["global_observation_values"] == list(selection.global_observation_value_columns)
+    assert column_groups["global_observation_masks"] == list(selection.global_observation_mask_columns)
+    assert column_groups["known_future"] == list(selection.known_future_columns)
+    assert column_groups["static"] == list(selection.static_columns)
+    assert column_groups["pairwise"] == list(selection.pairwise_columns)
+
+
 @pytest.mark.parametrize(
     ("feature_protocol_id", "source_column"),
     [
@@ -1129,6 +1300,29 @@ def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
 
 
 @pytest.mark.parametrize("dataset_id", ["hill_of_towie", "sdwpf_kddcup"])
+def test_world_model_v1_is_only_supported_for_kelmarsh_and_penmanshiel(dataset_id: str) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"feature_protocol_id 'world_model_v1' is not supported for dataset '{dataset_id}'\.",
+    ):
+        select_task_series_columns(
+            dataset_id=dataset_id,
+            available_columns={
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                "target_kw",
+                "is_observed",
+                "quality_flags",
+                "feature_quality_flags",
+                "farm_turbines_expected",
+            },
+            feature_protocol_id="world_model_v1",
+            turbine_static_columns={"coord_x", "coord_y"},
+        )
+
+
+@pytest.mark.parametrize("dataset_id", ["hill_of_towie", "sdwpf_kddcup"])
 def test_mask_protocol_is_only_supported_for_kelmarsh_and_penmanshiel(dataset_id: str) -> None:
     with pytest.raises(
         ValueError,
@@ -1176,6 +1370,7 @@ def test_mask_protocol_is_only_supported_for_kelmarsh_and_penmanshiel(dataset_id
         "power_wd_yaw_pitchmean_hist_sincos",
         "power_wd_yaw_pmean_hist_sincos_masked",
         "power_wd_yaw_lrpm_hist_sincos",
+        "world_model_v1",
     ],
 )
 def test_protocol_selection_rejects_missing_mapped_columns(feature_protocol_id: str) -> None:

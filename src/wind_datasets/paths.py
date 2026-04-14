@@ -87,6 +87,9 @@ class DatasetCachePaths:
     def task_known_future_path_for(self, *args: str) -> Path:
         return self.task_dir_for(*args) / "known_future.parquet"
 
+    def task_pairwise_path_for(self, *args: str) -> Path:
+        return self.task_dir_for(*args) / "pairwise.parquet"
+
     def task_series_path_for(self, *args: str) -> Path:
         return self.task_dir_for(*args) / "series.parquet"
 

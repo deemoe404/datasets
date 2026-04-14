@@ -21,6 +21,7 @@ def build_greenbyte_fixture(
     file_end: str = "2025-01-01",
     *,
     include_pitch_mask_cases: bool = False,
+    include_world_model_covariates: bool = False,
 ) -> DatasetSpec:
     static_name = f"{dataset_name}_WT_static.csv"
     scada_dir = root / f"{dataset_name}_SCADA_2024_0001"
@@ -80,6 +81,21 @@ def build_greenbyte_fixture(
         2024-01-01 00:20:00,2024-01-01 00:30:00,00:10:00,Warning,410,Sample warning,,Operating states,Partial Performance,,
         """,
     )
+    pmu_header = "# Date and time,GMS Power (kW),GMS Power setpoint (kW),GMS Grid frequency (Hz)"
+    pmu_rows = """
+        2024-01-01 00:00:00,900,950,50.0
+        2024-01-01 00:10:00,910,955,50.0
+        2024-01-01 00:20:00,920,960,49.9
+        2024-01-01 00:30:00,930,965,49.9
+    """
+    if include_world_model_covariates:
+        pmu_header = "# Date and time,GMS Power (kW),GMS Reactive power (kvar),GMS Current (A),GMS Power setpoint (kW),GMS Grid frequency (Hz)"
+        pmu_rows = """
+        2024-01-01 00:00:00,900,120,30,950,50.0
+        2024-01-01 00:10:00,910,121,31,955,50.0
+        2024-01-01 00:20:00,920,122,32,960,49.9
+        2024-01-01 00:30:00,930,123,33,965,49.9
+        """
     _write_text(
         pmu_dir / f"Device_Data_{dataset_name}_PMU_2024-01-01_-_{file_end}_0002.csv",
         f"""
@@ -88,11 +104,8 @@ def build_greenbyte_fixture(
         # Device: {dataset_name} PMU
         # Device type: Production Meter
         # Time zone: UTC
-        # Date and time,GMS Power (kW),GMS Power setpoint (kW),GMS Grid frequency (Hz)
-        2024-01-01 00:00:00,900,950,50.0
-        2024-01-01 00:10:00,910,955,50.0
-        2024-01-01 00:20:00,920,960,49.9
-        2024-01-01 00:30:00,930,965,49.9
+        {pmu_header}
+        {pmu_rows}
         """,
     )
     _write_text(
@@ -110,6 +123,16 @@ def build_greenbyte_fixture(
         2024-01-01 00:30:00,103,103,0.98
         """,
     )
+    farm_status_rows = """
+        2024-01-01 00:10:00,2024-01-01 00:20:00,00:10:00,Communication,9997,Data communication unavailable,,External conditions,System Warning,,
+    """
+    if include_world_model_covariates:
+        farm_status_rows = """
+        2024-01-01 00:00:00,2024-01-01 00:10:00,00:10:00,Stop,710,Sample stop,,Operating states,Technical Standby,,
+        2024-01-01 00:10:00,2024-01-01 00:20:00,00:10:00,Informational,0,System OK,,System OK,Full Performance,,
+        2024-01-01 00:20:00,2024-01-01 00:30:00,00:10:00,Warning,410,Sample warning,,Operating states,Partial Performance,,
+        2024-01-01 00:30:00,2024-01-01 00:40:00,00:10:00,Communication,9997,Data communication unavailable,,External conditions,System Warning,,
+        """
     _write_text(
         grid_dir / f"Status_{dataset_name}_Grid_Meter_2024-01-01_-_{file_end}_0003.csv",
         f"""
@@ -117,7 +140,7 @@ def build_greenbyte_fixture(
         #
         # {dataset_name} Grid Meter production: NaN kWh
         Timestamp start,Timestamp end,Duration,Status,Code,Message,Comment,Service contract category,IEC category,Global contract category,Custom contract category
-        2024-01-01 00:10:00,2024-01-01 00:20:00,00:10:00,Communication,9997,Data communication unavailable,,External conditions,System Warning,,
+        {farm_status_rows}
         """,
     )
     if dataset_name.lower() == "kelmarsh":
