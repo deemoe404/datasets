@@ -76,6 +76,7 @@ def _build_temp_cache(
     *,
     dataset_id: str = "toy_dataset",
     feature_protocol_id: str = "power_only",
+    target_history_mask_columns: tuple[str, ...] = (),
     past_covariate_columns: tuple[str, ...] = (),
     missing_past_covariate_indices: tuple[int, ...] = (),
     history_steps: int = 144,
@@ -103,6 +104,11 @@ def _build_temp_cache(
                 "timestamp": timestamp,
                 "target_kw": float(offset + index),
             }
+            for column_name in target_history_mask_columns:
+                if column_name == "target_kw__mask":
+                    row[column_name] = 0
+                else:
+                    raise ValueError(f"Unsupported target_history_mask_column {column_name!r}.")
             for column_index, column_name in enumerate(past_covariate_columns, start=1):
                 row[column_name] = (
                     None
@@ -152,7 +158,15 @@ def _build_temp_cache(
                 },
                 "time_axis_semantics": "farm_synchronous_long_panel",
                 "column_groups": {
-                    "series": ["dataset", "turbine_id", "timestamp", "target_kw", *past_covariate_columns],
+                    "series": [
+                        "dataset",
+                        "turbine_id",
+                        "timestamp",
+                        "target_kw",
+                        *target_history_mask_columns,
+                        *past_covariate_columns,
+                    ],
+                    "target_history_masks": list(target_history_mask_columns),
                     "past_covariates": list(past_covariate_columns),
                     "target_derived_covariates": [],
                     "known_future": ["dataset", "timestamp"],
@@ -870,6 +884,60 @@ def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_yaw_pitc
     )
     assert prepared.input_channels == 6
     assert prepared.source_tensor.shape == (2000, 3, 6)
+
+
+def test_prepare_dataset_places_target_history_mask_before_past_covariates(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    cache_root = tmp_path / "cache"
+    _build_temp_cache(
+        cache_root,
+        feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+        target_history_mask_columns=("target_kw__mask",),
+        past_covariate_columns=(
+            "wind_direction_sin",
+            "wind_direction_cos",
+            "yaw_error_sin",
+            "yaw_error_cos",
+            "pitch_mean",
+            "wind_direction_sin__mask",
+            "wind_direction_cos__mask",
+            "yaw_error_sin__mask",
+            "yaw_error_cos__mask",
+            "pitch_mean__mask",
+        ),
+    )
+    _patch_temp_bundle_loader(
+        monkeypatch,
+        module,
+        cache_root,
+        feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+    )
+
+    prepared = module.prepare_dataset(
+        "toy_dataset",
+        variant_spec=module.ExperimentVariant(
+            model_variant="official_aligned_power_wd_yaw_pmean_hist_sincos_masked_farm_sync",
+            feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+        ),
+        cache_root=cache_root,
+    )
+
+    assert prepared.input_channel_names == (
+        "target_pu",
+        "target_kw__mask",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    )
+    assert prepared.input_channels == 12
+    assert prepared.source_tensor.shape == (2000, 3, 12)
 
 
 def test_prepare_dataset_builds_multichannel_source_tensor_for_power_wd_yaw_lrpm_hist_sincos(

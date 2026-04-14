@@ -362,6 +362,7 @@ class VariantDatasetContext:
     feature_protocol_id: str
     metadata: DatasetMetadata
     series: pl.DataFrame
+    target_history_mask_columns: tuple[str, ...]
     past_covariate_columns: tuple[str, ...]
     strict_window_index: pl.DataFrame
     raw_timestamps: tuple[datetime, ...]
@@ -873,14 +874,23 @@ def resolve_past_covariate_columns(bundle: Any) -> tuple[str, ...]:
     return tuple(str(column) for column in raw_columns)
 
 
+def resolve_target_history_mask_columns(bundle: Any) -> tuple[str, ...]:
+    column_groups = bundle.task_context.get("column_groups", {})
+    if not isinstance(column_groups, dict):
+        raise ValueError("Task bundle task_context is missing column_groups.")
+    raw_columns = column_groups.get("target_history_masks") or ()
+    return tuple(str(column) for column in raw_columns)
+
+
 def load_series_frame(
     dataset_id: str,
     bundle: Any,
     *,
+    target_history_mask_columns: Sequence[str] = (),
     past_covariate_columns: Sequence[str] = (),
 ) -> pl.DataFrame:
     available_columns = set(bundle.series.columns)
-    required_columns = (*_SERIES_BASE_COLUMNS, *past_covariate_columns)
+    required_columns = (*_SERIES_BASE_COLUMNS, *target_history_mask_columns, *past_covariate_columns)
     missing_columns = [column for column in required_columns if column not in available_columns]
     if missing_columns:
         raise ValueError(
@@ -1105,6 +1115,7 @@ def _load_variant_dataset_context(
             f"feature_protocol_id={variant_spec.feature_protocol_id!r}."
         )
     metadata = load_dataset_metadata(dataset_id, bundle)
+    target_history_mask_columns = resolve_target_history_mask_columns(bundle)
     past_covariate_columns = resolve_past_covariate_columns(bundle)
     strict_window_index = load_strict_window_index(
         dataset_id,
@@ -1114,6 +1125,7 @@ def _load_variant_dataset_context(
     series = load_series_frame(
         dataset_id,
         bundle,
+        target_history_mask_columns=target_history_mask_columns,
         past_covariate_columns=past_covariate_columns,
     )
     coordinate_mode, distance_sanity = build_distance_sanity_frame(
@@ -1130,6 +1142,7 @@ def _load_variant_dataset_context(
         feature_protocol_id=variant_spec.feature_protocol_id,
         metadata=metadata,
         series=series,
+        target_history_mask_columns=target_history_mask_columns,
         past_covariate_columns=past_covariate_columns,
         strict_window_index=strict_window_index,
         raw_timestamps=raw_timestamps,
@@ -1219,13 +1232,15 @@ def build_source_tensor(
     turbine_ids: Sequence[str],
     raw_timestamps: Sequence[datetime],
     target_pu: np.ndarray,
+    target_history_mask_columns: Sequence[str],
     past_covariate_columns: Sequence[str],
     train_windows: FarmWindowDescriptorIndex,
     history_steps: int,
 ) -> tuple[np.ndarray, tuple[str, ...]]:
     source_channels = [target_pu.astype(np.float32, copy=False)]
     input_channel_names: list[str] = ["target_pu"]
-    if past_covariate_columns:
+    auxiliary_columns = (*target_history_mask_columns, *past_covariate_columns)
+    if auxiliary_columns:
         covariate_channels = np.stack(
             [
                 _build_feature_panel(
@@ -1234,7 +1249,7 @@ def build_source_tensor(
                     turbine_ids=turbine_ids,
                     expected_timestamps=raw_timestamps,
                 )
-                for feature_column in past_covariate_columns
+                for feature_column in auxiliary_columns
             ],
             axis=-1,
         )
@@ -1248,7 +1263,7 @@ def build_source_tensor(
             copy=False,
         )
         source_channels.extend(normalized_covariates[:, :, index] for index in range(normalized_covariates.shape[2]))
-        input_channel_names.extend(past_covariate_columns)
+        input_channel_names.extend(auxiliary_columns)
     source_tensor = np.stack(source_channels, axis=-1).astype(np.float32, copy=False)
     return source_tensor, tuple(input_channel_names)
 
@@ -1443,6 +1458,7 @@ def _finalize_prepared_dataset(
         turbine_ids=context.metadata.turbine_ids,
         raw_timestamps=context.raw_timestamps,
         target_pu=context.target_pu,
+        target_history_mask_columns=context.target_history_mask_columns,
         past_covariate_columns=context.past_covariate_columns,
         train_windows=train_windows,
         history_steps=HISTORY_STEPS,
