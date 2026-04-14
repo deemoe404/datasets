@@ -3,14 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import ceil, sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import polars as pl
 
 from .api import build_gold_base
+from .datasets import get_builder
+from .feature_protocols import feature_protocol_task_blocked_reason, list_feature_protocol_ids
+from .models import TaskBundlePaths, TaskSpec
 from .paths import dataset_cache_paths
 from .registry import get_dataset_spec
+from .utils import read_json
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -18,6 +22,7 @@ if TYPE_CHECKING:
 
 
 _POWER_COLUMNS = ["dataset", "turbine_id", "timestamp", "target_kw", "is_observed", "quality_flags"]
+_TASK_CONTEXT_REQUIRED_COLUMNS = ["dataset", "timestamp", "quality_flags", "feature_quality_flags"]
 _SITE_COLUMNS = [
     "dataset",
     "turbine_id",
@@ -31,6 +36,8 @@ _SITE_COLUMNS = [
     "rated_power_kw",
 ]
 _EARTH_RADIUS_M = 6_371_000.0
+_DEFAULT_TASK_SPEC = TaskSpec.next_6h_from_24h()
+_IGNORED_NOTEBOOK_FEATURE_QUALITY_FLAGS = frozenset({"missing_past_covariates"})
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,70 @@ class SiteLayout:
         }
 
 
+@dataclass(frozen=True)
+class ProtocolNotebookMetadata:
+    dataset_id: str
+    task_id: str
+    feature_protocol_id: str
+    display_name: str
+    summary: str
+    past_covariates: tuple[str, ...]
+    derived_source_columns: tuple[str, ...]
+    dataset_specific_notes: tuple[str, ...]
+
+    def to_summary(self) -> dict[str, object]:
+        return {
+            "dataset_id": self.dataset_id,
+            "task_id": self.task_id,
+            "feature_protocol_id": self.feature_protocol_id,
+            "display_name": self.display_name,
+            "summary": self.summary,
+            "past_covariates": list(self.past_covariates),
+            "derived_source_columns": list(self.derived_source_columns),
+            "dataset_specific_notes": list(self.dataset_specific_notes),
+        }
+
+
+@dataclass(frozen=True)
+class FarmStatusTile:
+    dataset_id: str
+    task_id: str
+    feature_protocol_id: str
+    start_timestamp: object
+    end_timestamp: object
+    total_points: int
+    clean_points: int
+    target_issue_points: int
+    feature_issue_points: int
+    any_issue_points: int
+    padding_points: int
+    tile_rows: int
+    tile_cols: int
+    status_grid: np.ndarray
+    target_issue_mask: np.ndarray
+    feature_issue_mask: np.ndarray
+    issue_mask: np.ndarray
+    padding_mask: np.ndarray
+
+    def to_summary(self) -> dict[str, object]:
+        return {
+            "dataset_id": self.dataset_id,
+            "task_id": self.task_id,
+            "feature_protocol_id": self.feature_protocol_id,
+            "start_timestamp": self.start_timestamp,
+            "end_timestamp": self.end_timestamp,
+            "total_points": self.total_points,
+            "clean_points": self.clean_points,
+            "target_issue_points": self.target_issue_points,
+            "feature_issue_points": self.feature_issue_points,
+            "any_issue_points": self.any_issue_points,
+            "any_issue_share": self.any_issue_points / self.total_points if self.total_points else 0.0,
+            "padding_points": self.padding_points,
+            "tile_rows": self.tile_rows,
+            "tile_cols": self.tile_cols,
+        }
+
+
 def resolve_turbine_selector(dataset_id: str, selector: int | str) -> str:
     turbine_ids = get_dataset_spec(dataset_id).turbine_ids
     if isinstance(selector, str):
@@ -156,6 +227,240 @@ def load_turbine_static_for_visualization(
     if frame.is_empty():
         raise ValueError(f"Turbine static frame for dataset {dataset_id!r} is empty.")
     return frame.select(_SITE_COLUMNS).sort("turbine_id")
+
+
+def list_supported_feature_protocol_ids_for_dataset(dataset_id: str) -> tuple[str, ...]:
+    # Validate the dataset id up front so callers get a stable error message.
+    get_dataset_spec(dataset_id)
+    return tuple(
+        feature_protocol_id
+        for feature_protocol_id in list_feature_protocol_ids()
+        if feature_protocol_task_blocked_reason(
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        is None
+    )
+
+
+def list_unsupported_feature_protocol_ids_for_dataset(dataset_id: str) -> tuple[str, ...]:
+    get_dataset_spec(dataset_id)
+    return tuple(
+        feature_protocol_id
+        for feature_protocol_id in list_feature_protocol_ids()
+        if feature_protocol_task_blocked_reason(
+            dataset_id=dataset_id,
+            feature_protocol_id=feature_protocol_id,
+        )
+        is not None
+    )
+
+
+def load_task_context_for_visualization(
+    dataset_id: str,
+    feature_protocol_id: str,
+    *,
+    task_spec: TaskSpec | None = None,
+    cache_root: str | Path = "cache",
+) -> dict[str, Any]:
+    task_paths = _ensure_task_bundle_paths(
+        dataset_id,
+        feature_protocol_id,
+        task_spec=task_spec,
+        cache_root=cache_root,
+    )
+    return read_json(task_paths.task_context_path)
+
+
+def load_protocol_notebook_metadata(
+    dataset_id: str,
+    feature_protocol_id: str,
+    *,
+    task_spec: TaskSpec | None = None,
+    cache_root: str | Path = "cache",
+) -> ProtocolNotebookMetadata:
+    task_context = load_task_context_for_visualization(
+        dataset_id,
+        feature_protocol_id,
+        task_spec=task_spec,
+        cache_root=cache_root,
+    )
+    protocol_context = _mapping_dict(task_context, "feature_protocol")
+    column_groups = _mapping_dict(task_context, "column_groups")
+    derived_source_columns: list[str] = []
+    for transform in _sequence_dicts(protocol_context.get("derived_angle_features")):
+        derived_source_columns.extend(_string_sequence(transform.get("source_columns")))
+    for transform in _sequence_dicts(protocol_context.get("derived_scalar_features")):
+        derived_source_columns.extend(_string_sequence(transform.get("source_columns")))
+    return ProtocolNotebookMetadata(
+        dataset_id=dataset_id,
+        task_id=str(_mapping_dict(task_context, "task")["task_id"]),
+        feature_protocol_id=feature_protocol_id,
+        display_name=str(protocol_context["display_name"]),
+        summary=str(protocol_context["summary"]),
+        past_covariates=_string_sequence(column_groups.get("past_covariates")),
+        derived_source_columns=tuple(dict.fromkeys(derived_source_columns)),
+        dataset_specific_notes=_string_sequence(protocol_context.get("dataset_specific_notes")),
+    )
+
+
+def load_farm_status_timestamp_summary(
+    dataset_id: str,
+    feature_protocol_id: str,
+    *,
+    task_spec: TaskSpec | None = None,
+    cache_root: str | Path = "cache",
+) -> pl.DataFrame:
+    task_paths = _ensure_task_bundle_paths(
+        dataset_id,
+        feature_protocol_id,
+        task_spec=task_spec,
+        cache_root=cache_root,
+    )
+    frame = (
+        pl.scan_parquet(task_paths.series_path)
+        .select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        .sort("timestamp")
+        .collect()
+    )
+    return build_farm_status_timestamp_summary(frame)
+
+
+def build_farm_status_timestamp_summary(dataset_frame: pl.DataFrame) -> pl.DataFrame:
+    missing_columns = [column for column in _TASK_CONTEXT_REQUIRED_COLUMNS if column not in dataset_frame.columns]
+    if missing_columns:
+        missing = ", ".join(missing_columns)
+        raise ValueError(f"Task series frame is missing required columns: {missing}.")
+    if dataset_frame.is_empty():
+        raise ValueError("Task series frame is empty.")
+
+    frame = (
+        dataset_frame.select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        .with_columns(
+            pl.col("quality_flags").fill_null("").alias("quality_flags"),
+            pl.col("feature_quality_flags")
+            .fill_null("")
+            .map_elements(_strip_notebook_ignored_feature_quality_flags, return_dtype=pl.String)
+            .alias("__visual_feature_quality_flags"),
+        )
+        .group_by(["dataset", "timestamp"])
+        .agg(
+            pl.len().alias("turbine_rows"),
+            (pl.col("quality_flags") != "").cast(pl.Int32).sum().alias("target_issue_turbines"),
+            (pl.col("__visual_feature_quality_flags") != "").cast(pl.Int32).sum().alias("feature_issue_turbines"),
+        )
+        .with_columns(
+            (pl.col("target_issue_turbines") > 0).alias("has_target_issue"),
+            (pl.col("feature_issue_turbines") > 0).alias("has_feature_issue"),
+        )
+        .with_columns(
+            (pl.col("has_target_issue") | pl.col("has_feature_issue")).alias("has_any_issue"),
+        )
+        .sort(["dataset", "timestamp"])
+    )
+    return frame
+
+
+def load_farm_status_tile(
+    dataset_id: str,
+    feature_protocol_id: str,
+    *,
+    task_spec: TaskSpec | None = None,
+    cache_root: str | Path = "cache",
+) -> FarmStatusTile:
+    task_paths = _ensure_task_bundle_paths(
+        dataset_id,
+        feature_protocol_id,
+        task_spec=task_spec,
+        cache_root=cache_root,
+    )
+    task_context = read_json(task_paths.task_context_path)
+    series_frame = (
+        pl.scan_parquet(task_paths.series_path)
+        .select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        .sort("timestamp")
+        .collect()
+    )
+    timestamp_summary = build_farm_status_timestamp_summary(series_frame)
+    return build_farm_status_tile(
+        timestamp_summary,
+        task_id=str(_mapping_dict(task_context, "task")["task_id"]),
+        feature_protocol_id=feature_protocol_id,
+    )
+
+
+def build_farm_status_tile(
+    timestamp_summary: pl.DataFrame,
+    *,
+    task_id: str,
+    feature_protocol_id: str,
+) -> FarmStatusTile:
+    required_columns = [
+        "dataset",
+        "timestamp",
+        "has_target_issue",
+        "has_feature_issue",
+        "has_any_issue",
+    ]
+    missing_columns = [column for column in required_columns if column not in timestamp_summary.columns]
+    if missing_columns:
+        missing = ", ".join(missing_columns)
+        raise ValueError(f"Farm status summary is missing required columns: {missing}.")
+    if timestamp_summary.is_empty():
+        raise ValueError("Farm status summary is empty.")
+
+    frame = timestamp_summary.sort("timestamp")
+    dataset_id = frame["dataset"][0]
+    total_points = frame.height
+    tile_cols = max(1, ceil(sqrt(total_points)))
+    tile_rows = ceil(total_points / tile_cols)
+    padding_points = tile_rows * tile_cols - total_points
+
+    status_grid = np.full((tile_rows, tile_cols), np.nan, dtype=float)
+    target_issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
+    feature_issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
+    issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
+    padding_mask = np.ones((tile_rows, tile_cols), dtype=bool)
+
+    target_issues = frame["has_target_issue"].to_list()
+    feature_issues = frame["has_feature_issue"].to_list()
+    any_issues = frame["has_any_issue"].to_list()
+
+    for index, (has_target_issue, has_feature_issue, has_any_issue) in enumerate(
+        zip(target_issues, feature_issues, any_issues, strict=True)
+    ):
+        row = index // tile_cols
+        column = index % tile_cols
+        padding_mask[row, column] = False
+        target_issue_mask[row, column] = bool(has_target_issue)
+        feature_issue_mask[row, column] = bool(has_feature_issue)
+        issue_mask[row, column] = bool(has_any_issue)
+        status_grid[row, column] = 0.0 if has_any_issue else 1.0
+
+    any_issue_points = int(np.count_nonzero(issue_mask))
+    target_issue_points = int(np.count_nonzero(target_issue_mask))
+    feature_issue_points = int(np.count_nonzero(feature_issue_mask))
+
+    return FarmStatusTile(
+        dataset_id=dataset_id,
+        task_id=task_id,
+        feature_protocol_id=feature_protocol_id,
+        start_timestamp=frame["timestamp"][0],
+        end_timestamp=frame["timestamp"][-1],
+        total_points=total_points,
+        clean_points=total_points - any_issue_points,
+        target_issue_points=target_issue_points,
+        feature_issue_points=feature_issue_points,
+        any_issue_points=any_issue_points,
+        padding_points=padding_points,
+        tile_rows=tile_rows,
+        tile_cols=tile_cols,
+        status_grid=status_grid,
+        target_issue_mask=target_issue_mask,
+        feature_issue_mask=feature_issue_mask,
+        issue_mask=issue_mask,
+        padding_mask=padding_mask,
+    )
 
 
 def build_power_tile(dataset_frame: pl.DataFrame) -> PowerTile:
@@ -377,6 +682,64 @@ def plot_power_tile(
     return figure, ax
 
 
+def plot_farm_status_tile(
+    tile: FarmStatusTile,
+    *,
+    ax: Axes | None = None,
+    clean_color: str = "#2ca25f",
+    issue_color: str = "#d73027",
+    padding_color: str = "#ffffff",
+) -> tuple[Figure, Axes]:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    figure: Figure
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
+    else:
+        figure = ax.figure
+
+    ax.set_facecolor(padding_color)
+    image = np.ma.masked_invalid(tile.status_grid)
+    cmap = ListedColormap([issue_color, clean_color])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+    ax.imshow(
+        image,
+        cmap=cmap,
+        norm=norm,
+        interpolation="nearest",
+        aspect="equal",
+    )
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(
+        "\n".join(
+            [
+                f"{tile.dataset_id} | {tile.feature_protocol_id}",
+                (
+                    f"{tile.start_timestamp:%Y-%m-%d %H:%M} -> {tile.end_timestamp:%Y-%m-%d %H:%M} | "
+                    f"steps={tile.total_points:,} | red={tile.any_issue_points:,} | "
+                    f"target={tile.target_issue_points:,} | feature={tile.feature_issue_points:,}"
+                ),
+            ]
+        )
+    )
+    ax.legend(
+        handles=[
+            Patch(facecolor=clean_color, edgecolor="none", label="clean"),
+            Patch(facecolor=issue_color, edgecolor="none", label="issue"),
+            Patch(facecolor=padding_color, edgecolor="#d9d9d9", label="padding"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.04),
+        frameon=False,
+        ncol=3,
+    )
+    return figure, ax
+
+
 def plot_site_layout(
     layout: SiteLayout,
     *,
@@ -552,3 +915,74 @@ def _resolve_layout_selector(layout: SiteLayout, selector: int | str) -> str:
     if selector < 0 or selector >= layout.turbine_count:
         raise ValueError(f"Turbine index {selector} is out of range for layout dataset {layout.dataset_id!r}.")
     return layout.turbine_ids[selector]
+
+
+def _ensure_task_bundle_paths(
+    dataset_id: str,
+    feature_protocol_id: str,
+    *,
+    task_spec: TaskSpec | None,
+    cache_root: str | Path,
+) -> TaskBundlePaths:
+    resolved_task_spec = task_spec or _DEFAULT_TASK_SPEC
+    spec = get_dataset_spec(dataset_id)
+    builder = get_builder(spec, Path(cache_root))
+    builder.ensure_task_cache_fresh(
+        resolved_task_spec,
+        feature_protocol_id=feature_protocol_id,
+    )
+    return builder.task_bundle_paths(
+        resolved_task_spec,
+        feature_protocol_id=feature_protocol_id,
+    )
+
+
+def _strip_notebook_ignored_feature_quality_flags(value: str | None) -> str:
+    if not value:
+        return ""
+    kept: list[str] = []
+    seen: set[str] = set()
+    for token in str(value).split("|"):
+        normalized = token.strip()
+        if not normalized or normalized in _IGNORED_NOTEBOOK_FEATURE_QUALITY_FLAGS or normalized in seen:
+            continue
+        kept.append(normalized)
+        seen.add(normalized)
+    return "|".join(kept)
+
+
+def _mapping_dict(value: object, key: str | None = None) -> dict[str, Any]:
+    candidate = value
+    if key is not None:
+        if not isinstance(value, dict) or key not in value:
+            raise ValueError(f"Expected mapping with key {key!r}.")
+        candidate = value[key]
+    if not isinstance(candidate, dict):
+        raise ValueError("Expected mapping value.")
+    return candidate
+
+
+def _sequence_dicts(value: object) -> tuple[dict[str, Any], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Expected a sequence of mapping values.")
+    items: list[dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError("Expected mapping value inside sequence.")
+        items.append(entry)
+    return tuple(items)
+
+
+def _string_sequence(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Expected a sequence of strings.")
+    items: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError("Expected a string value inside sequence.")
+        items.append(entry)
+    return tuple(items)

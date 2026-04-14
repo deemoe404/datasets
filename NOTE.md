@@ -33,6 +33,12 @@ source_data_root = "/path/to/Wind Power Forecasting"
 ./scripts/rebuild_cache.sh hill_of_towie
 ```
 
+可视化 notebook 重新生成：
+
+```shell
+./.conda/bin/python ./scripts/generate_visualization_notebooks.py
+```
+
 ## 实验运行
 
 当前 active tree 中只保留 `agcrn` family：
