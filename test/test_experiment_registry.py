@@ -22,12 +22,12 @@ def _load_module():
     return module
 
 
-def test_registry_snapshot_contains_only_active_family() -> None:
+def test_registry_snapshot_contains_active_families() -> None:
     module = _load_module()
 
     snapshot = module.load_registry_snapshot()
 
-    assert set(snapshot.families) == {"agcrn_official_aligned"}
+    assert set(snapshot.families) == {"agcrn_official_aligned", "agcrn_masked"}
 
 
 def test_registry_family_bindings_capture_current_active_contract() -> None:
@@ -35,6 +35,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
 
     snapshot = module.load_registry_snapshot()
     agcrn = snapshot.families["agcrn_official_aligned"]
+    agcrn_masked = snapshot.families["agcrn_masked"]
 
     assert agcrn.status == "pilot"
     assert agcrn.task_contract.granularity == "farm"
@@ -61,6 +62,13 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
         "official_aligned_power_wd_yaw_lrpm_hist_sincos_farm_sync": "power_wd_yaw_lrpm_hist_sincos",
         "official_aligned_power_ws_wd_hist_sincos_farm_sync": "power_ws_wd_hist_sincos",
     }
+    assert agcrn_masked.status == "pilot"
+    assert agcrn_masked.task_contract.granularity == "farm"
+    assert agcrn_masked.dataset_scope == ("kelmarsh", "penmanshiel")
+    assert agcrn_masked.supported_feature_protocols == ("power_wd_yaw_pmean_hist_sincos_masked",)
+    assert agcrn_masked.implementation_bindings == {
+        "masked_power_wd_yaw_pmean_hist_sincos_farm_sync": "power_wd_yaw_pmean_hist_sincos_masked",
+    }
 
 
 def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
@@ -69,67 +77,13 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     snapshot = module.load_registry_snapshot()
     rows = module.build_dataset_family_feature_matrix(snapshot)
 
-    assert len(rows) == 18
-    assert [row.dataset_id for row in rows] == [
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "kelmarsh",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-        "penmanshiel",
-    ]
-    assert [row.family_id for row in rows] == [
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-        "agcrn_official_aligned",
-    ]
-    assert [row.feature_protocol_id for row in rows] == [
-        "power_only",
-        "power_ws_hist",
-        "power_atemp_hist",
-        "power_itemp_hist",
-        "power_wd_hist_sincos",
-        "power_wd_yaw_hist_sincos",
-        "power_wd_yaw_pitchmean_hist_sincos",
-        "power_wd_yaw_lrpm_hist_sincos",
-        "power_ws_wd_hist_sincos",
-        "power_only",
-        "power_ws_hist",
-        "power_atemp_hist",
-        "power_itemp_hist",
-        "power_wd_hist_sincos",
-        "power_wd_yaw_hist_sincos",
-        "power_wd_yaw_pitchmean_hist_sincos",
-        "power_wd_yaw_lrpm_hist_sincos",
-        "power_ws_wd_hist_sincos",
-    ]
+    assert len(rows) == 20
+    assert rows[0].family_id == "agcrn_masked"
+    assert rows[0].feature_protocol_id == "power_wd_yaw_pmean_hist_sincos_masked"
+    assert rows[1].family_id == "agcrn_masked"
+    assert rows[1].dataset_id == "penmanshiel"
+    assert sum(row.family_id == "agcrn_official_aligned" for row in rows) == 18
+    assert sum(row.family_id == "agcrn_masked" for row in rows) == 2
     assert all(row.family_status == "pilot" for row in rows)
 
 
@@ -141,6 +95,7 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     rendered = module.render_matrix_markdown(rows)
 
     assert "agcrn_official_aligned" in rendered
+    assert "agcrn_masked" in rendered
     assert "official_aligned_power_only_farm_sync" in rendered
     assert "official_aligned_power_ws_hist_farm_sync" in rendered
     assert "official_aligned_power_atemp_hist_farm_sync" in rendered
@@ -157,5 +112,7 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "power_wd_hist_sincos" in rendered
     assert "power_wd_yaw_hist_sincos" in rendered
     assert "power_wd_yaw_pitchmean_hist_sincos" in rendered
+    assert "masked_power_wd_yaw_pmean_hist_sincos_farm_sync" in rendered
+    assert "power_wd_yaw_pmean_hist_sincos_masked" in rendered
     assert "power_wd_yaw_lrpm_hist_sincos" in rendered
     assert "power_ws_wd_hist_sincos" in rendered

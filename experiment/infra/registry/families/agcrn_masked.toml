@@ -1,0 +1,38 @@
+schema_version = 1
+family_id = "agcrn_masked"
+display_name = "AGCRN Masked"
+status = "pilot"
+summary = "Masked-output AGCRN smoke-test family on the kelmarsh and penmanshiel farm-synchronous masked yaw-aware wind-direction and pitch-mean task."
+model_family = "agcrn"
+training_mode = "trainable"
+implementation_root = "experiment/families/agcrn_masked"
+readme_path = "experiment/families/agcrn_masked/README.md"
+runner_entrypoint = "experiment/families/agcrn_masked/run_agcrn_masked.py"
+default_output_path = "experiment/artifacts/published/agcrn_masked/latest.csv"
+default_output_schema_version = "agcrn_masked.long_metrics.v1"
+dataset_scope = ["kelmarsh", "penmanshiel"]
+supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
+supported_result_splits = ["val", "test"]
+supported_feature_protocols = ["power_wd_yaw_pmean_hist_sincos_masked"]
+implementation_label_kind = "model_variant"
+implementation_labels = [
+  "masked_power_wd_yaw_pmean_hist_sincos_farm_sync",
+]
+model_variants = [
+  "masked_power_wd_yaw_pmean_hist_sincos_farm_sync",
+]
+notes = [
+  "This family exists to smoke-test masked task bundles without modifying the dataset generation layer.",
+  "It currently supports kelmarsh and penmanshiel only, because the masked protocol itself is not configured for hill_of_towie or sdwpf_kddcup.",
+]
+
+[task_contract]
+task_id = "next_6h_from_24h"
+history_duration = "24h"
+forecast_duration = "6h"
+window_protocol = "dense_sliding"
+split_protocol = "raw_chrono_70_10_20_strict_closed"
+granularity = "farm"
+
+[implementation_bindings]
+masked_power_wd_yaw_pmean_hist_sincos_farm_sync = "power_wd_yaw_pmean_hist_sincos_masked"

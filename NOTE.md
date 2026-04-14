@@ -41,12 +41,18 @@ source_data_root = "/path/to/Wind Power Forecasting"
 
 ## 实验运行
 
-当前 active tree 中只保留 `agcrn` family：
+当前 active tree 中保留两个 AGCRN family：
 
 ```shell
 cd experiment/families/agcrn
 ./create_env.sh
 ./.conda/bin/python run_agcrn.py
+```
+
+```shell
+cd experiment/families/agcrn_masked
+./create_env.sh
+./.conda/bin/python run_agcrn_masked.py
 ```
 
 正式运行默认会把结果写到 `experiment/artifacts/published/<family_id>/latest.csv`，并在

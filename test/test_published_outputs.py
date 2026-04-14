@@ -38,12 +38,24 @@ def test_default_family_output_path_uses_published_layout() -> None:
         / "agcrn_official_aligned"
         / "latest.csv"
     )
+    assert module.default_family_output_path(
+        repo_root=Path("/tmp/datasets"),
+        family_id="agcrn_masked",
+    ) == (
+        Path("/tmp/datasets").resolve()
+        / "experiment"
+        / "artifacts"
+        / "published"
+        / "agcrn_masked"
+        / "latest.csv"
+    )
 
 
 def test_family_id_for_experiment_name_resolves_active_family() -> None:
     module = _load_module()
 
     assert module.family_id_for_experiment_name("agcrn") == "agcrn_official_aligned"
+    assert module.family_id_for_experiment_name("agcrn_masked") == "agcrn_masked"
 
 
 def test_family_id_for_experiment_name_rejects_unknown_values() -> None:
