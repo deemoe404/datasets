@@ -20,7 +20,7 @@ from ..feature_protocols import (
     DEFAULT_FEATURE_PROTOCOL_ID,
     build_known_future_frame,
     feature_protocol_task_blocked_reason,
-    materialize_task_series_frame,
+    materialize_task_series,
     protocol_context_dict,
     select_task_series_columns,
 )
@@ -261,10 +261,11 @@ class BaseDatasetBuilder:
             .sort(["turbine_id", "timestamp"])
             .collect()
         )
-        series_frame = materialize_task_series_frame(source_frame, selection=selection)
-        if selection.past_covariate_columns:
+        materialized = materialize_task_series(source_frame, selection=selection)
+        series_frame = materialized.series_frame
+        if selection.past_covariate_value_columns:
             missing_past_covariate_expr = pl.any_horizontal(
-                [pl.col(column).is_null() for column in selection.past_covariate_columns]
+                [pl.col(column).is_null() for column in selection.past_covariate_value_columns]
             )
             series_frame = (
                 series_frame
@@ -309,7 +310,14 @@ class BaseDatasetBuilder:
             selection,
             static_columns=tuple(task_static.columns),
         )
-        self._finalize_task_report(task_paths, resolved, feature_protocol_id, selection)
+        self._finalize_task_report(
+            task_paths,
+            resolved,
+            feature_protocol_id,
+            selection,
+            mask_hit_counts_by_column=materialized.mask_hit_counts_by_column,
+            null_cause_counts_by_output_column=materialized.null_cause_counts_by_output_column,
+        )
         self._write_task_build_meta(task=resolved, feature_protocol_id=feature_protocol_id)
         return task_paths.task_dir
 
@@ -453,8 +461,20 @@ class BaseDatasetBuilder:
         task: ResolvedTaskSpec,
         feature_protocol_id: str,
         selection,
+        *,
+        mask_hit_counts_by_column: dict[str, int],
+        null_cause_counts_by_output_column: dict[str, dict[str, int]],
     ) -> Path:
         payload = read_json(task_paths.task_report_path) if task_paths.task_report_path.exists() else {}
+        mask_diagnostics: dict[str, Any] = {
+            "mask_hit_counts_by_column": dict(mask_hit_counts_by_column),
+        }
+        pitch_mean_counts = null_cause_counts_by_output_column.get("pitch_mean")
+        if pitch_mean_counts is not None:
+            mask_diagnostics["pitch_mean_null_cause_counts"] = {
+                "raw_pitch_rule_rows": int(pitch_mean_counts.get("raw_rule_rows", 0)),
+                "raw_pitch_missing_rows": int(pitch_mean_counts.get("raw_missing_rows", 0)),
+            }
         payload.update(
             {
                 "schema_version": "task_report.v1",
@@ -463,9 +483,13 @@ class BaseDatasetBuilder:
                 "feature_protocol_id": feature_protocol_id,
                 "granularity": task.granularity,
                 "series_columns": list(selection.all_columns),
+                "target_history_mask_columns": list(selection.target_history_mask_columns),
                 "past_covariate_columns": list(selection.past_covariate_columns),
+                "past_covariate_value_columns": list(selection.past_covariate_value_columns),
+                "past_covariate_mask_columns": list(selection.past_covariate_mask_columns),
                 "target_derived_columns": list(selection.target_derived_columns),
                 "known_future_columns": list(selection.known_future_columns),
+                "mask_diagnostics": mask_diagnostics,
             }
         )
         return write_json(task_paths.task_report_path, payload)

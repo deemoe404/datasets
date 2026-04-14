@@ -169,6 +169,7 @@ The active protocol IDs today are:
 - `power_wd_hist_sincos`
 - `power_wd_yaw_hist_sincos`
 - `power_wd_yaw_pitchmean_hist_sincos`
+- `power_wd_yaw_pmean_hist_sincos_masked`
 - `power_wd_yaw_lrpm_hist_sincos`
 - `power_ws_wd_hist_sincos`
 
@@ -181,6 +182,7 @@ Protocol semantics:
 - `power_wd_hist_sincos`: target history plus task-derived wind-direction `sin/cos` covariates
 - `power_wd_yaw_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates
 - `power_wd_yaw_pitchmean_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates and task-derived `pitch_mean`
+- `power_wd_yaw_pmean_hist_sincos_masked`: `kelmarsh`/`penmanshiel` only; extends `power_wd_yaw_pitchmean_hist_sincos` with one `target_kw__mask` target-history channel plus five companion `__mask` input channels where `1` means the paired value channel is unavailable, `0` means available; raw blade-pitch inputs are masked before `pitch_mean` derivation when they fall outside `[-10, 95]`
 - `power_wd_yaw_lrpm_hist_sincos`: target history plus task-derived wind-direction and yaw-error `sin/cos` covariates and dataset-native low-speed rotor RPM history
 - `power_ws_wd_hist_sincos`: target history plus dataset-native wind speed and task-derived wind-direction `sin/cos` covariates
 
@@ -189,8 +191,11 @@ angle and absolute wind direction is reconstructed as `Ndir + Wdir` for the
 wind-direction protocols. The yaw-aware protocol additionally emits
 `yaw_error_sin/cos` directly from `Wdir`. The low-speed-rotor-RPM protocol is
 not supported for `sdwpf_kddcup` and raises an explicit dataset-support error.
-The bundle `task_context.json` records the exact per-dataset angle transforms
-used by each protocol.
+The mask-bearing `power_wd_yaw_pmean_hist_sincos_masked` protocol is
+supported only for `kelmarsh` and `penmanshiel`; it is blocked for
+`hill_of_towie` and `sdwpf_kddcup`. The bundle `task_context.json` records the
+exact per-dataset angle transforms, raw-source mask rules, mask polarity, and
+target-history/value/mask column groups used by each protocol.
 
 The default feature protocol is `power_only`.
 

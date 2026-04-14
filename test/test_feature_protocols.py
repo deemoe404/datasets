@@ -48,6 +48,7 @@ def test_active_feature_protocols_are_registered() -> None:
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
         "power_wd_yaw_pitchmean_hist_sincos",
+        "power_wd_yaw_pmean_hist_sincos_masked",
         "power_wd_yaw_lrpm_hist_sincos",
     )
 
@@ -93,6 +94,14 @@ def test_active_feature_protocols_are_registered() -> None:
     assert power_wd_yaw_pitchmean_hist.feature_protocol_id == "power_wd_yaw_pitchmean_hist_sincos"
     assert power_wd_yaw_pitchmean_hist.uses_target_history is True
     assert power_wd_yaw_pitchmean_hist.uses_past_covariates is True
+
+    power_wd_yaw_pmean_hist_masked = get_feature_protocol_spec("power_wd_yaw_pmean_hist_sincos_masked")
+    assert (
+        power_wd_yaw_pmean_hist_masked.feature_protocol_id
+        == "power_wd_yaw_pmean_hist_sincos_masked"
+    )
+    assert power_wd_yaw_pmean_hist_masked.uses_target_history is True
+    assert power_wd_yaw_pmean_hist_masked.uses_past_covariates is True
 
     power_wd_yaw_lrpm_hist = get_feature_protocol_spec("power_wd_yaw_lrpm_hist_sincos")
     assert power_wd_yaw_lrpm_hist.feature_protocol_id == "power_wd_yaw_lrpm_hist_sincos"
@@ -448,6 +457,95 @@ def test_power_wd_yaw_pitchmean_hist_sincos_selection_emits_cyclic_covariates_an
 
 
 @pytest.mark.parametrize(
+    ("dataset_id", "source_columns"),
+    [
+        (
+            "kelmarsh",
+            (
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ),
+        ),
+        (
+            "penmanshiel",
+            (
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ),
+        ),
+    ],
+)
+def test_power_wd_yaw_pmean_hist_sincos_masked_selection_emits_value_and_mask_covariates(
+    dataset_id: str,
+    source_columns: tuple[str, ...],
+) -> None:
+    selection = _selection(dataset_id, "power_wd_yaw_pmean_hist_sincos_masked", *source_columns)
+
+    assert selection.source_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        *source_columns,
+        "farm_turbines_expected",
+    )
+    assert selection.target_history_mask_columns == ("target_kw__mask",)
+    assert selection.past_covariate_value_columns == (
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    )
+    assert selection.past_covariate_mask_columns == (
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    )
+    assert selection.past_covariate_columns == (
+        *selection.past_covariate_value_columns,
+        *selection.past_covariate_mask_columns,
+    )
+    assert selection.all_columns == (
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        "target_kw__mask",
+        *selection.past_covariate_columns,
+        "farm_turbines_expected",
+    )
+    assert tuple((pair.value_column, pair.mask_column) for pair in selection.target_history_mask_pairs) == (
+        ("target_kw", "target_kw__mask"),
+    )
+    assert tuple((pair.value_column, pair.mask_column) for pair in selection.companion_mask_pairs) == (
+        ("wind_direction_sin", "wind_direction_sin__mask"),
+        ("wind_direction_cos", "wind_direction_cos__mask"),
+        ("yaw_error_sin", "yaw_error_sin__mask"),
+        ("yaw_error_cos", "yaw_error_cos__mask"),
+        ("pitch_mean", "pitch_mean__mask"),
+    )
+    assert len(selection.raw_source_mask_rules) == 1
+    assert selection.raw_source_mask_rules[0].source_columns == source_columns[-3:]
+    assert selection.raw_source_mask_rules[0].minimum_allowed == pytest.approx(-10.0)
+    assert selection.raw_source_mask_rules[0].maximum_allowed == pytest.approx(95.0)
+
+
+@pytest.mark.parametrize(
     ("dataset_id", "source_columns", "lrpm_column"),
     [
         ("kelmarsh", ("Wind direction (°)", "Nacelle position (°)"), "Rotor speed (RPM)"),
@@ -644,6 +742,60 @@ def test_materialize_task_series_frame_computes_pitch_mean_and_requires_all_thre
     assert frame["pitch_mean"].to_list() == [pytest.approx(2.0), None]
 
 
+def test_materialize_task_series_frame_with_masks_masks_out_of_range_pitch_and_emits_binary_masks() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "power_wd_yaw_pmean_hist_sincos_masked",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+    )
+
+    frame = materialize_task_series_frame(
+        pl.DataFrame(
+            {
+                "dataset": ["kelmarsh", "kelmarsh"],
+                "turbine_id": ["T01", "T01"],
+                "timestamp": [datetime(2024, 1, 1, 0, 0), datetime(2024, 1, 1, 0, 10)],
+                "target_kw": [None, 110.0],
+                "is_observed": [True, True],
+                "quality_flags": ["", ""],
+                "feature_quality_flags": ["", ""],
+                "farm_turbines_expected": [6, 6],
+                "Wind direction (°)": [180.0, None],
+                "Nacelle position (°)": [174.0, 174.0],
+                "Blade angle (pitch position) A (°)": [120.0, 1.0],
+                "Blade angle (pitch position) B (°)": [1.0, 2.0],
+                "Blade angle (pitch position) C (°)": [1.0, 3.0],
+            }
+        ),
+        selection=selection,
+    )
+
+    assert frame.columns == list(selection.all_columns)
+    assert frame["target_kw__mask"].to_list() == [1, 0]
+    assert frame["pitch_mean"].to_list() == [None, pytest.approx(2.0)]
+    assert frame["pitch_mean__mask"].to_list() == [1, 0]
+    assert frame["wind_direction_sin__mask"].to_list() == [0, 1]
+    assert frame["wind_direction_cos__mask"].to_list() == [0, 1]
+    assert frame["yaw_error_sin__mask"].to_list() == [0, 1]
+    assert frame["yaw_error_cos__mask"].to_list() == [0, 1]
+
+    for pair in (*selection.target_history_mask_pairs, *selection.companion_mask_pairs):
+        mask_column = frame.get_column(pair.mask_column)
+        expected_mask = (
+            frame
+            .select(pl.col(pair.value_column).is_null().cast(pl.Int8).alias(pair.mask_column))
+            .get_column(pair.mask_column)
+        )
+        assert mask_column.dtype == pl.Int8
+        assert mask_column.null_count() == 0
+        assert set(mask_column.unique().to_list()).issubset({0, 1})
+        assert mask_column.to_list() == expected_mask.to_list()
+
+
 def test_materialize_task_series_frame_appends_lrpm_after_derived_direction_and_yaw_error() -> None:
     selection = _selection(
         "kelmarsh",
@@ -792,6 +944,108 @@ def test_protocol_context_records_pitch_mean_scalar_feature() -> None:
     ]
 
 
+def test_protocol_context_records_mask_semantics_and_raw_source_mask_rules() -> None:
+    selection = _selection(
+        "kelmarsh",
+        "power_wd_yaw_pmean_hist_sincos_masked",
+        "Wind direction (°)",
+        "Nacelle position (°)",
+        "Blade angle (pitch position) A (°)",
+        "Blade angle (pitch position) B (°)",
+        "Blade angle (pitch position) C (°)",
+    )
+
+    context = protocol_context_dict(
+        dataset_id="kelmarsh",
+        task={"task_id": "next_6h_from_24h"},
+        feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+        turbine_ids=("WT01", "WT02"),
+        selection=selection,
+        static_columns=("dataset", "turbine_id", "turbine_index"),
+    )
+
+    feature_protocol = context["feature_protocol"]
+    column_groups = context["column_groups"]
+
+    assert feature_protocol["mask_polarity"] == "1_means_unavailable"
+    assert feature_protocol["mask_dtype"] == "int8"
+    assert feature_protocol["mask_valid_values"] == [0, 1]
+    assert feature_protocol["raw_source_mask_rules"] == [
+        {
+            "source_columns": [
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ],
+            "rule_kind": "outside_closed_interval",
+            "description": (
+                "Mask raw blade-pitch observations before pitch_mean derivation when the value falls outside "
+                "the closed interval [-10, 95] degrees."
+            ),
+            "affected_output_columns": ["pitch_mean"],
+            "minimum_allowed": -10.0,
+            "maximum_allowed": 95.0,
+        }
+    ]
+    assert feature_protocol["companion_mask_pairs"] == [
+        {"value_column": "wind_direction_sin", "mask_column": "wind_direction_sin__mask"},
+        {"value_column": "wind_direction_cos", "mask_column": "wind_direction_cos__mask"},
+        {"value_column": "yaw_error_sin", "mask_column": "yaw_error_sin__mask"},
+        {"value_column": "yaw_error_cos", "mask_column": "yaw_error_cos__mask"},
+        {"value_column": "pitch_mean", "mask_column": "pitch_mean__mask"},
+    ]
+    assert column_groups["series"] == [
+        "dataset",
+        "turbine_id",
+        "timestamp",
+        "target_kw",
+        "is_observed",
+        "quality_flags",
+        "feature_quality_flags",
+        "target_kw__mask",
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+        "farm_turbines_expected",
+    ]
+    assert column_groups["target_history_masks"] == [
+        "target_kw__mask",
+    ]
+    assert column_groups["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    ]
+    assert column_groups["past_covariate_values"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
+    assert column_groups["past_covariate_masks"] == [
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    ]
+
+
 @pytest.mark.parametrize(
     ("feature_protocol_id", "source_column"),
     [
@@ -874,6 +1128,42 @@ def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
         )
 
 
+@pytest.mark.parametrize("dataset_id", ["hill_of_towie", "sdwpf_kddcup"])
+def test_mask_protocol_is_only_supported_for_kelmarsh_and_penmanshiel(dataset_id: str) -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"feature_protocol_id 'power_wd_yaw_pmean_hist_sincos_masked' is not supported "
+            rf"for dataset '{dataset_id}'\."
+        ),
+    ):
+        select_task_series_columns(
+            dataset_id=dataset_id,
+            available_columns={
+                "dataset",
+                "turbine_id",
+                "timestamp",
+                "target_kw",
+                "is_observed",
+                "quality_flags",
+                "feature_quality_flags",
+                "farm_turbines_expected",
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+                "Ndir",
+                "Wdir",
+                "Pab1",
+                "Pab2",
+                "Pab3",
+            },
+            feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+            turbine_static_columns={"coord_x", "coord_y"},
+        )
+
+
 @pytest.mark.parametrize(
     "feature_protocol_id",
     [
@@ -884,6 +1174,7 @@ def test_sdwpf_rejects_power_wd_yaw_lrpm_hist_sincos_as_unsupported() -> None:
         "power_ws_wd_hist_sincos",
         "power_wd_yaw_hist_sincos",
         "power_wd_yaw_pitchmean_hist_sincos",
+        "power_wd_yaw_pmean_hist_sincos_masked",
         "power_wd_yaw_lrpm_hist_sincos",
     ],
 )

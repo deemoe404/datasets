@@ -162,6 +162,118 @@ def test_end_to_end_greenbyte_pipeline(tmp_path) -> None:
     )["feature_quality_flags"][0].endswith("missing_past_covariates")
 
 
+def test_end_to_end_greenbyte_pmean_masked_protocol_reports_mask_diagnostics(tmp_path) -> None:
+    spec = build_greenbyte_fixture(
+        tmp_path / "raw" / "kelmarsh_mask",
+        "Kelmarsh",
+        "Kelmarsh 1",
+        include_pitch_mask_cases=True,
+    )
+    builder = GreenbyteDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")
+    task = TaskSpec(
+        history_duration="30m",
+        forecast_duration="30m",
+        task_id="short_task",
+        granularity="farm",
+    )
+
+    builder.build_task_cache(task, feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked")
+    bundle = builder.load_task_bundle(task, feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked")
+
+    series = bundle.series
+    task_report = bundle.task_report
+
+    assert bundle.task_context["column_groups"]["target_history_masks"] == [
+        "target_kw__mask",
+    ]
+    assert bundle.task_context["column_groups"]["past_covariates"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    ]
+    assert bundle.task_context["column_groups"]["past_covariate_values"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
+    assert bundle.task_context["column_groups"]["past_covariate_masks"] == [
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    ]
+
+    mask_columns = bundle.task_context["column_groups"]["past_covariate_masks"]
+    for column in mask_columns:
+        assert column in series.columns
+        assert series.get_column(column).dtype == pl.Int8
+        assert series.get_column(column).null_count() == 0
+        assert set(series.get_column(column).unique().to_list()).issubset({0, 1})
+    assert "target_kw__mask" in series.columns
+    assert series.get_column("target_kw__mask").dtype == pl.Int8
+    assert series.get_column("target_kw__mask").null_count() == 0
+    assert set(series.get_column("target_kw__mask").unique().to_list()).issubset({0, 1})
+
+    rule_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:10:00")
+    missing_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:20:00")
+    clean_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:30:00")
+    target_mask_row = series.filter(pl.col("timestamp").dt.strftime("%Y-%m-%d %H:%M:%S") == "2024-01-01 00:40:00")
+
+    assert rule_row["pitch_mean"][0] is None
+    assert rule_row["pitch_mean__mask"][0] == 1
+    assert missing_row["pitch_mean"][0] is None
+    assert missing_row["pitch_mean__mask"][0] == 1
+    assert clean_row["pitch_mean"][0] == pytest.approx(1.0)
+    assert clean_row["pitch_mean__mask"][0] == 0
+    assert target_mask_row["target_kw"][0] is None
+    assert target_mask_row["target_kw__mask"][0] == 1
+    assert rule_row["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert missing_row["feature_quality_flags"][0].endswith("missing_past_covariates")
+    assert clean_row["feature_quality_flags"][0] == ""
+
+    assert task_report["target_history_mask_columns"] == [
+        "target_kw__mask",
+    ]
+    assert task_report["past_covariate_value_columns"] == [
+        "wind_direction_sin",
+        "wind_direction_cos",
+        "yaw_error_sin",
+        "yaw_error_cos",
+        "pitch_mean",
+    ]
+    assert task_report["past_covariate_mask_columns"] == [
+        "wind_direction_sin__mask",
+        "wind_direction_cos__mask",
+        "yaw_error_sin__mask",
+        "yaw_error_cos__mask",
+        "pitch_mean__mask",
+    ]
+    assert task_report["mask_diagnostics"] == {
+        "mask_hit_counts_by_column": {
+            "target_kw__mask": 1,
+            "wind_direction_sin__mask": 0,
+            "wind_direction_cos__mask": 0,
+            "yaw_error_sin__mask": 0,
+            "yaw_error_cos__mask": 0,
+            "pitch_mean__mask": 2,
+        },
+        "pitch_mean_null_cause_counts": {
+            "raw_pitch_rule_rows": 1,
+            "raw_pitch_missing_rows": 1,
+        },
+    }
+
+
 def test_end_to_end_hill_pipeline(tmp_path) -> None:
     spec = build_hill_fixture(tmp_path / "raw" / "hill")
     builder = HillOfTowieDatasetBuilder(spec=spec, cache_root=tmp_path / "cache")

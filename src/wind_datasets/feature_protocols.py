@@ -14,6 +14,10 @@ _WIND_DIRECTION_COS_COLUMN = "wind_direction_cos"
 _YAW_ERROR_SIN_COLUMN = "yaw_error_sin"
 _YAW_ERROR_COS_COLUMN = "yaw_error_cos"
 _PITCH_MEAN_COLUMN = "pitch_mean"
+_MASK_COLUMN_SUFFIX = "__mask"
+_MASK_POLARITY_UNAVAILABLE = "1_means_unavailable"
+_MASK_VALID_VALUES = (0, 1)
+_TARGET_HISTORY_MASK_COLUMN = "target_kw__mask"
 _YAW_ERROR_CONVENTION = "yaw_error_degrees = wind_direction_degrees - nacelle_or_yaw_position_degrees"
 _SDWPF_YAW_ERROR_NOTE = (
     "sdwpf_kddcup Wdir stores the documented relative yaw-error angle under the repository convention."
@@ -107,6 +111,7 @@ _NACELLE_OR_YAW_POSITION_COLUMN_BY_DATASET = {
 _SDWPF_YAW_ERROR_COLUMN = "Wdir"
 _UNSUPPORTED_DATASET_IDS_BY_PROTOCOL = {
     "power_wd_yaw_lrpm_hist_sincos": ("sdwpf_kddcup",),
+    "power_wd_yaw_pmean_hist_sincos_masked": ("hill_of_towie", "sdwpf_kddcup"),
 }
 
 
@@ -146,19 +151,48 @@ class ScalarTransformSpec:
 
 
 @dataclass(frozen=True)
+class RawSourceMaskRuleSpec:
+    source_columns: tuple[str, ...]
+    rule_kind: str
+    description: str
+    affected_output_columns: tuple[str, ...] = ()
+    minimum_allowed: float | None = None
+    maximum_allowed: float | None = None
+
+
+@dataclass(frozen=True)
+class CompanionMaskPair:
+    value_column: str
+    mask_column: str
+
+
+@dataclass(frozen=True)
 class TaskSeriesSelection:
     feature_protocol_id: str
     source_columns: tuple[str, ...]
     all_columns: tuple[str, ...]
+    target_history_mask_columns: tuple[str, ...]
     past_covariate_columns: tuple[str, ...]
+    past_covariate_value_columns: tuple[str, ...]
+    past_covariate_mask_columns: tuple[str, ...]
     known_future_columns: tuple[str, ...]
     static_columns: tuple[str, ...]
     target_derived_columns: tuple[str, ...]
     audit_columns: tuple[str, ...]
     derived_angle_transforms: tuple[AngleTransformSpec, ...] = ()
     derived_scalar_transforms: tuple[ScalarTransformSpec, ...] = ()
+    raw_source_mask_rules: tuple[RawSourceMaskRuleSpec, ...] = ()
+    target_history_mask_pairs: tuple[CompanionMaskPair, ...] = ()
+    companion_mask_pairs: tuple[CompanionMaskPair, ...] = ()
     angle_convention: str | None = None
     dataset_specific_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TaskSeriesMaterializationResult:
+    series_frame: pl.DataFrame
+    mask_hit_counts_by_column: dict[str, int]
+    null_cause_counts_by_output_column: dict[str, dict[str, int]]
 
 
 _POWER_ONLY_PROTOCOL = FeatureProtocolSpec(
@@ -274,6 +308,26 @@ _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     past_covariate_source="task_bundle.wind_direction_and_yaw_error_angles_plus_pitch_mean",
     past_covariate_stage="task_bundle.angle_sincos_plus_scalar_covariate",
 )
+_POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL = FeatureProtocolSpec(
+    feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+    display_name="Power + Wind Direction/Yaw Error/Pitch Mean History (Sin/Cos) Masked",
+    protocol_kind="past_covariate_combination",
+    summary=(
+        "Use target power history plus task-derived sine/cosine wind-direction and yaw-error covariates, "
+        "task-derived pitch-mean history, a target-history mask channel, and companion mask channels "
+        "where 1 marks an unavailable input."
+    ),
+    uses_target_history=True,
+    uses_static_covariates=False,
+    uses_known_future_covariates=False,
+    uses_past_covariates=True,
+    uses_target_derived_covariates=False,
+    aliases=("power_with_wd_yaw_pitchmean_history_sincos_masked",),
+    past_covariate_source=(
+        "task_bundle.wind_direction_and_yaw_error_angles_plus_pitch_mean_with_target_and_companion_masks"
+    ),
+    past_covariate_stage="task_bundle.angle_sincos_plus_scalar_covariate_with_target_and_companion_masks",
+)
 _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL = FeatureProtocolSpec(
     feature_protocol_id="power_wd_yaw_lrpm_hist_sincos",
     display_name="Power + Wind Direction/Yaw Error/LS RPM History (Sin/Cos)",
@@ -300,6 +354,7 @@ _FEATURE_PROTOCOLS = (
     _POWER_WS_WD_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_HIST_SINCOS_PROTOCOL,
     _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL,
+    _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL,
     _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL,
 )
 _FEATURE_PROTOCOLS_BY_ID = {
@@ -431,6 +486,10 @@ def _sum_angle_transform(
     )
 
 
+def _mask_column_name(value_column: str) -> str:
+    return f"{value_column}{_MASK_COLUMN_SUFFIX}"
+
+
 def _row_mean_scalar_transform(
     *,
     output_column: str,
@@ -461,11 +520,13 @@ def _angle_transforms_for_protocol(
         _POWER_WS_WD_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
     uses_yaw_error = feature_protocol_id in {
         _POWER_WD_YAW_HIST_SINCOS_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
         _POWER_WD_YAW_LRPM_HIST_SINCOS_PROTOCOL.feature_protocol_id,
     }
 
@@ -548,7 +609,10 @@ def _scalar_transforms_for_protocol(
     dataset_id: str,
     feature_protocol_id: str,
 ) -> tuple[ScalarTransformSpec, ...]:
-    if feature_protocol_id != _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id:
+    if feature_protocol_id not in {
+        _POWER_WD_YAW_PITCHMEAN_HIST_SINCOS_PROTOCOL.feature_protocol_id,
+        _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id,
+    }:
         return ()
     try:
         pitch_columns = _PITCH_COLUMNS_BY_DATASET[dataset_id]
@@ -562,6 +626,64 @@ def _scalar_transforms_for_protocol(
             source_columns=pitch_columns,
             description="Compute the arithmetic mean of the three blade-pitch angles when all three inputs are present.",
             missing_value_policy="all_sources_required",
+        ),
+    )
+
+
+def _raw_source_mask_rules_for_protocol(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+) -> tuple[RawSourceMaskRuleSpec, ...]:
+    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+        return ()
+    try:
+        pitch_columns = _PITCH_COLUMNS_BY_DATASET[dataset_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"feature_protocol_id {feature_protocol_id!r} is not configured for dataset {dataset_id!r}."
+        ) from exc
+    return (
+        RawSourceMaskRuleSpec(
+            source_columns=pitch_columns,
+            rule_kind="outside_closed_interval",
+            description=(
+                "Mask raw blade-pitch observations before pitch_mean derivation when the value falls outside "
+                "the closed interval [-10, 95] degrees."
+            ),
+            affected_output_columns=(_PITCH_MEAN_COLUMN,),
+            minimum_allowed=-10.0,
+            maximum_allowed=95.0,
+        ),
+    )
+
+
+def _companion_mask_pairs_for_protocol(
+    *,
+    feature_protocol_id: str,
+    past_covariate_value_columns: tuple[str, ...],
+) -> tuple[CompanionMaskPair, ...]:
+    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+        return ()
+    return tuple(
+        CompanionMaskPair(
+            value_column=value_column,
+            mask_column=_mask_column_name(value_column),
+        )
+        for value_column in past_covariate_value_columns
+    )
+
+
+def _target_history_mask_pairs_for_protocol(
+    *,
+    feature_protocol_id: str,
+) -> tuple[CompanionMaskPair, ...]:
+    if feature_protocol_id != _POWER_WD_YAW_PMEAN_HIST_SINCOS_MASKED_PROTOCOL.feature_protocol_id:
+        return ()
+    return (
+        CompanionMaskPair(
+            value_column="target_kw",
+            mask_column=_TARGET_HISTORY_MASK_COLUMN,
         ),
     )
 
@@ -671,12 +793,144 @@ def _angle_degrees_expr(transform: AngleTransformSpec) -> pl.Expr:
     raise ValueError(f"Unsupported angle transform kind {transform.transform_kind!r}.")
 
 
-def materialize_task_series_frame(
+def _rule_hit_expr_for_column(
+    *,
+    rule: RawSourceMaskRuleSpec,
+    source_column: str,
+) -> pl.Expr:
+    if rule.rule_kind != "outside_closed_interval":
+        raise ValueError(f"Unsupported raw source mask rule kind {rule.rule_kind!r}.")
+    source_expr = pl.col(source_column).cast(pl.Float64, strict=False)
+    invalid_expr: pl.Expr | None = None
+    if rule.minimum_allowed is not None:
+        invalid_expr = source_expr < pl.lit(rule.minimum_allowed)
+    if rule.maximum_allowed is not None:
+        upper_expr = source_expr > pl.lit(rule.maximum_allowed)
+        invalid_expr = upper_expr if invalid_expr is None else (invalid_expr | upper_expr)
+    if invalid_expr is None:
+        raise ValueError("Raw source mask rule must define at least one numeric bound.")
+    return pl.col(source_column).is_not_null() & invalid_expr
+
+
+def _combine_exprs_with_or(exprs: tuple[pl.Expr, ...]) -> pl.Expr:
+    combined = exprs[0]
+    for expr in exprs[1:]:
+        combined = combined | expr
+    return combined
+
+
+def _apply_protocol_scoped_raw_source_masks(
     source_frame: pl.DataFrame,
     *,
     selection: TaskSeriesSelection,
-) -> pl.DataFrame:
-    series_frame = source_frame
+) -> tuple[pl.DataFrame, dict[str, dict[str, int]]]:
+    if not selection.raw_source_mask_rules:
+        return source_frame, {}
+
+    schema = source_frame.schema
+    replacement_exprs: list[pl.Expr] = []
+    null_cause_counts_by_output_column: dict[str, dict[str, int]] = {}
+    combined_rule_exprs_by_column: dict[str, list[pl.Expr]] = {}
+
+    for rule in selection.raw_source_mask_rules:
+        column_rule_exprs = tuple(
+            _rule_hit_expr_for_column(rule=rule, source_column=source_column)
+            for source_column in rule.source_columns
+        )
+        rule_hit_expr = pl.any_horizontal(list(column_rule_exprs))
+        original_missing_expr = pl.any_horizontal([pl.col(source_column).is_null() for source_column in rule.source_columns])
+        diagnostics = source_frame.select(
+            rule_hit_expr.cast(pl.Int64).sum().alias("raw_rule_rows"),
+            ((~rule_hit_expr) & original_missing_expr).cast(pl.Int64).sum().alias("raw_missing_rows"),
+        ).row(0, named=True)
+        for output_column in rule.affected_output_columns:
+            if output_column in null_cause_counts_by_output_column:
+                raise ValueError(
+                    f"Multiple raw source mask rules attempted to publish diagnostics for output column {output_column!r}."
+                )
+            null_cause_counts_by_output_column[output_column] = {
+                "raw_rule_rows": int(diagnostics["raw_rule_rows"] or 0),
+                "raw_missing_rows": int(diagnostics["raw_missing_rows"] or 0),
+            }
+        for source_column, expr in zip(rule.source_columns, column_rule_exprs, strict=True):
+            combined_rule_exprs_by_column.setdefault(source_column, []).append(expr)
+
+    for source_column, exprs in combined_rule_exprs_by_column.items():
+        combined_expr = _combine_exprs_with_or(tuple(exprs)) if len(exprs) > 1 else exprs[0]
+        replacement_exprs.append(
+            pl.when(combined_expr)
+            .then(pl.lit(None, dtype=schema[source_column]))
+            .otherwise(pl.col(source_column))
+            .alias(source_column)
+        )
+
+    return source_frame.with_columns(*replacement_exprs), null_cause_counts_by_output_column
+
+
+def _validate_mask_columns(
+    series_frame: pl.DataFrame,
+    *,
+    mask_pairs: tuple[CompanionMaskPair, ...],
+) -> None:
+    valid_values = set(_MASK_VALID_VALUES)
+    for pair in mask_pairs:
+        mask_series = series_frame.get_column(pair.mask_column)
+        if mask_series.dtype != pl.Int8:
+            raise ValueError(
+                f"Mask column {pair.mask_column!r} must have dtype Int8, found {mask_series.dtype!r}."
+            )
+        if mask_series.null_count() != 0:
+            raise ValueError(f"Mask column {pair.mask_column!r} must not contain null values.")
+        unique_values = set(mask_series.unique().to_list())
+        if not unique_values.issubset(valid_values):
+            raise ValueError(
+                f"Mask column {pair.mask_column!r} must only contain {sorted(valid_values)!r}, found {sorted(unique_values)!r}."
+            )
+        mismatch_count = series_frame.select(
+            (pl.col(pair.mask_column) != pl.col(pair.value_column).is_null().cast(pl.Int8))
+            .cast(pl.Int64)
+            .sum()
+            .alias("mismatch_count")
+        )["mismatch_count"][0]
+        if int(mismatch_count or 0) != 0:
+            raise ValueError(
+                f"Mask column {pair.mask_column!r} must exactly match nullness of value column {pair.value_column!r}."
+            )
+
+
+def _append_mask_columns(
+    series_frame: pl.DataFrame,
+    *,
+    mask_pairs: tuple[CompanionMaskPair, ...],
+) -> tuple[pl.DataFrame, dict[str, int]]:
+    if not mask_pairs:
+        return series_frame, {}
+
+    with_masks = series_frame.with_columns(
+        *[
+            pl.col(pair.value_column).is_null().cast(pl.Int8).alias(pair.mask_column)
+            for pair in mask_pairs
+        ]
+    )
+    _validate_mask_columns(with_masks, mask_pairs=mask_pairs)
+    diagnostics_row = with_masks.select(
+        *[
+            pl.col(pair.mask_column).cast(pl.Int64).sum().alias(pair.mask_column)
+            for pair in mask_pairs
+        ]
+    ).row(0, named=True)
+    return with_masks, {column: int(count or 0) for column, count in diagnostics_row.items()}
+
+
+def materialize_task_series(
+    source_frame: pl.DataFrame,
+    *,
+    selection: TaskSeriesSelection,
+) -> TaskSeriesMaterializationResult:
+    series_frame, null_cause_counts_by_output_column = _apply_protocol_scoped_raw_source_masks(
+        source_frame,
+        selection=selection,
+    )
     derived_columns: list[pl.Expr] = []
     for transform in selection.derived_angle_transforms:
         angle_radians = _angle_degrees_expr(transform) * pl.lit(_PI / 180.0)
@@ -699,7 +953,33 @@ def materialize_task_series_frame(
         raise ValueError(f"Unsupported scalar transform kind {transform.transform_kind!r}.")
     if derived_columns:
         series_frame = series_frame.with_columns(*derived_columns)
-    return series_frame.select(list(selection.all_columns))
+    series_frame, target_history_mask_hit_counts = _append_mask_columns(
+        series_frame,
+        mask_pairs=selection.target_history_mask_pairs,
+    )
+    series_frame, past_covariate_mask_hit_counts = _append_mask_columns(
+        series_frame,
+        mask_pairs=selection.companion_mask_pairs,
+    )
+    return TaskSeriesMaterializationResult(
+        series_frame=series_frame.select(list(selection.all_columns)),
+        mask_hit_counts_by_column={
+            **target_history_mask_hit_counts,
+            **past_covariate_mask_hit_counts,
+        },
+        null_cause_counts_by_output_column=null_cause_counts_by_output_column,
+    )
+
+
+def materialize_task_series_frame(
+    source_frame: pl.DataFrame,
+    *,
+    selection: TaskSeriesSelection,
+) -> pl.DataFrame:
+    return materialize_task_series(
+        source_frame,
+        selection=selection,
+    ).series_frame
 
 
 def select_task_series_columns(
@@ -716,7 +996,7 @@ def select_task_series_columns(
     )
     (
         source_past_covariate_columns,
-        past_covariate_columns,
+        past_covariate_value_columns,
         derived_angle_transforms,
         derived_scalar_transforms,
         angle_convention,
@@ -726,19 +1006,47 @@ def select_task_series_columns(
         available_columns=available_columns,
         feature_protocol_id=feature_protocol_id,
     )
+    raw_source_mask_rules = _raw_source_mask_rules_for_protocol(
+        dataset_id=dataset_id,
+        feature_protocol_id=feature_protocol_id,
+    )
+    target_history_mask_pairs = _target_history_mask_pairs_for_protocol(
+        feature_protocol_id=feature_protocol_id,
+    )
+    target_history_mask_columns = tuple(pair.mask_column for pair in target_history_mask_pairs)
+    companion_mask_pairs = _companion_mask_pairs_for_protocol(
+        feature_protocol_id=feature_protocol_id,
+        past_covariate_value_columns=past_covariate_value_columns,
+    )
+    past_covariate_mask_columns = tuple(pair.mask_column for pair in companion_mask_pairs)
+    past_covariate_columns = tuple((*past_covariate_value_columns, *past_covariate_mask_columns))
     audit_columns = tuple(column for column in _SERIES_OPTIONAL_AUDIT_COLUMNS if column in available_columns)
     source_columns = tuple((*_SERIES_BASE_COLUMNS, *source_past_covariate_columns, *audit_columns))
     return TaskSeriesSelection(
         feature_protocol_id=feature_protocol_id,
         source_columns=source_columns,
-        all_columns=tuple((*_SERIES_BASE_COLUMNS, *past_covariate_columns, *audit_columns)),
+        all_columns=tuple(
+            (
+                *_SERIES_BASE_COLUMNS,
+                *target_history_mask_columns,
+                *past_covariate_value_columns,
+                *past_covariate_mask_columns,
+                *audit_columns,
+            )
+        ),
+        target_history_mask_columns=target_history_mask_columns,
         past_covariate_columns=past_covariate_columns,
+        past_covariate_value_columns=past_covariate_value_columns,
+        past_covariate_mask_columns=past_covariate_mask_columns,
         known_future_columns=("dataset", "timestamp"),
         static_columns=(),
         target_derived_columns=(),
         audit_columns=audit_columns,
         derived_angle_transforms=derived_angle_transforms,
         derived_scalar_transforms=derived_scalar_transforms,
+        raw_source_mask_rules=raw_source_mask_rules,
+        target_history_mask_pairs=target_history_mask_pairs,
+        companion_mask_pairs=companion_mask_pairs,
         angle_convention=angle_convention,
         dataset_specific_notes=dataset_specific_notes,
     )
@@ -794,6 +1102,24 @@ def _scalar_transform_context_dict(transform: ScalarTransformSpec) -> dict[str, 
     }
 
 
+def _raw_source_mask_rule_context_dict(rule: RawSourceMaskRuleSpec) -> dict[str, object]:
+    return {
+        "source_columns": list(rule.source_columns),
+        "rule_kind": rule.rule_kind,
+        "description": rule.description,
+        "affected_output_columns": list(rule.affected_output_columns),
+        "minimum_allowed": rule.minimum_allowed,
+        "maximum_allowed": rule.maximum_allowed,
+    }
+
+
+def _companion_mask_pair_context_dict(pair: CompanionMaskPair) -> dict[str, object]:
+    return {
+        "value_column": pair.value_column,
+        "mask_column": pair.mask_column,
+    }
+
+
 def protocol_context_dict(
     *,
     dataset_id: str,
@@ -804,6 +1130,7 @@ def protocol_context_dict(
     static_columns: tuple[str, ...],
 ) -> dict[str, object]:
     protocol = get_feature_protocol_spec(feature_protocol_id)
+    has_mask_columns = bool(selection.target_history_mask_pairs or selection.companion_mask_pairs)
     return {
         "schema_version": TASK_BUNDLE_SCHEMA_VERSION,
         "dataset_id": dataset_id,
@@ -831,13 +1158,27 @@ def protocol_context_dict(
                 _scalar_transform_context_dict(transform)
                 for transform in selection.derived_scalar_transforms
             ],
+            "mask_polarity": _MASK_POLARITY_UNAVAILABLE if has_mask_columns else None,
+            "mask_dtype": "int8" if has_mask_columns else None,
+            "mask_valid_values": list(_MASK_VALID_VALUES) if has_mask_columns else [],
+            "raw_source_mask_rules": [
+                _raw_source_mask_rule_context_dict(rule)
+                for rule in selection.raw_source_mask_rules
+            ],
+            "companion_mask_pairs": [
+                _companion_mask_pair_context_dict(pair)
+                for pair in selection.companion_mask_pairs
+            ],
         },
         "task": task,
         "turbine_ids": list(turbine_ids),
         "time_axis_semantics": "farm_synchronous_long_panel",
         "column_groups": {
             "series": list(selection.all_columns),
+            "target_history_masks": list(selection.target_history_mask_columns),
             "past_covariates": list(selection.past_covariate_columns),
+            "past_covariate_values": list(selection.past_covariate_value_columns),
+            "past_covariate_masks": list(selection.past_covariate_mask_columns),
             "target_derived_covariates": list(selection.target_derived_columns),
             "known_future": list(selection.known_future_columns),
             "static": list(static_columns),
@@ -851,14 +1192,18 @@ __all__ = [
     "DEFAULT_FEATURE_PROTOCOL_ID",
     "TASK_BUNDLE_SCHEMA_VERSION",
     "AngleTransformSpec",
+    "CompanionMaskPair",
     "FeatureProtocolSpec",
+    "RawSourceMaskRuleSpec",
     "ScalarTransformSpec",
     "TaskSeriesSelection",
+    "TaskSeriesMaterializationResult",
     "build_known_future_frame",
     "feature_protocol_task_blocked_reason",
     "get_feature_protocol_spec",
     "list_feature_protocol_ids",
     "list_feature_protocol_specs",
+    "materialize_task_series",
     "materialize_task_series_frame",
     "protocol_context_dict",
     "select_task_series_columns",

@@ -19,6 +19,8 @@ def build_greenbyte_fixture(
     dataset_name: str,
     turbine_name: str,
     file_end: str = "2025-01-01",
+    *,
+    include_pitch_mask_cases: bool = False,
 ) -> DatasetSpec:
     static_name = f"{dataset_name}_WT_static.csv"
     scada_dir = root / f"{dataset_name}_SCADA_2024_0001"
@@ -33,14 +35,7 @@ def build_greenbyte_fixture(
         {dataset_name},{turbine_name},{turbine_name},ID-1,Senvion,MM82,2050,78.5,92,52.4,-0.94,140,UK,2016-01-01
         """,
     )
-    _write_text(
-        scada_dir / f"{turbine_file_stem}.csv",
-        f"""
-        # This file was exported by Greenbyte.
-        #
-        # Turbine: {turbine_name}
-        # Time zone: UTC
-        # Date and time,Power (kW),Wind speed (m/s),Wind direction (°),Nacelle position (°),Generator RPM (RPM),Rotor speed (RPM),Ambient temperature (converter) (°C),Nacelle ambient temperature (°C),Nacelle temperature (°C),Grid frequency (Hz),Blade angle (pitch position) A (°),Blade angle (pitch position) B (°),Blade angle (pitch position) C (°)
+    scada_rows = """
         2024-01-01 00:00:00,100,8.0,180,174,1500,12,5,4.0,10,50,1,1,
         2024-01-01 00:00:00,,8.2,,,,,,,,,,,0.9
         2024-01-01 00:10:00,110,8.4,181,175,1510,12.1,5.1,4.1,10.2,50,1,1,1
@@ -50,6 +45,27 @@ def build_greenbyte_fixture(
         2024-01-01 01:00:00,150,9.8,185,179,1550,12.5,5.5,4.5,11.0,50,1,1,1
         2024-01-01 01:10:00,160,10.0,186,180,1560,12.6,5.6,4.6,11.2,50,1,1,1
         2024-01-01 01:20:00,170,10.2,187,181,1570,12.7,5.7,4.7,11.4,50,1,1,1
+    """
+    if include_pitch_mask_cases:
+        scada_rows = """
+        2024-01-01 00:00:00,100,8.0,180,174,1500,12,5,4.0,10,50,1,1,1
+        2024-01-01 00:10:00,110,8.4,181,175,1510,12.1,5.1,4.1,10.2,50,120,1,1
+        2024-01-01 00:20:00,120,8.8,182,176,1520,12.2,5.2,4.2,10.4,50,1,,1
+        2024-01-01 00:30:00,130,9.1,183,177,1530,12.3,5.3,4.3,10.6,50,1,1,1
+        2024-01-01 00:40:00,NaN,9.5,184,178,1540,12.4,5.4,4.4,10.8,50,1,1,1
+        2024-01-01 00:50:00,150,9.8,185,179,1550,12.5,5.5,4.5,11.0,50,1,1,1
+        2024-01-01 01:00:00,160,10.0,186,180,1560,12.6,5.6,4.6,11.2,50,1,1,1
+        2024-01-01 01:10:00,170,10.2,187,181,1570,12.7,5.7,4.7,11.4,50,1,1,1
+        """
+    _write_text(
+        scada_dir / f"{turbine_file_stem}.csv",
+        f"""
+        # This file was exported by Greenbyte.
+        #
+        # Turbine: {turbine_name}
+        # Time zone: UTC
+        # Date and time,Power (kW),Wind speed (m/s),Wind direction (°),Nacelle position (°),Generator RPM (RPM),Rotor speed (RPM),Ambient temperature (converter) (°C),Nacelle ambient temperature (°C),Nacelle temperature (°C),Grid frequency (Hz),Blade angle (pitch position) A (°),Blade angle (pitch position) B (°),Blade angle (pitch position) C (°)
+        {scada_rows}
         """,
     )
     _write_text(
