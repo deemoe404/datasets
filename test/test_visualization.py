@@ -212,6 +212,7 @@ def test_list_supported_feature_protocol_ids_for_dataset_skips_unsupported_sdwpf
     supported = list_supported_feature_protocol_ids_for_dataset("sdwpf_kddcup")
 
     assert "power_wd_yaw_lrpm_hist_sincos" not in supported
+    assert "power_wd_yaw_pmean_hist_sincos_masked" not in supported
     assert supported == (
         "power_only",
         "power_ws_hist",
@@ -222,6 +223,12 @@ def test_list_supported_feature_protocol_ids_for_dataset_skips_unsupported_sdwpf
         "power_wd_yaw_hist_sincos",
         "power_wd_yaw_pitchmean_hist_sincos",
     )
+
+
+def test_list_supported_feature_protocol_ids_for_dataset_skips_unsupported_hill_mask_protocol() -> None:
+    supported = list_supported_feature_protocol_ids_for_dataset("hill_of_towie")
+
+    assert "power_wd_yaw_pmean_hist_sincos_masked" not in supported
 
 
 def test_build_farm_status_timestamp_summary_collapses_multi_turbine_rows() -> None:
@@ -265,6 +272,8 @@ def test_build_farm_status_timestamp_summary_collapses_multi_turbine_rows() -> N
     assert summary["turbine_rows"].to_list() == [2, 2, 2]
     assert summary["target_issue_turbines"].to_list() == [1, 0, 0]
     assert summary["feature_issue_turbines"].to_list() == [0, 0, 1]
+    assert summary["mask_hit_turbines"].to_list() == [0, 0, 0]
+    assert summary["has_mask_hit"].to_list() == [False, False, False]
     assert summary["has_any_issue"].to_list() == [True, False, True]
 
 
@@ -295,6 +304,31 @@ def test_build_farm_status_timestamp_summary_ignores_warmup_only_feature_flags()
     assert summary["has_any_issue"].to_list() == [False, True]
 
 
+def test_build_farm_status_timestamp_summary_tracks_mask_hits_separately_from_feature_issues() -> None:
+    frame = pl.DataFrame(
+        {
+            "dataset": ["sample"] * 4,
+            "timestamp": [
+                datetime(2024, 1, 1, 0, 0),
+                datetime(2024, 1, 1, 0, 0),
+                datetime(2024, 1, 1, 0, 10),
+                datetime(2024, 1, 1, 0, 10),
+            ],
+            "quality_flags": ["", "", "", ""],
+            "feature_quality_flags": ["missing_past_covariates", "", "feature_source_conflict__grid", ""],
+            "pitch_mean__mask": [1, 0, 1, 0],
+        }
+    )
+
+    summary = build_farm_status_timestamp_summary(frame, mask_columns=("pitch_mean__mask",))
+
+    assert summary["mask_hit_turbines"].to_list() == [1, 1]
+    assert summary["has_mask_hit"].to_list() == [True, True]
+    assert summary["feature_issue_turbines"].to_list() == [0, 1]
+    assert summary["has_feature_issue"].to_list() == [False, True]
+    assert summary["has_any_issue"].to_list() == [False, True]
+
+
 def test_build_farm_status_tile_tracks_issue_masks_and_padding() -> None:
     summary = pl.DataFrame(
         {
@@ -306,6 +340,7 @@ def test_build_farm_status_tile_tracks_issue_masks_and_padding() -> None:
                 datetime(2024, 1, 1, 0, 10),
                 datetime(2024, 1, 1, 0, 30),
             ],
+            "has_mask_hit": [False, False, True, True, True],
             "has_target_issue": [False, True, False, False, True],
             "has_feature_issue": [False, False, False, True, True],
             "has_any_issue": [False, True, False, True, True],
@@ -322,15 +357,21 @@ def test_build_farm_status_tile_tracks_issue_masks_and_padding() -> None:
     assert tile.tile_cols == 3
     assert tile.padding_points == 1
     assert tile.any_issue_points == 3
-    assert tile.clean_points == 2
+    assert tile.mask_hit_points == 3
+    assert tile.clean_points == 1
     assert tile.target_issue_points == 2
+    assert tile.feature_issue_only_points == 0
     assert tile.feature_issue_points == 2
     assert tile.status_grid[0, 0] == 0.0
-    assert tile.status_grid[0, 1] == 0.0
-    assert tile.status_grid[0, 2] == 1.0
-    assert tile.status_grid[1, 0] == 0.0
-    assert tile.status_grid[1, 1] == 1.0
+    assert tile.status_grid[0, 1] == 2.0
+    assert tile.status_grid[0, 2] == 3.0
+    assert tile.status_grid[1, 0] == 2.0
+    assert tile.status_grid[1, 1] == 2.0
     assert np.isnan(tile.status_grid[1, 2])
+    assert tile.target_issue_mask[1, 0]
+    assert tile.mask_hit_mask[1, 0]
+    assert tile.mask_hit_mask[1, 1]
+    assert not np.any(tile.feature_issue_only_mask)
     assert tile.padding_mask[1, 2]
 
 
@@ -347,6 +388,7 @@ def test_plot_farm_status_tile_smoke() -> None:
                 datetime(2024, 1, 1, 0, 20),
                 datetime(2024, 1, 1, 0, 30),
             ],
+            "has_mask_hit": [False, False, True, False],
             "has_target_issue": [False, True, False, False],
             "has_feature_issue": [False, False, True, False],
             "has_any_issue": [False, True, True, False],
@@ -362,7 +404,10 @@ def test_plot_farm_status_tile_smoke() -> None:
     figure.canvas.draw()
 
     assert "power_wd_yaw_hist_sincos" in axis.get_title()
-    assert len(axis.get_legend().texts) == 3
+    assert "black=" in axis.get_title()
+    assert "red=" in axis.get_title()
+    assert "yellow=" in axis.get_title()
+    assert len(axis.get_legend().texts) == 5
 
 
 def test_notebook_generator_builds_one_site_section_and_one_pair_per_protocol() -> None:
@@ -375,6 +420,8 @@ def test_notebook_generator_builds_one_site_section_and_one_pair_per_protocol() 
             display_name="Power Only",
             summary="Use only target power history as model input.",
             past_covariates=(),
+            past_covariate_value_columns=(),
+            past_covariate_mask_columns=(),
             derived_source_columns=(),
             dataset_specific_notes=(),
         ),
@@ -385,6 +432,8 @@ def test_notebook_generator_builds_one_site_section_and_one_pair_per_protocol() 
             display_name="Power + Wind Direction/Yaw Error History (Sin/Cos)",
             summary="Use target power history plus direction-aware covariates.",
             past_covariates=("wind_direction_sin", "wind_direction_cos", "yaw_error_sin", "yaw_error_cos"),
+            past_covariate_value_columns=("wind_direction_sin", "wind_direction_cos", "yaw_error_sin", "yaw_error_cos"),
+            past_covariate_mask_columns=(),
             derived_source_columns=("Wind direction (°)", "Nacelle position (°)"),
             dataset_specific_notes=("Angle transform uses repository yaw-error convention.",),
         ),
@@ -411,7 +460,90 @@ def test_notebook_generator_builds_one_site_section_and_one_pair_per_protocol() 
     assert "## Power + Wind Direction/Yaw Error History (Sin/Cos)" in "".join(cells[6]["source"])
     assert "`wind_direction_sin`" in "".join(cells[6]["source"])
     assert "`Wind direction (°)`" in "".join(cells[6]["source"])
+    assert "STATUS_MASK_COLOR" in "".join(cells[1]["source"])
+    assert "STATUS_FEATURE_ISSUE_COLOR" in "".join(cells[1]["source"])
+    assert "STATUS_TARGET_ISSUE_COLOR" in "".join(cells[1]["source"])
+    assert "mask_color=STATUS_MASK_COLOR" in "".join(cells[7]["source"])
+    assert "feature_issue_color=STATUS_FEATURE_ISSUE_COLOR" in "".join(cells[7]["source"])
+    assert "target_issue_color=STATUS_TARGET_ISSUE_COLOR" in "".join(cells[7]["source"])
     assert "load_farm_status_tile" in "".join(cells[7]["source"])
+    compile("".join(cells[7]["source"]), "<protocol_plot_cell>", "exec")
+
+
+def test_notebook_setup_code_reloads_wind_datasets_modules_from_src() -> None:
+    generator_module = _load_notebook_generator_module()
+
+    setup_code = generator_module._setup_code("toy_dataset", "next_6h_from_24h")
+
+    assert "import importlib" in setup_code
+    assert "importlib.invalidate_caches()" in setup_code
+    assert 'name == "wind_datasets" or name.startswith("wind_datasets.")' in setup_code
+    assert "sys.modules.pop(module_name, None)" in setup_code
+
+
+def test_notebook_generator_marks_mask_protocol_sections_in_yellow() -> None:
+    generator_module = _load_notebook_generator_module()
+    protocol_metadata = (
+        ProtocolNotebookMetadata(
+            dataset_id="toy_dataset",
+            task_id="next_6h_from_24h",
+            feature_protocol_id="power_wd_yaw_pmean_hist_sincos_masked",
+            display_name="Power + Wind Direction/Yaw Error/Pitch Mean History (Sin/Cos) Masked",
+            summary="Use target power history plus derived covariates and companion mask channels.",
+            past_covariates=(
+                "wind_direction_sin",
+                "wind_direction_cos",
+                "yaw_error_sin",
+                "yaw_error_cos",
+                "pitch_mean",
+                "wind_direction_sin__mask",
+                "wind_direction_cos__mask",
+                "yaw_error_sin__mask",
+                "yaw_error_cos__mask",
+                "pitch_mean__mask",
+            ),
+            past_covariate_value_columns=(
+                "wind_direction_sin",
+                "wind_direction_cos",
+                "yaw_error_sin",
+                "yaw_error_cos",
+                "pitch_mean",
+            ),
+            past_covariate_mask_columns=(
+                "wind_direction_sin__mask",
+                "wind_direction_cos__mask",
+                "yaw_error_sin__mask",
+                "yaw_error_cos__mask",
+                "pitch_mean__mask",
+            ),
+            derived_source_columns=(
+                "Wind direction (°)",
+                "Nacelle position (°)",
+                "Blade angle (pitch position) A (°)",
+                "Blade angle (pitch position) B (°)",
+                "Blade angle (pitch position) C (°)",
+            ),
+            dataset_specific_notes=(),
+            target_history_mask_columns=("target_kw__mask",),
+            mask_polarity="1_means_unavailable",
+        ),
+    )
+
+    payload = generator_module.build_dataset_notebook_payload(
+        "toy_dataset",
+        official_name="Toy Dataset",
+        task_id="next_6h_from_24h",
+        protocol_metadata=protocol_metadata,
+    )
+
+    markdown = "".join(payload["cells"][4]["source"])
+    assert "background-color:#ffe066" in markdown
+    assert "MASK</span>" in markdown
+    assert "Masked protocol inputs enabled." in markdown
+    assert "`target_kw__mask`" in markdown
+    assert "Target history mask columns" in markdown
+    assert "`wind_direction_sin__mask`" in markdown
+    assert "`1_means_unavailable`" in markdown
 
 
 def test_load_farm_status_tile_reads_series_and_context_without_requiring_turbine_id_column(
@@ -462,6 +594,7 @@ def test_load_farm_status_tile_reads_series_and_context_without_requiring_turbin
     assert tile.dataset_id == "toy"
     assert tile.task_id == "next_6h_from_24h"
     assert tile.total_points == 2
+    assert tile.mask_hit_points == 0
     assert tile.any_issue_points == 2
     assert tile.target_issue_points == 1
     assert tile.feature_issue_points == 1

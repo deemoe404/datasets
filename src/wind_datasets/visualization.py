@@ -118,8 +118,12 @@ class ProtocolNotebookMetadata:
     display_name: str
     summary: str
     past_covariates: tuple[str, ...]
+    past_covariate_value_columns: tuple[str, ...]
+    past_covariate_mask_columns: tuple[str, ...]
     derived_source_columns: tuple[str, ...]
     dataset_specific_notes: tuple[str, ...]
+    target_history_mask_columns: tuple[str, ...] = ()
+    mask_polarity: str | None = None
 
     def to_summary(self) -> dict[str, object]:
         return {
@@ -129,8 +133,12 @@ class ProtocolNotebookMetadata:
             "display_name": self.display_name,
             "summary": self.summary,
             "past_covariates": list(self.past_covariates),
+            "past_covariate_value_columns": list(self.past_covariate_value_columns),
+            "past_covariate_mask_columns": list(self.past_covariate_mask_columns),
+            "target_history_mask_columns": list(self.target_history_mask_columns),
             "derived_source_columns": list(self.derived_source_columns),
             "dataset_specific_notes": list(self.dataset_specific_notes),
+            "mask_polarity": self.mask_polarity,
         }
 
 
@@ -143,14 +151,18 @@ class FarmStatusTile:
     end_timestamp: object
     total_points: int
     clean_points: int
+    mask_hit_points: int
     target_issue_points: int
+    feature_issue_only_points: int
     feature_issue_points: int
     any_issue_points: int
     padding_points: int
     tile_rows: int
     tile_cols: int
     status_grid: np.ndarray
+    mask_hit_mask: np.ndarray
     target_issue_mask: np.ndarray
+    feature_issue_only_mask: np.ndarray
     feature_issue_mask: np.ndarray
     issue_mask: np.ndarray
     padding_mask: np.ndarray
@@ -164,7 +176,13 @@ class FarmStatusTile:
             "end_timestamp": self.end_timestamp,
             "total_points": self.total_points,
             "clean_points": self.clean_points,
+            "mask_hit_points": self.mask_hit_points,
+            "mask_hit_share": self.mask_hit_points / self.total_points if self.total_points else 0.0,
             "target_issue_points": self.target_issue_points,
+            "feature_issue_only_points": self.feature_issue_only_points,
+            "feature_issue_only_share": (
+                self.feature_issue_only_points / self.total_points if self.total_points else 0.0
+            ),
             "feature_issue_points": self.feature_issue_points,
             "any_issue_points": self.any_issue_points,
             "any_issue_share": self.any_issue_points / self.total_points if self.total_points else 0.0,
@@ -299,8 +317,12 @@ def load_protocol_notebook_metadata(
         display_name=str(protocol_context["display_name"]),
         summary=str(protocol_context["summary"]),
         past_covariates=_string_sequence(column_groups.get("past_covariates")),
+        past_covariate_value_columns=_string_sequence(column_groups.get("past_covariate_values")),
+        past_covariate_mask_columns=_string_sequence(column_groups.get("past_covariate_masks")),
         derived_source_columns=tuple(dict.fromkeys(derived_source_columns)),
         dataset_specific_notes=_string_sequence(protocol_context.get("dataset_specific_notes")),
+        target_history_mask_columns=_string_sequence(column_groups.get("target_history_masks")),
+        mask_polarity=str(protocol_context["mask_polarity"]) if protocol_context.get("mask_polarity") else None,
     )
 
 
@@ -317,41 +339,58 @@ def load_farm_status_timestamp_summary(
         task_spec=task_spec,
         cache_root=cache_root,
     )
+    task_context = read_json(task_paths.task_context_path)
+    column_groups = task_context.get("column_groups") if isinstance(task_context, dict) else None
+    mask_columns = _string_sequence(column_groups.get("past_covariate_masks")) if isinstance(column_groups, dict) else ()
+    selected_columns = tuple(dict.fromkeys((*_TASK_CONTEXT_REQUIRED_COLUMNS, *mask_columns)))
     frame = (
         pl.scan_parquet(task_paths.series_path)
-        .select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        .select(list(selected_columns))
         .sort("timestamp")
         .collect()
     )
-    return build_farm_status_timestamp_summary(frame)
+    return build_farm_status_timestamp_summary(frame, mask_columns=mask_columns)
 
 
-def build_farm_status_timestamp_summary(dataset_frame: pl.DataFrame) -> pl.DataFrame:
-    missing_columns = [column for column in _TASK_CONTEXT_REQUIRED_COLUMNS if column not in dataset_frame.columns]
+def build_farm_status_timestamp_summary(
+    dataset_frame: pl.DataFrame,
+    *,
+    mask_columns: tuple[str, ...] = (),
+) -> pl.DataFrame:
+    required_columns = tuple(dict.fromkeys((*_TASK_CONTEXT_REQUIRED_COLUMNS, *mask_columns)))
+    missing_columns = [column for column in required_columns if column not in dataset_frame.columns]
     if missing_columns:
         missing = ", ".join(missing_columns)
         raise ValueError(f"Task series frame is missing required columns: {missing}.")
     if dataset_frame.is_empty():
         raise ValueError("Task series frame is empty.")
 
+    mask_hit_expr = (
+        pl.any_horizontal([(pl.col(column).fill_null(0).cast(pl.Int8) == 1) for column in mask_columns])
+        if mask_columns
+        else pl.lit(False)
+    )
     frame = (
-        dataset_frame.select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        dataset_frame.select(list(required_columns))
         .with_columns(
             pl.col("quality_flags").fill_null("").alias("quality_flags"),
             pl.col("feature_quality_flags")
             .fill_null("")
             .map_elements(_strip_notebook_ignored_feature_quality_flags, return_dtype=pl.String)
             .alias("__visual_feature_quality_flags"),
+            mask_hit_expr.alias("__visual_mask_hit"),
         )
         .group_by(["dataset", "timestamp"])
         .agg(
             pl.len().alias("turbine_rows"),
             (pl.col("quality_flags") != "").cast(pl.Int32).sum().alias("target_issue_turbines"),
             (pl.col("__visual_feature_quality_flags") != "").cast(pl.Int32).sum().alias("feature_issue_turbines"),
+            pl.col("__visual_mask_hit").cast(pl.Int32).sum().alias("mask_hit_turbines"),
         )
         .with_columns(
             (pl.col("target_issue_turbines") > 0).alias("has_target_issue"),
             (pl.col("feature_issue_turbines") > 0).alias("has_feature_issue"),
+            (pl.col("mask_hit_turbines") > 0).alias("has_mask_hit"),
         )
         .with_columns(
             (pl.col("has_target_issue") | pl.col("has_feature_issue")).alias("has_any_issue"),
@@ -375,13 +414,16 @@ def load_farm_status_tile(
         cache_root=cache_root,
     )
     task_context = read_json(task_paths.task_context_path)
+    column_groups = task_context.get("column_groups") if isinstance(task_context, dict) else None
+    mask_columns = _string_sequence(column_groups.get("past_covariate_masks")) if isinstance(column_groups, dict) else ()
+    selected_columns = tuple(dict.fromkeys((*_TASK_CONTEXT_REQUIRED_COLUMNS, *mask_columns)))
     series_frame = (
         pl.scan_parquet(task_paths.series_path)
-        .select(_TASK_CONTEXT_REQUIRED_COLUMNS)
+        .select(list(selected_columns))
         .sort("timestamp")
         .collect()
     )
-    timestamp_summary = build_farm_status_timestamp_summary(series_frame)
+    timestamp_summary = build_farm_status_timestamp_summary(series_frame, mask_columns=mask_columns)
     return build_farm_status_tile(
         timestamp_summary,
         task_id=str(_mapping_dict(task_context, "task")["task_id"]),
@@ -410,6 +452,8 @@ def build_farm_status_tile(
         raise ValueError("Farm status summary is empty.")
 
     frame = timestamp_summary.sort("timestamp")
+    if "has_mask_hit" not in frame.columns:
+        frame = frame.with_columns(pl.lit(False).alias("has_mask_hit"))
     dataset_id = frame["dataset"][0]
     total_points = frame.height
     tile_cols = max(1, ceil(sqrt(total_points)))
@@ -417,17 +461,20 @@ def build_farm_status_tile(
     padding_points = tile_rows * tile_cols - total_points
 
     status_grid = np.full((tile_rows, tile_cols), np.nan, dtype=float)
+    mask_hit_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
     target_issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
+    feature_issue_only_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
     feature_issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
     issue_mask = np.zeros((tile_rows, tile_cols), dtype=bool)
     padding_mask = np.ones((tile_rows, tile_cols), dtype=bool)
 
+    mask_hits = frame["has_mask_hit"].to_list()
     target_issues = frame["has_target_issue"].to_list()
     feature_issues = frame["has_feature_issue"].to_list()
     any_issues = frame["has_any_issue"].to_list()
 
-    for index, (has_target_issue, has_feature_issue, has_any_issue) in enumerate(
-        zip(target_issues, feature_issues, any_issues, strict=True)
+    for index, (has_mask_hit, has_target_issue, has_feature_issue, has_any_issue) in enumerate(
+        zip(mask_hits, target_issues, feature_issues, any_issues, strict=True)
     ):
         row = index // tile_cols
         column = index % tile_cols
@@ -435,10 +482,22 @@ def build_farm_status_tile(
         target_issue_mask[row, column] = bool(has_target_issue)
         feature_issue_mask[row, column] = bool(has_feature_issue)
         issue_mask[row, column] = bool(has_any_issue)
-        status_grid[row, column] = 0.0 if has_any_issue else 1.0
+        # Display priority is mask > target issue > feature issue > clean.
+        if has_mask_hit:
+            mask_hit_mask[row, column] = True
+            status_grid[row, column] = 2.0
+        elif has_target_issue:
+            status_grid[row, column] = 0.0
+        elif has_feature_issue:
+            feature_issue_only_mask[row, column] = True
+            status_grid[row, column] = 1.0
+        else:
+            status_grid[row, column] = 3.0
 
     any_issue_points = int(np.count_nonzero(issue_mask))
+    mask_hit_points = int(np.count_nonzero(mask_hit_mask))
     target_issue_points = int(np.count_nonzero(target_issue_mask))
+    feature_issue_only_points = int(np.count_nonzero(feature_issue_only_mask))
     feature_issue_points = int(np.count_nonzero(feature_issue_mask))
 
     return FarmStatusTile(
@@ -448,15 +507,19 @@ def build_farm_status_tile(
         start_timestamp=frame["timestamp"][0],
         end_timestamp=frame["timestamp"][-1],
         total_points=total_points,
-        clean_points=total_points - any_issue_points,
+        clean_points=int(np.count_nonzero(status_grid == 3.0)),
+        mask_hit_points=mask_hit_points,
         target_issue_points=target_issue_points,
+        feature_issue_only_points=feature_issue_only_points,
         feature_issue_points=feature_issue_points,
         any_issue_points=any_issue_points,
         padding_points=padding_points,
         tile_rows=tile_rows,
         tile_cols=tile_cols,
         status_grid=status_grid,
+        mask_hit_mask=mask_hit_mask,
         target_issue_mask=target_issue_mask,
+        feature_issue_only_mask=feature_issue_only_mask,
         feature_issue_mask=feature_issue_mask,
         issue_mask=issue_mask,
         padding_mask=padding_mask,
@@ -687,7 +750,9 @@ def plot_farm_status_tile(
     *,
     ax: Axes | None = None,
     clean_color: str = "#2ca25f",
-    issue_color: str = "#d73027",
+    mask_color: str = "#ffd54f",
+    feature_issue_color: str = "#d73027",
+    target_issue_color: str = "#111111",
     padding_color: str = "#ffffff",
 ) -> tuple[Figure, Axes]:
     import matplotlib.pyplot as plt
@@ -702,8 +767,8 @@ def plot_farm_status_tile(
 
     ax.set_facecolor(padding_color)
     image = np.ma.masked_invalid(tile.status_grid)
-    cmap = ListedColormap([issue_color, clean_color])
-    norm = BoundaryNorm([-0.5, 0.5, 1.5], cmap.N)
+    cmap = ListedColormap([target_issue_color, feature_issue_color, mask_color, clean_color])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
     ax.imshow(
         image,
         cmap=cmap,
@@ -720,8 +785,9 @@ def plot_farm_status_tile(
                 f"{tile.dataset_id} | {tile.feature_protocol_id}",
                 (
                     f"{tile.start_timestamp:%Y-%m-%d %H:%M} -> {tile.end_timestamp:%Y-%m-%d %H:%M} | "
-                    f"steps={tile.total_points:,} | red={tile.any_issue_points:,} | "
-                    f"target={tile.target_issue_points:,} | feature={tile.feature_issue_points:,}"
+                    f"steps={tile.total_points:,} | black={int(np.count_nonzero(tile.status_grid == 0.0)):,} | "
+                    f"red={int(np.count_nonzero(tile.status_grid == 1.0)):,} | "
+                    f"yellow={int(np.count_nonzero(tile.status_grid == 2.0)):,}"
                 ),
             ]
         )
@@ -729,13 +795,15 @@ def plot_farm_status_tile(
     ax.legend(
         handles=[
             Patch(facecolor=clean_color, edgecolor="none", label="clean"),
-            Patch(facecolor=issue_color, edgecolor="none", label="issue"),
+            Patch(facecolor=mask_color, edgecolor="none", label="mask"),
+            Patch(facecolor=feature_issue_color, edgecolor="none", label="feature issue"),
+            Patch(facecolor=target_issue_color, edgecolor="none", label="target issue"),
             Patch(facecolor=padding_color, edgecolor="#d9d9d9", label="padding"),
         ],
         loc="upper center",
         bbox_to_anchor=(0.5, -0.04),
         frameon=False,
-        ncol=3,
+        ncol=5,
     )
     return figure, ax
 

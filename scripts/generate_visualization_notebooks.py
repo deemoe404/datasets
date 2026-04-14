@@ -162,27 +162,52 @@ def _intro_markdown(
         - Task: `{task_id}`
         - The top figure shows the full-farm turbine layout and neighbor structure.
         - Each protocol section below renders a farm-level timestamp status tile for one supported `feature_protocol_id`.
-        - Green means the farm timestamp is clean. Red means at least one turbine has a target issue (`quality_flags != ""`)
-          or a protocol-variable issue after excluding warmup-only `missing_past_covariates` flags.
+        - Green means the farm timestamp is clean. Yellow means at least one turbine uses a protocol mask input at that
+          timestamp; mask has the highest display priority and overrides issue colors. Red means there is a
+          protocol-variable issue after excluding warmup-only `missing_past_covariates` flags, with no target issue and
+          no mask hit. Black means at least one turbine has a target issue (`quality_flags != ""`) and there is no mask
+          hit.
         - Running a section may lazily build missing cache artifacts on first use, so the first run can be slower.{omitted_line}
         """
     ).strip()
 
 
 def _protocol_markdown(metadata: ProtocolNotebookMetadata) -> str:
-    past_covariates = ", ".join(f"`{column}`" for column in metadata.past_covariates) or "_none_"
+    protocol_columns = ", ".join(
+        f"`{column}`"
+        for column in (*metadata.target_history_mask_columns, *metadata.past_covariates)
+    ) or "_none_"
+    target_history_masks = ", ".join(f"`{column}`" for column in metadata.target_history_mask_columns) or "_none_"
+    past_covariate_masks = ", ".join(f"`{column}`" for column in metadata.past_covariate_mask_columns) or "_none_"
     derived_source_columns = ", ".join(f"`{column}`" for column in metadata.derived_source_columns) or "_none_"
     notes = "\n".join(f"- Note: {note}" for note in metadata.dataset_specific_notes)
     notes_block = f"\n{notes}" if notes else ""
+    mask_badge = ""
+    mask_lines = ""
+    mask_block = ""
+    if metadata.target_history_mask_columns or metadata.past_covariate_mask_columns:
+        mask_badge = (
+            ' <span style="background-color:#ffe066;color:#5f4b00;'
+            'padding:0.1rem 0.45rem;border-radius:0.35rem;font-size:0.72em;'
+            'font-weight:700;vertical-align:middle;">MASK</span>'
+        )
+        mask_line_items = ['- <span style="color:#8a6d00;font-weight:700;">Masked protocol inputs enabled.</span>']
+        if metadata.target_history_mask_columns:
+            mask_line_items.append(f"- Target history mask columns: {target_history_masks}")
+        if metadata.past_covariate_mask_columns:
+            mask_line_items.append(f"- Companion mask columns: {past_covariate_masks}")
+        mask_line_items.append(f"- Mask polarity: `{metadata.mask_polarity or 'unspecified'}`")
+        mask_lines = "\n".join(mask_line_items)
+        mask_block = f"\n{mask_lines}"
     return textwrap.dedent(
         f"""
-        ## {metadata.display_name}
+        ## {metadata.display_name}{mask_badge}
 
         - `task_id`: `{metadata.task_id}`
         - `feature_protocol_id`: `{metadata.feature_protocol_id}`
         - Summary: {metadata.summary}
-        - Protocol-covered task columns: {past_covariates}
-        - Raw source columns for derived protocol covariates: {derived_source_columns}{notes_block}
+        - Protocol-covered task columns: {protocol_columns}
+        - Raw source columns for derived protocol covariates: {derived_source_columns}{mask_block}{notes_block}
         """
     ).strip()
 
@@ -190,6 +215,7 @@ def _protocol_markdown(metadata: ProtocolNotebookMetadata) -> str:
 def _setup_code(dataset_id: str, task_id: str) -> str:
     return textwrap.dedent(
         f"""
+        import importlib
         from pathlib import Path
         import sys
 
@@ -209,6 +235,9 @@ def _setup_code(dataset_id: str, task_id: str) -> str:
         SRC_ROOT = REPO_ROOT / "src"
         if str(SRC_ROOT) not in sys.path:
             sys.path.insert(0, str(SRC_ROOT))
+        importlib.invalidate_caches()
+        for module_name in [name for name in tuple(sys.modules) if name == "wind_datasets" or name.startswith("wind_datasets.")]:
+            sys.modules.pop(module_name, None)
 
         from wind_datasets.visualization import (
             build_site_layout,
@@ -225,7 +254,9 @@ def _setup_code(dataset_id: str, task_id: str) -> str:
         SITE_EDGE_COLOR = "#aab2bd"
         SITE_NODE_COLOR = "#2b6f97"
         STATUS_CLEAN_COLOR = "#2ca25f"
-        STATUS_ISSUE_COLOR = "#d73027"
+        STATUS_MASK_COLOR = "#ffd54f"
+        STATUS_FEATURE_ISSUE_COLOR = "#d73027"
+        STATUS_TARGET_ISSUE_COLOR = "#111111"
         PADDING_COLOR = "#ffffff"
         DPI = 160
 
@@ -265,13 +296,16 @@ def _protocol_plot_code(feature_protocol_id: str) -> str:
                 pl.col("start_timestamp").dt.strftime("%Y-%m-%d %H:%M:%S"),
                 pl.col("end_timestamp").dt.strftime("%Y-%m-%d %H:%M:%S"),
                 pl.col("any_issue_share").round(4),
+                pl.col("mask_hit_share").round(4),
             )
         )
         display(status_summary)
         status_figure, status_axis = plot_farm_status_tile(
             status_tile,
             clean_color=STATUS_CLEAN_COLOR,
-            issue_color=STATUS_ISSUE_COLOR,
+            mask_color=STATUS_MASK_COLOR,
+            feature_issue_color=STATUS_FEATURE_ISSUE_COLOR,
+            target_issue_color=STATUS_TARGET_ISSUE_COLOR,
             padding_color=PADDING_COLOR,
         )
         plt.show()
