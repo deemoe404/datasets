@@ -1,0 +1,38 @@
+schema_version = 1
+family_id = "world_model_rollout_v1"
+display_name = "World-Model Rollout v1"
+status = "prototype"
+summary = "Filtering-plus-rollout world-model family that consumes the full world_model_v1 protocol on kelmarsh and penmanshiel."
+model_family = "world_model"
+training_mode = "trainable"
+implementation_root = "experiment/families/world_model_rollout_v1"
+readme_path = "experiment/families/world_model_rollout_v1/README.md"
+runner_entrypoint = "experiment/families/world_model_rollout_v1/run_world_model_rollout_v1.py"
+default_output_path = "experiment/artifacts/published/world_model_rollout_v1/latest.csv"
+default_output_schema_version = "world_model_rollout_v1.long_metrics.v1"
+dataset_scope = ["kelmarsh", "penmanshiel"]
+supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
+supported_result_splits = ["val", "test"]
+supported_feature_protocols = ["world_model_v1"]
+implementation_label_kind = "model_variant"
+implementation_labels = [
+  "world_model_rollout_v1_farm_sync",
+]
+model_variants = [
+  "world_model_rollout_v1_farm_sync",
+]
+notes = [
+  "This family uses the world_model_v1 task bundle directly and replaces the AGCRN seq2seq core with a deterministic filtering-plus-rollout world model.",
+  "It currently supports kelmarsh and penmanshiel only, because world_model_v1 is not configured for hill_of_towie or sdwpf_kddcup in the active experiment tree.",
+]
+
+[task_contract]
+task_id = "next_6h_from_24h"
+history_duration = "24h"
+forecast_duration = "6h"
+window_protocol = "dense_sliding"
+split_protocol = "raw_chrono_70_10_20_strict_closed"
+granularity = "farm"
+
+[implementation_bindings]
+world_model_rollout_v1_farm_sync = "world_model_v1"

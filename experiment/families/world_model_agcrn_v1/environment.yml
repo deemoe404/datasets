@@ -1,0 +1,13 @@
+name: world-model-agcrn-v1
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - polars
+  - pyarrow
+  - pytest
+  - tqdm
+  - pip:
+      - torch

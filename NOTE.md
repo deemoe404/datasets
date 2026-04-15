@@ -23,6 +23,9 @@ source_data_root = "/path/to/Wind Power Forecasting"
 ./.conda/bin/python -m pytest
 ```
 
+注意：项目根 `./.conda` 主要用于数据处理和测试，可以是 CPU-only。实验 family 自己的
+`experiment/families/<family>/.conda` 才是训练环境。
+
 ## 缓存重建
 
 常用命令：
@@ -41,7 +44,7 @@ source_data_root = "/path/to/Wind Power Forecasting"
 
 ## 实验运行
 
-当前 active tree 中保留两个 AGCRN family：
+当前 active tree 中保留四个 family：
 
 ```shell
 cd experiment/families/agcrn
@@ -53,6 +56,19 @@ cd experiment/families/agcrn
 cd experiment/families/agcrn_masked
 ./create_env.sh
 ./.conda/bin/python run_agcrn_masked.py
+```
+
+```shell
+cd experiment/families/world_model_agcrn_v1
+./create_env.sh
+./.conda/bin/python run_world_model_agcrn_v1.py
+./.conda/bin/python search_world_model_agcrn_v1.py
+```
+
+```shell
+cd experiment/families/world_model_rollout_v1
+./create_env.sh
+./.conda/bin/python run_world_model_rollout_v1.py
 ```
 
 正式运行默认会把结果写到 `experiment/artifacts/published/<family_id>/latest.csv`，并在

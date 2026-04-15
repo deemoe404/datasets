@@ -12,3 +12,6 @@ Each family owns:
 Current families:
 
 - `agcrn`
+- `agcrn_masked`
+- `world_model_agcrn_v1`
+- `world_model_rollout_v1`
