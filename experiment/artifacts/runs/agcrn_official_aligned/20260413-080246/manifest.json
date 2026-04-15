@@ -1,0 +1,135 @@
+{
+  "args": {
+    "batch_size": null,
+    "cheb_k": null,
+    "datasets": null,
+    "device": "auto",
+    "embed_dim": null,
+    "epochs": null,
+    "grad_clip_norm": null,
+    "hidden_dim": null,
+    "learning_rate": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "no_record_run": false,
+    "num_layers": null,
+    "output_path": "../../artifacts/scratch/agcrn_official_aligned/power_temp_hist_only.csv",
+    "patience": null,
+    "resolved_variant_hyperparameters": {
+      "official_aligned_power_atemp_hist_farm_sync": {
+        "batch_size": 512,
+        "cheb_k": 2,
+        "early_stopping_patience": 5,
+        "embed_dim": 10,
+        "feature_protocol_id": "power_atemp_hist",
+        "grad_clip_norm": 5.0,
+        "hidden_dim": 64,
+        "learning_rate": 0.001,
+        "max_epochs": 20,
+        "num_layers": 2
+      },
+      "official_aligned_power_itemp_hist_farm_sync": {
+        "batch_size": 512,
+        "cheb_k": 2,
+        "early_stopping_patience": 5,
+        "embed_dim": 10,
+        "feature_protocol_id": "power_itemp_hist",
+        "grad_clip_norm": 5.0,
+        "hidden_dim": 64,
+        "learning_rate": 0.001,
+        "max_epochs": 20,
+        "num_layers": 2
+      }
+    },
+    "run_label": null,
+    "seed": 42,
+    "variants": [
+      "official_aligned_power_atemp_hist_farm_sync",
+      "official_aligned_power_itemp_hist_farm_sync"
+    ]
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/scratch/agcrn_official_aligned/power_temp_hist_only.csv",
+      "sha256": "86ba1cf364efdd7b3e4fc9f7fa9ae948983ffb1594993efbf0a1358ee50d330a",
+      "size_bytes": 127560
+    }
+  },
+  "created_at_utc": "2026-04-13T08:02:46.574642+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/agcrn_official_aligned/latest.csv",
+    "default_output_schema_version": "agcrn_official_aligned.long_metrics.v1",
+    "display_name": "AGCRN Official-Aligned",
+    "family_id": "agcrn_official_aligned",
+    "implementation_root": "experiment/families/agcrn",
+    "model_family": "agcrn",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/agcrn/README.md",
+    "runner_entrypoint": "experiment/families/agcrn/run_agcrn.py",
+    "status": "pilot",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "1fa1bc9b30c184c163287fd03a3126cd1ae29824",
+    "is_dirty": true,
+    "status_short": [
+      "M README.md",
+      " M experiment/README.md",
+      " M experiment/families/agcrn/README.md",
+      " M experiment/families/agcrn/agcrn.py",
+      " M experiment/families/agcrn/search_agcrn.py",
+      " M experiment/infra/registry/families/agcrn_official_aligned.toml",
+      " M src/README.md",
+      " M src/wind_datasets/cache_state.py",
+      " M src/wind_datasets/data/feature_policy/kelmarsh.csv",
+      " M src/wind_datasets/data/feature_policy/penmanshiel.csv",
+      " M src/wind_datasets/data/source_column_policy/hill_of_towie.csv",
+      " M src/wind_datasets/data/source_column_policy/kelmarsh.csv",
+      " M src/wind_datasets/data/source_column_policy/penmanshiel.csv",
+      " M src/wind_datasets/data/source_column_policy/sdwpf_kddcup.csv",
+      " M src/wind_datasets/datasets/greenbyte.py",
+      " M src/wind_datasets/feature_protocols.py",
+      " M test/helpers.py",
+      " M test/test_agcrn.py",
+      " M test/test_cache_dag.py",
+      " M test/test_end_to_end.py",
+      " M test/test_experiment_registry.py",
+      " M test/test_feature_protocols.py",
+      " M test/test_run_records.py",
+      " M test/test_source_column_policy.py"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/agcrn/run_agcrn.py",
+    "kind": "family_runner",
+    "run_label": null
+  },
+  "notes": [],
+  "result": {
+    "row_count": 296
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "power_atemp_hist",
+      "power_itemp_hist"
+    ],
+    "model_variants": [
+      "official_aligned_power_atemp_hist_farm_sync",
+      "official_aligned_power_itemp_hist_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}

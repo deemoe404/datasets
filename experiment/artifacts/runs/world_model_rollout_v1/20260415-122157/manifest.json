@@ -1,0 +1,173 @@
+{
+  "args": {
+    "aux_site_loss_weight": null,
+    "aux_turbine_loss_weight": null,
+    "batch_size": null,
+    "consistency_loss_weight": null,
+    "datasets": null,
+    "device": "auto",
+    "dropout": null,
+    "edge_hidden_dim": null,
+    "epochs": null,
+    "eval_batch_size": null,
+    "force_rerun": true,
+    "global_state_dim": null,
+    "grad_clip_norm": null,
+    "hidden_state_dim": null,
+    "hist_loss_weight": null,
+    "latent_state_dim": null,
+    "learning_rate": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "message_dim": null,
+    "no_record_run": false,
+    "node_state_dim": null,
+    "num_workers": null,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_rollout_v1/latest.csv",
+    "patience": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_rollout_v1_farm_sync": {
+          "aux_site_loss_weight": 0.1,
+          "aux_turbine_loss_weight": 0.1,
+          "batch_size": 256,
+          "consistency_loss_weight": 0.05,
+          "dropout": 0.1,
+          "early_stopping_patience": 5,
+          "edge_hidden_dim": 64,
+          "feature_protocol_id": "world_model_v1",
+          "global_state_dim": 64,
+          "grad_clip_norm": 1.0,
+          "hidden_state_dim": 96,
+          "hist_loss_weight": 0.3,
+          "latent_state_dim": 32,
+          "learning_rate": 0.001,
+          "max_epochs": 20,
+          "message_dim": 64,
+          "node_state_dim": 128,
+          "tau_embed_dim": 16,
+          "weight_decay": 0.0
+        }
+      },
+      "penmanshiel": {
+        "world_model_rollout_v1_farm_sync": {
+          "aux_site_loss_weight": 0.1,
+          "aux_turbine_loss_weight": 0.1,
+          "batch_size": 64,
+          "consistency_loss_weight": 0.05,
+          "dropout": 0.1,
+          "early_stopping_patience": 5,
+          "edge_hidden_dim": 64,
+          "feature_protocol_id": "world_model_v1",
+          "global_state_dim": 64,
+          "grad_clip_norm": 1.0,
+          "hidden_state_dim": 96,
+          "hist_loss_weight": 0.3,
+          "latent_state_dim": 32,
+          "learning_rate": 0.001,
+          "max_epochs": 20,
+          "message_dim": 64,
+          "node_state_dim": 128,
+          "tau_embed_dim": 16,
+          "weight_decay": 0.0
+        }
+      }
+    },
+    "resume": false,
+    "run_label": null,
+    "seed": 42,
+    "tau_embed_dim": null,
+    "variants": null,
+    "weight_decay": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_rollout_v1/latest.csv",
+      "sha256": "ac6719dd79cd9547f8451f90cd6558d94939c4026e519b0b0e8f2aec13de3d14",
+      "size_bytes": 128960
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_rollout_v1/latest.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-15T12:21:57.985433+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_rollout_v1/latest.csv",
+    "default_output_schema_version": "world_model_rollout_v1.long_metrics.v1",
+    "display_name": "World-Model Rollout v1",
+    "family_id": "world_model_rollout_v1",
+    "implementation_root": "experiment/families/world_model_rollout_v1",
+    "model_family": "world_model",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_rollout_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_rollout_v1/run_world_model_rollout_v1.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "22b8ed4b39d4c3f4ebb2be911e723b65b6b27633",
+    "is_dirty": true,
+    "status_short": [
+      "M .gitignore",
+      " M NOTE.md",
+      " M experiment/README.md",
+      " M experiment/artifacts/published/README.md",
+      " M experiment/artifacts/runs/README.md",
+      " M experiment/families/README.md",
+      " M experiment/families/agcrn/README.md",
+      " M experiment/families/agcrn/agcrn.py",
+      " M experiment/families/agcrn_masked/README.md",
+      " M experiment/families/agcrn_masked/agcrn_masked.py",
+      " M experiment/infra/common/published_outputs.py",
+      " M test/test_agcrn.py",
+      " M test/test_agcrn_masked.py",
+      " M test/test_experiment_registry.py",
+      " M test/test_published_outputs.py",
+      "?? experiment/artifacts/published/agcrn_masked/",
+      "?? experiment/artifacts/published/agcrn_official_aligned/",
+      "?? experiment/artifacts/published/world_model_agcrn_v1/",
+      "?? experiment/artifacts/published/world_model_rollout_v1/",
+      "?? experiment/artifacts/runs/agcrn_masked/",
+      "?? experiment/artifacts/runs/agcrn_official_aligned/",
+      "?? experiment/artifacts/runs/world_model_agcrn_v1/",
+      "?? experiment/families/world_model_agcrn_v1/",
+      "?? experiment/families/world_model_rollout_v1/",
+      "?? experiment/infra/registry/families/world_model_agcrn_v1.toml",
+      "?? experiment/infra/registry/families/world_model_rollout_v1.toml",
+      "?? test/test_world_model_agcrn_v1.py",
+      "?? test/test_world_model_rollout_v1.py"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_rollout_v1/run_world_model_rollout_v1.py",
+    "kind": "family_runner",
+    "run_label": null
+  },
+  "notes": [],
+  "result": {
+    "row_count": 296
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh",
+      "penmanshiel"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_rollout_v1_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}

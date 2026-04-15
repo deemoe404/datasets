@@ -7,12 +7,6 @@ cache/
 experiment/*.csv
 experiment/families/*/.conda/
 experiment/families/*/.work*/
-experiment/artifacts/published/**
-!experiment/artifacts/published/
-!experiment/artifacts/published/README.md
-experiment/artifacts/runs/**
-!experiment/artifacts/runs/
-!experiment/artifacts/runs/README.md
 experiment/artifacts/scratch/**
 !experiment/artifacts/scratch/
 !experiment/artifacts/scratch/README.md

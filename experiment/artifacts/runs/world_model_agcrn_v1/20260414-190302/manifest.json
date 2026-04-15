@@ -1,0 +1,123 @@
+{
+  "args": {
+    "batch_size": null,
+    "cheb_k": null,
+    "datasets": null,
+    "device": "auto",
+    "embed_dim": null,
+    "epochs": null,
+    "eval_batch_size": null,
+    "force_rerun": true,
+    "grad_clip_norm": null,
+    "hidden_dim": null,
+    "learning_rate": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "no_record_run": false,
+    "num_layers": null,
+    "num_workers": null,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_agcrn_v1/latest.csv",
+    "patience": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_v1_seq2seq_farm_sync": {
+          "batch_size": 512,
+          "cheb_k": 2,
+          "early_stopping_patience": 5,
+          "embed_dim": 16,
+          "feature_protocol_id": "world_model_v1",
+          "grad_clip_norm": 5.0,
+          "hidden_dim": 64,
+          "learning_rate": 0.001,
+          "max_epochs": 20,
+          "num_layers": 2
+        }
+      },
+      "penmanshiel": {
+        "world_model_v1_seq2seq_farm_sync": {
+          "batch_size": 512,
+          "cheb_k": 3,
+          "early_stopping_patience": 5,
+          "embed_dim": 24,
+          "feature_protocol_id": "world_model_v1",
+          "grad_clip_norm": 5.0,
+          "hidden_dim": 64,
+          "learning_rate": 0.0005,
+          "max_epochs": 20,
+          "num_layers": 2
+        }
+      }
+    },
+    "resume": false,
+    "run_label": null,
+    "seed": 42,
+    "variants": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_agcrn_v1/latest.csv",
+      "sha256": "b9d951fc82f77bc3d8bfcb8951e50b39b55ca031cbe43097e737a3287c2341c3",
+      "size_bytes": 127257
+    }
+  },
+  "created_at_utc": "2026-04-14T19:03:02.876617+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_agcrn_v1/latest.csv",
+    "default_output_schema_version": "world_model_agcrn_v1.long_metrics.v1",
+    "display_name": "World-Model AGCRN v1",
+    "family_id": "world_model_agcrn_v1",
+    "implementation_root": "experiment/families/world_model_agcrn_v1",
+    "model_family": "agcrn",
+    "orchestrator_entrypoint": "experiment/families/world_model_agcrn_v1/search_world_model_agcrn_v1.py",
+    "readme_path": "experiment/families/world_model_agcrn_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_agcrn_v1/run_world_model_agcrn_v1.py",
+    "status": "pilot",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "22b8ed4b39d4c3f4ebb2be911e723b65b6b27633",
+    "is_dirty": true,
+    "status_short": [
+      "M NOTE.md",
+      " M experiment/README.md",
+      " M experiment/infra/common/published_outputs.py",
+      " M test/test_experiment_registry.py",
+      " M test/test_published_outputs.py",
+      "?? experiment/families/world_model_agcrn_v1/",
+      "?? experiment/infra/registry/families/world_model_agcrn_v1.toml",
+      "?? test/test_world_model_agcrn_v1.py"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_agcrn_v1/run_world_model_agcrn_v1.py",
+    "kind": "family_runner",
+    "run_label": null
+  },
+  "notes": [],
+  "result": {
+    "row_count": 296
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh",
+      "penmanshiel"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_v1_seq2seq_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}
