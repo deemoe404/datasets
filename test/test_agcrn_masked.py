@@ -269,6 +269,12 @@ def test_run_experiment_smoke_trains_masked_family_on_toy_cache(tmp_path, monkey
     )
 
     assert output_path.exists()
+    history_path = module.training_history_output_path(output_path)
+    assert history_path.exists()
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
     assert results.height == 148
     assert results["model_variant"].unique().to_list() == [module.MODEL_VARIANT]
     assert results["prediction_count"].min() > 0

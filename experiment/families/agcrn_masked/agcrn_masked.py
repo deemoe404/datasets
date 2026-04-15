@@ -170,6 +170,28 @@ _RESULT_COLUMNS = [
     "batch_size",
     "learning_rate",
 ]
+_TRAINING_HISTORY_COLUMNS = [
+    "dataset_id",
+    "model_id",
+    "model_variant",
+    "feature_protocol_id",
+    "task_id",
+    "window_protocol",
+    "epoch",
+    "train_loss_mean",
+    "train_loss_last",
+    "val_rmse_pu",
+    "best_val_rmse_pu",
+    "is_best_epoch",
+    "epochs_without_improvement",
+    "train_batch_count",
+    "train_window_count",
+    "val_window_count",
+    "device",
+    "seed",
+    "batch_size",
+    "learning_rate",
+]
 _DATASET_ORDER = {dataset_id: index for index, dataset_id in enumerate(DEFAULT_DATASETS)}
 _MODEL_VARIANT_ORDER = {MODEL_VARIANT: 0}
 _SPLIT_NAMES = ("train", "val", "test")
@@ -367,6 +389,7 @@ class ResumePaths:
     slot_dir: Path
     state_path: Path
     partial_results_path: Path
+    training_history_path: Path
     checkpoints_dir: Path
 
 
@@ -388,6 +411,10 @@ class EvaluationMetrics:
 
 def _empty_result_frame() -> pl.DataFrame:
     return pl.DataFrame(schema=_RESULT_COLUMNS)
+
+
+def _empty_training_history_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_TRAINING_HISTORY_COLUMNS)
 
 
 def _temporary_path(path: Path) -> Path:
@@ -424,8 +451,16 @@ def _resume_paths_for_output(*, output_path: str | Path, work_root: str | Path) 
         slot_dir=slot_dir,
         state_path=slot_dir / "run_state.json",
         partial_results_path=slot_dir / "partial_results.csv",
+        training_history_path=slot_dir / "training_history.csv",
         checkpoints_dir=slot_dir / "checkpoints",
     )
+
+
+def training_history_output_path(output_path: str | Path) -> Path:
+    output = _normalize_output_path(output_path)
+    suffix = output.suffix or ".csv"
+    stem = output.stem if output.suffix else output.name
+    return output.with_name(f"{stem}.training_history{suffix}")
 
 
 def _job_key(dataset_id: str, model_variant: str) -> tuple[str, str]:
@@ -560,11 +595,84 @@ def _write_partial_results(paths: ResumePaths, frame: pl.DataFrame) -> None:
     _atomic_write_csv(paths.partial_results_path, frame)
 
 
+def _read_training_history(path: str | Path) -> pl.DataFrame:
+    history_path = Path(path)
+    if not history_path.exists():
+        return _empty_training_history_frame()
+    frame = pl.read_csv(history_path, infer_schema_length=None)
+    if not frame.columns:
+        return _empty_training_history_frame()
+    missing_columns = [column for column in _TRAINING_HISTORY_COLUMNS if column not in frame.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Training history at {history_path} is missing expected columns: {missing_columns!r}."
+        )
+    frame = frame.select(_TRAINING_HISTORY_COLUMNS)
+    if frame.is_empty():
+        return frame
+    return sort_training_history_frame(frame)
+
+
+def _write_training_history(path: str | Path, frame: pl.DataFrame) -> None:
+    _atomic_write_csv(Path(path), sort_training_history_frame(frame))
+
+
+def _training_history_job_expr(job_identity: dict[str, str]) -> pl.Expr:
+    return (
+        (pl.col("dataset_id") == job_identity["dataset_id"])
+        & (pl.col("model_variant") == job_identity["model_variant"])
+        & (pl.col("feature_protocol_id") == job_identity["feature_protocol_id"])
+    )
+
+
+def _prune_training_history_for_job(
+    path: str | Path,
+    *,
+    job_identity: dict[str, str],
+    min_epoch: int,
+) -> None:
+    history_path = Path(path)
+    if not history_path.exists():
+        return
+    frame = _read_training_history(history_path)
+    if frame.is_empty():
+        return
+    retained = frame.filter(~(_training_history_job_expr(job_identity) & (pl.col("epoch") >= min_epoch)))
+    _write_training_history(history_path, retained)
+
+
+def _append_training_history_row(path: str | Path, row: dict[str, object]) -> None:
+    history_path = Path(path)
+    frame = _read_training_history(history_path)
+    row_frame = pl.DataFrame([row], infer_schema_length=None).select(_TRAINING_HISTORY_COLUMNS)
+    job_identity = {
+        "dataset_id": str(row["dataset_id"]),
+        "model_variant": str(row["model_variant"]),
+        "feature_protocol_id": str(row["feature_protocol_id"]),
+    }
+    if frame.is_empty():
+        combined = row_frame
+    else:
+        retained = frame.filter(
+            ~(_training_history_job_expr(job_identity) & (pl.col("epoch") == int(row["epoch"])))
+        )
+        combined = pl.concat([retained, row_frame], how="diagonal_relaxed")
+    _write_training_history(history_path, combined)
+
+
+def _publish_training_history(paths: ResumePaths, output_path: str | Path) -> Path:
+    published_path = training_history_output_path(output_path)
+    history = _read_training_history(paths.training_history_path)
+    _write_training_history(published_path, history)
+    return published_path
+
+
 def _reset_resume_slot(paths: ResumePaths, *, effective_config: dict[str, object]) -> None:
     if paths.slot_dir.exists():
         shutil.rmtree(paths.slot_dir)
     paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
     _write_partial_results(paths, _empty_result_frame())
+    _write_training_history(paths.training_history_path, _empty_training_history_frame())
     _write_resume_state(paths, status="running", effective_config=effective_config, active_job=None)
 
 
@@ -1948,6 +2056,7 @@ def train_model(
     cheb_k: int = DEFAULT_CHEB_K,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     checkpoint_path: str | Path | None = None,
+    training_history_path: str | Path | None = None,
     resume_from_checkpoint: bool = False,
     progress_label: str | None = None,
 ) -> TrainingOutcome:
@@ -1974,6 +2083,7 @@ def train_model(
     )
 
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
     checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
     best_state: dict[str, Any] | None = None
     best_epoch = 0
@@ -2032,6 +2142,12 @@ def train_model(
                     device=resolved_device,
                     model=model,
                 )
+    if resolved_training_history_path is not None:
+        _prune_training_history_for_job(
+            resolved_training_history_path,
+            job_identity=checkpoint_job_identity,
+            min_epoch=start_epoch,
+        )
     epoch_progress = _create_progress_bar(
         total=max_epochs,
         desc=f"{progress_label or prepared_dataset.dataset_id} epochs",
@@ -2054,6 +2170,9 @@ def train_model(
                 desc=f"{progress_label or prepared_dataset.dataset_id} train e{epoch_index}",
             )
             last_loss_value: float | None = None
+            train_loss_sum = 0.0
+            train_loss_weight = 0
+            train_batch_count = 0
             try:
                 for batch_history, batch_targets, batch_target_valid_mask in train_loader:
                     batch_history = batch_history.to(device=resolved_device, dtype=resolved_torch.float32)
@@ -2073,6 +2192,10 @@ def train_model(
                     optimizer.step()
                     if hasattr(loss, "item"):
                         last_loss_value = float(loss.item())
+                        batch_window_count = int(batch_history.shape[0])
+                        train_loss_sum += last_loss_value * batch_window_count
+                        train_loss_weight += batch_window_count
+                        train_batch_count += 1
                         batch_progress.set_postfix_str(f"loss={last_loss_value:.4f}")
                     batch_progress.update(1)
             finally:
@@ -2088,19 +2211,48 @@ def train_model(
                 progress_label=f"{progress_label or prepared_dataset.dataset_id} val e{epoch_index}",
             )
             val_rmse_pu = float(val_metrics.rmse_pu)
+            is_best_epoch = False
             if val_rmse_pu < best_val_rmse_pu - 1e-12:
                 best_val_rmse_pu = val_rmse_pu
                 best_epoch = epoch_index
                 best_state = copy.deepcopy(model.state_dict())
                 epochs_without_improvement = 0
+                is_best_epoch = True
             else:
                 epochs_without_improvement += 1
+            train_loss_mean = train_loss_sum / train_loss_weight if train_loss_weight else math.nan
             epoch_progress.update(1)
             postfix_parts = [f"val_rmse={val_rmse_pu:.4f}", f"best={best_val_rmse_pu:.4f}"]
             if last_loss_value is not None:
                 postfix_parts.insert(0, f"loss={last_loss_value:.4f}")
             epoch_progress.set_postfix_str(" ".join(postfix_parts))
             should_stop = epochs_without_improvement >= early_stopping_patience or epoch_index >= max_epochs
+            if resolved_training_history_path is not None:
+                _append_training_history_row(
+                    resolved_training_history_path,
+                    {
+                        "dataset_id": prepared_dataset.dataset_id,
+                        "model_id": MODEL_ID,
+                        "model_variant": prepared_dataset.model_variant,
+                        "feature_protocol_id": prepared_dataset.feature_protocol_id,
+                        "task_id": TASK_ID,
+                        "window_protocol": WINDOW_PROTOCOL,
+                        "epoch": epoch_index,
+                        "train_loss_mean": train_loss_mean,
+                        "train_loss_last": last_loss_value,
+                        "val_rmse_pu": val_rmse_pu,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "is_best_epoch": is_best_epoch,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "train_batch_count": train_batch_count,
+                        "train_window_count": len(prepared_dataset.train_windows),
+                        "val_window_count": len(prepared_dataset.val_rolling_windows),
+                        "device": resolved_device,
+                        "seed": seed,
+                        "batch_size": batch_size,
+                        "learning_rate": learning_rate,
+                    },
+                )
             if resolved_checkpoint_path is not None:
                 _save_training_checkpoint(
                     resolved_checkpoint_path,
@@ -2271,6 +2423,7 @@ def execute_training_job(
     cheb_k: int = DEFAULT_CHEB_K,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     checkpoint_path: str | Path | None = None,
+    training_history_path: str | Path | None = None,
     resume_from_checkpoint: bool = False,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
@@ -2289,6 +2442,7 @@ def execute_training_job(
         cheb_k=cheb_k,
         grad_clip_norm=grad_clip_norm,
         checkpoint_path=checkpoint_path,
+        training_history_path=training_history_path,
         resume_from_checkpoint=resume_from_checkpoint,
         progress_label=progress_label,
     )
@@ -2394,6 +2548,24 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def sort_training_history_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame.select(_TRAINING_HISTORY_COLUMNS)
+    return (
+        frame.select(_TRAINING_HISTORY_COLUMNS)
+        .with_columns(
+            pl.col("dataset_id")
+            .replace_strict(_DATASET_ORDER, default=len(_DATASET_ORDER))
+            .alias("__dataset_order"),
+            pl.col("model_variant")
+            .replace_strict(_MODEL_VARIANT_ORDER, default=len(_MODEL_VARIANT_ORDER))
+            .alias("__model_variant_order"),
+        )
+        .sort(["__dataset_order", "__model_variant_order", "epoch"])
+        .drop(["__dataset_order", "__model_variant_order"])
+    )
+
+
 def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
@@ -2477,6 +2649,7 @@ def run_experiment(
     if len(completed_job_keys) == total_jobs:
         results = _result_frame_from_rows(rows)
         _atomic_write_csv(output, results)
+        _publish_training_history(resume_paths, output)
         _clear_checkpoint_dir(resume_paths)
         _write_resume_state(resume_paths, status="complete", effective_config=effective_config, active_job=None)
         return results
@@ -2564,6 +2737,7 @@ def run_experiment(
                         cheb_k=resolved_profile.cheb_k,
                         grad_clip_norm=resolved_profile.grad_clip_norm,
                         checkpoint_path=checkpoint_path,
+                        training_history_path=resume_paths.training_history_path,
                         resume_from_checkpoint=resume_from_checkpoint,
                     )
                 )
@@ -2583,6 +2757,7 @@ def run_experiment(
 
     results = _result_frame_from_rows(rows)
     _atomic_write_csv(output, results)
+    _publish_training_history(resume_paths, output)
     _clear_checkpoint_dir(resume_paths)
     _write_resume_state(resume_paths, status="complete", effective_config=effective_config, active_job=None)
     return results
@@ -2772,6 +2947,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_variants=tuple(spec.model_variant for spec in variant_specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("val", "test"),
+            artifacts={"training_history": training_history_output_path(args.output_path)},
             run_label=args.run_label,
         )
     return 0

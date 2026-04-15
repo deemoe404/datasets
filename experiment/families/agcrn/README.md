@@ -175,6 +175,7 @@ This writes:
 
 ```text
 ../../artifacts/published/agcrn_official_aligned/latest.csv
+../../artifacts/published/agcrn_official_aligned/latest.training_history.csv
 ```
 
 For ad hoc smoke/debug runs, prefer an explicit `--output-path` under
@@ -210,6 +211,7 @@ Resume state is family-local and keyed by the resolved `--output-path`:
 ./.work/run_agcrn/<sha256(output_path)>/
   run_state.json
   partial_results.csv
+  training_history.csv
   checkpoints/<dataset_id>__<model_variant>.pt
 ```
 
@@ -217,6 +219,8 @@ Behavior:
 
 - `--resume` is required to continue an interrupted run; the default invocation still starts a fresh run
 - completed `(dataset_id, model_variant)` jobs are skipped based on `partial_results.csv`
+- completed epochs are recorded in `training_history.csv` and republished beside
+  the result CSV as `<output-stem>.training_history.csv`
 - the interrupted active job resumes from the latest epoch checkpoint when the matching `.pt` file exists
 - if the active job has no checkpoint file, that job restarts from epoch `0`
 - only epoch-boundary recovery is supported; there is no batch-level recovery

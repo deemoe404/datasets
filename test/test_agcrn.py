@@ -2392,6 +2392,7 @@ def test_train_model_resume_matches_continuous_training(tmp_path, monkeypatch) -
     full = module.train_model(prepared, **common_kwargs)
 
     original_save = module._save_training_checkpoint
+    history_path = tmp_path / "training_history.csv"
 
     def _interrupting_save(path, payload):
         original_save(path, payload)
@@ -2400,15 +2401,27 @@ def test_train_model_resume_matches_continuous_training(tmp_path, monkeypatch) -
 
     monkeypatch.setattr(module, "_save_training_checkpoint", _interrupting_save)
     with pytest.raises(_PlannedInterrupt, match="simulated interrupt"):
-        module.train_model(prepared, checkpoint_path=checkpoint_path, **common_kwargs)
+        module.train_model(
+            prepared,
+            checkpoint_path=checkpoint_path,
+            training_history_path=history_path,
+            **common_kwargs,
+        )
 
     monkeypatch.setattr(module, "_save_training_checkpoint", original_save)
     resumed = module.train_model(
         prepared,
         checkpoint_path=checkpoint_path,
+        training_history_path=history_path,
         resume_from_checkpoint=True,
         **common_kwargs,
     )
+
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1, 2, 3, 4]
+    assert history["model_variant"].unique().to_list() == [module.MODEL_VARIANT]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
 
     assert resumed.best_epoch == full.best_epoch
     assert resumed.epochs_ran == full.epochs_ran

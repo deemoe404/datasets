@@ -56,6 +56,7 @@ and writes:
 
 ```text
 ../../artifacts/published/agcrn_masked/latest.csv
+../../artifacts/published/agcrn_masked/latest.training_history.csv
 ```
 
 For ad hoc smoke runs, prefer an explicit output path under
@@ -83,8 +84,12 @@ Resume state is family-local and keyed by the resolved `--output-path`:
 ./.work/run_agcrn_masked/<sha256(output_path)>/
   run_state.json
   partial_results.csv
+  training_history.csv
   checkpoints/<dataset_id>__<model_variant>.pt
 ```
+
+`training_history.csv` records one row per completed epoch and is republished
+beside the selected output CSV as `<output-stem>.training_history.csv`.
 
 Formal run records are written under
 `experiment/artifacts/runs/agcrn_masked/<timestamp>/manifest.json` unless
