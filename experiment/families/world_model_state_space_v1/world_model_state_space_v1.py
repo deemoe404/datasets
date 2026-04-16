@@ -95,7 +95,7 @@ FORECAST_STEPS = 36
 STRIDE_STEPS = 1
 FEATURE_PROTOCOL_ID = "world_model_v1"
 
-DEFAULT_BATCH_SIZE = 128
+DEFAULT_BATCH_SIZE = 432
 DEFAULT_LEARNING_RATE = 2e-4
 DEFAULT_MAX_EPOCHS = 30
 DEFAULT_EARLY_STOPPING_PATIENCE = 10
@@ -124,7 +124,7 @@ DEFAULT_WAKE_KAPPA = 2.0
 DEFAULT_BOUNDED_OUTPUT_EPSILON = 0.05
 DEFAULT_DELTA_CAP_STEPS = 72
 DEFAULT_HISTORY_RECON_BURN_IN = 108
-DEFAULT_CUDA_NUM_WORKERS = 2
+DEFAULT_CUDA_NUM_WORKERS = 4
 DEFAULT_CUDA_PREFETCH_FACTOR = 4
 DEFAULT_EVAL_BATCH_SIZE_MULTIPLIER = 2
 DEFAULT_MAX_CUDA_EVAL_BATCH_SIZE = 256
@@ -145,6 +145,11 @@ KNOWN_FUTURE_FEATURE_COLUMNS = rollout_base.KNOWN_FUTURE_FEATURE_COLUMNS
 STATIC_FEATURE_NAMES = rollout_base.STATIC_FEATURE_NAMES
 PAIRWISE_FEATURE_NAMES = rollout_base.PAIRWISE_FEATURE_NAMES
 WAKE_GEOMETRY_FEATURE_NAMES = ("delta_x_like", "delta_y_like", "distance_in_rotor_diameters_like")
+_RAW_WAKE_GEOMETRY_COLUMNS = (
+    "delta_x_m",
+    "delta_y_m",
+    "distance_in_rotor_diameters",
+)
 
 _REPO_ROOT = EXPERIMENT_ROOT.parent
 _CACHE_ROOT = _REPO_ROOT / "cache"
@@ -750,7 +755,61 @@ def _delta_since_available(mask_unavailable: np.ndarray, *, cap_steps: int = DEF
     return (np.minimum(result, float(cap_steps)) / float(cap_steps)).reshape(masks.shape)
 
 
-def _build_state_space_tensors(base: rollout_base.PreparedDataset) -> dict[str, object]:
+def _build_raw_wake_geometry_tensor(
+    *,
+    dataset_id: str,
+    feature_protocol_id: str,
+    cache_root: str | Path = _CACHE_ROOT,
+) -> np.ndarray:
+    bundle = world_model_base._load_task_bundle(
+        dataset_id,
+        feature_protocol_id=feature_protocol_id,
+        cache_root=cache_root,
+    )
+    metadata = world_model_base.load_dataset_metadata(dataset_id, bundle)
+    pairwise_frame = world_model_base.load_pairwise_frame(dataset_id, bundle)
+    feature_frame = pairwise_frame.select(list(_RAW_WAKE_GEOMETRY_COLUMNS))
+    incomplete = [column for column in _RAW_WAKE_GEOMETRY_COLUMNS if feature_frame[column].null_count() > 0]
+    if incomplete:
+        raise ValueError(f"Task bundle pairwise sidecar has null values in wake geometry columns {incomplete!r}.")
+
+    node_count = len(metadata.turbine_ids)
+    turbine_index_by_id = {turbine_id: index for index, turbine_id in enumerate(metadata.turbine_ids)}
+    raw_features = feature_frame.to_numpy().astype(np.float32, copy=False)
+    tensor = np.zeros((node_count, node_count, len(_RAW_WAKE_GEOMETRY_COLUMNS)), dtype=np.float32)
+    coverage: set[tuple[int, int]] = set()
+    for row_index, row in enumerate(pairwise_frame.iter_rows(named=True)):
+        src_turbine_id = str(row["src_turbine_id"])
+        dst_turbine_id = str(row["dst_turbine_id"])
+        src_index = int(row["src_turbine_index"])
+        dst_index = int(row["dst_turbine_index"])
+        expected_src_index = turbine_index_by_id.get(src_turbine_id)
+        expected_dst_index = turbine_index_by_id.get(dst_turbine_id)
+        if expected_src_index is None or expected_dst_index is None:
+            raise ValueError("Pairwise sidecar references turbine ids that are not present in the task-local order.")
+        if src_index != expected_src_index or dst_index != expected_dst_index:
+            raise ValueError(
+                "Pairwise sidecar src/dst turbine ids do not match the declared src/dst turbine indices."
+            )
+        if src_index == dst_index:
+            raise ValueError("Pairwise sidecar must not contain self edges.")
+        if (dst_index, src_index) in coverage:
+            raise ValueError("Pairwise sidecar contains duplicate directed turbine pairs.")
+        tensor[dst_index, src_index, :] = raw_features[row_index]
+        coverage.add((dst_index, src_index))
+    expected_coverage = {
+        (dst_index, src_index)
+        for src_index in range(node_count)
+        for dst_index in range(node_count)
+        if src_index != dst_index
+    }
+    if coverage != expected_coverage:
+        missing = sorted(expected_coverage.difference(coverage))
+        raise ValueError(f"Pairwise sidecar does not cover all directed turbine pairs; missing {missing[:5]!r}.")
+    return tensor
+
+
+def _build_state_space_tensors(base: rollout_base.PreparedDataset, *, raw_wake_geometry: np.ndarray) -> dict[str, object]:
     local = base.local_history_tensor
     value_indices = [0, *range(2, 18)]
     mask_indices = [1, *range(18, 34)]
@@ -810,9 +869,6 @@ def _build_state_space_tensors(base: rollout_base.PreparedDataset) -> dict[str, 
     farm_target = global_values[:, 1:2].astype(np.float32)
     farm_valid = (1.0 - global_masks[:, 1:2]).astype(np.float32)
 
-    pairwise = base.pairwise_tensor
-    wake_geometry = np.stack([pairwise[:, :, 0], pairwise[:, :, 1], pairwise[:, :, 6]], axis=-1).astype(np.float32)
-
     return {
         "local_tensor": local_tensor,
         "local_names": local_names,
@@ -830,7 +886,7 @@ def _build_state_space_tensors(base: rollout_base.PreparedDataset) -> dict[str, 
         "site_summary_valid": site_summary_valid,
         "farm_target": farm_target,
         "farm_valid": farm_valid,
-        "wake_geometry": wake_geometry,
+        "wake_geometry": raw_wake_geometry.astype(np.float32, copy=False),
     }
 
 
@@ -854,7 +910,12 @@ def prepare_dataset(
         max_train_origins=max_train_origins,
         max_eval_origins=max_eval_origins,
     )
-    tensors = _build_state_space_tensors(base)
+    raw_wake_geometry = _build_raw_wake_geometry_tensor(
+        dataset_id=dataset_id,
+        feature_protocol_id=resolved_variant.feature_protocol_id,
+        cache_root=cache_root,
+    )
+    tensors = _build_state_space_tensors(base, raw_wake_geometry=raw_wake_geometry)
     prepared = PreparedDataset(
         dataset_id=base.dataset_id,
         model_variant=resolved_variant.model_variant,

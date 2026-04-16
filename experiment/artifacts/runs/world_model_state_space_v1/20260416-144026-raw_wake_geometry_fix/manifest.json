@@ -1,0 +1,148 @@
+{
+  "args": {
+    "batch_size": null,
+    "bounded_output_epsilon": null,
+    "datasets": null,
+    "device": "auto",
+    "disable_tensorboard": false,
+    "dropout": null,
+    "edge_hidden_dim": null,
+    "edge_message_dim": null,
+    "epochs": null,
+    "eval_batch_size": null,
+    "farm_loss_weight": null,
+    "force_rerun": true,
+    "global_state_dim": null,
+    "grad_clip_norm": null,
+    "h_dim": null,
+    "hist_recon_loss_weight": null,
+    "innovation_dim": null,
+    "innovation_loss_weight": null,
+    "learning_rate": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "met_loss_weight": null,
+    "met_summary_dim": null,
+    "no_record_run": false,
+    "num_workers": null,
+    "obs_encoding_dim": null,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_state_space_v1/latest.csv",
+    "patience": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_state_space_v1_farm_sync": {
+          "batch_size": 432,
+          "bounded_output_epsilon": 0.05,
+          "dropout": 0.05,
+          "early_stopping_patience": 10,
+          "edge_hidden_dim": 128,
+          "edge_message_dim": 64,
+          "farm_loss_weight": 0.1,
+          "feature_protocol_id": "world_model_v1",
+          "global_state_dim": 48,
+          "grad_clip_norm": 1.0,
+          "h_dim": 64,
+          "hist_recon_loss_weight": 0.2,
+          "innovation_dim": 32,
+          "innovation_loss_weight": 0.0001,
+          "learning_rate": 0.0002,
+          "max_epochs": 30,
+          "met_loss_weight": 0.05,
+          "met_summary_dim": 6,
+          "obs_encoding_dim": 64,
+          "source_summary_dim": 32,
+          "tau_embed_dim": 16,
+          "turbine_embed_dim": 8,
+          "wake_kappa": 2.0,
+          "wake_lambda_x": 6.0,
+          "wake_lambda_y": 2.0,
+          "weight_decay": 0.0001,
+          "z_dim": 32
+        }
+      }
+    },
+    "resume": false,
+    "run_label": "raw_wake_geometry_fix",
+    "seed": 3407,
+    "source_summary_dim": null,
+    "tau_embed_dim": null,
+    "tensorboard_log_dir": null,
+    "turbine_embed_dim": null,
+    "variants": null,
+    "wake_kappa": null,
+    "wake_lambda_x": null,
+    "wake_lambda_y": null,
+    "weight_decay": null,
+    "z_dim": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_state_space_v1/latest.csv",
+      "sha256": "c7d02a687193e77aea34516b9dba977358a33b851b9e5fa0e1d6f30cf721c59f",
+      "size_bytes": 71569
+    },
+    "tensorboard_root": {
+      "path": "experiment/families/world_model_state_space_v1/.work/run_world_model_state_space_v1/182c1c436eff15a8d7d4c5350426c9a63f23e2a1b617efad72411c30cca63516/tensorboard"
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_state_space_v1/latest.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-16T14:40:26.726188+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_state_space_v1/latest.csv",
+    "default_output_schema_version": "world_model_state_space_v1.long_metrics.v1",
+    "display_name": "World-Model State-Space v1",
+    "family_id": "world_model_state_space_v1",
+    "implementation_root": "experiment/families/world_model_state_space_v1",
+    "model_family": "world_model",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_state_space_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_state_space_v1/run_world_model_state_space_v1.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "b771ec50c2c69d41b3e6d4557f670c570927e080",
+    "is_dirty": true,
+    "status_short": [
+      "M experiment/artifacts/published/world_model_state_space_v1/latest.csv",
+      " M experiment/artifacts/published/world_model_state_space_v1/latest.training_history.csv",
+      " M experiment/families/world_model_state_space_v1/world_model_state_space_v1.py",
+      " M test/test_world_model_state_space_v1.py",
+      "?? wind_farm_design_revised_v3.pdf",
+      "?? wind_farm_design_revised_v3.tex"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_state_space_v1/run_world_model_state_space_v1.py",
+    "kind": "family_runner",
+    "run_label": "raw_wake_geometry_fix"
+  },
+  "notes": [],
+  "result": {
+    "row_count": 148
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_state_space_v1_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}

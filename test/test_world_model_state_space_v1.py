@@ -146,6 +146,14 @@ def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
     assert root == expected
 
 
+def test_default_hyperparameters_use_tuned_kelmarsh_batch_size() -> None:
+    module = _load_module()
+    profile = module.resolve_hyperparameter_profile(module.MODEL_VARIANT, dataset_id="kelmarsh")
+
+    assert profile.batch_size == 432
+    assert module.resolve_loader_num_workers(device="cuda") == 4
+
+
 def test_prepare_dataset_builds_state_space_contract(tmp_path, monkeypatch) -> None:
     module = _load_module()
     prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
@@ -177,6 +185,27 @@ def test_prepare_dataset_builds_state_space_contract(tmp_path, monkeypatch) -> N
     assert prepared.local_history_tensor[200, 0, module._LOCAL_DELTA_START] == pytest.approx(1.0 / 72.0)
     assert prepared.local_history_tensor[201, 0, module._LOCAL_DELTA_START] == pytest.approx(0.0)
     assert prepared.local_history_tensor[201, 0, module._LOCAL_DELTA_START + 1] == pytest.approx(1.0 / 72.0)
+
+
+def test_wake_geometry_uses_raw_pairwise_values(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
+
+    # Directed edge src=T01 (0) -> dst=T02 (1) in the toy cache.
+    assert prepared.wake_geometry_tensor[1, 0, 0] == pytest.approx(100.0)
+    assert prepared.wake_geometry_tensor[1, 0, 1] == pytest.approx(0.0)
+    assert prepared.wake_geometry_tensor[1, 0, 2] == pytest.approx(100.0 / 90.0)
+
+    # Directed edge src=T01 (0) -> dst=T03 (2) in the toy cache.
+    assert prepared.wake_geometry_tensor[2, 0, 0] == pytest.approx(220.0)
+    assert prepared.wake_geometry_tensor[2, 0, 1] == pytest.approx(30.0)
+    assert prepared.wake_geometry_tensor[2, 0, 2] == pytest.approx(np.hypot(220.0, 30.0) / 90.0)
+
+    # The normalized pairwise tensor keeps the same directed indexing but should not
+    # equal the raw geometry values for these channels.
+    assert prepared.pairwise_tensor[1, 0, 0] != pytest.approx(prepared.wake_geometry_tensor[1, 0, 0])
+    assert prepared.pairwise_tensor[2, 0, 1] != pytest.approx(prepared.wake_geometry_tensor[2, 0, 1])
+    assert prepared.pairwise_tensor[2, 0, 6] != pytest.approx(prepared.wake_geometry_tensor[2, 0, 2])
 
 
 def test_future_inputs_exclude_real_observations(tmp_path, monkeypatch) -> None:
