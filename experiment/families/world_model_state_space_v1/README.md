@@ -11,6 +11,17 @@ history steps run transition plus correction with real historical observations,
 future steps roll out open-loop from latent state and calendar inputs, and future
 SCADA/PMU/global observations are used only as supervised targets.
 
+Active variants:
+
+- `world_model_state_space_v1_farm_sync`: canonical model.
+- `world_model_state_space_v1_wake_off_farm_sync`: disables only dynamic wake features.
+- `world_model_state_space_v1_graph_off_farm_sync`: bypasses graph aggregation.
+- `world_model_state_space_v1_no_farm_aux_farm_sync`: sets farm auxiliary loss weight to `0.0`.
+- `world_model_state_space_v1_no_met_aux_farm_sync`: sets met auxiliary loss weight to `0.0`.
+
+The default runner behavior remains canonical-only; ablations must be selected
+explicitly with repeated `--variant` flags.
+
 ## Run
 
 ```shell
@@ -46,6 +57,7 @@ Default TensorBoard output:
 - Dataset scope: `kelmarsh` only.
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
+- Default variant: `world_model_state_space_v1_farm_sync`.
 - Deferred: search harness, multi-seed orchestration, staged training, robust
   augmentation, learned residual edges, stratified evaluation, and full ablation
   matrix.

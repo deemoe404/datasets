@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -86,6 +86,10 @@ Dataset = world_model_base.Dataset
 MODEL_ID = "WORLD_MODEL"
 FAMILY_ID = "world_model_state_space_v1"
 MODEL_VARIANT = "world_model_state_space_v1_farm_sync"
+WAKE_OFF_MODEL_VARIANT = "world_model_state_space_v1_wake_off_farm_sync"
+GRAPH_OFF_MODEL_VARIANT = "world_model_state_space_v1_graph_off_farm_sync"
+NO_FARM_AUX_MODEL_VARIANT = "world_model_state_space_v1_no_farm_aux_farm_sync"
+NO_MET_AUX_MODEL_VARIANT = "world_model_state_space_v1_no_met_aux_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -158,7 +162,6 @@ _RUN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_world_model_state_space_v1"
 _RUN_STATE_SCHEMA_VERSION = "world_model_state_space_v1.run.resume.v1"
 _TRAINING_CHECKPOINT_SCHEMA_VERSION = "world_model_state_space_v1.training_checkpoint.v1"
 _DATASET_ORDER = {"kelmarsh": 0}
-_MODEL_VARIANT_ORDER = {MODEL_VARIANT: 0}
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
 _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
@@ -272,6 +275,10 @@ _TRAINING_HISTORY_COLUMNS = [
 class ExperimentVariant:
     model_variant: str
     feature_protocol_id: str
+    uses_graph: bool = True
+    uses_wake_dynamic: bool = True
+    uses_farm_aux: bool = True
+    uses_met_aux: bool = True
 
 
 @dataclass(frozen=True)
@@ -404,9 +411,32 @@ class ModelOutputs:
 
 VARIANT_SPECS = (
     ExperimentVariant(model_variant=MODEL_VARIANT, feature_protocol_id=FEATURE_PROTOCOL_ID),
+    ExperimentVariant(
+        model_variant=WAKE_OFF_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        uses_wake_dynamic=False,
+    ),
+    ExperimentVariant(
+        model_variant=GRAPH_OFF_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        uses_graph=False,
+        uses_wake_dynamic=False,
+    ),
+    ExperimentVariant(
+        model_variant=NO_FARM_AUX_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        uses_farm_aux=False,
+    ),
+    ExperimentVariant(
+        model_variant=NO_MET_AUX_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        uses_met_aux=False,
+    ),
 )
-DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
+ALL_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
+DEFAULT_VARIANTS = (MODEL_VARIANT,)
 _VARIANT_SPECS_BY_NAME = {spec.model_variant: spec for spec in VARIANT_SPECS}
+_MODEL_VARIANT_ORDER = {variant_name: index for index, variant_name in enumerate(ALL_VARIANTS)}
 _DEFAULT_PROFILE = HyperparameterProfile(
     batch_size=DEFAULT_BATCH_SIZE,
     learning_rate=DEFAULT_LEARNING_RATE,
@@ -436,7 +466,7 @@ _DEFAULT_PROFILE = HyperparameterProfile(
     bounded_output_epsilon=DEFAULT_BOUNDED_OUTPUT_EPSILON,
 )
 TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
-    "kelmarsh": {MODEL_VARIANT: _DEFAULT_PROFILE},
+    "kelmarsh": {variant_name: _DEFAULT_PROFILE for variant_name in ALL_VARIANTS},
 }
 
 
@@ -456,15 +486,19 @@ def _validate_dataset_ids(dataset_ids: Sequence[str]) -> tuple[str, ...]:
     return resolved
 
 
+def _resolve_variant_spec(variant_name: str) -> ExperimentVariant:
+    try:
+        return _VARIANT_SPECS_BY_NAME[variant_name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown model variant {variant_name!r}.") from exc
+
+
 def resolve_variant_specs(variant_names: Sequence[str] | None = None) -> tuple[ExperimentVariant, ...]:
     requested = tuple(variant_names or DEFAULT_VARIANTS)
     resolved: list[ExperimentVariant] = []
     seen: set[str] = set()
     for variant_name in requested:
-        try:
-            spec = _VARIANT_SPECS_BY_NAME[variant_name]
-        except KeyError as exc:
-            raise ValueError(f"Unknown model variant {variant_name!r}.") from exc
+        spec = _resolve_variant_spec(variant_name)
         if spec.model_variant in seen:
             continue
         resolved.append(spec)
@@ -503,6 +537,7 @@ def resolve_hyperparameter_profile(
     wake_kappa: float | None = None,
     bounded_output_epsilon: float | None = None,
 ) -> HyperparameterProfile:
+    variant_spec = _resolve_variant_spec(variant_name)
     try:
         defaults = TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT[dataset_id][variant_name]
     except KeyError as exc:
@@ -545,6 +580,36 @@ def resolve_hyperparameter_profile(
     )
     if profile.dropout < 0.0 or profile.dropout >= 1.0:
         raise ValueError(f"dropout must be in [0, 1), found {profile.dropout!r}.")
+    if not variant_spec.uses_farm_aux:
+        if farm_loss_weight is not None and not math.isclose(float(farm_loss_weight), 0.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"{variant_name!r} disables the farm auxiliary loss and requires farm_loss_weight=0.0."
+            )
+        profile = replace(profile, farm_loss_weight=0.0)
+    if not variant_spec.uses_met_aux:
+        if met_loss_weight is not None and not math.isclose(float(met_loss_weight), 0.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                f"{variant_name!r} disables the met auxiliary loss and requires met_loss_weight=0.0."
+            )
+        profile = replace(profile, met_loss_weight=0.0)
+    if not variant_spec.uses_graph or not variant_spec.uses_wake_dynamic:
+        wake_overrides = (
+            ("wake_lambda_x", wake_lambda_x, DEFAULT_WAKE_LAMBDA_X),
+            ("wake_lambda_y", wake_lambda_y, DEFAULT_WAKE_LAMBDA_Y),
+            ("wake_kappa", wake_kappa, DEFAULT_WAKE_KAPPA),
+        )
+        for field_name, field_value, default_value in wake_overrides:
+            if field_value is None:
+                continue
+            numeric_value = float(field_value)
+            if not (
+                math.isclose(numeric_value, float(default_value), rel_tol=0.0, abs_tol=1e-12)
+                or math.isclose(numeric_value, 0.0, rel_tol=0.0, abs_tol=1e-12)
+            ):
+                raise ValueError(
+                    f"{variant_name!r} fixes {field_name} and does not allow non-default overrides."
+                )
+        profile = replace(profile, wake_lambda_x=0.0, wake_lambda_y=0.0, wake_kappa=0.0)
     return profile
 
 
@@ -1086,6 +1151,8 @@ if nn is not None and F is not None:
             turbine_embed_dim: int,
             forecast_steps: int,
             dropout: float,
+            uses_graph: bool,
+            uses_wake_dynamic: bool,
             wake_lambda_x: float,
             wake_lambda_y: float,
             wake_kappa: float,
@@ -1099,6 +1166,9 @@ if nn is not None and F is not None:
             self.global_state_dim = global_state_dim
             self.met_summary_dim = met_summary_dim
             self.forecast_steps = forecast_steps
+            self.edge_message_dim = edge_message_dim
+            self.uses_graph = bool(uses_graph)
+            self.uses_wake_dynamic = bool(uses_wake_dynamic)
             self.wake_lambda_x = wake_lambda_x
             self.wake_lambda_y = wake_lambda_y
             self.wake_kappa = wake_kappa
@@ -1175,6 +1245,8 @@ if nn is not None and F is not None:
             return torch.cat((raw[:, 0:1], torch.tanh(raw[:, 1:3]), torch.sigmoid(raw[:, 3:6])), dim=-1)
 
         def _wake(self, met):
+            if not self.uses_wake_dynamic:
+                return met.new_zeros((met.shape[0], self.node_count, self.node_count, 3))
             cos_value = met[:, 1]
             sin_value = met[:, 2]
             dx = self.wake_geometry[:, :, 0][None, :, :].to(device=met.device, dtype=met.dtype)
@@ -1189,6 +1261,8 @@ if nn is not None and F is not None:
 
         def _aggregate(self, source_summary, g, met, calendar, edge_net, gate_net, *, static=None):
             batch_size = source_summary.shape[0]
+            if not self.uses_graph:
+                return source_summary.new_zeros((batch_size, self.node_count, self.edge_message_dim))
             static_nodes = self._static(batch_size) if static is None else static
             dst_static = static_nodes[:, :, None, :].expand(batch_size, self.node_count, self.node_count, -1)
             src_static = static_nodes[:, None, :, :].expand(batch_size, self.node_count, self.node_count, -1)
@@ -1349,6 +1423,8 @@ def build_model(
     wake_lambda_y: float,
     wake_kappa: float,
     bounded_output_epsilon: float,
+    uses_graph: bool = True,
+    uses_wake_dynamic: bool = True,
 ):
     _require_torch()
     return WorldModelStateSpace(
@@ -1373,6 +1449,8 @@ def build_model(
         turbine_embed_dim=turbine_embed_dim,
         forecast_steps=forecast_steps,
         dropout=dropout,
+        uses_graph=uses_graph,
+        uses_wake_dynamic=uses_wake_dynamic,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -1986,6 +2064,7 @@ def train_model(
     resolved_torch, _, _, _, _ = _require_torch()
     _set_random_seed(seed)
     resolved_device = resolve_device(device)
+    variant_spec = _resolve_variant_spec(prepared_dataset.model_variant)
     world_model_base._configure_torch_runtime(device=resolved_device, torch_module=resolved_torch)
     amp_enabled = resolved_device == "cuda"
     resolved_eval_batch_size = resolve_eval_batch_size(
@@ -2015,6 +2094,8 @@ def train_model(
         turbine_embed_dim=turbine_embed_dim,
         forecast_steps=prepared_dataset.forecast_steps,
         dropout=dropout,
+        uses_graph=variant_spec.uses_graph,
+        uses_wake_dynamic=variant_spec.uses_wake_dynamic,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -2474,13 +2555,13 @@ def execute_training_job(
     dropout: float = DEFAULT_DROPOUT,
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     hist_recon_loss_weight: float = DEFAULT_HIST_RECON_LOSS_WEIGHT,
-    farm_loss_weight: float = DEFAULT_FARM_LOSS_WEIGHT,
-    met_loss_weight: float = DEFAULT_MET_LOSS_WEIGHT,
+    farm_loss_weight: float | None = None,
+    met_loss_weight: float | None = None,
     innovation_loss_weight: float = DEFAULT_INNOVATION_LOSS_WEIGHT,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
-    wake_lambda_x: float = DEFAULT_WAKE_LAMBDA_X,
-    wake_lambda_y: float = DEFAULT_WAKE_LAMBDA_Y,
-    wake_kappa: float = DEFAULT_WAKE_KAPPA,
+    wake_lambda_x: float | None = None,
+    wake_lambda_y: float | None = None,
+    wake_kappa: float | None = None,
     bounded_output_epsilon: float = DEFAULT_BOUNDED_OUTPUT_EPSILON,
     num_workers: int | None = None,
     checkpoint_path: str | Path | None = None,
@@ -2490,7 +2571,9 @@ def execute_training_job(
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     progress_label = f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}"
-    resolved_profile = HyperparameterProfile(
+    resolved_profile = resolve_hyperparameter_profile(
+        prepared_dataset.model_variant,
+        dataset_id=prepared_dataset.dataset_id,
         batch_size=batch_size,
         learning_rate=learning_rate,
         max_epochs=max_epochs,
@@ -2520,7 +2603,7 @@ def execute_training_job(
     )
     resolved_device = resolve_device(device)
     resolved_eval_batch_size = resolve_eval_batch_size(
-        batch_size,
+        resolved_profile.batch_size,
         device=resolved_device,
         eval_batch_size=eval_batch_size,
     )
@@ -2543,33 +2626,33 @@ def execute_training_job(
             prepared_dataset,
             device=resolved_device,
             seed=seed,
-            batch_size=batch_size,
+            batch_size=resolved_profile.batch_size,
             eval_batch_size=resolved_eval_batch_size,
-            learning_rate=learning_rate,
-            max_epochs=max_epochs,
-            early_stopping_patience=early_stopping_patience,
-            z_dim=z_dim,
-            h_dim=h_dim,
-            global_state_dim=global_state_dim,
-            obs_encoding_dim=obs_encoding_dim,
-            innovation_dim=innovation_dim,
-            source_summary_dim=source_summary_dim,
-            edge_message_dim=edge_message_dim,
-            edge_hidden_dim=edge_hidden_dim,
-            tau_embed_dim=tau_embed_dim,
-            met_summary_dim=met_summary_dim,
-            turbine_embed_dim=turbine_embed_dim,
-            dropout=dropout,
-            grad_clip_norm=grad_clip_norm,
-            hist_recon_loss_weight=hist_recon_loss_weight,
-            farm_loss_weight=farm_loss_weight,
-            met_loss_weight=met_loss_weight,
-            innovation_loss_weight=innovation_loss_weight,
-            weight_decay=weight_decay,
-            wake_lambda_x=wake_lambda_x,
-            wake_lambda_y=wake_lambda_y,
-            wake_kappa=wake_kappa,
-            bounded_output_epsilon=bounded_output_epsilon,
+            learning_rate=resolved_profile.learning_rate,
+            max_epochs=resolved_profile.max_epochs,
+            early_stopping_patience=resolved_profile.early_stopping_patience,
+            z_dim=resolved_profile.z_dim,
+            h_dim=resolved_profile.h_dim,
+            global_state_dim=resolved_profile.global_state_dim,
+            obs_encoding_dim=resolved_profile.obs_encoding_dim,
+            innovation_dim=resolved_profile.innovation_dim,
+            source_summary_dim=resolved_profile.source_summary_dim,
+            edge_message_dim=resolved_profile.edge_message_dim,
+            edge_hidden_dim=resolved_profile.edge_hidden_dim,
+            tau_embed_dim=resolved_profile.tau_embed_dim,
+            met_summary_dim=resolved_profile.met_summary_dim,
+            turbine_embed_dim=resolved_profile.turbine_embed_dim,
+            dropout=resolved_profile.dropout,
+            grad_clip_norm=resolved_profile.grad_clip_norm,
+            hist_recon_loss_weight=resolved_profile.hist_recon_loss_weight,
+            farm_loss_weight=resolved_profile.farm_loss_weight,
+            met_loss_weight=resolved_profile.met_loss_weight,
+            innovation_loss_weight=resolved_profile.innovation_loss_weight,
+            weight_decay=resolved_profile.weight_decay,
+            wake_lambda_x=resolved_profile.wake_lambda_x,
+            wake_lambda_y=resolved_profile.wake_lambda_y,
+            wake_kappa=resolved_profile.wake_kappa,
+            bounded_output_epsilon=resolved_profile.bounded_output_epsilon,
             num_workers=num_workers,
             checkpoint_path=checkpoint_path,
             training_history_path=training_history_path,
@@ -2929,9 +3012,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--variant",
         action="append",
-        choices=list(DEFAULT_VARIANTS),
+        choices=list(ALL_VARIANTS),
         dest="variants",
-        help="Limit execution to the active state-space world-model variant.",
+        help="Limit execution to one or more state-space world-model variants.",
     )
     parser.add_argument("--epochs", type=int, default=None, help="Maximum training epochs.")
     parser.add_argument(

@@ -43,14 +43,19 @@ def _prepare_temp_dataset(
     monkeypatch,
     *,
     dataset_id: str = "kelmarsh",
+    variant_name: str | None = None,
     max_train_origins: int = 4,
     max_eval_origins: int = 2,
 ):
     cache_root = tmp_path / "cache"
     _build_world_model_temp_cache(cache_root, dataset_id=dataset_id)
     _patch_bundle_loader(monkeypatch, module.rollout_base, cache_root, dataset_id=dataset_id)
+    variant_spec = None
+    if variant_name is not None:
+        variant_spec = module.resolve_variant_specs((variant_name,))[0]
     return module.prepare_dataset(
         dataset_id,
+        variant_spec=variant_spec,
         cache_root=cache_root,
         max_train_origins=max_train_origins,
         max_eval_origins=max_eval_origins,
@@ -81,7 +86,9 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def _tiny_model_kwargs(module, prepared) -> dict[str, object]:
+def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> dict[str, object]:
+    resolved_variant_name = prepared.model_variant if variant_name is None else variant_name
+    variant_spec = module.resolve_variant_specs((resolved_variant_name,))[0]
     return {
         "node_count": prepared.node_count,
         "local_input_channels": prepared.local_input_channels,
@@ -104,6 +111,8 @@ def _tiny_model_kwargs(module, prepared) -> dict[str, object]:
         "turbine_embed_dim": 3,
         "forecast_steps": prepared.forecast_steps,
         "dropout": 0.0,
+        "uses_graph": variant_spec.uses_graph,
+        "uses_wake_dynamic": variant_spec.uses_wake_dynamic,
         "wake_lambda_x": module.DEFAULT_WAKE_LAMBDA_X,
         "wake_lambda_y": module.DEFAULT_WAKE_LAMBDA_Y,
         "wake_kappa": module.DEFAULT_WAKE_KAPPA,
@@ -126,6 +135,10 @@ def test_registry_declares_kelmarsh_only() -> None:
     assert 'dataset_scope = ["kelmarsh"]' in text
     assert 'supported_feature_protocols = ["world_model_v1"]' in text
     assert 'world_model_state_space_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_wake_off_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_graph_off_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_no_farm_aux_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_no_met_aux_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -152,6 +165,59 @@ def test_default_hyperparameters_use_tuned_kelmarsh_batch_size() -> None:
 
     assert profile.batch_size == 432
     assert module.resolve_loader_num_workers(device="cuda") == 4
+
+
+def test_default_variants_remain_canonical_only() -> None:
+    module = _load_module()
+
+    assert module.DEFAULT_VARIANTS == (module.MODEL_VARIANT,)
+    assert set(module.ALL_VARIANTS) == {
+        module.MODEL_VARIANT,
+        module.WAKE_OFF_MODEL_VARIANT,
+        module.GRAPH_OFF_MODEL_VARIANT,
+        module.NO_FARM_AUX_MODEL_VARIANT,
+        module.NO_MET_AUX_MODEL_VARIANT,
+    }
+    parser = module.build_arg_parser()
+    variant_action = next(action for action in parser._actions if action.dest == "variants")
+    assert set(variant_action.choices) == set(module.ALL_VARIANTS)
+
+
+def test_resolve_hyperparameter_profile_applies_ablation_guardrails() -> None:
+    module = _load_module()
+
+    wake_profile = module.resolve_hyperparameter_profile(module.WAKE_OFF_MODEL_VARIANT, dataset_id="kelmarsh")
+    graph_profile = module.resolve_hyperparameter_profile(module.GRAPH_OFF_MODEL_VARIANT, dataset_id="kelmarsh")
+    no_farm_profile = module.resolve_hyperparameter_profile(module.NO_FARM_AUX_MODEL_VARIANT, dataset_id="kelmarsh")
+    no_met_profile = module.resolve_hyperparameter_profile(module.NO_MET_AUX_MODEL_VARIANT, dataset_id="kelmarsh")
+
+    assert wake_profile.wake_lambda_x == 0.0
+    assert wake_profile.wake_lambda_y == 0.0
+    assert wake_profile.wake_kappa == 0.0
+    assert graph_profile.wake_lambda_x == 0.0
+    assert graph_profile.wake_lambda_y == 0.0
+    assert graph_profile.wake_kappa == 0.0
+    assert no_farm_profile.farm_loss_weight == 0.0
+    assert no_met_profile.met_loss_weight == 0.0
+
+    with pytest.raises(ValueError, match="farm_loss_weight=0.0"):
+        module.resolve_hyperparameter_profile(
+            module.NO_FARM_AUX_MODEL_VARIANT,
+            dataset_id="kelmarsh",
+            farm_loss_weight=0.1,
+        )
+    with pytest.raises(ValueError, match="met_loss_weight=0.0"):
+        module.resolve_hyperparameter_profile(
+            module.NO_MET_AUX_MODEL_VARIANT,
+            dataset_id="kelmarsh",
+            met_loss_weight=0.05,
+        )
+    with pytest.raises(ValueError, match="wake_lambda_x"):
+        module.resolve_hyperparameter_profile(
+            module.WAKE_OFF_MODEL_VARIANT,
+            dataset_id="kelmarsh",
+            wake_lambda_x=99.0,
+        )
 
 
 def test_prepare_dataset_builds_state_space_contract(tmp_path, monkeypatch) -> None:
@@ -249,6 +315,40 @@ def test_forward_outputs_shapes_and_bounded_forecast(tmp_path, monkeypatch) -> N
     assert float(outputs.future_predictions.max().item()) <= 1.05
 
 
+def test_wake_off_zeros_dynamic_wake_but_keeps_graph_path(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, variant_name=module.WAKE_OFF_MODEL_VARIANT)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared, variant_name=module.WAKE_OFF_MODEL_VARIANT))
+    met = torch_module.randn(2, module.DEFAULT_MET_SUMMARY_DIM)
+
+    dynamic = model._wake(met)
+
+    assert model.uses_graph is True
+    assert model.uses_wake_dynamic is False
+    assert torch_module.count_nonzero(dynamic) == 0
+    assert float(model.pairwise_features.abs().sum().item()) > 0.0
+
+
+def test_graph_off_aggregate_returns_zero_message(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, variant_name=module.GRAPH_OFF_MODEL_VARIANT)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared, variant_name=module.GRAPH_OFF_MODEL_VARIANT))
+    static = model._static(batch_size=1)
+    source_summary = torch_module.randn(1, prepared.node_count, 4)
+    g = torch_module.randn(1, 8)
+    met = torch_module.randn(1, module.DEFAULT_MET_SUMMARY_DIM)
+    calendar = torch_module.randn(1, prepared.context_future_channels)
+
+    edge_message = model._aggregate(source_summary, g, met, calendar, model.update_edge, model.update_gate, static=static)
+
+    assert model.uses_graph is False
+    assert model.uses_wake_dynamic is False
+    assert edge_message.shape == (1, prepared.node_count, 4)
+    assert torch_module.count_nonzero(edge_message) == 0
+
+
 def test_all_missing_node_keeps_prior_in_update(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -265,16 +365,29 @@ def test_all_missing_node_keeps_prior_in_update(tmp_path, monkeypatch) -> None:
 
     assert torch_module.allclose(z_post[:, 0, :], z[:, 0, :])
     assert torch_module.allclose(h_post[:, 0, :], h[:, 0, :])
-    assert not torch_module.allclose(z_post[:, 1, :], z[:, 1, :])
+    available = 1.0 - local_observations[0, :, module._LOCAL_MASK_START : module._LOCAL_MASK_START + module.LOCAL_MASK_COUNT]
+    observed_nodes = torch_module.nonzero(available.sum(dim=-1) > 0, as_tuple=False).flatten().tolist()
+    observed_nodes = [index for index in observed_nodes if index != 0]
+    assert observed_nodes, "toy batch should still contain at least one observed node after masking node 0"
+    assert any(not torch_module.allclose(z_post[:, index, :], z[:, index, :]) for index in observed_nodes)
 
 
-def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "variant_name",
+    (
+        "world_model_state_space_v1_farm_sync",
+        "world_model_state_space_v1_graph_off_farm_sync",
+        "world_model_state_space_v1_no_met_aux_farm_sync",
+    ),
+)
+def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch, variant_name: str) -> None:
     module = _load_module()
     _require_torch(module)
     prepared = _prepare_temp_dataset(
         module,
         tmp_path,
         monkeypatch,
+        variant_name=variant_name,
         max_train_origins=2,
         max_eval_origins=1,
     )
@@ -314,10 +427,16 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch) -> Non
     assert history["train_farm_loss_mean"].null_count() == 0
     assert len(rows) == 148
     assert {row["split_name"] for row in rows} == {"val", "test"}
-    assert rows[0]["model_variant"] == module.MODEL_VARIANT
+    assert rows[0]["model_variant"] == variant_name
     assert rows[0]["z_dim"] == 4
     assert rows[0]["h_dim"] == 6
     assert rows[0]["amp_enabled"] is False
+    if variant_name == module.GRAPH_OFF_MODEL_VARIANT:
+        assert rows[0]["wake_lambda_x"] == 0.0
+        assert rows[0]["wake_lambda_y"] == 0.0
+        assert rows[0]["wake_kappa"] == 0.0
+    if variant_name == module.NO_MET_AUX_MODEL_VARIANT:
+        assert rows[0]["met_loss_weight"] == 0.0
 
 
 def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkeypatch) -> None:
