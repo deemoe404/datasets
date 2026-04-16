@@ -70,6 +70,10 @@ def _chronos_variant_spec(module):
     return module.resolve_variant_specs((module.CHRONOS_VARIANT,))[0]
 
 
+def _itransformer_variant_spec(module):
+    return module.resolve_variant_specs((module.ITRANSFORMER_VARIANT,))[0]
+
+
 class _FakeSummaryWriter:
     instances: list["_FakeSummaryWriter"] = []
 
@@ -94,7 +98,7 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def test_registry_declares_kelmarsh_only_and_five_variants() -> None:
+def test_registry_declares_kelmarsh_only_and_six_variants() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
@@ -113,6 +117,7 @@ def test_registry_declares_kelmarsh_only_and_five_variants() -> None:
     assert 'world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_dgcrn_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_chronos_2_zero_shot_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_itransformer_no_graph_v1_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -155,6 +160,19 @@ def test_dgcrn_default_hyperparameters_match_family_contract() -> None:
     assert profile.cheb_k == 2
     assert profile.teacher_forcing_ratio == pytest.approx(0.5)
     assert profile.d_model is None
+
+
+def test_itransformer_default_hyperparameters_are_kelmarsh_specific() -> None:
+    module = _load_module()
+    profile = module.resolve_hyperparameter_profile(module.ITRANSFORMER_VARIANT, dataset_id="kelmarsh")
+
+    assert profile.batch_size == 64
+    assert profile.learning_rate == pytest.approx(1e-4)
+    assert profile.d_model == 64
+    assert profile.lstm_hidden_dim is None
+    assert profile.attention_heads == 4
+    assert profile.dropout == pytest.approx(0.1)
+    assert profile.weight_decay == pytest.approx(1e-4)
 
 
 def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
@@ -372,6 +390,60 @@ def test_timexer_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None
     assert float(outputs.max().item()) <= 1.05
 
 
+def test_itransformer_dataset_returns_full_window_tensors(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_itransformer_variant_spec(module),
+    )
+
+    dataset = module.ITransformerWindowDataset(prepared, prepared.val_rolling_windows, include_indices=True)
+    sample = dataset[0]
+
+    assert len(dataset) == len(prepared.val_rolling_windows)
+    assert sample[0].shape == (prepared.history_steps, prepared.node_count, prepared.local_input_channels)
+    assert sample[1].shape == (prepared.history_steps, prepared.context_history_channels)
+    assert sample[2].shape == (prepared.forecast_steps, prepared.context_future_channels)
+    assert sample[3].shape == (prepared.node_count, prepared.static_feature_count)
+    assert sample[4].shape == (prepared.forecast_steps, prepared.node_count, 1)
+    assert sample[5].shape == (prepared.forecast_steps, prepared.node_count, 1)
+    assert int(sample[6]) == 0
+
+
+def test_itransformer_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_itransformer_variant_spec(module),
+    )
+    model = module.build_itransformer_model(
+        prepared_dataset=prepared,
+        d_model=8,
+        attention_heads=2,
+        dropout=0.0,
+        bounded_output_epsilon=module.DEFAULT_BOUNDED_OUTPUT_EPSILON,
+    )
+    sample = module.ITransformerWindowDataset(prepared, prepared.val_rolling_windows)[0]
+
+    with torch_module.no_grad():
+        outputs = model(
+            torch_module.from_numpy(sample[0][None]),
+            torch_module.from_numpy(sample[1][None]),
+            torch_module.from_numpy(sample[2][None]),
+            torch_module.from_numpy(sample[3][None]),
+        )
+
+    assert outputs.shape == (1, prepared.forecast_steps, prepared.node_count, 1)
+    assert float(outputs.min().item()) >= 0.0
+    assert float(outputs.max().item()) <= 1.05
+
+
 def test_tft_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -403,6 +475,53 @@ def test_tft_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
     metrics = module.evaluate_tft_model(
+        _ZeroModel(),
+        prepared,
+        prepared.val_rolling_windows,
+        batch_size=2,
+        device="cpu",
+        seed=123,
+        num_workers=0,
+    )
+
+    expected_shape = (len(prepared.val_rolling_windows), prepared.forecast_steps, prepared.node_count, 1)
+    assert captured["predictions"] == expected_shape
+    assert captured["targets"] == expected_shape
+    assert captured["valid"] == expected_shape
+    assert metrics.window_count == len(prepared.val_rolling_windows)
+
+
+def test_itransformer_eval_reaggregates_full_window_predictions(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_itransformer_variant_spec(module),
+    )
+    captured: dict[str, tuple[int, ...]] = {}
+    original_metrics = module._metrics_from_arrays
+
+    def _capture_metrics(predictions, targets, valid_mask, *, rated_power_kw):
+        captured["predictions"] = predictions.shape
+        captured["targets"] = targets.shape
+        captured["valid"] = valid_mask.shape
+        return original_metrics(predictions, targets, valid_mask, rated_power_kw=rated_power_kw)
+
+    class _ZeroModel(torch_module.nn.Module):
+        def forward(self, local_history, context_history, context_future, static_features):
+            del local_history, context_history, static_features
+            return torch_module.zeros(
+                (context_future.shape[0], context_future.shape[1], prepared.node_count, 1),
+                dtype=context_future.dtype,
+                device=context_future.device,
+            )
+
+    monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
+    metrics = module.evaluate_itransformer_model(
         _ZeroModel(),
         prepared,
         prepared.val_rolling_windows,
@@ -751,6 +870,48 @@ def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> No
     assert rows[0]["ff_hidden_dim"] == 16
 
 
+def test_itransformer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_itransformer_variant_spec(module),
+    )
+    history_path = tmp_path / "itransformer.training_history.csv"
+
+    rows = module.execute_training_job(
+        prepared,
+        variant_spec=_itransformer_variant_spec(module),
+        device="cpu",
+        seed=123,
+        batch_size=2,
+        eval_batch_size=2,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        d_model=8,
+        attention_heads=2,
+        dropout=0.0,
+        num_workers=0,
+        training_history_path=history_path,
+    )
+
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1]
+    assert history["baseline_type"].to_list() == ["itransformer_no_graph"]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
+    assert len(rows) == 148
+    assert rows[0]["model_variant"] == module.ITRANSFORMER_VARIANT
+    assert rows[0]["d_model"] == 8
+    assert rows[0]["lstm_hidden_dim"] is None
+    assert rows[0]["uses_future_observations"] is False
+
+
 def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
     module = _load_module()
     _require_torch(module)
@@ -902,13 +1063,14 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 740
+    assert results.height == 888
     assert set(results["model_variant"].unique().to_list()) == {
         module.PERSISTENCE_VARIANT,
         module.TFT_VARIANT,
         module.TIMEXER_VARIANT,
         module.DGCRN_VARIANT,
         module.CHRONOS_VARIANT,
+        module.ITRANSFORMER_VARIANT,
     }
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()

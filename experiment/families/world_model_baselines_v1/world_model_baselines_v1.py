@@ -87,6 +87,7 @@ TFT_VARIANT = "world_model_shared_weight_tft_no_graph_v1_farm_sync"
 TIMEXER_VARIANT = "world_model_shared_weight_timexer_no_graph_v1_farm_sync"
 DGCRN_VARIANT = "world_model_dgcrn_v1_farm_sync"
 CHRONOS_VARIANT = "world_model_chronos_2_zero_shot_v1_farm_sync"
+ITRANSFORMER_VARIANT = "world_model_itransformer_no_graph_v1_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -120,6 +121,8 @@ DEFAULT_CUDA_NUM_WORKERS = 2
 DEFAULT_CUDA_PREFETCH_FACTOR = 4
 DEFAULT_EVAL_BATCH_SIZE_MULTIPLIER = 2
 DEFAULT_MAX_CUDA_EVAL_BATCH_SIZE = 1024
+ITRANSFORMER_ENCODER_LAYERS = 3
+ITRANSFORMER_FFN_MULTIPLIER = 4
 PROFILE_LOG_PREFIX = "[world_model_baselines_v1] "
 _CHRONOS_MODEL_ID = "amazon/chronos-2"
 
@@ -136,6 +139,7 @@ _MODEL_VARIANT_ORDER = {
     TIMEXER_VARIANT: 2,
     DGCRN_VARIANT: 3,
     CHRONOS_VARIANT: 4,
+    ITRANSFORMER_VARIANT: 5,
 }
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
@@ -339,6 +343,11 @@ VARIANT_SPECS = (
         feature_protocol_id=FEATURE_PROTOCOL_ID,
         baseline_type="chronos_2_zero_shot",
     ),
+    ExperimentVariant(
+        model_variant=ITRANSFORMER_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        baseline_type="itransformer_no_graph",
+    ),
 )
 DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
 _VARIANT_SPECS_BY_NAME = {spec.model_variant: spec for spec in VARIANT_SPECS}
@@ -426,6 +435,27 @@ _DEFAULT_DGCRN_PROFILE = HyperparameterProfile(
     weight_decay=0.0,
     bounded_output_epsilon=None,
 )
+_DEFAULT_ITRANSFORMER_PROFILE = HyperparameterProfile(
+    batch_size=64,
+    learning_rate=1e-4,
+    max_epochs=30,
+    early_stopping_patience=10,
+    d_model=64,
+    lstm_hidden_dim=None,
+    attention_heads=4,
+    patch_len=None,
+    encoder_layers=None,
+    ff_hidden_dim=None,
+    hidden_dim=None,
+    embed_dim=None,
+    num_layers=None,
+    cheb_k=None,
+    teacher_forcing_ratio=None,
+    dropout=0.1,
+    grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+    weight_decay=1e-4,
+    bounded_output_epsilon=DEFAULT_BOUNDED_OUTPUT_EPSILON,
+)
 TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
     "kelmarsh": {
         PERSISTENCE_VARIANT: _DEFAULT_PERSISTENCE_PROFILE,
@@ -433,6 +463,7 @@ TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
         TIMEXER_VARIANT: _DEFAULT_TIMEXER_PROFILE,
         DGCRN_VARIANT: _DEFAULT_DGCRN_PROFILE,
         CHRONOS_VARIANT: _DEFAULT_PERSISTENCE_PROFILE,
+        ITRANSFORMER_VARIANT: _DEFAULT_ITRANSFORMER_PROFILE,
     },
 }
 
@@ -538,7 +569,7 @@ def resolve_hyperparameter_profile(
         raise ValueError(f"grad_clip_norm must be positive, found {profile.grad_clip_norm!r}.")
     if profile.weight_decay < 0.0:
         raise ValueError(f"weight_decay must be non-negative, found {profile.weight_decay!r}.")
-    if variant_name in {TFT_VARIANT, TIMEXER_VARIANT}:
+    if variant_name in {TFT_VARIANT, TIMEXER_VARIANT, ITRANSFORMER_VARIANT}:
         if profile.dropout is None or profile.dropout < 0.0 or profile.dropout >= 1.0:
             raise ValueError(f"dropout must be in [0, 1), found {profile.dropout!r}.")
         if profile.d_model is None or profile.attention_heads is None:
@@ -1265,6 +1296,40 @@ if Dataset is not None:
                 return item
             return (*item, np.int64(window_pos), np.int64(node_index))
 
+
+    class ITransformerWindowDataset(Dataset):
+        def __init__(
+            self,
+            prepared_dataset: state_base.PreparedDataset,
+            windows: world_model_base.FarmWindowDescriptorIndex,
+            *,
+            include_indices: bool = False,
+        ) -> None:
+            self.prepared_dataset = prepared_dataset
+            self.windows = windows
+            self.include_indices = include_indices
+
+        def __len__(self) -> int:
+            return len(self.windows)
+
+        def __getitem__(self, index: int):
+            prepared = self.prepared_dataset
+            window_pos = int(index)
+            target_index = int(self.windows.target_indices[window_pos])
+            history_slice = slice(target_index - prepared.history_steps, target_index)
+            future_slice = slice(target_index, target_index + prepared.forecast_steps)
+            item = (
+                prepared.local_history_tensor[history_slice, :, :].astype(np.float32, copy=True),
+                prepared.context_history_tensor[history_slice, :].astype(np.float32, copy=True),
+                prepared.context_future_tensor[future_slice, :].astype(np.float32, copy=True),
+                prepared.static_tensor[:, :].astype(np.float32, copy=True),
+                prepared.target_pu_filled[future_slice, :, None].astype(np.float32, copy=True),
+                prepared.target_valid_mask[future_slice, :, None].astype(np.float32, copy=True),
+            )
+            if not self.include_indices:
+                return item
+            return (*item, np.int64(window_pos))
+
 else:
 
     class TurbineWindowDataset:  # pragma: no cover
@@ -1273,6 +1338,11 @@ else:
 
 
     class TimeXerWindowDataset:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+
+    class ITransformerWindowDataset:  # pragma: no cover
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
 
@@ -1376,6 +1446,36 @@ def _build_timexer_dataloader(
     generator.manual_seed(seed)
     loader_kwargs: dict[str, object] = {
         "dataset": TimeXerWindowDataset(prepared_dataset, windows, include_indices=include_indices),
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "generator": generator if shuffle else None,
+        "pin_memory": resolved_device == "cuda",
+        "num_workers": resolved_num_workers,
+    }
+    if resolved_num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = DEFAULT_CUDA_PREFETCH_FACTOR
+    return resolved_loader(**loader_kwargs)
+
+
+def _build_itransformer_dataloader(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    batch_size: int,
+    device: str,
+    shuffle: bool,
+    seed: int,
+    num_workers: int | None = None,
+    include_indices: bool = False,
+):
+    resolved_torch, _, _, resolved_loader, _ = _require_torch()
+    resolved_device = resolve_device(device)
+    resolved_num_workers = resolve_loader_num_workers(device=resolved_device, num_workers=num_workers)
+    generator = resolved_torch.Generator()
+    generator.manual_seed(seed)
+    loader_kwargs: dict[str, object] = {
+        "dataset": ITransformerWindowDataset(prepared_dataset, windows, include_indices=include_indices),
         "batch_size": batch_size,
         "shuffle": shuffle,
         "generator": generator if shuffle else None,
@@ -1529,6 +1629,69 @@ if nn is not None and F is not None:
             attended, _weights = self.attention(queries, keys, values, need_weights=False)
             fused = self.output_grn(torch.cat((queries, attended, future_encoded), dim=-1))
             return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(self.output_head(fused))
+
+
+    class ITransformerNoGraph(nn.Module):
+        def __init__(
+            self,
+            *,
+            history_steps: int,
+            local_input_channels: int,
+            context_history_channels: int,
+            context_future_channels: int,
+            static_feature_count: int,
+            forecast_steps: int,
+            d_model: int,
+            attention_heads: int,
+            dropout: float,
+            bounded_output_epsilon: float,
+            encoder_layers: int = ITRANSFORMER_ENCODER_LAYERS,
+        ) -> None:
+            super().__init__()
+            history_input_dim = history_steps * (local_input_channels + context_history_channels)
+            future_hidden_dim = max(d_model * ITRANSFORMER_FFN_MULTIPLIER, d_model)
+            self.bounded_output_epsilon = bounded_output_epsilon
+            self.history_encoder = FeedForward(history_input_dim, future_hidden_dim, d_model, dropout=dropout)
+            self.static_encoder = FeedForward(
+                static_feature_count,
+                max(d_model, static_feature_count * 2),
+                d_model,
+                dropout=dropout,
+            )
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=attention_heads,
+                dim_feedforward=d_model * ITRANSFORMER_FFN_MULTIPLIER,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_layers)
+            self.horizon_embedding = nn.Embedding(forecast_steps, d_model)
+            self.output_grn = GatedResidualBlock(
+                (d_model * 3) + context_future_channels,
+                d_model * 2,
+                d_model,
+                dropout=dropout,
+            )
+            self.output_head = nn.Linear(d_model, 1)
+
+        def forward(self, local_history, context_history, context_future, static_features):
+            batch_size, _history_steps, node_count, _local_channels = local_history.shape
+            history_context = context_history[:, :, None, :].expand(-1, -1, node_count, -1)
+            history_inputs = torch.cat((local_history, history_context), dim=-1)
+            history_inputs = history_inputs.permute(0, 2, 1, 3).reshape(batch_size, node_count, -1)
+            history_tokens = self.history_encoder(history_inputs)
+            static_tokens = self.static_encoder(static_features)
+            encoded_tokens = self.encoder(history_tokens + static_tokens)
+            horizon_index = torch.arange(context_future.shape[1], device=context_future.device, dtype=torch.long)
+            horizon = self.horizon_embedding(horizon_index)[None, :, None, :].expand(batch_size, -1, node_count, -1)
+            encoded = encoded_tokens[:, None, :, :].expand(-1, context_future.shape[1], -1, -1)
+            static = static_tokens[:, None, :, :].expand(-1, context_future.shape[1], -1, -1)
+            future = context_future[:, :, None, :].expand(-1, -1, node_count, -1)
+            decoded = self.output_grn(torch.cat((encoded, static, horizon, future), dim=-1))
+            return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(self.output_head(decoded))
 
 
     class DynamicChebyshevConv(nn.Module):
@@ -1913,6 +2076,10 @@ else:
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
 
+    class ITransformerNoGraph:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
     class DynamicChebyshevConv:  # pragma: no cover
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
@@ -1960,6 +2127,29 @@ def build_tft_model(
         forecast_steps=prepared_dataset.forecast_steps,
         d_model=d_model,
         lstm_hidden_dim=lstm_hidden_dim,
+        attention_heads=attention_heads,
+        dropout=dropout,
+        bounded_output_epsilon=bounded_output_epsilon,
+    )
+
+
+def build_itransformer_model(
+    *,
+    prepared_dataset: state_base.PreparedDataset,
+    d_model: int,
+    attention_heads: int,
+    dropout: float,
+    bounded_output_epsilon: float,
+):
+    _require_torch()
+    return ITransformerNoGraph(
+        history_steps=prepared_dataset.history_steps,
+        local_input_channels=prepared_dataset.local_input_channels,
+        context_history_channels=prepared_dataset.context_history_channels,
+        context_future_channels=prepared_dataset.context_future_channels,
+        static_feature_count=prepared_dataset.static_feature_count,
+        forecast_steps=prepared_dataset.forecast_steps,
+        d_model=d_model,
         attention_heads=attention_heads,
         dropout=dropout,
         bounded_output_epsilon=bounded_output_epsilon,
@@ -2205,6 +2395,102 @@ def evaluate_timexer_model(
                     predictions[int(window_id), :, int(node_id), :] = batch_predictions_np[row_index]
                     targets[int(window_id), :, int(node_id), :] = batch_targets_np[row_index]
                     valid[int(window_id), :, int(node_id), :] = batch_valid_np[row_index]
+                progress.update(1)
+    finally:
+        progress.close()
+    return _metrics_from_arrays(
+        predictions,
+        targets,
+        valid,
+        rated_power_kw=prepared_dataset.rated_power_kw,
+    )
+
+
+def evaluate_itransformer_model(
+    model,
+    prepared_dataset: state_base.PreparedDataset,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    *,
+    batch_size: int,
+    device: str,
+    seed: int,
+    num_workers: int | None = None,
+    amp_enabled: bool = False,
+    progress_label: str | None = None,
+) -> EvaluationMetrics:
+    resolved_torch, _, _, _, _ = _require_torch()
+    predictions = np.zeros((len(windows), prepared_dataset.forecast_steps, prepared_dataset.node_count, 1), dtype=np.float32)
+    targets = np.zeros_like(predictions, dtype=np.float32)
+    valid = np.zeros_like(predictions, dtype=np.float32)
+    loader = _build_itransformer_dataloader(
+        prepared_dataset,
+        windows=windows,
+        batch_size=batch_size,
+        device=device,
+        shuffle=False,
+        seed=seed,
+        num_workers=num_workers,
+        include_indices=True,
+    )
+    model.eval()
+    progress = _create_progress_bar(total=_loader_batch_total(loader), desc=progress_label or "evaluate")
+    try:
+        with resolved_torch.no_grad():
+            for raw_batch in loader:
+                (
+                    batch_local_history,
+                    batch_context_history,
+                    batch_context_future,
+                    batch_static,
+                    batch_targets,
+                    batch_valid,
+                    batch_window_pos,
+                ) = raw_batch
+                batch_local_history = batch_local_history.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_context_history = batch_context_history.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_context_future = batch_context_future.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_static = batch_static.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_targets = batch_targets.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_valid = batch_valid.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                with _amp_context(torch_module=resolved_torch, device=device, enabled=amp_enabled):
+                    batch_predictions = model(
+                        batch_local_history,
+                        batch_context_history,
+                        batch_context_future,
+                        batch_static,
+                    ).float()
+                window_pos = batch_window_pos.detach().cpu().numpy().astype(np.int64, copy=False)
+                batch_predictions_np = batch_predictions.detach().cpu().numpy().astype(np.float32, copy=False)
+                batch_targets_np = batch_targets.detach().cpu().numpy().astype(np.float32, copy=False)
+                batch_valid_np = batch_valid.detach().cpu().numpy().astype(np.float32, copy=False)
+                for row_index, window_id in enumerate(window_pos):
+                    predictions[int(window_id)] = batch_predictions_np[row_index]
+                    targets[int(window_id)] = batch_targets_np[row_index]
+                    valid[int(window_id)] = batch_valid_np[row_index]
                 progress.update(1)
     finally:
         progress.close()
@@ -2866,6 +3152,326 @@ def train_timexer_model(
     )
 
 
+def train_itransformer_model(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    device: str,
+    seed: int,
+    batch_size: int,
+    eval_batch_size: int | None,
+    learning_rate: float,
+    max_epochs: int,
+    early_stopping_patience: int,
+    d_model: int,
+    attention_heads: int,
+    dropout: float,
+    grad_clip_norm: float,
+    weight_decay: float,
+    bounded_output_epsilon: float,
+    num_workers: int | None = None,
+    checkpoint_path: str | Path | None = None,
+    training_history_path: str | Path | None = None,
+    resume_from_checkpoint: bool = False,
+    progress_label: str | None = None,
+    tensorboard_writer=None,
+) -> TrainingOutcome:
+    resolved_torch, _, _, _, _ = _require_torch()
+    _set_random_seed(seed)
+    resolved_device = resolve_device(device)
+    world_model_base._configure_torch_runtime(device=resolved_device, torch_module=resolved_torch)
+    amp_enabled = resolved_device == "cuda"
+    resolved_eval_batch_size = resolve_eval_batch_size(
+        batch_size,
+        device=resolved_device,
+        eval_batch_size=eval_batch_size,
+    )
+    model = build_itransformer_model(
+        prepared_dataset=prepared_dataset,
+        d_model=d_model,
+        attention_heads=attention_heads,
+        dropout=dropout,
+        bounded_output_epsilon=bounded_output_epsilon,
+    ).to(device=resolved_device)
+    initialize_model_parameters(model)
+    optimizer = resolved_torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
+    resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    best_state: dict[str, Any] | None = None
+    best_epoch = 0
+    best_val_mae_pu = float("inf")
+    best_val_rmse_pu = float("inf")
+    epochs_without_improvement = 0
+    epochs_ran = 0
+    start_epoch = 1
+    if resume_from_checkpoint:
+        if resolved_checkpoint_path is None:
+            raise ValueError("resume_from_checkpoint=True requires checkpoint_path to be set.")
+        if resolved_checkpoint_path.exists():
+            checkpoint_payload = world_model_base._torch_load_checkpoint(
+                resolved_checkpoint_path,
+                map_location=resolved_device,
+            )
+            if checkpoint_payload.get("schema_version") != _TRAINING_CHECKPOINT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Unsupported checkpoint schema at {resolved_checkpoint_path}: "
+                    f"{checkpoint_payload.get('schema_version')!r}."
+                )
+            if checkpoint_payload.get("job") != checkpoint_job_identity:
+                raise RuntimeError(f"Checkpoint at {resolved_checkpoint_path} does not match the active job.")
+            model.load_state_dict(checkpoint_payload["model_state_dict"])
+            optimizer.load_state_dict(checkpoint_payload["optimizer_state_dict"])
+            if "scaler_state_dict" in checkpoint_payload:
+                scaler.load_state_dict(checkpoint_payload["scaler_state_dict"])
+            best_state = checkpoint_payload.get("best_state_dict")
+            best_epoch = int(checkpoint_payload["best_epoch"])
+            best_val_mae_pu = float(checkpoint_payload["best_val_mae_pu"])
+            best_val_rmse_pu = float(checkpoint_payload["best_val_rmse_pu"])
+            epochs_without_improvement = int(checkpoint_payload["epochs_without_improvement"])
+            epochs_ran = int(checkpoint_payload["epochs_ran"])
+            start_epoch = int(checkpoint_payload["next_epoch"])
+            if bool(checkpoint_payload.get("training_complete", False)):
+                if best_state is None:
+                    raise RuntimeError(f"Checkpoint at {resolved_checkpoint_path} has no best state.")
+                model.load_state_dict(best_state)
+                return TrainingOutcome(
+                    best_epoch=best_epoch,
+                    epochs_ran=epochs_ran,
+                    best_val_rmse_pu=best_val_rmse_pu,
+                    best_val_mae_pu=best_val_mae_pu,
+                    device=resolved_device,
+                    amp_enabled=amp_enabled,
+                    model=model,
+                )
+    if resolved_training_history_path is not None:
+        _prune_training_history_for_job(
+            resolved_training_history_path,
+            job_identity=checkpoint_job_identity,
+            min_epoch=start_epoch,
+        )
+    epoch_progress = _create_progress_bar(
+        total=max_epochs,
+        desc=f"{progress_label or prepared_dataset.dataset_id} epochs",
+        leave=True,
+    )
+    try:
+        if start_epoch > 1:
+            epoch_progress.update(start_epoch - 1)
+        for epoch_index in range(start_epoch, max_epochs + 1):
+            model.train()
+            train_loader = _build_itransformer_dataloader(
+                prepared_dataset,
+                windows=prepared_dataset.train_windows,
+                batch_size=batch_size,
+                device=resolved_device,
+                shuffle=True,
+                seed=seed + epoch_index,
+                num_workers=num_workers,
+            )
+            batch_progress = _create_progress_bar(
+                total=_loader_batch_total(train_loader),
+                desc=f"{progress_label or prepared_dataset.dataset_id} train e{epoch_index}",
+            )
+            train_loss_sum = 0.0
+            train_loss_weight = 0
+            train_batch_count = 0
+            train_valid_sum = 0.0
+            train_target_count = 0
+            latest_loss = float("nan")
+            try:
+                for raw_batch in train_loader:
+                    (
+                        batch_local_history,
+                        batch_context_history,
+                        batch_context_future,
+                        batch_static,
+                        batch_targets,
+                        batch_valid,
+                    ) = _move_batch_to_device(raw_batch, torch_module=resolved_torch, device=resolved_device)
+                    optimizer.zero_grad(set_to_none=True)
+                    with _amp_context(torch_module=resolved_torch, device=resolved_device, enabled=amp_enabled):
+                        predictions = model(
+                            batch_local_history,
+                            batch_context_history,
+                            batch_context_future,
+                            batch_static,
+                        )
+                        loss = masked_huber_loss(
+                            predictions,
+                            batch_targets,
+                            batch_valid,
+                            torch_module=resolved_torch,
+                        )
+                    if amp_enabled:
+                        scaler.scale(loss).backward()
+                        if grad_clip_norm > 0:
+                            scaler.unscale_(optimizer)
+                            resolved_torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        if grad_clip_norm > 0:
+                            resolved_torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        optimizer.step()
+                    batch_weight = int(batch_local_history.shape[0])
+                    train_valid_sum += float(batch_valid.sum().item())
+                    train_target_count += int(batch_valid.numel())
+                    latest_loss = float(loss.item())
+                    train_loss_sum += latest_loss * batch_weight
+                    train_loss_weight += batch_weight
+                    train_batch_count += 1
+                    batch_progress.set_postfix_str(f"loss={latest_loss:.4f}")
+                    batch_progress.update(1)
+            finally:
+                batch_progress.close()
+            epochs_ran = epoch_index
+            val_metrics = evaluate_itransformer_model(
+                model,
+                prepared_dataset,
+                prepared_dataset.val_rolling_windows,
+                batch_size=resolved_eval_batch_size,
+                device=resolved_device,
+                seed=seed,
+                num_workers=num_workers,
+                amp_enabled=amp_enabled,
+                progress_label=f"{progress_label or prepared_dataset.dataset_id} val e{epoch_index}",
+            )
+            val_mae_pu = float(val_metrics.mae_pu)
+            val_rmse_pu = float(val_metrics.rmse_pu)
+            is_best_epoch = False
+            if best_state is None or (
+                math.isfinite(val_mae_pu)
+                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            ):
+                best_val_mae_pu = val_mae_pu
+                best_val_rmse_pu = val_rmse_pu
+                best_epoch = epoch_index
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+                is_best_epoch = True
+            else:
+                epochs_without_improvement += 1
+            train_loss_mean = train_loss_sum / train_loss_weight if train_loss_weight else math.nan
+            train_valid_fraction = train_valid_sum / train_target_count if train_target_count else math.nan
+            val_valid_fraction = (
+                float(val_metrics.prediction_count)
+                / float(
+                    len(prepared_dataset.val_rolling_windows)
+                    * prepared_dataset.forecast_steps
+                    * prepared_dataset.node_count
+                )
+                if len(prepared_dataset.val_rolling_windows) > 0 and prepared_dataset.node_count > 0
+                else math.nan
+            )
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_mean", train_loss_mean, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_last", latest_loss, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/valid_fraction", train_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/batch_count", train_batch_count, epoch_index)
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "train/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                epoch_index,
+            )
+            _tensorboard_add_scalar(tensorboard_writer, "val/valid_fraction", val_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_mae_pu", best_val_mae_pu, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_rmse_pu", best_val_rmse_pu, epoch_index)
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/epochs_without_improvement",
+                epochs_without_improvement,
+                epoch_index,
+            )
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/is_best_epoch",
+                1 if is_best_epoch else 0,
+                epoch_index,
+            )
+            _tensorboard_add_metrics(tensorboard_writer, "val", val_metrics, step=epoch_index)
+            if resolved_training_history_path is not None:
+                _append_training_history_row(
+                    resolved_training_history_path,
+                    {
+                        "dataset_id": prepared_dataset.dataset_id,
+                        "model_id": MODEL_ID,
+                        "model_variant": prepared_dataset.model_variant,
+                        "feature_protocol_id": prepared_dataset.feature_protocol_id,
+                        "task_id": TASK_ID,
+                        "window_protocol": WINDOW_PROTOCOL,
+                        "baseline_type": "itransformer_no_graph",
+                        "hidden_dim": None,
+                        "embed_dim": None,
+                        "num_layers": None,
+                        "cheb_k": None,
+                        "teacher_forcing_ratio": None,
+                        "patch_len": None,
+                        "encoder_layers": None,
+                        "ff_hidden_dim": None,
+                        "epoch": epoch_index,
+                        "train_loss_mean": train_loss_mean,
+                        "train_loss_last": latest_loss,
+                        "val_mae_pu": val_mae_pu,
+                        "val_rmse_pu": val_rmse_pu,
+                        "best_val_mae_pu": best_val_mae_pu,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "is_best_epoch": is_best_epoch,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "train_batch_count": train_batch_count,
+                        "train_window_count": len(prepared_dataset.train_windows),
+                        "val_window_count": len(prepared_dataset.val_rolling_windows),
+                        "device": resolved_device,
+                        "seed": seed,
+                        "batch_size": batch_size,
+                        "learning_rate": learning_rate,
+                        "amp_enabled": amp_enabled,
+                    },
+                )
+            should_stop = epochs_without_improvement >= early_stopping_patience or epoch_index >= max_epochs
+            if resolved_checkpoint_path is not None:
+                world_model_base._save_training_checkpoint(
+                    resolved_checkpoint_path,
+                    {
+                        "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
+                        "job": checkpoint_job_identity,
+                        "seed": seed,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "best_state_dict": best_state,
+                        "best_epoch": best_epoch,
+                        "best_val_mae_pu": best_val_mae_pu,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "epochs_ran": epochs_ran,
+                        "next_epoch": epoch_index + 1,
+                        "training_complete": should_stop,
+                    },
+                )
+            epoch_progress.update(1)
+            epoch_progress.set_postfix_str(
+                f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}"
+            )
+            if should_stop:
+                break
+    finally:
+        epoch_progress.close()
+    if best_state is None:
+        raise RuntimeError("Training completed without a best checkpoint.")
+    model.load_state_dict(best_state)
+    return TrainingOutcome(
+        best_epoch=best_epoch,
+        epochs_ran=epochs_ran,
+        best_val_rmse_pu=best_val_rmse_pu,
+        best_val_mae_pu=best_val_mae_pu,
+        device=resolved_device,
+        amp_enabled=amp_enabled,
+        model=model,
+    )
+
+
 def train_dgcrn_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
@@ -3193,6 +3799,7 @@ def build_result_rows(
     rows: list[dict[str, object]] = []
     is_tft = variant_spec.model_variant == TFT_VARIANT
     is_timexer = variant_spec.model_variant == TIMEXER_VARIANT
+    is_itransformer = variant_spec.model_variant == ITRANSFORMER_VARIANT
     is_dgcrn = variant_spec.model_variant == DGCRN_VARIANT
     base_row = {
         "dataset_id": prepared_dataset.dataset_id,
@@ -3221,15 +3828,15 @@ def build_result_rows(
         "num_layers": profile.num_layers if is_dgcrn else None,
         "cheb_k": profile.cheb_k if is_dgcrn else None,
         "teacher_forcing_ratio": profile.teacher_forcing_ratio if is_dgcrn else None,
-        "bounded_output_epsilon": profile.bounded_output_epsilon if (is_tft or is_timexer) else None,
-        "d_model": profile.d_model if (is_tft or is_timexer) else None,
+        "bounded_output_epsilon": profile.bounded_output_epsilon if (is_tft or is_timexer or is_itransformer) else None,
+        "d_model": profile.d_model if (is_tft or is_timexer or is_itransformer) else None,
         "lstm_hidden_dim": profile.lstm_hidden_dim if is_tft else None,
-        "attention_heads": profile.attention_heads if (is_tft or is_timexer) else None,
+        "attention_heads": profile.attention_heads if (is_tft or is_timexer or is_itransformer) else None,
         "patch_len": profile.patch_len if is_timexer else None,
         "encoder_layers": profile.encoder_layers if is_timexer else None,
         "ff_hidden_dim": profile.ff_hidden_dim if is_timexer else None,
-        "dropout": profile.dropout if (is_tft or is_timexer) else None,
-        "weight_decay": profile.weight_decay if (is_tft or is_timexer or is_dgcrn) else None,
+        "dropout": profile.dropout if (is_tft or is_timexer or is_itransformer) else None,
+        "weight_decay": profile.weight_decay if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
         "amp_enabled": training_outcome.amp_enabled,
         "device": training_outcome.device,
         "runtime_seconds": round(runtime_seconds, 6),
@@ -3241,8 +3848,8 @@ def build_result_rows(
         "best_val_rmse_pu": training_outcome.best_val_rmse_pu,
         "best_val_mae_pu": training_outcome.best_val_mae_pu,
         "seed": seed,
-        "batch_size": profile.batch_size if (is_tft or is_timexer or is_dgcrn) else None,
-        "learning_rate": profile.learning_rate if (is_tft or is_timexer or is_dgcrn) else None,
+        "batch_size": profile.batch_size if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
+        "learning_rate": profile.learning_rate if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
     }
     for split_name, eval_protocol, windows, metrics in evaluation_results:
         start_timestamp, end_timestamp = _window_bounds(windows)
@@ -3562,6 +4169,93 @@ def execute_timexer_job(
     )
 
 
+def execute_itransformer_job(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    variant_spec: ExperimentVariant,
+    device: str | None,
+    seed: int,
+    profile: HyperparameterProfile,
+    eval_batch_size: int | None,
+    num_workers: int | None,
+    checkpoint_path: str | Path | None,
+    training_history_path: str | Path | None,
+    resume_from_checkpoint: bool,
+    tensorboard_log_dir: str | Path | None,
+) -> list[dict[str, object]]:
+    started = time.monotonic()
+    resolved_device = resolve_device(device)
+    resolved_eval_batch_size = resolve_eval_batch_size(
+        profile.batch_size,
+        device=resolved_device,
+        eval_batch_size=eval_batch_size,
+    )
+    writer = _open_tensorboard_writer(
+        tensorboard_log_dir,
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=variant_spec.model_variant,
+    )
+    _tensorboard_log_run_config(
+        writer,
+        prepared_dataset=prepared_dataset,
+        variant_spec=variant_spec,
+        profile=profile,
+        seed=seed,
+        device=resolved_device,
+        eval_batch_size=resolved_eval_batch_size,
+        num_workers=resolve_loader_num_workers(device=resolved_device, num_workers=num_workers),
+    )
+    try:
+        training_outcome = train_itransformer_model(
+            prepared_dataset,
+            device=resolved_device,
+            seed=seed,
+            batch_size=profile.batch_size,
+            eval_batch_size=resolved_eval_batch_size,
+            learning_rate=profile.learning_rate,
+            max_epochs=profile.max_epochs,
+            early_stopping_patience=profile.early_stopping_patience,
+            d_model=profile.d_model,
+            attention_heads=profile.attention_heads,
+            dropout=profile.dropout,
+            grad_clip_norm=profile.grad_clip_norm,
+            weight_decay=profile.weight_decay,
+            bounded_output_epsilon=profile.bounded_output_epsilon,
+            num_workers=num_workers,
+            checkpoint_path=checkpoint_path,
+            training_history_path=training_history_path,
+            resume_from_checkpoint=resume_from_checkpoint,
+            progress_label=f"{prepared_dataset.dataset_id}/{variant_spec.model_variant}",
+            tensorboard_writer=writer,
+        )
+        evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
+        for split_name, eval_protocol, windows in iter_evaluation_specs(prepared_dataset):
+            metrics = evaluate_itransformer_model(
+                training_outcome.model,
+                prepared_dataset,
+                windows,
+                batch_size=resolved_eval_batch_size,
+                device=training_outcome.device,
+                seed=seed,
+                num_workers=num_workers,
+                amp_enabled=training_outcome.amp_enabled,
+                progress_label=f"{prepared_dataset.dataset_id}/{variant_spec.model_variant} {split_name}/{eval_protocol}",
+            )
+            evaluation_results.append((split_name, eval_protocol, windows, metrics))
+        _tensorboard_log_final_evaluations(writer, evaluation_results, step=training_outcome.epochs_ran)
+    finally:
+        _close_tensorboard_writer(writer)
+    return build_result_rows(
+        prepared_dataset,
+        variant_spec=variant_spec,
+        training_outcome=training_outcome,
+        runtime_seconds=time.monotonic() - started,
+        seed=seed,
+        profile=profile,
+        evaluation_results=evaluation_results,
+    )
+
+
 def execute_dgcrn_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
@@ -3841,6 +4535,20 @@ def execute_training_job(
         )
     if resolved_variant.model_variant == TIMEXER_VARIANT:
         return execute_timexer_job(
+            prepared_dataset,
+            variant_spec=resolved_variant,
+            device=device,
+            seed=seed,
+            profile=profile,
+            eval_batch_size=eval_batch_size,
+            num_workers=num_workers,
+            checkpoint_path=checkpoint_path,
+            training_history_path=training_history_path,
+            resume_from_checkpoint=resume_from_checkpoint,
+            tensorboard_log_dir=tensorboard_log_dir,
+        )
+    if resolved_variant.model_variant == ITRANSFORMER_VARIANT:
+        return execute_itransformer_job(
             prepared_dataset,
             variant_spec=resolved_variant,
             device=device,
