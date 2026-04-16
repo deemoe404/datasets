@@ -44,7 +44,7 @@ source_data_root = "/path/to/Wind Power Forecasting"
 
 ## 实验运行
 
-当前 active tree 中保留四个 family：
+当前 active tree 中保留六个 family：
 
 ```shell
 cd experiment/families/agcrn
@@ -69,6 +69,19 @@ cd experiment/families/world_model_agcrn_v1
 cd experiment/families/world_model_rollout_v1
 ./create_env.sh
 ./.conda/bin/python run_world_model_rollout_v1.py
+```
+
+```shell
+cd experiment/families/world_model_state_space_v1
+./create_env.sh
+./.conda/bin/python run_world_model_state_space_v1.py
+```
+
+```shell
+cd experiment/families/world_model_baselines_v1
+./create_env.sh
+./.conda/bin/python run_world_model_baselines_v1.py
+tensorboard --logdir ./.work/run_world_model_baselines_v1
 ```
 
 正式运行默认会把结果写到 `experiment/artifacts/published/<family_id>/latest.csv`，并在

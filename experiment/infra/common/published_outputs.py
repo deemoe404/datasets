@@ -9,14 +9,18 @@ _KNOWN_FAMILY_IDS = {
     "agcrn_official_aligned",
     "agcrn_masked",
     "world_model_agcrn_v1",
+    "world_model_baselines_v1",
     "world_model_rollout_v1",
+    "world_model_state_space_v1",
 }
 
 _EXPERIMENT_NAME_TO_FAMILY_ID = {
     "agcrn": "agcrn_official_aligned",
     "agcrn_masked": "agcrn_masked",
     "world_model_agcrn_v1": "world_model_agcrn_v1",
+    "world_model_baselines_v1": "world_model_baselines_v1",
     "world_model_rollout_v1": "world_model_rollout_v1",
+    "world_model_state_space_v1": "world_model_state_space_v1",
 }
 
 

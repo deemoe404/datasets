@@ -71,6 +71,28 @@ def test_default_family_output_path_uses_published_layout() -> None:
         / "world_model_rollout_v1"
         / "latest.csv"
     )
+    assert module.default_family_output_path(
+        repo_root=Path("/tmp/datasets"),
+        family_id="world_model_baselines_v1",
+    ) == (
+        Path("/tmp/datasets").resolve()
+        / "experiment"
+        / "artifacts"
+        / "published"
+        / "world_model_baselines_v1"
+        / "latest.csv"
+    )
+    assert module.default_family_output_path(
+        repo_root=Path("/tmp/datasets"),
+        family_id="world_model_state_space_v1",
+    ) == (
+        Path("/tmp/datasets").resolve()
+        / "experiment"
+        / "artifacts"
+        / "published"
+        / "world_model_state_space_v1"
+        / "latest.csv"
+    )
 
 
 def test_family_id_for_experiment_name_resolves_active_family() -> None:
@@ -80,6 +102,8 @@ def test_family_id_for_experiment_name_resolves_active_family() -> None:
     assert module.family_id_for_experiment_name("agcrn_masked") == "agcrn_masked"
     assert module.family_id_for_experiment_name("world_model_agcrn_v1") == "world_model_agcrn_v1"
     assert module.family_id_for_experiment_name("world_model_rollout_v1") == "world_model_rollout_v1"
+    assert module.family_id_for_experiment_name("world_model_baselines_v1") == "world_model_baselines_v1"
+    assert module.family_id_for_experiment_name("world_model_state_space_v1") == "world_model_state_space_v1"
 
 
 def test_family_id_for_experiment_name_rejects_unknown_values() -> None:

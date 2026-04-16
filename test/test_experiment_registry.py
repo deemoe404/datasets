@@ -31,7 +31,9 @@ def test_registry_snapshot_contains_active_families() -> None:
         "agcrn_official_aligned",
         "agcrn_masked",
         "world_model_agcrn_v1",
+        "world_model_baselines_v1",
         "world_model_rollout_v1",
+        "world_model_state_space_v1",
     }
 
 
@@ -42,7 +44,9 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     agcrn = snapshot.families["agcrn_official_aligned"]
     agcrn_masked = snapshot.families["agcrn_masked"]
     world_model = snapshot.families["world_model_agcrn_v1"]
+    world_model_baselines = snapshot.families["world_model_baselines_v1"]
     world_model_rollout = snapshot.families["world_model_rollout_v1"]
+    world_model_state_space = snapshot.families["world_model_state_space_v1"]
 
     assert agcrn.status == "pilot"
     assert agcrn.task_contract.granularity == "farm"
@@ -83,12 +87,27 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model.implementation_bindings == {
         "world_model_v1_seq2seq_farm_sync": "world_model_v1",
     }
+    assert world_model_baselines.status == "prototype"
+    assert world_model_baselines.task_contract.granularity == "farm"
+    assert world_model_baselines.dataset_scope == ("kelmarsh",)
+    assert world_model_baselines.supported_feature_protocols == ("world_model_v1",)
+    assert world_model_baselines.implementation_bindings == {
+        "world_model_persistence_last_value_v1_farm_sync": "world_model_v1",
+        "world_model_shared_weight_tft_no_graph_v1_farm_sync": "world_model_v1",
+    }
     assert world_model_rollout.status == "prototype"
     assert world_model_rollout.task_contract.granularity == "farm"
     assert world_model_rollout.dataset_scope == ("kelmarsh", "penmanshiel")
     assert world_model_rollout.supported_feature_protocols == ("world_model_v1",)
     assert world_model_rollout.implementation_bindings == {
         "world_model_rollout_v1_farm_sync": "world_model_v1",
+    }
+    assert world_model_state_space.status == "prototype"
+    assert world_model_state_space.task_contract.granularity == "farm"
+    assert world_model_state_space.dataset_scope == ("kelmarsh",)
+    assert world_model_state_space.supported_feature_protocols == ("world_model_v1",)
+    assert world_model_state_space.implementation_bindings == {
+        "world_model_state_space_v1_farm_sync": "world_model_v1",
     }
 
 
@@ -98,7 +117,7 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     snapshot = module.load_registry_snapshot()
     rows = module.build_dataset_family_feature_matrix(snapshot)
 
-    assert len(rows) == 24
+    assert len(rows) == 26
     assert rows[0].family_id == "agcrn_masked"
     assert rows[0].feature_protocol_id == "power_wd_yaw_pmean_hist_sincos_masked"
     assert rows[1].family_id == "agcrn_masked"
@@ -106,7 +125,9 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     assert sum(row.family_id == "agcrn_official_aligned" for row in rows) == 18
     assert sum(row.family_id == "agcrn_masked" for row in rows) == 2
     assert sum(row.family_id == "world_model_agcrn_v1" for row in rows) == 2
+    assert sum(row.family_id == "world_model_baselines_v1" for row in rows) == 1
     assert sum(row.family_id == "world_model_rollout_v1" for row in rows) == 2
+    assert sum(row.family_id == "world_model_state_space_v1" for row in rows) == 1
     assert {row.family_status for row in rows} == {"pilot", "prototype"}
 
 
@@ -120,7 +141,9 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "agcrn_official_aligned" in rendered
     assert "agcrn_masked" in rendered
     assert "world_model_agcrn_v1" in rendered
+    assert "world_model_baselines_v1" in rendered
     assert "world_model_rollout_v1" in rendered
+    assert "world_model_state_space_v1" in rendered
     assert "official_aligned_power_only_farm_sync" in rendered
     assert "official_aligned_power_ws_hist_farm_sync" in rendered
     assert "official_aligned_power_atemp_hist_farm_sync" in rendered
@@ -140,7 +163,10 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "masked_power_wd_yaw_pmean_hist_sincos_farm_sync" in rendered
     assert "power_wd_yaw_pmean_hist_sincos_masked" in rendered
     assert "world_model_v1_seq2seq_farm_sync" in rendered
+    assert "world_model_persistence_last_value_v1_farm_sync" in rendered
+    assert "world_model_shared_weight_tft_no_graph_v1_farm_sync" in rendered
     assert "world_model_rollout_v1_farm_sync" in rendered
+    assert "world_model_state_space_v1_farm_sync" in rendered
     assert "world_model_v1" in rendered
     assert "power_wd_yaw_lrpm_hist_sincos" in rendered
     assert "power_ws_wd_hist_sincos" in rendered

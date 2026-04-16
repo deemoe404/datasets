@@ -14,4 +14,6 @@ Current families:
 - `agcrn`
 - `agcrn_masked`
 - `world_model_agcrn_v1`
+- `world_model_baselines_v1`
 - `world_model_rollout_v1`
+- `world_model_state_space_v1`

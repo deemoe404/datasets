@@ -1,0 +1,145 @@
+{
+  "args": {
+    "attention_heads": null,
+    "batch_size": null,
+    "bounded_output_epsilon": null,
+    "d_model": null,
+    "datasets": null,
+    "device": "auto",
+    "disable_tensorboard": false,
+    "dropout": null,
+    "epochs": null,
+    "eval_batch_size": null,
+    "force_rerun": true,
+    "grad_clip_norm": null,
+    "learning_rate": null,
+    "lstm_hidden_dim": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "no_record_run": false,
+    "num_workers": null,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_baselines_v1/latest.csv",
+    "patience": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_persistence_last_value_v1_farm_sync": {
+          "attention_heads": 4,
+          "baseline_type": "persistence_last_value",
+          "batch_size": 512,
+          "bounded_output_epsilon": 0.05,
+          "d_model": 64,
+          "dropout": 0.3,
+          "early_stopping_patience": 10,
+          "feature_protocol_id": "world_model_v1",
+          "grad_clip_norm": 1.0,
+          "learning_rate": 8e-05,
+          "lstm_hidden_dim": 64,
+          "max_epochs": 30,
+          "weight_decay": 0.002
+        },
+        "world_model_shared_weight_tft_no_graph_v1_farm_sync": {
+          "attention_heads": 4,
+          "baseline_type": "shared_weight_tft_no_graph",
+          "batch_size": 512,
+          "bounded_output_epsilon": 0.05,
+          "d_model": 64,
+          "dropout": 0.3,
+          "early_stopping_patience": 10,
+          "feature_protocol_id": "world_model_v1",
+          "grad_clip_norm": 1.0,
+          "learning_rate": 8e-05,
+          "lstm_hidden_dim": 64,
+          "max_epochs": 30,
+          "weight_decay": 0.002
+        }
+      }
+    },
+    "resume": false,
+    "run_label": null,
+    "seed": 3407,
+    "tensorboard_log_dir": null,
+    "variants": null,
+    "weight_decay": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_baselines_v1/latest.csv",
+      "sha256": "ee8f67af8aec05c749ce60b3e7e8eccbf7fab512700470bdc5402a3e575bd4a2",
+      "size_bytes": 149252
+    },
+    "tensorboard_root": {
+      "path": "experiment/families/world_model_baselines_v1/.work/run_world_model_baselines_v1/b0ad7d2fa248e8bd65ad8193f8e39891d204506d3e0df5d636db66c318451968/tensorboard"
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_baselines_v1/latest.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-16T03:50:17.313958+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_baselines_v1/latest.csv",
+    "default_output_schema_version": "world_model_baselines_v1.long_metrics.v1",
+    "display_name": "World-Model Baselines v1",
+    "family_id": "world_model_baselines_v1",
+    "implementation_root": "experiment/families/world_model_baselines_v1",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_baselines_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_baselines_v1/run_world_model_baselines_v1.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "53c404eacc60e7a528a5f8ad45198abc17ae925a",
+    "is_dirty": true,
+    "status_short": [
+      "M NOTE.md",
+      " M experiment/README.md",
+      " M experiment/families/README.md",
+      " M experiment/infra/common/published_outputs.py",
+      " M test/test_experiment_registry.py",
+      " M test/test_published_outputs.py",
+      "?? experiment/artifacts/published/world_model_baselines_v1/",
+      "?? experiment/artifacts/runs/world_model_baselines_v1/",
+      "?? experiment/families/world_model_baselines_v1/",
+      "?? experiment/families/world_model_state_space_v1/",
+      "?? experiment/infra/registry/families/world_model_baselines_v1.toml",
+      "?? experiment/infra/registry/families/world_model_state_space_v1.toml",
+      "?? test/test_world_model_baselines_v1.py",
+      "?? test/test_world_model_state_space_v1.py",
+      "?? wind_farm_design_revised_v3.pdf",
+      "?? wind_farm_design_revised_v3.tex"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_baselines_v1/run_world_model_baselines_v1.py",
+    "kind": "family_runner",
+    "run_label": null
+  },
+  "notes": [],
+  "result": {
+    "row_count": 296
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_persistence_last_value_v1_farm_sync",
+      "world_model_shared_weight_tft_no_graph_v1_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}
