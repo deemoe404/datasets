@@ -58,6 +58,10 @@ def _prepare_temp_dataset(
     )
 
 
+def _timexer_variant_spec(module):
+    return module.resolve_variant_specs((module.TIMEXER_VARIANT,))[0]
+
+
 class _FakeSummaryWriter:
     instances: list["_FakeSummaryWriter"] = []
 
@@ -82,7 +86,7 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def test_registry_declares_kelmarsh_only_and_two_variants() -> None:
+def test_registry_declares_kelmarsh_only_and_three_variants() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
@@ -98,6 +102,7 @@ def test_registry_declares_kelmarsh_only_and_two_variants() -> None:
     assert 'supported_feature_protocols = ["world_model_v1"]' in text
     assert 'world_model_persistence_last_value_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_shared_weight_tft_no_graph_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -117,6 +122,15 @@ def test_tft_default_hyperparameters_are_more_conservative() -> None:
     assert profile.lstm_hidden_dim == 64
     assert profile.dropout == pytest.approx(0.2)
     assert profile.weight_decay == pytest.approx(1e-3)
+
+
+def test_timexer_default_hyperparameters_include_patching() -> None:
+    module = _load_module()
+    profile = module.resolve_hyperparameter_profile(module.TIMEXER_VARIANT, dataset_id="kelmarsh")
+
+    assert profile.patch_len == 24
+    assert profile.encoder_layers == 2
+    assert profile.ff_hidden_dim == 256
 
 
 def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
@@ -197,6 +211,35 @@ def test_tft_dataset_expands_to_turbine_instances_and_calendar_future(tmp_path, 
     assert not any("farm" in name.lower() for name in prepared.context_future_feature_names)
 
 
+def test_timexer_dataset_splits_endogenous_exogenous_and_history_marks(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_timexer_variant_spec(module),
+    )
+
+    layout = module.resolve_timexer_feature_layout(prepared)
+    dataset = module.TimeXerWindowDataset(prepared, prepared.val_rolling_windows, include_indices=True)
+    sample = dataset[0]
+
+    assert len(dataset) == len(prepared.val_rolling_windows) * prepared.node_count
+    assert layout.endogenous_history_names == ("target_pu",)
+    assert layout.history_mark_names == _KNOWN_FUTURE_COLUMNS
+    assert len(layout.exogenous_history_names) == 86
+    assert layout.exogenous_history_names[0] == "target_kw__mask"
+    assert "farm_pmu__gms_power_kw" in layout.exogenous_history_names
+    assert sample[0].shape == (prepared.history_steps, 1)
+    assert sample[1].shape == (prepared.history_steps, 86)
+    assert sample[2].shape == (prepared.history_steps, 7)
+    assert sample[3].shape == (prepared.forecast_steps, 1)
+    assert sample[4].shape == (prepared.forecast_steps, 1)
+    assert int(sample[5]) == 0
+    assert int(sample[6]) == 0
+
+
 def test_tft_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -217,6 +260,39 @@ def test_tft_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None:
             torch_module.from_numpy(sample[1][None]),
             torch_module.from_numpy(sample[2][None]),
             torch_module.from_numpy(sample[3][None]),
+        )
+
+    assert outputs.shape == (1, prepared.forecast_steps, 1)
+    assert float(outputs.min().item()) >= 0.0
+    assert float(outputs.max().item()) <= 1.05
+
+
+def test_timexer_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_timexer_variant_spec(module),
+    )
+    model = module.build_timexer_model(
+        prepared_dataset=prepared,
+        d_model=8,
+        attention_heads=2,
+        patch_len=24,
+        encoder_layers=1,
+        ff_hidden_dim=16,
+        dropout=0.0,
+        bounded_output_epsilon=module.DEFAULT_BOUNDED_OUTPUT_EPSILON,
+    )
+    sample = module.TimeXerWindowDataset(prepared, prepared.val_rolling_windows)[0]
+
+    with torch_module.no_grad():
+        outputs = model(
+            torch_module.from_numpy(sample[0][None]),
+            torch_module.from_numpy(sample[1][None]),
+            torch_module.from_numpy(sample[2][None]),
         )
 
     assert outputs.shape == (1, prepared.forecast_steps, 1)
@@ -255,6 +331,52 @@ def test_tft_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
     metrics = module.evaluate_tft_model(
+        _ZeroModel(),
+        prepared,
+        prepared.val_rolling_windows,
+        batch_size=2,
+        device="cpu",
+        seed=123,
+        num_workers=0,
+    )
+
+    expected_shape = (len(prepared.val_rolling_windows), prepared.forecast_steps, prepared.node_count, 1)
+    assert captured["predictions"] == expected_shape
+    assert captured["targets"] == expected_shape
+    assert captured["valid"] == expected_shape
+    assert metrics.window_count == len(prepared.val_rolling_windows)
+
+
+def test_timexer_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_timexer_variant_spec(module),
+    )
+    captured: dict[str, tuple[int, ...]] = {}
+    original_metrics = module._metrics_from_arrays
+
+    def _capture_metrics(predictions, targets, valid_mask, *, rated_power_kw):
+        captured["predictions"] = predictions.shape
+        captured["targets"] = targets.shape
+        captured["valid"] = valid_mask.shape
+        return original_metrics(predictions, targets, valid_mask, rated_power_kw=rated_power_kw)
+
+    class _ZeroModel(torch_module.nn.Module):
+        def forward(self, endogenous_history, _exogenous_history, _history_marks):
+            return torch_module.zeros(
+                (endogenous_history.shape[0], prepared.forecast_steps, 1),
+                dtype=endogenous_history.dtype,
+                device=endogenous_history.device,
+            )
+
+    monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
+    metrics = module.evaluate_timexer_model(
         _ZeroModel(),
         prepared,
         prepared.val_rolling_windows,
@@ -375,6 +497,54 @@ def test_tft_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
     assert rows[0]["uses_future_observations"] is False
 
 
+def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_timexer_variant_spec(module),
+    )
+    history_path = tmp_path / "timexer.training_history.csv"
+
+    rows = module.execute_training_job(
+        prepared,
+        variant_spec=_timexer_variant_spec(module),
+        device="cpu",
+        seed=123,
+        batch_size=3,
+        eval_batch_size=3,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        d_model=8,
+        attention_heads=2,
+        patch_len=24,
+        encoder_layers=1,
+        ff_hidden_dim=16,
+        dropout=0.0,
+        num_workers=0,
+        training_history_path=history_path,
+    )
+
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1]
+    assert history["baseline_type"].to_list() == ["shared_weight_timexer_no_graph"]
+    assert history["patch_len"].to_list() == [24]
+    assert history["encoder_layers"].to_list() == [1]
+    assert history["ff_hidden_dim"].to_list() == [16]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
+    assert len(rows) == 148
+    assert rows[0]["model_variant"] == module.TIMEXER_VARIANT
+    assert rows[0]["patch_len"] == 24
+    assert rows[0]["encoder_layers"] == 1
+    assert rows[0]["ff_hidden_dim"] == 16
+
+
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:
     module = _load_module()
     prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_train_origins=2, max_eval_origins=1)
@@ -396,6 +566,9 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             d_model=kwargs["d_model"],
             lstm_hidden_dim=kwargs["lstm_hidden_dim"],
             attention_heads=kwargs["attention_heads"],
+            patch_len=kwargs["patch_len"],
+            encoder_layers=kwargs["encoder_layers"],
+            ff_hidden_dim=kwargs["ff_hidden_dim"],
             dropout=kwargs["dropout"],
             grad_clip_norm=kwargs["grad_clip_norm"],
             weight_decay=kwargs["weight_decay"],
@@ -453,6 +626,9 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         d_model=8,
         lstm_hidden_dim=8,
         attention_heads=2,
+        patch_len=24,
+        encoder_layers=1,
+        ff_hidden_dim=16,
         dropout=0.0,
         work_root=work_root,
         dataset_loader=_dataset_loader,
@@ -461,8 +637,12 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 296
-    assert set(results["model_variant"].unique().to_list()) == {module.PERSISTENCE_VARIANT, module.TFT_VARIANT}
+    assert results.height == 444
+    assert set(results["model_variant"].unique().to_list()) == {
+        module.PERSISTENCE_VARIANT,
+        module.TFT_VARIANT,
+        module.TIMEXER_VARIANT,
+    }
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()
     assert paths.slot_dir.name == expected_slot

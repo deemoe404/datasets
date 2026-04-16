@@ -94,6 +94,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model_baselines.implementation_bindings == {
         "world_model_persistence_last_value_v1_farm_sync": "world_model_v1",
         "world_model_shared_weight_tft_no_graph_v1_farm_sync": "world_model_v1",
+        "world_model_shared_weight_timexer_no_graph_v1_farm_sync": "world_model_v1",
     }
     assert world_model_rollout.status == "prototype"
     assert world_model_rollout.task_contract.granularity == "farm"
@@ -169,6 +170,7 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "world_model_v1_seq2seq_farm_sync" in rendered
     assert "world_model_persistence_last_value_v1_farm_sync" in rendered
     assert "world_model_shared_weight_tft_no_graph_v1_farm_sync" in rendered
+    assert "world_model_shared_weight_timexer_no_graph_v1_farm_sync" in rendered
     assert "world_model_rollout_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_wake_off_farm_sync" in rendered

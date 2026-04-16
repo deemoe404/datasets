@@ -13,6 +13,11 @@ The first implementation includes:
 - `world_model_shared_weight_tft_no_graph_v1_farm_sync`: repo-local PyTorch
   shared-weight TFT-style model with no graph, no pairwise features, no global
   latent state, no future observations, and no turbine id embedding.
+- `world_model_shared_weight_timexer_no_graph_v1_farm_sync`: repo-local
+  shared-weight TimeXer-style exogenous forecaster with endogenous
+  `target_pu` history patches, historical local/global exogenous channels, and
+  historical calendar marks only; it does not consume `context_future`,
+  `static`, or `pairwise`.
 
 ## Run
 
@@ -70,7 +75,7 @@ Or override the log root explicitly:
 - Dataset scope: `kelmarsh` only.
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
-- Registry `training_mode` is `trainable` because the family includes TFT, even
-  though persistence is analytic.
+- Registry `training_mode` is `trainable` because the family includes TFT and
+  TimeXer, even though persistence is analytic.
 - Deferred: state-space ablations such as no-dynamic-graph, no-global-state,
   single-state, linear-head, and no-met-loss variants.
