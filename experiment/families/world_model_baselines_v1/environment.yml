@@ -12,3 +12,4 @@ dependencies:
   - tqdm
   - pip:
       - torch
+      - chronos-forecasting==2.2.2

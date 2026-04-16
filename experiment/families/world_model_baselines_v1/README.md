@@ -22,6 +22,10 @@ The first implementation includes:
   recurrent baseline that consumes the same `world_model_v1` bundle contract
   through broadcast history context, known-future calendar inputs, static node
   metadata, and pairwise geometry bias terms.
+- `world_model_chronos_2_zero_shot_v1_farm_sync`: Chronos-2 zero-shot baseline
+  over the same `world_model_v1` history/future tensor contract, with NaN-restored
+  target history, local/global historical covariates, and calendar covariates
+  adapted into Chronos batch payloads without fine-tuning.
 
 ## Run
 
@@ -43,6 +47,13 @@ Run only DGCRN:
 ```shell
 ./.conda/bin/python run_world_model_baselines_v1.py \
   --variant world_model_dgcrn_v1_farm_sync
+```
+
+Run only Chronos-2 zero-shot:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --variant world_model_chronos_2_zero_shot_v1_farm_sync
 ```
 
 Smoke run:
@@ -87,6 +98,7 @@ Or override the log root explicitly:
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
 - Registry `training_mode` is `trainable` because the family includes TFT,
-  TimeXer, and DGCRN, even though persistence is analytic.
+  TimeXer, and DGCRN, even though persistence and Chronos-2 are analytic /
+  zero-shot baselines.
 - Deferred: state-space ablations such as no-dynamic-graph, no-global-state,
   single-state, linear-head, and no-met-loss variants.

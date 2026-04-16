@@ -86,6 +86,7 @@ PERSISTENCE_VARIANT = "world_model_persistence_last_value_v1_farm_sync"
 TFT_VARIANT = "world_model_shared_weight_tft_no_graph_v1_farm_sync"
 TIMEXER_VARIANT = "world_model_shared_weight_timexer_no_graph_v1_farm_sync"
 DGCRN_VARIANT = "world_model_dgcrn_v1_farm_sync"
+CHRONOS_VARIANT = "world_model_chronos_2_zero_shot_v1_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -120,6 +121,7 @@ DEFAULT_CUDA_PREFETCH_FACTOR = 4
 DEFAULT_EVAL_BATCH_SIZE_MULTIPLIER = 2
 DEFAULT_MAX_CUDA_EVAL_BATCH_SIZE = 1024
 PROFILE_LOG_PREFIX = "[world_model_baselines_v1] "
+_CHRONOS_MODEL_ID = "amazon/chronos-2"
 
 _REPO_ROOT = EXPERIMENT_ROOT.parent
 _CACHE_ROOT = _REPO_ROOT / "cache"
@@ -133,6 +135,7 @@ _MODEL_VARIANT_ORDER = {
     TFT_VARIANT: 1,
     TIMEXER_VARIANT: 2,
     DGCRN_VARIANT: 3,
+    CHRONOS_VARIANT: 4,
 }
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
@@ -331,6 +334,11 @@ VARIANT_SPECS = (
         feature_protocol_id=FEATURE_PROTOCOL_ID,
         baseline_type="dgcrn_dynamic_graph",
     ),
+    ExperimentVariant(
+        model_variant=CHRONOS_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        baseline_type="chronos_2_zero_shot",
+    ),
 )
 DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
 _VARIANT_SPECS_BY_NAME = {spec.model_variant: spec for spec in VARIANT_SPECS}
@@ -424,6 +432,7 @@ TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
         TFT_VARIANT: _DEFAULT_TFT_PROFILE,
         TIMEXER_VARIANT: _DEFAULT_TIMEXER_PROFILE,
         DGCRN_VARIANT: _DEFAULT_DGCRN_PROFILE,
+        CHRONOS_VARIANT: _DEFAULT_PERSISTENCE_PROFILE,
     },
 }
 
@@ -779,6 +788,247 @@ def prepare_dataset(
         max_eval_origins=max_eval_origins,
     )
     return replace(prepared, model_variant=resolved_variant.model_variant)
+
+
+def _require_chronos2_pipeline_class():
+    try:
+        from chronos import Chronos2Pipeline
+    except ImportError as exc:  # pragma: no cover - exercised only when the family env is missing
+        raise ImportError(
+            "Chronos-2 zero-shot baseline requires `chronos-forecasting==2.2.2` in the "
+            "`experiment/families/world_model_baselines_v1/.conda` environment."
+        ) from exc
+    return Chronos2Pipeline
+
+
+def _load_chronos_zero_shot_pipeline(*, device: str):
+    resolved_device = resolve_device(device)
+    Chronos2Pipeline = _require_chronos2_pipeline_class()
+    pipeline = Chronos2Pipeline.from_pretrained(_CHRONOS_MODEL_ID, torch_dtype="float32")
+    model = getattr(pipeline, "model", None)
+    if model is not None and hasattr(model, "to"):
+        model.to(resolved_device)
+        if hasattr(model, "eval"):
+            model.eval()
+    return pipeline
+
+
+def _chronos_target_and_local_names(
+    prepared_dataset: state_base.PreparedDataset,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    return (
+        prepared_dataset.local_input_feature_names[state_base._LOCAL_VALUE_START + 1 : state_base._LOCAL_MASK_START],
+        prepared_dataset.local_input_feature_names[
+            state_base._LOCAL_MASK_START + 1 : state_base._LOCAL_DELTA_START
+        ],
+        prepared_dataset.context_history_feature_names[
+            state_base._CONTEXT_GLOBAL_VALUE_START : state_base._CONTEXT_GLOBAL_MASK_START
+        ],
+        prepared_dataset.context_history_feature_names[state_base._CONTEXT_CALENDAR_START :],
+    )
+
+
+def build_chronos_zero_shot_input(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    target_index: int,
+    node_index: int,
+) -> dict[str, np.ndarray | dict[str, np.ndarray]]:
+    history_slice = slice(target_index - prepared_dataset.history_steps, target_index)
+    future_slice = slice(target_index, target_index + prepared_dataset.forecast_steps)
+    (
+        local_value_names,
+        local_mask_names,
+        global_value_names,
+        calendar_names,
+    ) = _chronos_target_and_local_names(prepared_dataset)
+    target_history = prepared_dataset.local_history_tensor[
+        history_slice,
+        node_index,
+        state_base._LOCAL_VALUE_START,
+    ].astype(np.float32, copy=True)
+    target_mask = prepared_dataset.local_history_tensor[
+        history_slice,
+        node_index,
+        state_base._LOCAL_MASK_START,
+    ]
+    target_history[target_mask >= 0.5] = np.nan
+
+    past_covariates: dict[str, np.ndarray] = {}
+    local_values = prepared_dataset.local_history_tensor[
+        history_slice,
+        node_index,
+        state_base._LOCAL_VALUE_START + 1 : state_base._LOCAL_MASK_START,
+    ]
+    local_masks = prepared_dataset.local_history_tensor[
+        history_slice,
+        node_index,
+        state_base._LOCAL_MASK_START + 1 : state_base._LOCAL_DELTA_START,
+    ]
+    if local_values.shape[1] != len(local_value_names) or local_masks.shape[1] != len(local_mask_names):
+        raise ValueError("Local Chronos covariate layout does not match the expected state-space tensor contract.")
+    for column_index, column_name in enumerate(local_value_names):
+        values = local_values[:, column_index].astype(np.float32, copy=True)
+        values[local_masks[:, column_index] >= 0.5] = np.nan
+        past_covariates[column_name] = values
+
+    global_values = prepared_dataset.context_history_tensor[
+        history_slice,
+        state_base._CONTEXT_GLOBAL_VALUE_START : state_base._CONTEXT_GLOBAL_MASK_START,
+    ]
+    global_masks = prepared_dataset.context_history_tensor[
+        history_slice,
+        state_base._CONTEXT_GLOBAL_MASK_START : state_base._CONTEXT_GLOBAL_DELTA_START,
+    ]
+    if global_values.shape[1] != len(global_value_names) or global_masks.shape[1] != len(global_value_names):
+        raise ValueError("Global Chronos covariate layout does not match the expected state-space tensor contract.")
+    for column_index, column_name in enumerate(global_value_names):
+        values = global_values[:, column_index].astype(np.float32, copy=True)
+        values[global_masks[:, column_index] >= 0.5] = np.nan
+        past_covariates[column_name] = values
+
+    history_calendar = prepared_dataset.context_history_tensor[
+        history_slice,
+        state_base._CONTEXT_CALENDAR_START :,
+    ]
+    future_calendar = prepared_dataset.context_future_tensor[future_slice]
+    if history_calendar.shape[1] != len(calendar_names) or future_calendar.shape[1] != len(calendar_names):
+        raise ValueError("Calendar Chronos covariate layout does not match the expected state-space tensor contract.")
+    future_covariates: dict[str, np.ndarray] = {}
+    for column_index, column_name in enumerate(calendar_names):
+        past_covariates[column_name] = history_calendar[:, column_index].astype(np.float32, copy=True)
+        future_covariates[column_name] = future_calendar[:, column_index].astype(np.float32, copy=True)
+    return {
+        "target": target_history,
+        "past_covariates": past_covariates,
+        "future_covariates": future_covariates,
+    }
+
+
+def _iter_chronos_batch_payloads(
+    prepared_dataset: state_base.PreparedDataset,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    *,
+    batch_size: int,
+):
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, found {batch_size!r}.")
+    batch_inputs: list[dict[str, np.ndarray | dict[str, np.ndarray]]] = []
+    batch_targets: list[np.ndarray] = []
+    batch_valid: list[np.ndarray] = []
+    batch_window_ids: list[int] = []
+    batch_node_ids: list[int] = []
+    for window_pos, target_index in enumerate(windows.target_indices):
+        target_index_int = int(target_index)
+        future_slice = slice(target_index_int, target_index_int + prepared_dataset.forecast_steps)
+        for node_index in range(prepared_dataset.node_count):
+            batch_inputs.append(
+                build_chronos_zero_shot_input(
+                    prepared_dataset,
+                    target_index=target_index_int,
+                    node_index=node_index,
+                )
+            )
+            batch_targets.append(
+                prepared_dataset.target_pu_filled[future_slice, node_index, None].astype(np.float32, copy=True)
+            )
+            batch_valid.append(
+                prepared_dataset.target_valid_mask[future_slice, node_index, None].astype(np.float32, copy=True)
+            )
+            batch_window_ids.append(window_pos)
+            batch_node_ids.append(node_index)
+            if len(batch_inputs) >= batch_size:
+                yield (
+                    batch_inputs,
+                    np.stack(batch_targets, axis=0),
+                    np.stack(batch_valid, axis=0),
+                    np.asarray(batch_window_ids, dtype=np.int64),
+                    np.asarray(batch_node_ids, dtype=np.int64),
+                )
+                batch_inputs = []
+                batch_targets = []
+                batch_valid = []
+                batch_window_ids = []
+                batch_node_ids = []
+    if batch_inputs:
+        yield (
+            batch_inputs,
+            np.stack(batch_targets, axis=0),
+            np.stack(batch_valid, axis=0),
+            np.asarray(batch_window_ids, dtype=np.int64),
+            np.asarray(batch_node_ids, dtype=np.int64),
+        )
+
+
+def _chronos_point_forecast_to_numpy(point_forecast: object, *, forecast_steps: int) -> np.ndarray:
+    if hasattr(point_forecast, "detach"):
+        point_forecast = point_forecast.detach()
+    if hasattr(point_forecast, "cpu"):
+        point_forecast = point_forecast.cpu()
+    point_forecast_array = np.asarray(point_forecast, dtype=np.float32)
+    if point_forecast_array.ndim == 2:
+        if point_forecast_array.shape[0] != 1:
+            raise ValueError(
+                f"Expected Chronos point forecast to have a single target row, found {point_forecast_array.shape!r}."
+            )
+        point_forecast_array = point_forecast_array[0]
+    if point_forecast_array.ndim != 1 or point_forecast_array.shape[0] != forecast_steps:
+        raise ValueError(
+            f"Expected Chronos point forecast shape ({forecast_steps},), found {point_forecast_array.shape!r}."
+        )
+    return point_forecast_array.astype(np.float32, copy=False)
+
+
+def evaluate_chronos_zero_shot(
+    pipeline,
+    prepared_dataset: state_base.PreparedDataset,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    *,
+    batch_size: int,
+    progress_label: str | None = None,
+) -> EvaluationMetrics:
+    predictions = np.zeros((len(windows), prepared_dataset.forecast_steps, prepared_dataset.node_count, 1), dtype=np.float32)
+    targets = np.zeros_like(predictions, dtype=np.float32)
+    valid = np.zeros_like(predictions, dtype=np.float32)
+    total_instances = len(windows) * prepared_dataset.node_count
+    batch_total = None if total_instances <= 0 else math.ceil(total_instances / batch_size)
+    progress = _create_progress_bar(total=batch_total, desc=progress_label or "chronos_zero_shot_evaluate")
+    try:
+        for batch_inputs, batch_targets, batch_valid, batch_window_ids, batch_node_ids in _iter_chronos_batch_payloads(
+            prepared_dataset,
+            windows,
+            batch_size=batch_size,
+        ):
+            _quantiles, batch_point_forecasts = pipeline.predict_quantiles(
+                batch_inputs,
+                prediction_length=prepared_dataset.forecast_steps,
+                batch_size=batch_size,
+                context_length=prepared_dataset.history_steps,
+                cross_learning=False,
+                limit_prediction_length=False,
+            )
+            if len(batch_point_forecasts) != len(batch_inputs):
+                raise RuntimeError(
+                    f"Chronos-2 returned {len(batch_point_forecasts)} point forecasts for {len(batch_inputs)} inputs."
+                )
+            for row_index, point_forecast in enumerate(batch_point_forecasts):
+                window_id = int(batch_window_ids[row_index])
+                node_id = int(batch_node_ids[row_index])
+                predictions[window_id, :, node_id, 0] = _chronos_point_forecast_to_numpy(
+                    point_forecast,
+                    forecast_steps=prepared_dataset.forecast_steps,
+                )
+                targets[window_id, :, node_id, :] = batch_targets[row_index]
+                valid[window_id, :, node_id, :] = batch_valid[row_index]
+            progress.update(1)
+    finally:
+        progress.close()
+    return _metrics_from_arrays(
+        predictions,
+        targets,
+        valid,
+        rated_power_kw=prepared_dataset.rated_power_kw,
+    )
 
 
 def resolve_timexer_feature_layout(prepared_dataset: state_base.PreparedDataset) -> TimeXerFeatureLayout:
@@ -3399,6 +3649,117 @@ def execute_dgcrn_job(
     )
 
 
+def execute_chronos_zero_shot_job(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    variant_spec: ExperimentVariant,
+    device: str | None,
+    seed: int,
+    profile: HyperparameterProfile,
+    eval_batch_size: int | None,
+    tensorboard_log_dir: str | Path | None,
+    training_history_path: str | Path | None = None,
+) -> list[dict[str, object]]:
+    started = time.monotonic()
+    resolved_device = resolve_device(device)
+    resolved_eval_batch_size = resolve_eval_batch_size(
+        profile.batch_size,
+        device=resolved_device,
+        eval_batch_size=eval_batch_size,
+    )
+    writer = _open_tensorboard_writer(
+        tensorboard_log_dir,
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=variant_spec.model_variant,
+    )
+    _tensorboard_log_run_config(
+        writer,
+        prepared_dataset=prepared_dataset,
+        variant_spec=variant_spec,
+        profile=profile,
+        seed=seed,
+        device=resolved_device,
+        eval_batch_size=resolved_eval_batch_size,
+        num_workers=0,
+    )
+    pipeline = _load_chronos_zero_shot_pipeline(device=resolved_device)
+    try:
+        evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
+        for split_name, eval_protocol, windows in iter_evaluation_specs(prepared_dataset):
+            metrics = evaluate_chronos_zero_shot(
+                pipeline,
+                prepared_dataset,
+                windows,
+                batch_size=resolved_eval_batch_size,
+                progress_label=f"{prepared_dataset.dataset_id}/{variant_spec.model_variant} {split_name}/{eval_protocol}",
+            )
+            evaluation_results.append((split_name, eval_protocol, windows, metrics))
+        _tensorboard_log_final_evaluations(writer, evaluation_results, step=0)
+    finally:
+        _close_tensorboard_writer(writer)
+    val_rolling = next(
+        metrics
+        for split_name, eval_protocol, _windows, metrics in evaluation_results
+        if split_name == "val" and eval_protocol == ROLLING_EVAL_PROTOCOL
+    )
+    if training_history_path is not None:
+        _append_training_history_row(
+            training_history_path,
+            {
+                "dataset_id": prepared_dataset.dataset_id,
+                "model_id": MODEL_ID,
+                "model_variant": prepared_dataset.model_variant,
+                "feature_protocol_id": prepared_dataset.feature_protocol_id,
+                "task_id": TASK_ID,
+                "window_protocol": WINDOW_PROTOCOL,
+                "baseline_type": "chronos_2_zero_shot",
+                "hidden_dim": None,
+                "embed_dim": None,
+                "num_layers": None,
+                "cheb_k": None,
+                "teacher_forcing_ratio": None,
+                "patch_len": None,
+                "encoder_layers": None,
+                "ff_hidden_dim": None,
+                "epoch": 0,
+                "train_loss_mean": None,
+                "train_loss_last": None,
+                "val_mae_pu": val_rolling.mae_pu,
+                "val_rmse_pu": val_rolling.rmse_pu,
+                "best_val_mae_pu": val_rolling.mae_pu,
+                "best_val_rmse_pu": val_rolling.rmse_pu,
+                "is_best_epoch": True,
+                "epochs_without_improvement": 0,
+                "train_batch_count": 0,
+                "train_window_count": len(prepared_dataset.train_windows),
+                "val_window_count": len(prepared_dataset.val_rolling_windows),
+                "device": resolved_device,
+                "seed": seed,
+                "batch_size": None,
+                "learning_rate": None,
+                "amp_enabled": False,
+            },
+        )
+    outcome = TrainingOutcome(
+        best_epoch=0,
+        epochs_ran=0,
+        best_val_rmse_pu=float(val_rolling.rmse_pu),
+        best_val_mae_pu=float(val_rolling.mae_pu),
+        device=resolved_device,
+        amp_enabled=False,
+        model=None,
+    )
+    return build_result_rows(
+        prepared_dataset,
+        variant_spec=variant_spec,
+        training_outcome=outcome,
+        runtime_seconds=time.monotonic() - started,
+        seed=seed,
+        profile=profile,
+        evaluation_results=evaluation_results,
+    )
+
+
 def execute_training_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
@@ -3505,6 +3866,17 @@ def execute_training_job(
             training_history_path=training_history_path,
             resume_from_checkpoint=resume_from_checkpoint,
             tensorboard_log_dir=tensorboard_log_dir,
+        )
+    if resolved_variant.model_variant == CHRONOS_VARIANT:
+        return execute_chronos_zero_shot_job(
+            prepared_dataset,
+            variant_spec=resolved_variant,
+            device=device,
+            seed=seed,
+            profile=profile,
+            eval_batch_size=eval_batch_size,
+            tensorboard_log_dir=tensorboard_log_dir,
+            training_history_path=training_history_path,
         )
     raise ValueError(f"Unsupported baseline variant {resolved_variant.model_variant!r}.")
 

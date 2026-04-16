@@ -66,6 +66,10 @@ def _dgcrn_variant_spec(module):
     return module.resolve_variant_specs((module.DGCRN_VARIANT,))[0]
 
 
+def _chronos_variant_spec(module):
+    return module.resolve_variant_specs((module.CHRONOS_VARIANT,))[0]
+
+
 class _FakeSummaryWriter:
     instances: list["_FakeSummaryWriter"] = []
 
@@ -90,7 +94,7 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def test_registry_declares_kelmarsh_only_and_four_variants() -> None:
+def test_registry_declares_kelmarsh_only_and_five_variants() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
@@ -108,6 +112,7 @@ def test_registry_declares_kelmarsh_only_and_four_variants() -> None:
     assert 'world_model_shared_weight_tft_no_graph_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_dgcrn_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_chronos_2_zero_shot_v1_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -228,6 +233,54 @@ def test_tft_dataset_expands_to_turbine_instances_and_calendar_future(tmp_path, 
     assert int(sample[7]) == 0
     assert prepared.context_future_feature_names == _KNOWN_FUTURE_COLUMNS
     assert not any("farm" in name.lower() for name in prepared.context_future_feature_names)
+
+
+def test_chronos_input_adapter_restores_nan_and_calendar_covariates(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_chronos_variant_spec(module),
+    )
+    target_index = int(prepared.val_rolling_windows.target_indices[0])
+    history_slice = slice(target_index - prepared.history_steps, target_index)
+    future_slice = slice(target_index, target_index + prepared.forecast_steps)
+
+    local_history = prepared.local_history_tensor.copy()
+    context_history = prepared.context_history_tensor.copy()
+    local_history[history_slice.start, 0, module.state_base._LOCAL_VALUE_START] = 0.4321
+    local_history[history_slice.start, 0, module.state_base._LOCAL_MASK_START] = 1.0
+    local_history[history_slice.start, 0, module.state_base._LOCAL_VALUE_START + 1] = 0.6543
+    local_history[history_slice.start, 0, module.state_base._LOCAL_MASK_START + 1] = 1.0
+    context_history[history_slice.start, module.state_base._CONTEXT_GLOBAL_VALUE_START] = 0.9876
+    context_history[history_slice.start, module.state_base._CONTEXT_GLOBAL_MASK_START] = 1.0
+    mutated_prepared = replace(prepared, local_history_tensor=local_history, context_history_tensor=context_history)
+
+    chronos_input = module.build_chronos_zero_shot_input(
+        mutated_prepared,
+        target_index=target_index,
+        node_index=0,
+    )
+
+    past_covariates = chronos_input["past_covariates"]
+    future_covariates = chronos_input["future_covariates"]
+    assert isinstance(past_covariates, dict)
+    assert isinstance(future_covariates, dict)
+    assert np.isnan(np.asarray(chronos_input["target"])[0])
+    assert np.isnan(
+        np.asarray(past_covariates[prepared.local_input_feature_names[module.state_base._LOCAL_VALUE_START + 1]])[0]
+    )
+    assert np.isnan(
+        np.asarray(past_covariates[prepared.context_history_feature_names[module.state_base._CONTEXT_GLOBAL_VALUE_START]])[0]
+    )
+    assert tuple(future_covariates) == _KNOWN_FUTURE_COLUMNS
+    assert set(future_covariates).issubset(set(past_covariates))
+    for column_name in _KNOWN_FUTURE_COLUMNS:
+        assert np.allclose(
+            np.asarray(future_covariates[column_name]),
+            prepared.context_future_tensor[future_slice, _KNOWN_FUTURE_COLUMNS.index(column_name)],
+        )
 
 
 def test_timexer_dataset_splits_endogenous_exogenous_and_history_marks(tmp_path, monkeypatch) -> None:
@@ -492,6 +545,87 @@ def test_persistence_job_writes_synthetic_training_history(tmp_path, monkeypatch
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.PERSISTENCE_VARIANT
     assert rows[0]["uses_graph"] is False
+
+
+def test_chronos_zero_shot_job_reaggregates_batches_and_writes_synthetic_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_chronos_variant_spec(module),
+    )
+    history_path = tmp_path / "chronos.training_history.csv"
+    captured_shapes: list[tuple[int, ...]] = []
+    original_metrics = module._metrics_from_arrays
+
+    def _capture_metrics(predictions, targets, valid_mask, *, rated_power_kw):
+        captured_shapes.append(predictions.shape)
+        assert predictions.shape == targets.shape == valid_mask.shape
+        return original_metrics(predictions, targets, valid_mask, rated_power_kw=rated_power_kw)
+
+    class _FakeChronosPipeline:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def predict_quantiles(
+            self,
+            inputs,
+            *,
+            prediction_length,
+            batch_size,
+            context_length,
+            cross_learning,
+            limit_prediction_length,
+        ):
+            self.calls.append(
+                {
+                    "count": len(inputs),
+                    "prediction_length": prediction_length,
+                    "batch_size": batch_size,
+                    "context_length": context_length,
+                    "cross_learning": cross_learning,
+                    "limit_prediction_length": limit_prediction_length,
+                }
+            )
+            means = []
+            for item in inputs:
+                target = np.asarray(item["target"], dtype=np.float32)
+                anchor = float(np.nan_to_num(target[-1], nan=0.0))
+                means.append(np.full((1, prediction_length), anchor, dtype=np.float32))
+            return [None] * len(means), means
+
+    fake_pipeline = _FakeChronosPipeline()
+    monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
+    monkeypatch.setattr(module, "_load_chronos_zero_shot_pipeline", lambda *, device: fake_pipeline)
+
+    rows = module.execute_training_job(
+        prepared,
+        variant_spec=_chronos_variant_spec(module),
+        device="cpu",
+        seed=123,
+        batch_size=3,
+        eval_batch_size=2,
+        training_history_path=history_path,
+    )
+
+    expected_shape = (len(prepared.val_rolling_windows), prepared.forecast_steps, prepared.node_count, 1)
+    assert captured_shapes
+    assert all(shape == expected_shape for shape in captured_shapes)
+    assert len(fake_pipeline.calls) == 8
+    assert all(call["batch_size"] == 2 for call in fake_pipeline.calls)
+    assert all(call["context_length"] == prepared.history_steps for call in fake_pipeline.calls)
+    assert all(call["cross_learning"] is False for call in fake_pipeline.calls)
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [0]
+    assert history["baseline_type"].to_list() == ["chronos_2_zero_shot"]
+    assert history["train_loss_mean"].null_count() == 1
+    assert history["device"].to_list() == ["cpu"]
+    assert len(rows) == 148
+    assert rows[0]["model_variant"] == module.CHRONOS_VARIANT
+    assert rows[0]["baseline_type"] == "chronos_2_zero_shot"
 
 
 def test_persistence_logs_tensorboard_scalars_with_fake_writer(tmp_path, monkeypatch) -> None:
@@ -768,12 +902,13 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 592
+    assert results.height == 740
     assert set(results["model_variant"].unique().to_list()) == {
         module.PERSISTENCE_VARIANT,
         module.TFT_VARIANT,
         module.TIMEXER_VARIANT,
         module.DGCRN_VARIANT,
+        module.CHRONOS_VARIANT,
     }
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()
