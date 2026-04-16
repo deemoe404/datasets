@@ -62,6 +62,10 @@ def _timexer_variant_spec(module):
     return module.resolve_variant_specs((module.TIMEXER_VARIANT,))[0]
 
 
+def _dgcrn_variant_spec(module):
+    return module.resolve_variant_specs((module.DGCRN_VARIANT,))[0]
+
+
 class _FakeSummaryWriter:
     instances: list["_FakeSummaryWriter"] = []
 
@@ -86,7 +90,7 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def test_registry_declares_kelmarsh_only_and_three_variants() -> None:
+def test_registry_declares_kelmarsh_only_and_four_variants() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
@@ -103,6 +107,7 @@ def test_registry_declares_kelmarsh_only_and_three_variants() -> None:
     assert 'world_model_persistence_last_value_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_shared_weight_tft_no_graph_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_dgcrn_v1_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -131,6 +136,20 @@ def test_timexer_default_hyperparameters_include_patching() -> None:
     assert profile.patch_len == 24
     assert profile.encoder_layers == 2
     assert profile.ff_hidden_dim == 256
+
+
+def test_dgcrn_default_hyperparameters_match_family_contract() -> None:
+    module = _load_module()
+    profile = module.resolve_hyperparameter_profile(module.DGCRN_VARIANT, dataset_id="kelmarsh")
+
+    assert profile.batch_size == 256
+    assert profile.learning_rate == pytest.approx(5e-4)
+    assert profile.hidden_dim == 64
+    assert profile.embed_dim == 16
+    assert profile.num_layers == 2
+    assert profile.cheb_k == 2
+    assert profile.teacher_forcing_ratio == pytest.approx(0.5)
+    assert profile.d_model is None
 
 
 def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
@@ -393,6 +412,59 @@ def test_timexer_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> N
     assert metrics.window_count == len(prepared.val_rolling_windows)
 
 
+def test_dgcrn_dataset_builds_farm_panel_history_and_future(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_dgcrn_variant_spec(module),
+    )
+
+    dataset = module.FarmPanelWindowDataset(prepared, prepared.val_rolling_windows)
+    sample = dataset[0]
+
+    assert len(dataset) == len(prepared.val_rolling_windows)
+    assert sample[0].shape == (prepared.history_steps, prepared.node_count, 94)
+    assert sample[1].shape == (prepared.forecast_steps, 7)
+    assert sample[2].shape == (prepared.forecast_steps, prepared.node_count, 1)
+    assert sample[3].shape == (prepared.forecast_steps, prepared.node_count, 1)
+
+
+def test_dgcrn_forward_shape_and_dynamic_graph_changes_with_state(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_dgcrn_variant_spec(module),
+    )
+    model = module.build_dgcrn_model(
+        prepared_dataset=prepared,
+        hidden_dim=8,
+        embed_dim=4,
+        num_layers=1,
+        cheb_k=2,
+    )
+    sample = module.FarmPanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+
+    with torch_module.no_grad():
+        outputs = model(
+            torch_module.from_numpy(sample[0][None]),
+            torch_module.from_numpy(sample[1][None]),
+        )
+        zero_state = torch_module.zeros((1, prepared.node_count, 8), dtype=torch_module.float32)
+        one_state = torch_module.ones((1, prepared.node_count, 8), dtype=torch_module.float32)
+        adjacency_zero = model.compute_dynamic_adjacency(zero_state)
+        adjacency_one = model.compute_dynamic_adjacency(one_state)
+
+    assert outputs.shape == (1, prepared.forecast_steps, prepared.node_count, 1)
+    assert adjacency_zero.shape == (1, prepared.node_count, prepared.node_count)
+    assert not torch_module.allclose(adjacency_zero, adjacency_one)
+
+
 def test_persistence_job_writes_synthetic_training_history(tmp_path, monkeypatch) -> None:
     module = _load_module()
     prepared = _prepare_temp_dataset(
@@ -545,6 +617,55 @@ def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> No
     assert rows[0]["ff_hidden_dim"] == 16
 
 
+def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_dgcrn_variant_spec(module),
+    )
+    history_path = tmp_path / "dgcrn.training_history.csv"
+
+    rows = module.execute_training_job(
+        prepared,
+        variant_spec=_dgcrn_variant_spec(module),
+        device="cpu",
+        seed=123,
+        batch_size=2,
+        eval_batch_size=2,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        hidden_dim=8,
+        embed_dim=4,
+        num_layers=1,
+        cheb_k=2,
+        teacher_forcing_ratio=0.0,
+        num_workers=0,
+        training_history_path=history_path,
+    )
+
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1]
+    assert history["baseline_type"].to_list() == ["dgcrn_dynamic_graph"]
+    assert history["hidden_dim"].to_list() == [8]
+    assert history["embed_dim"].to_list() == [4]
+    assert history["num_layers"].to_list() == [1]
+    assert history["cheb_k"].to_list() == [2]
+    assert history["teacher_forcing_ratio"].to_list() == [0.0]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
+    assert len(rows) == 148
+    assert rows[0]["model_variant"] == module.DGCRN_VARIANT
+    assert rows[0]["hidden_dim"] == 8
+    assert rows[0]["uses_graph"] is True
+    assert rows[0]["uses_pairwise"] is True
+
+
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:
     module = _load_module()
     prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_train_origins=2, max_eval_origins=1)
@@ -569,6 +690,11 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             patch_len=kwargs["patch_len"],
             encoder_layers=kwargs["encoder_layers"],
             ff_hidden_dim=kwargs["ff_hidden_dim"],
+            hidden_dim=kwargs["hidden_dim"],
+            embed_dim=kwargs["embed_dim"],
+            num_layers=kwargs["num_layers"],
+            cheb_k=kwargs["cheb_k"],
+            teacher_forcing_ratio=kwargs["teacher_forcing_ratio"],
             dropout=kwargs["dropout"],
             grad_clip_norm=kwargs["grad_clip_norm"],
             weight_decay=kwargs["weight_decay"],
@@ -629,6 +755,11 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         patch_len=24,
         encoder_layers=1,
         ff_hidden_dim=16,
+        hidden_dim=8,
+        embed_dim=4,
+        num_layers=1,
+        cheb_k=2,
+        teacher_forcing_ratio=0.0,
         dropout=0.0,
         work_root=work_root,
         dataset_loader=_dataset_loader,
@@ -637,11 +768,12 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 444
+    assert results.height == 592
     assert set(results["model_variant"].unique().to_list()) == {
         module.PERSISTENCE_VARIANT,
         module.TFT_VARIANT,
         module.TIMEXER_VARIANT,
+        module.DGCRN_VARIANT,
     }
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()

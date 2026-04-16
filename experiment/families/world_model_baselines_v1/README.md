@@ -18,6 +18,10 @@ The first implementation includes:
   `target_pu` history patches, historical local/global exogenous channels, and
   historical calendar marks only; it does not consume `context_future`,
   `static`, or `pairwise`.
+- `world_model_dgcrn_v1_farm_sync`: repo-local DGCRN-style dynamic-graph
+  recurrent baseline that consumes the same `world_model_v1` bundle contract
+  through broadcast history context, known-future calendar inputs, static node
+  metadata, and pairwise geometry bias terms.
 
 ## Run
 
@@ -32,6 +36,13 @@ Run only persistence:
 ```shell
 ./.conda/bin/python run_world_model_baselines_v1.py \
   --variant world_model_persistence_last_value_v1_farm_sync
+```
+
+Run only DGCRN:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --variant world_model_dgcrn_v1_farm_sync
 ```
 
 Smoke run:
@@ -75,7 +86,7 @@ Or override the log root explicitly:
 - Dataset scope: `kelmarsh` only.
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
-- Registry `training_mode` is `trainable` because the family includes TFT and
-  TimeXer, even though persistence is analytic.
+- Registry `training_mode` is `trainable` because the family includes TFT,
+  TimeXer, and DGCRN, even though persistence is analytic.
 - Deferred: state-space ablations such as no-dynamic-graph, no-global-state,
   single-state, linear-head, and no-met-loss variants.

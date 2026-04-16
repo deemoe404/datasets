@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "world_model_baselines_v1"
 display_name = "World-Model Baselines v1"
 status = "prototype"
-summary = "Kelmarsh-only key baseline family for world_model_state_space_v1, including last-value persistence, shared-weight TFT, and shared-weight TimeXer without graph inputs."
+summary = "Kelmarsh-only key baseline family for world_model_state_space_v1, including last-value persistence, shared-weight TFT, shared-weight TimeXer without graph inputs, and a DGCRN-style dynamic-graph baseline."
 model_family = "world_model_baseline"
 training_mode = "trainable"
 implementation_root = "experiment/families/world_model_baselines_v1"
@@ -19,15 +19,18 @@ implementation_labels = [
   "world_model_persistence_last_value_v1_farm_sync",
   "world_model_shared_weight_tft_no_graph_v1_farm_sync",
   "world_model_shared_weight_timexer_no_graph_v1_farm_sync",
+  "world_model_dgcrn_v1_farm_sync",
 ]
 model_variants = [
   "world_model_persistence_last_value_v1_farm_sync",
   "world_model_shared_weight_tft_no_graph_v1_farm_sync",
   "world_model_shared_weight_timexer_no_graph_v1_farm_sync",
+  "world_model_dgcrn_v1_farm_sync",
 ]
 notes = [
-  "The family is marked trainable because it includes a TFT baseline; persistence is analytic and writes a synthetic epoch-0 training-history row.",
-  "All baselines consume the existing world_model_v1 task bundle through the state-space tensor contract and do not introduce a dataset-side feature protocol.",
+  "The family is marked trainable because it includes TFT, TimeXer, and DGCRN baselines; persistence is analytic and writes a synthetic epoch-0 training-history row.",
+  "All variants consume the existing world_model_v1 task bundle through the state-space tensor contract and do not introduce a dataset-side feature protocol.",
+  "The DGCRN variant keeps the same Kelmarsh-only world_model_v1 bundle contract and adds dynamic graph recurrence with static-node embeddings and pairwise geometry bias.",
 ]
 
 [task_contract]
@@ -42,3 +45,4 @@ granularity = "farm"
 world_model_persistence_last_value_v1_farm_sync = "world_model_v1"
 world_model_shared_weight_tft_no_graph_v1_farm_sync = "world_model_v1"
 world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"
+world_model_dgcrn_v1_farm_sync = "world_model_v1"
