@@ -1073,6 +1073,226 @@ G=L+H=180\ \mathrm{steps}=30\ \mathrm{hours}.
 
 \noindent 图中 $\hat c_{t+\tau}$ 统一表示未来窗使用的站点上下文简写，实际由模型内部解码得到的气象摘要 $\hat c^{met}_{t+\tau}$ 与已知未来日历 $\mathrm{cal}_{t+\tau}$ 拼接而成。
 
+\medskip
+
+\noindent 上图保留为前期草图，便于和既有讨论记录对应。为与当前 v1 正文公式严格对齐，下图另给出一张新版结构总览。
+
+\begin{figure}[t]
+\centering
+{\footnotesize\bfseries Historical window: filtering / assimilation\par}
+\vspace{1mm}
+\resizebox{0.97\linewidth}{!}{%
+\begin{tikzpicture}[
+    >=Latex,
+    semithick,
+    font=\scriptsize,
+    net/.style={
+        draw,
+        rounded corners=2pt,
+        fill=yellow!25,
+        align=center,
+        text width=12mm,
+        minimum height=8mm,
+        inner sep=1.5pt
+    },
+    state/.style={
+        draw,
+        rounded corners=2pt,
+        fill=blue!6,
+        align=center,
+        text width=21mm,
+        minimum height=9mm,
+        inner sep=1.5pt
+    },
+    io/.style={
+        draw,
+        rounded corners=2pt,
+        fill=green!8,
+        align=center,
+        text width=26mm,
+        minimum height=9mm,
+        inner sep=1.5pt
+    },
+    aux/.style={
+        draw,
+        rounded corners=2pt,
+        fill=white,
+        align=center,
+        text width=11mm,
+        minimum height=6mm,
+        inner sep=1.5pt
+    },
+    flow/.style={->},
+    lab/.style={font=\scriptsize, fill=white, inner sep=1pt}
+]
+\node[state] (histprev)  at (0.0, 0.0)  {prev posterior\\$\{z^+_{i,t-1},\,h^+_{i,t-1}\},\,g^+_{t-1}$};
+\node[aux]   (cal_h)     at (2.2, 1.8)  {$\mathrm{cal}_{t}$};
+\node[net]   (decg_h)    at (2.2, 0.0)  {$\mathrm{Dec}^{met}_g$};
+\node[net]   (src_h)     at (3.9, 0.0)  {$\mathrm{MLP}^{pred}_{src}$};
+\node[net]   (ep_h)      at (5.6, 0.0)  {$\mathrm{MLP}^{pred}_e$};
+\node[net]   (ap_h)      at (7.3, 0.0)  {$\mathrm{MLP}^{pred}_a$};
+\node[net]   (sp_h)      at (9.0, 0.0)  {$\mathrm{MLP}^{pred}_{\Sigma}$};
+\node[net]   (tr_h)      at (9.0,-2.2)  {Transition};
+\node[net]   (pt_h)      at (10.7,-2.2) {$\mathrm{MLP}^{tr}_{pool}$};
+\node[net]   (pat_h)     at (12.4,-2.2) {$\mathrm{MLP}^{a,tr}_{pool}$};
+\node[net]   (tg_h)      at (14.1,-2.2) {Transition$_g$};
+\node[state] (histprior) at (16.6,-2.2) {prior state\\$\{z^-_{i,t},\,h^-_{i,t}\},\,g^-_{t}$};
+
+\node[io]    (histin)    at (0.0,-5.5)  {current inputs\\$o_{i,t},\,u^{ops}_{i,t},\,q_t,\,\Delta t_t,\,s_i$};
+\node[net]   (mops)      at (2.4,-5.5)  {$\mathrm{MLP}_{ops}$};
+\node[net]   (mobs)      at (4.1,-5.5)  {$\mathrm{MLP}_{obs}$};
+\node[net]   (esrc)      at (5.8,-5.5)  {Enc$_{src}$};
+\node[net]   (eu)        at (7.5,-5.5)  {$\mathrm{MLP}^{upd}_e$};
+\node[net]   (au)        at (9.2,-5.5)  {$\mathrm{MLP}^{upd}_a$};
+\node[net]   (su)        at (10.9,-5.5) {$\mathrm{MLP}^{upd}_{\Sigma}$};
+\node[aux]   (ctxt)      at (9.2,-7.2)  {$c_t$};
+\node[net]   (dobs)      at (13.7,-5.5) {Dec$_{obs}$};
+\node[net]   (env)       at (15.4,-5.5) {Enc$_{\nu}$};
+\node[net]   (upd)       at (17.1,-5.5) {Update};
+\node[net]   (pp)        at (18.8,-5.5) {$\mathrm{MLP}^{+}_{pool}$};
+\node[net]   (pap)       at (20.5,-5.5) {$\mathrm{MLP}^{a,+}_{pool}$};
+\node[net]   (ug)        at (22.2,-5.5) {Update$_g$};
+\node[state] (histpost)  at (24.7,-5.5) {posterior state\\$\{z^+_{i,t},\,h^+_{i,t}\},\,g^+_{t}$};
+
+\draw[flow] (histprev) -- (decg_h);
+\draw[flow] (cal_h) -- (decg_h);
+\draw[flow] (decg_h) -- (src_h);
+\draw[flow] (src_h) -- (ep_h);
+\draw[flow] (ep_h) -- (ap_h);
+\draw[flow] (ap_h) -- (sp_h);
+\draw[flow] (sp_h) -- (tr_h);
+\draw[flow] (tr_h) -- (pt_h);
+\draw[flow] (pt_h) -- (pat_h);
+\draw[flow] (pat_h) -- (tg_h);
+\draw[flow] (tg_h) -- (histprior);
+
+\draw[flow] (histin) -- (mops);
+\draw[flow] (mops) -- (mobs);
+\draw[flow] (mobs) -- (esrc);
+\draw[flow] (esrc) -- (eu);
+\draw[flow] (eu) -- (au);
+\draw[flow] (au) -- (su);
+\draw[flow] (ctxt) -- (au);
+\draw[flow] (dobs) -- (env);
+\draw[flow] (env) -- (upd);
+\draw[flow] (upd) -- (pp);
+\draw[flow] (pp) -- (pap);
+\draw[flow] (pap) -- (ug);
+\draw[flow] (ug) -- (histpost);
+\draw[flow] (histprior.south) -- ++(0,-0.7) -| (dobs.north);
+\draw[flow] (mobs.south) -- ++(0,-0.7) -| (env.north);
+\draw[flow] (su.south) -- ++(0,-0.7) |- (upd.north);
+
+\node[
+    draw,
+    dashed,
+    rounded corners=3pt,
+    inner sep=5pt,
+    fit=(histprev)(cal_h)(decg_h)(src_h)(ep_h)(ap_h)(sp_h)(tr_h)(pt_h)(pat_h)(tg_h)(histprior)(histin)(mops)(mobs)(esrc)(eu)(au)(su)(ctxt)(dobs)(env)(upd)(pp)(pap)(ug)(histpost)
+] {};
+\end{tikzpicture}%
+}
+
+\vspace{1mm}
+{\footnotesize rollout initialization at $\tau=1$:
+$\{z_{i,t|t},\,h_{i,t|t},\,g_{t|t}\}\equiv\{z^+_{i,t},\,h^+_{i,t},\,g^+_t\}$\par}
+\vspace{1mm}
+{\footnotesize\bfseries Future window: open-loop rollout\par}
+\vspace{1mm}
+\resizebox{0.97\linewidth}{!}{%
+\begin{tikzpicture}[
+    >=Latex,
+    semithick,
+    font=\scriptsize,
+    net/.style={
+        draw,
+        rounded corners=2pt,
+        fill=yellow!25,
+        align=center,
+        text width=12mm,
+        minimum height=8mm,
+        inner sep=1.5pt
+    },
+    state/.style={
+        draw,
+        rounded corners=2pt,
+        fill=blue!6,
+        align=center,
+        text width=21mm,
+        minimum height=9mm,
+        inner sep=1.5pt
+    },
+    io/.style={
+        draw,
+        rounded corners=2pt,
+        fill=green!8,
+        align=center,
+        text width=16mm,
+        minimum height=9mm,
+        inner sep=1.5pt
+    },
+    aux/.style={
+        draw,
+        rounded corners=2pt,
+        fill=white,
+        align=center,
+        text width=11mm,
+        minimum height=6mm,
+        inner sep=1.5pt
+    },
+    flow/.style={->}
+]
+\node[state] (rollprev) at (0.0, 0.0) {prev rollout state\\$\{z_{i,t+\tau-1|t},\,h_{i,t+\tau-1|t}\},\,g_{t+\tau-1|t}$};
+\node[aux]   (cal)     at (2.3, 1.8) {$\mathrm{cal}_{t+\tau}$};
+\node[net]   (decg_f)  at (2.3, 0.0) {$\mathrm{Dec}^{met}_g$};
+\node[net]   (src_f)   at (4.0, 0.0) {$\mathrm{MLP}^{pred}_{src}$};
+\node[net]   (ep_f)    at (5.7, 0.0) {$\mathrm{MLP}^{pred}_e$};
+\node[net]   (ap_f)    at (7.4, 0.0) {$\mathrm{MLP}^{pred}_a$};
+\node[net]   (sp_f)    at (9.1, 0.0) {$\mathrm{MLP}^{pred}_{\Sigma}$};
+\node[net]   (tr_f)    at (9.1,-2.2) {Transition};
+\node[net]   (pt_f)    at (10.8,-2.2) {$\mathrm{MLP}^{tr}_{pool}$};
+\node[net]   (pat_f)   at (12.5,-2.2) {$\mathrm{MLP}^{a,tr}_{pool}$};
+\node[net]   (tg_f)    at (14.2,-2.2) {Transition$_g$};
+\node[state] (rollnext) at (16.8,-2.2) {next rollout state\\$\{z_{i,t+\tau|t},\,h_{i,t+\tau|t}\},\,g_{t+\tau|t}$};
+\node[net]   (mdec)    at (19.2,-2.2) {$\mathrm{MLP}^{raw}_{dec}$};
+\node[io]    (yhat)    at (21.3,-2.2) {forecast\\$\hat y_{i,t+\tau|t}$};
+
+\draw[flow] (rollprev) -- (decg_f);
+\draw[flow] (cal) -- (decg_f);
+\draw[flow] (decg_f) -- (src_f);
+\draw[flow] (src_f) -- (ep_f);
+\draw[flow] (ep_f) -- (ap_f);
+\draw[flow] (ap_f) -- (sp_f);
+\draw[flow] (sp_f) -- (tr_f);
+\draw[flow] (tr_f) -- (pt_f);
+\draw[flow] (pt_f) -- (pat_f);
+\draw[flow] (pat_f) -- (tg_f);
+\draw[flow] (tg_f) -- (rollnext);
+\draw[flow] (rollnext) -- (mdec);
+\draw[flow] (mdec) -- (yhat);
+
+\node[
+    draw,
+    dashed,
+    rounded corners=3pt,
+    inner sep=5pt,
+    fit=(rollprev)(cal)(decg_f)(src_f)(ep_f)(ap_f)(sp_f)(tr_f)(pt_f)(pat_f)(tg_f)(rollnext)(mdec)(yhat)
+] {};
+\end{tikzpicture}%
+}
+\caption{新版 v1 结构总览：上图为历史窗 filtering / assimilation，下图为未来窗 open-loop rollout。}
+\label{fig:structure_overview_v1}
+\end{figure}
+
+\noindent 新增图中，每个黄色框都对应一个\textbf{独立命名的神经网络模块}。历史窗 prior propagation 显式拆成
+Dec$_g^{met}$、$\mathrm{MLP}^{pred}_{src}$、$\mathrm{MLP}^{pred}_e$、$\mathrm{MLP}^{pred}_a$、
+$\mathrm{MLP}^{pred}_{\Sigma}$、Transition、$\mathrm{MLP}^{tr}_{pool}$、
+$\mathrm{MLP}^{a,tr}_{pool}$ 与 Transition$_g$；posterior correction 则显式拆成
+$\mathrm{MLP}_{ops}$、$\mathrm{MLP}_{obs}$、Enc$_{src}$、$\mathrm{MLP}^{upd}_e$、
+$\mathrm{MLP}^{upd}_a$、$\mathrm{MLP}^{upd}_{\Sigma}$、Dec$_{obs}$、Enc$_\nu$、Update、
+$\mathrm{MLP}^{+}_{pool}$、$\mathrm{MLP}^{a,+}_{pool}$ 与 Update$_g$。未来窗沿用对应的 pred / tr 模块，并将 Decode 明确写成 $\mathrm{MLP}^{raw}_{dec}$；其中 $\hat c_{t+\tau}$ 仍表示
+$[\hat c^{met}_{t+\tau},\,\mathrm{cal}_{t+\tau}]$。
+
 \section{未来可能的方向}
 
 \subsection{搜索增强}

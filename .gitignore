@@ -4,6 +4,11 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 cache/
+plan/cache/
+plan/.latex-tmp/
+plan/latex-tmp/
+plan/*.pdf
+plan/*.synctex.gz
 experiment/*.csv
 experiment/families/*/.conda/
 experiment/families/*/.work*/
