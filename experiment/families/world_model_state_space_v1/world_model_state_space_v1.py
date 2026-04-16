@@ -20,6 +20,11 @@ import numpy as np
 import polars as pl
 
 try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - optional dependency
+    SummaryWriter = None
+
+try:
     from tqdm.auto import tqdm
 
     HAS_TQDM = True
@@ -578,6 +583,157 @@ def resolve_eval_batch_size(train_batch_size: int, *, device: str, eval_batch_si
 def _profile_log(dataset_id: str, phase: str, **fields: object) -> None:
     payload = {"dataset_id": dataset_id, "phase": phase, **fields}
     print(f"{PROFILE_LOG_PREFIX}{json.dumps(payload, ensure_ascii=False, default=str, sort_keys=True)}", file=sys.stderr)
+
+
+def _tensorboard_job_log_dir(
+    tensorboard_root: str | Path,
+    *,
+    dataset_id: str,
+    model_variant: str,
+) -> Path:
+    return Path(tensorboard_root) / dataset_id / model_variant
+
+
+def _open_tensorboard_writer(
+    tensorboard_log_dir: str | Path | None,
+    *,
+    dataset_id: str,
+    model_variant: str,
+):
+    if tensorboard_log_dir is None:
+        return None
+    resolved_dir = Path(tensorboard_log_dir).expanduser().resolve()
+    if SummaryWriter is None:
+        _profile_log(
+            dataset_id,
+            "tensorboard_unavailable",
+            model_variant=model_variant,
+            log_dir=str(resolved_dir),
+            reason="tensorboard package is not installed in the family environment",
+        )
+        return None
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    _profile_log(
+        dataset_id,
+        "tensorboard_enabled",
+        model_variant=model_variant,
+        log_dir=str(resolved_dir),
+    )
+    return SummaryWriter(log_dir=str(resolved_dir), flush_secs=10)
+
+
+def _close_tensorboard_writer(writer) -> None:
+    if writer is None:
+        return
+    writer.flush()
+    writer.close()
+
+
+def _tensorboard_add_scalar(writer, tag: str, value: object, step: int) -> None:
+    if writer is None or value is None:
+        return
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
+        return
+    writer.add_scalar(tag, numeric_value, step)
+
+
+def _tensorboard_add_text(writer, tag: str, text: str, *, step: int = 0) -> None:
+    if writer is None:
+        return
+    writer.add_text(tag, text, global_step=step)
+
+
+def _tensorboard_add_metrics(writer, prefix: str, metrics: EvaluationMetrics, *, step: int) -> None:
+    if writer is None:
+        return
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/mae_pu", metrics.mae_pu, step)
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/rmse_pu", metrics.rmse_pu, step)
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/mae_kw", metrics.mae_kw, step)
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/rmse_kw", metrics.rmse_kw, step)
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/window_count", metrics.window_count, step)
+    _tensorboard_add_scalar(writer, f"{prefix}/overall/prediction_count", metrics.prediction_count, step)
+    for lead_index in range(len(metrics.horizon_mae_pu)):
+        lead_step = lead_index + 1
+        lead_tag = f"lead_{lead_step:02d}"
+        _tensorboard_add_scalar(writer, f"{prefix}/horizon/mae_pu/{lead_tag}", metrics.horizon_mae_pu[lead_index], step)
+        _tensorboard_add_scalar(writer, f"{prefix}/horizon/rmse_pu/{lead_tag}", metrics.horizon_rmse_pu[lead_index], step)
+        _tensorboard_add_scalar(writer, f"{prefix}/horizon/mae_kw/{lead_tag}", metrics.horizon_mae_kw[lead_index], step)
+        _tensorboard_add_scalar(writer, f"{prefix}/horizon/rmse_kw/{lead_tag}", metrics.horizon_rmse_kw[lead_index], step)
+
+
+def _tensorboard_log_run_config(
+    writer,
+    *,
+    prepared_dataset: PreparedDataset,
+    profile: HyperparameterProfile,
+    seed: int,
+    device: str,
+    eval_batch_size: int | None,
+    num_workers: int | None,
+) -> None:
+    if writer is None:
+        return
+    config = {
+        "dataset_id": prepared_dataset.dataset_id,
+        "model_variant": prepared_dataset.model_variant,
+        "feature_protocol_id": prepared_dataset.feature_protocol_id,
+        "task_id": TASK_ID,
+        "history_steps": prepared_dataset.history_steps,
+        "forecast_steps": prepared_dataset.forecast_steps,
+        "node_count": prepared_dataset.node_count,
+        "resolution_minutes": prepared_dataset.resolution_minutes,
+        "rated_power_kw": prepared_dataset.rated_power_kw,
+        "local_input_channels": prepared_dataset.local_input_channels,
+        "context_history_channels": prepared_dataset.context_history_channels,
+        "context_future_channels": prepared_dataset.context_future_channels,
+        "static_feature_count": prepared_dataset.static_feature_count,
+        "pairwise_feature_count": prepared_dataset.pairwise_feature_count,
+        "train_window_count": len(prepared_dataset.train_windows),
+        "val_window_count": len(prepared_dataset.val_rolling_windows),
+        "test_window_count": len(prepared_dataset.test_rolling_windows),
+        "device": device,
+        "seed": seed,
+        "eval_batch_size": eval_batch_size,
+        "num_workers": num_workers,
+        **asdict(profile),
+    }
+    _tensorboard_add_text(writer, "run/config_json", f"```json\n{json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True)}\n```")
+    _tensorboard_add_scalar(writer, "data/train_window_count", len(prepared_dataset.train_windows), 0)
+    _tensorboard_add_scalar(writer, "data/val_window_count", len(prepared_dataset.val_rolling_windows), 0)
+    _tensorboard_add_scalar(writer, "data/test_window_count", len(prepared_dataset.test_rolling_windows), 0)
+
+
+def _tensorboard_log_final_evaluations(
+    writer,
+    evaluation_results: Sequence[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]],
+    *,
+    step: int,
+) -> None:
+    if writer is None:
+        return
+    summary_rows: list[dict[str, object]] = []
+    for split_name, eval_protocol, _windows, metrics in evaluation_results:
+        prefix = f"final/{split_name}/{eval_protocol}"
+        _tensorboard_add_metrics(writer, prefix, metrics, step=step)
+        summary_rows.append(
+            {
+                "split_name": split_name,
+                "eval_protocol": eval_protocol,
+                "mae_pu": float(metrics.mae_pu),
+                "rmse_pu": float(metrics.rmse_pu),
+                "mae_kw": float(metrics.mae_kw),
+                "rmse_kw": float(metrics.rmse_kw),
+                "window_count": int(metrics.window_count),
+                "prediction_count": int(metrics.prediction_count),
+            }
+        )
+    _tensorboard_add_text(
+        writer,
+        "final/summary_json",
+        f"```json\n{json.dumps(summary_rows, ensure_ascii=False, indent=2, sort_keys=True)}\n```",
+        step=step,
+    )
 
 
 def _delta_since_available(mask_unavailable: np.ndarray, *, cap_steps: int = DEFAULT_DELTA_CAP_STEPS) -> np.ndarray:
@@ -1645,6 +1801,8 @@ def _build_effective_config(
     wake_kappa: float | None,
     bounded_output_epsilon: float | None,
     num_workers: int | None,
+    tensorboard_root: str | Path | None,
+    disable_tensorboard: bool,
 ) -> dict[str, object]:
     resolved_device = resolve_device(device)
     return {
@@ -1656,6 +1814,8 @@ def _build_effective_config(
         "max_eval_origins": max_eval_origins,
         "eval_batch_size": eval_batch_size,
         "num_workers": resolve_loader_num_workers(device=resolved_device, num_workers=num_workers),
+        "tensorboard_root": None if tensorboard_root is None else str(Path(tensorboard_root).expanduser().resolve()),
+        "tensorboard_enabled": not disable_tensorboard,
         "resolved_dataset_variant_hyperparameters": {
             dataset_id: {
                 spec.model_variant: {
@@ -1716,6 +1876,13 @@ def _move_batch_to_device(batch, *, torch_module, device: str):
     )
 
 
+def _forecast_valid_fraction(*, prediction_count: int, window_count: int, forecast_steps: int, node_count: int) -> float:
+    denominator = int(window_count) * int(forecast_steps) * int(node_count)
+    if denominator <= 0:
+        return math.nan
+    return float(prediction_count) / float(denominator)
+
+
 def train_model(
     prepared_dataset: PreparedDataset,
     *,
@@ -1753,6 +1920,7 @@ def train_model(
     training_history_path: str | Path | None = None,
     resume_from_checkpoint: bool = False,
     progress_label: str | None = None,
+    tensorboard_writer=None,
 ) -> TrainingOutcome:
     resolved_torch, _, _, _, _ = _require_torch()
     _set_random_seed(seed)
@@ -1896,6 +2064,8 @@ def train_model(
                 "innovation": 0.0,
             }
             train_loss_weight = 0
+            train_target_valid_count = 0.0
+            train_target_total_count = 0
             train_batch_count = 0
             try:
                 for raw_batch in train_loader:
@@ -1944,6 +2114,8 @@ def train_model(
                     for loss_name, loss_value in latest_losses.items():
                         loss_sums[loss_name] += float(loss_value) * batch_window_count
                     train_loss_weight += batch_window_count
+                    train_target_valid_count += float(batch_target_valid_mask.sum().item())
+                    train_target_total_count += int(batch_target_valid_mask.numel())
                     train_batch_count += 1
                     batch_progress.set_postfix_str(f"loss={latest_losses['total']:.4f}")
                     batch_progress.update(1)
@@ -1975,6 +2147,17 @@ def train_model(
                 loss_name: loss_sum / train_loss_weight if train_loss_weight else math.nan
                 for loss_name, loss_sum in loss_sums.items()
             }
+            train_valid_fraction = (
+                train_target_valid_count / float(train_target_total_count)
+                if train_target_total_count > 0
+                else math.nan
+            )
+            val_valid_fraction = _forecast_valid_fraction(
+                prediction_count=val_metrics.prediction_count,
+                window_count=val_metrics.window_count,
+                forecast_steps=prepared_dataset.forecast_steps,
+                node_count=prepared_dataset.node_count,
+            )
             epoch_progress.update(1)
             postfix_parts = [f"val_rmse={val_rmse_pu:.4f}", f"best={best_val_rmse_pu:.4f}"]
             if latest_losses:
@@ -2020,6 +2203,37 @@ def train_model(
                         "amp_enabled": amp_enabled,
                     },
                 )
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_mean", loss_means["total"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_last", latest_losses.get("total"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/forecast_loss_mean", loss_means["forecast"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/forecast_loss_last", latest_losses.get("forecast"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/hist_recon_loss_mean", loss_means["hist_recon"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/hist_recon_loss_last", latest_losses.get("hist_recon"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/farm_loss_mean", loss_means["farm"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/farm_loss_last", latest_losses.get("farm"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_mean", loss_means["met"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_last", latest_losses.get("met"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/innovation_loss_mean", loss_means["innovation"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/innovation_loss_last", latest_losses.get("innovation"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/valid_fraction", train_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/batch_count", train_batch_count, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/learning_rate", optimizer.param_groups[0]["lr"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "val/valid_fraction", val_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_mae_pu", best_val_mae_pu, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_rmse_pu", best_val_rmse_pu, epoch_index)
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/epochs_without_improvement",
+                epochs_without_improvement,
+                epoch_index,
+            )
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/patience_limit",
+                early_stopping_patience,
+                epoch_index,
+            )
+            _tensorboard_add_metrics(tensorboard_writer, "val", val_metrics, step=epoch_index)
             if resolved_checkpoint_path is not None:
                 world_model_base._save_training_checkpoint(
                     resolved_checkpoint_path,
@@ -2211,6 +2425,7 @@ def execute_training_job(
     checkpoint_path: str | Path | None = None,
     training_history_path: str | Path | None = None,
     resume_from_checkpoint: bool = False,
+    tensorboard_log_dir: str | Path | None = None,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
     progress_label = f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}"
@@ -2248,71 +2463,90 @@ def execute_training_job(
         device=resolved_device,
         eval_batch_size=eval_batch_size,
     )
-    training_outcome = train_model(
-        prepared_dataset,
-        device=resolved_device,
-        seed=seed,
-        batch_size=batch_size,
-        eval_batch_size=resolved_eval_batch_size,
-        learning_rate=learning_rate,
-        max_epochs=max_epochs,
-        early_stopping_patience=early_stopping_patience,
-        z_dim=z_dim,
-        h_dim=h_dim,
-        global_state_dim=global_state_dim,
-        obs_encoding_dim=obs_encoding_dim,
-        innovation_dim=innovation_dim,
-        source_summary_dim=source_summary_dim,
-        edge_message_dim=edge_message_dim,
-        edge_hidden_dim=edge_hidden_dim,
-        tau_embed_dim=tau_embed_dim,
-        met_summary_dim=met_summary_dim,
-        turbine_embed_dim=turbine_embed_dim,
-        dropout=dropout,
-        grad_clip_norm=grad_clip_norm,
-        hist_recon_loss_weight=hist_recon_loss_weight,
-        farm_loss_weight=farm_loss_weight,
-        met_loss_weight=met_loss_weight,
-        innovation_loss_weight=innovation_loss_weight,
-        weight_decay=weight_decay,
-        wake_lambda_x=wake_lambda_x,
-        wake_lambda_y=wake_lambda_y,
-        wake_kappa=wake_kappa,
-        bounded_output_epsilon=bounded_output_epsilon,
-        num_workers=num_workers,
-        checkpoint_path=checkpoint_path,
-        training_history_path=training_history_path,
-        resume_from_checkpoint=resume_from_checkpoint,
-        progress_label=progress_label,
+    writer = _open_tensorboard_writer(
+        tensorboard_log_dir,
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=prepared_dataset.model_variant,
     )
-    evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
-    eval_specs = iter_evaluation_specs(prepared_dataset)
-    eval_progress = _create_progress_bar(total=len(eval_specs), desc=f"{progress_label} eval")
+    _tensorboard_log_run_config(
+        writer,
+        prepared_dataset=prepared_dataset,
+        profile=resolved_profile,
+        seed=seed,
+        device=resolved_device,
+        eval_batch_size=resolved_eval_batch_size,
+        num_workers=resolve_loader_num_workers(device=resolved_device, num_workers=num_workers),
+    )
     try:
-        for split_name, eval_protocol, windows in eval_specs:
-            loader = _build_dataloader(
-                prepared_dataset,
-                windows=windows,
-                batch_size=resolved_eval_batch_size,
-                device=training_outcome.device,
-                shuffle=False,
-                seed=seed,
-                num_workers=num_workers,
-            )
-            metrics = evaluate_model(
-                training_outcome.model,
-                loader,
-                device=training_outcome.device,
-                rated_power_kw=prepared_dataset.rated_power_kw,
-                forecast_steps=prepared_dataset.forecast_steps,
-                amp_enabled=training_outcome.amp_enabled,
-                progress_label=f"{progress_label} {split_name}/{eval_protocol}",
-            )
-            evaluation_results.append((split_name, eval_protocol, windows, metrics))
-            eval_progress.update(1)
-            eval_progress.set_postfix_str(f"{split_name}/{eval_protocol}")
+        training_outcome = train_model(
+            prepared_dataset,
+            device=resolved_device,
+            seed=seed,
+            batch_size=batch_size,
+            eval_batch_size=resolved_eval_batch_size,
+            learning_rate=learning_rate,
+            max_epochs=max_epochs,
+            early_stopping_patience=early_stopping_patience,
+            z_dim=z_dim,
+            h_dim=h_dim,
+            global_state_dim=global_state_dim,
+            obs_encoding_dim=obs_encoding_dim,
+            innovation_dim=innovation_dim,
+            source_summary_dim=source_summary_dim,
+            edge_message_dim=edge_message_dim,
+            edge_hidden_dim=edge_hidden_dim,
+            tau_embed_dim=tau_embed_dim,
+            met_summary_dim=met_summary_dim,
+            turbine_embed_dim=turbine_embed_dim,
+            dropout=dropout,
+            grad_clip_norm=grad_clip_norm,
+            hist_recon_loss_weight=hist_recon_loss_weight,
+            farm_loss_weight=farm_loss_weight,
+            met_loss_weight=met_loss_weight,
+            innovation_loss_weight=innovation_loss_weight,
+            weight_decay=weight_decay,
+            wake_lambda_x=wake_lambda_x,
+            wake_lambda_y=wake_lambda_y,
+            wake_kappa=wake_kappa,
+            bounded_output_epsilon=bounded_output_epsilon,
+            num_workers=num_workers,
+            checkpoint_path=checkpoint_path,
+            training_history_path=training_history_path,
+            resume_from_checkpoint=resume_from_checkpoint,
+            progress_label=progress_label,
+            tensorboard_writer=writer,
+        )
+        evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
+        eval_specs = iter_evaluation_specs(prepared_dataset)
+        eval_progress = _create_progress_bar(total=len(eval_specs), desc=f"{progress_label} eval")
+        try:
+            for split_name, eval_protocol, windows in eval_specs:
+                loader = _build_dataloader(
+                    prepared_dataset,
+                    windows=windows,
+                    batch_size=resolved_eval_batch_size,
+                    device=training_outcome.device,
+                    shuffle=False,
+                    seed=seed,
+                    num_workers=num_workers,
+                )
+                metrics = evaluate_model(
+                    training_outcome.model,
+                    loader,
+                    device=training_outcome.device,
+                    rated_power_kw=prepared_dataset.rated_power_kw,
+                    forecast_steps=prepared_dataset.forecast_steps,
+                    amp_enabled=training_outcome.amp_enabled,
+                    progress_label=f"{progress_label} {split_name}/{eval_protocol}",
+                )
+                evaluation_results.append((split_name, eval_protocol, windows, metrics))
+                eval_progress.update(1)
+                eval_progress.set_postfix_str(f"{split_name}/{eval_protocol}")
+        finally:
+            eval_progress.close()
+        _tensorboard_log_final_evaluations(writer, evaluation_results, step=training_outcome.epochs_ran)
     finally:
-        eval_progress.close()
+        _close_tensorboard_writer(writer)
     runtime_seconds = time.monotonic() - dataset_start
     test_rolling_metrics = next(
         metrics
@@ -2379,6 +2613,8 @@ def run_experiment(
     wake_kappa: float | None = None,
     bounded_output_epsilon: float | None = None,
     num_workers: int | None = None,
+    tensorboard_log_dir: str | Path | None = None,
+    disable_tensorboard: bool = False,
     resume: bool = False,
     force_rerun: bool = False,
     work_root: str | Path = _RUN_WORK_ROOT,
@@ -2390,6 +2626,12 @@ def run_experiment(
     runner = job_runner or execute_training_job
     output = _normalize_output_path(output_path)
     resume_paths = _resume_paths_for_output(output_path=output, work_root=work_root)
+    resolved_tensorboard_root = resolve_tensorboard_root(
+        output_path=output,
+        work_root=work_root,
+        tensorboard_log_dir=tensorboard_log_dir,
+        disable_tensorboard=disable_tensorboard,
+    )
     effective_config = _build_effective_config(
         dataset_ids=resolved_dataset_ids,
         variant_specs=variant_specs,
@@ -2425,6 +2667,8 @@ def run_experiment(
         wake_kappa=wake_kappa,
         bounded_output_epsilon=bounded_output_epsilon,
         num_workers=num_workers,
+        tensorboard_root=resolved_tensorboard_root,
+        disable_tensorboard=disable_tensorboard,
     )
     existing_state = _load_resume_state_if_exists(resume_paths)
     if resume and force_rerun:
@@ -2571,6 +2815,15 @@ def run_experiment(
                         checkpoint_path=checkpoint_path,
                         training_history_path=resume_paths.training_history_path,
                         resume_from_checkpoint=resume_from_checkpoint,
+                        tensorboard_log_dir=(
+                            None
+                            if resolved_tensorboard_root is None
+                            else _tensorboard_job_log_dir(
+                                resolved_tensorboard_root,
+                                dataset_id=dataset_id,
+                                model_variant=variant_spec.model_variant,
+                            )
+                        ),
                     )
                 )
                 partial_results = _result_frame_from_rows(rows)
@@ -2656,6 +2909,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wake-kappa", type=float, default=None, help="Wake prior upstream/downstream gate scale.")
     parser.add_argument("--bounded-output-epsilon", type=float, default=None, help="Forecast upper bound slack.")
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count.")
+    parser.add_argument("--tensorboard-log-dir", type=Path, default=None, help="Optional TensorBoard log root.")
+    parser.add_argument("--disable-tensorboard", action="store_true", help="Disable TensorBoard logging.")
     parser.add_argument(
         "--run-label",
         type=str,
@@ -2728,11 +2983,39 @@ def _resolved_record_hyperparameters(
     }
 
 
+def tensorboard_root_path(
+    output_path: str | Path,
+    *,
+    work_root: str | Path = _RUN_WORK_ROOT,
+) -> Path:
+    return _resume_paths_for_output(output_path=output_path, work_root=work_root).slot_dir / "tensorboard"
+
+
+def resolve_tensorboard_root(
+    *,
+    output_path: str | Path,
+    work_root: str | Path = _RUN_WORK_ROOT,
+    tensorboard_log_dir: str | Path | None = None,
+    disable_tensorboard: bool = False,
+) -> Path | None:
+    if disable_tensorboard:
+        return None
+    if tensorboard_log_dir is not None:
+        return Path(tensorboard_log_dir).expanduser().resolve()
+    return tensorboard_root_path(output_path, work_root=work_root)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     resolved_dataset_ids = _validate_dataset_ids(tuple(args.datasets) if args.datasets else DEFAULT_DATASETS)
     variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
+    resolved_tensorboard_root = resolve_tensorboard_root(
+        output_path=args.output_path,
+        work_root=_RUN_WORK_ROOT,
+        tensorboard_log_dir=args.tensorboard_log_dir,
+        disable_tensorboard=args.disable_tensorboard,
+    )
     resolved_dataset_variant_hyperparameters = _resolved_record_hyperparameters(
         resolved_dataset_ids,
         variant_specs,
@@ -2774,6 +3057,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         wake_kappa=args.wake_kappa,
         bounded_output_epsilon=args.bounded_output_epsilon,
         num_workers=args.num_workers,
+        tensorboard_log_dir=args.tensorboard_log_dir,
+        disable_tensorboard=args.disable_tensorboard,
         resume=args.resume,
         force_rerun=args.force_rerun,
     )
@@ -2793,7 +3078,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_variants=tuple(spec.model_variant for spec in variant_specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("val", "test"),
-            artifacts={"training_history": training_history_output_path(args.output_path)},
+            artifacts={
+                "training_history": training_history_output_path(args.output_path),
+                **({} if resolved_tensorboard_root is None else {"tensorboard_root": resolved_tensorboard_root}),
+            },
             run_label=args.run_label,
         )
     return 0

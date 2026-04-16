@@ -17,6 +17,7 @@ SCADA/PMU/global observations are used only as supervised targets.
 cd experiment/families/world_model_state_space_v1
 ./create_env.sh
 ./.conda/bin/python run_world_model_state_space_v1.py
+tensorboard --logdir ./.work/run_world_model_state_space_v1
 ```
 
 Smoke run:
@@ -35,6 +36,10 @@ Default formal output:
 - `experiment/artifacts/published/world_model_state_space_v1/latest.csv`
 - `experiment/artifacts/published/world_model_state_space_v1/latest.training_history.csv`
 - `experiment/artifacts/runs/world_model_state_space_v1/<timestamp>/manifest.json`
+
+Default TensorBoard output:
+
+- `experiment/families/world_model_state_space_v1/.work/run_world_model_state_space_v1/<output-hash>/tensorboard/<dataset>/<variant>/`
 
 ## Scope
 

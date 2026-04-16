@@ -75,6 +75,7 @@ cd experiment/families/world_model_rollout_v1
 cd experiment/families/world_model_state_space_v1
 ./create_env.sh
 ./.conda/bin/python run_world_model_state_space_v1.py
+tensorboard --logdir ./.work/run_world_model_state_space_v1
 ```
 
 ```shell

@@ -57,6 +57,30 @@ def _prepare_temp_dataset(
     )
 
 
+class _FakeSummaryWriter:
+    instances: list["_FakeSummaryWriter"] = []
+
+    def __init__(self, log_dir: str, flush_secs: int = 10) -> None:
+        self.log_dir = log_dir
+        self.flush_secs = flush_secs
+        self.scalars: list[tuple[str, float, int]] = []
+        self.texts: list[tuple[str, str, int]] = []
+        self.closed = False
+        _FakeSummaryWriter.instances.append(self)
+
+    def add_scalar(self, tag: str, value: float, global_step: int) -> None:
+        self.scalars.append((tag, float(value), int(global_step)))
+
+    def add_text(self, tag: str, text: str, global_step: int = 0) -> None:
+        self.texts.append((tag, text, int(global_step)))
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _tiny_model_kwargs(module, prepared) -> dict[str, object]:
     return {
         "node_count": prepared.node_count,
@@ -109,6 +133,17 @@ def test_non_kelmarsh_dataset_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="only supports"):
         module.run_experiment(dataset_ids=("penmanshiel",), output_path=Path("/tmp/unused.csv"))
+
+
+def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
+    module = _load_module()
+    output_path = tmp_path / "published" / "latest.csv"
+    work_root = tmp_path / ".work"
+
+    root = module.resolve_tensorboard_root(output_path=output_path, work_root=work_root)
+    expected = module._resume_paths_for_output(output_path=output_path, work_root=work_root).slot_dir / "tensorboard"
+
+    assert root == expected
 
 
 def test_prepare_dataset_builds_state_space_contract(tmp_path, monkeypatch) -> None:
@@ -254,6 +289,61 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch) -> Non
     assert rows[0]["z_dim"] == 4
     assert rows[0]["h_dim"] == 6
     assert rows[0]["amp_enabled"] is False
+
+
+def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    _FakeSummaryWriter.instances.clear()
+    monkeypatch.setattr(module, "SummaryWriter", _FakeSummaryWriter)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+    )
+    history_path = tmp_path / "training_history.csv"
+    log_dir = tmp_path / "tensorboard" / "state_space"
+
+    module.execute_training_job(
+        prepared,
+        device="cpu",
+        seed=123,
+        batch_size=2,
+        eval_batch_size=1,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        z_dim=4,
+        h_dim=6,
+        global_state_dim=8,
+        obs_encoding_dim=8,
+        innovation_dim=4,
+        source_summary_dim=4,
+        edge_message_dim=4,
+        edge_hidden_dim=8,
+        tau_embed_dim=4,
+        met_summary_dim=module.DEFAULT_MET_SUMMARY_DIM,
+        turbine_embed_dim=3,
+        dropout=0.0,
+        grad_clip_norm=1.0,
+        training_history_path=history_path,
+        tensorboard_log_dir=log_dir,
+    )
+
+    assert len(_FakeSummaryWriter.instances) == 1
+    writer = _FakeSummaryWriter.instances[0]
+    assert Path(writer.log_dir) == log_dir.resolve()
+    assert writer.closed is True
+    scalar_tags = {tag for tag, _value, _step in writer.scalars}
+    text_tags = {tag for tag, _text, _step in writer.texts}
+    assert "train/loss_mean" in scalar_tags
+    assert "train/forecast_loss_mean" in scalar_tags
+    assert "val/overall/rmse_pu" in scalar_tags
+    assert "final/test/rolling_origin_no_refit/overall/rmse_pu" in scalar_tags
+    assert "run/config_json" in text_tags
+    assert "final/summary_json" in text_tags
 
 
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:

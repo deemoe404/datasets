@@ -8,6 +8,7 @@ dependencies:
   - polars
   - pyarrow
   - pytest
+  - tensorboard
   - tqdm
   - pip:
       - torch
