@@ -30,6 +30,10 @@ The first implementation includes:
   baseline that consumes full farm windows without graph inputs and predicts
   all turbines jointly from local history, global history context, future
   calendar covariates, and static turbine metadata.
+- `world_model_mtgnn_calendar_graph_v1_farm_sync`: repo-local MTGNN calendar-
+  graph baseline that learns an adaptive turbine graph from the same history
+  and calendar tensors and predicts all turbines jointly without adding new
+  dataset-side features.
 
 ## Run
 
@@ -65,6 +69,13 @@ Run only iTransformer:
 ```shell
 ./.conda/bin/python run_world_model_baselines_v1.py \
   --variant world_model_itransformer_no_graph_v1_farm_sync
+```
+
+Run only MTGNN:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --variant world_model_mtgnn_calendar_graph_v1_farm_sync
 ```
 
 Smoke run:
@@ -109,7 +120,7 @@ Or override the log root explicitly:
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
 - Registry `training_mode` is `trainable` because the family includes TFT,
-  TimeXer, DGCRN, and iTransformer, even though persistence and Chronos-2 are
-  analytic / zero-shot baselines.
+  TimeXer, DGCRN, iTransformer, and MTGNN, even though persistence and
+  Chronos-2 are analytic / zero-shot baselines.
 - Deferred: state-space ablations such as no-dynamic-graph, no-global-state,
   single-state, linear-head, and no-met-loss variants.

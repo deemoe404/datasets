@@ -7,6 +7,7 @@ dependencies:
   - numpy
   - polars
   - pyarrow
+  - duckdb
   - pytest
   - tensorboard
   - tqdm

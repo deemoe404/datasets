@@ -88,6 +88,7 @@ TIMEXER_VARIANT = "world_model_shared_weight_timexer_no_graph_v1_farm_sync"
 DGCRN_VARIANT = "world_model_dgcrn_v1_farm_sync"
 CHRONOS_VARIANT = "world_model_chronos_2_zero_shot_v1_farm_sync"
 ITRANSFORMER_VARIANT = "world_model_itransformer_no_graph_v1_farm_sync"
+MTGNN_VARIANT = "world_model_mtgnn_calendar_graph_v1_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
@@ -117,6 +118,15 @@ DEFAULT_EMBED_DIM = 16
 DEFAULT_NUM_LAYERS = 2
 DEFAULT_CHEB_K = 2
 DEFAULT_TEACHER_FORCING_RATIO = 0.5
+DEFAULT_RESIDUAL_CHANNELS = 32
+DEFAULT_SKIP_CHANNELS = 64
+DEFAULT_END_CHANNELS = 128
+DEFAULT_GCN_DEPTH = 2
+DEFAULT_MTGNN_LAYERS = 4
+DEFAULT_SUBGRAPH_SIZE = 4
+DEFAULT_NODE_EMBED_DIM = 16
+DEFAULT_DILATION_EXPONENTIAL = 2
+DEFAULT_PROPALPHA = 0.05
 DEFAULT_CUDA_NUM_WORKERS = 2
 DEFAULT_CUDA_PREFETCH_FACTOR = 4
 DEFAULT_EVAL_BATCH_SIZE_MULTIPLIER = 2
@@ -140,6 +150,7 @@ _MODEL_VARIANT_ORDER = {
     DGCRN_VARIANT: 3,
     CHRONOS_VARIANT: 4,
     ITRANSFORMER_VARIANT: 5,
+    MTGNN_VARIANT: 6,
 }
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
@@ -192,6 +203,15 @@ _RESULT_COLUMNS = [
     "patch_len",
     "encoder_layers",
     "ff_hidden_dim",
+    "residual_channels",
+    "skip_channels",
+    "end_channels",
+    "gcn_depth",
+    "mtgnn_layers",
+    "subgraph_size",
+    "node_embed_dim",
+    "dilation_exponential",
+    "propalpha",
     "dropout",
     "weight_decay",
     "amp_enabled",
@@ -224,6 +244,15 @@ _TRAINING_HISTORY_COLUMNS = [
     "patch_len",
     "encoder_layers",
     "ff_hidden_dim",
+    "residual_channels",
+    "skip_channels",
+    "end_channels",
+    "gcn_depth",
+    "mtgnn_layers",
+    "subgraph_size",
+    "node_embed_dim",
+    "dilation_exponential",
+    "propalpha",
     "epoch",
     "train_loss_mean",
     "train_loss_last",
@@ -263,6 +292,15 @@ class HyperparameterProfile:
     patch_len: int | None
     encoder_layers: int | None
     ff_hidden_dim: int | None
+    residual_channels: int | None
+    skip_channels: int | None
+    end_channels: int | None
+    gcn_depth: int | None
+    mtgnn_layers: int | None
+    subgraph_size: int | None
+    node_embed_dim: int | None
+    dilation_exponential: int | None
+    propalpha: float | None
     hidden_dim: int | None
     embed_dim: int | None
     num_layers: int | None
@@ -348,6 +386,11 @@ VARIANT_SPECS = (
         feature_protocol_id=FEATURE_PROTOCOL_ID,
         baseline_type="itransformer_no_graph",
     ),
+    ExperimentVariant(
+        model_variant=MTGNN_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        baseline_type="mtgnn_calendar_graph",
+    ),
 )
 DEFAULT_VARIANTS = tuple(spec.model_variant for spec in VARIANT_SPECS)
 _VARIANT_SPECS_BY_NAME = {spec.model_variant: spec for spec in VARIANT_SPECS}
@@ -362,6 +405,15 @@ _DEFAULT_PERSISTENCE_PROFILE = HyperparameterProfile(
     patch_len=None,
     encoder_layers=None,
     ff_hidden_dim=None,
+    residual_channels=None,
+    skip_channels=None,
+    end_channels=None,
+    gcn_depth=None,
+    mtgnn_layers=None,
+    subgraph_size=None,
+    node_embed_dim=None,
+    dilation_exponential=None,
+    propalpha=None,
     hidden_dim=None,
     embed_dim=None,
     num_layers=None,
@@ -383,6 +435,15 @@ _DEFAULT_TFT_PROFILE = HyperparameterProfile(
     patch_len=None,
     encoder_layers=None,
     ff_hidden_dim=None,
+    residual_channels=None,
+    skip_channels=None,
+    end_channels=None,
+    gcn_depth=None,
+    mtgnn_layers=None,
+    subgraph_size=None,
+    node_embed_dim=None,
+    dilation_exponential=None,
+    propalpha=None,
     hidden_dim=None,
     embed_dim=None,
     num_layers=None,
@@ -404,6 +465,15 @@ _DEFAULT_TIMEXER_PROFILE = HyperparameterProfile(
     patch_len=DEFAULT_TIMEXER_PATCH_LEN,
     encoder_layers=DEFAULT_TIMEXER_ENCODER_LAYERS,
     ff_hidden_dim=DEFAULT_TIMEXER_FF_HIDDEN_DIM,
+    residual_channels=None,
+    skip_channels=None,
+    end_channels=None,
+    gcn_depth=None,
+    mtgnn_layers=None,
+    subgraph_size=None,
+    node_embed_dim=None,
+    dilation_exponential=None,
+    propalpha=None,
     hidden_dim=None,
     embed_dim=None,
     num_layers=None,
@@ -425,6 +495,15 @@ _DEFAULT_DGCRN_PROFILE = HyperparameterProfile(
     patch_len=None,
     encoder_layers=None,
     ff_hidden_dim=None,
+    residual_channels=None,
+    skip_channels=None,
+    end_channels=None,
+    gcn_depth=None,
+    mtgnn_layers=None,
+    subgraph_size=None,
+    node_embed_dim=None,
+    dilation_exponential=None,
+    propalpha=None,
     hidden_dim=DEFAULT_HIDDEN_DIM,
     embed_dim=DEFAULT_EMBED_DIM,
     num_layers=DEFAULT_NUM_LAYERS,
@@ -446,6 +525,15 @@ _DEFAULT_ITRANSFORMER_PROFILE = HyperparameterProfile(
     patch_len=None,
     encoder_layers=None,
     ff_hidden_dim=None,
+    residual_channels=None,
+    skip_channels=None,
+    end_channels=None,
+    gcn_depth=None,
+    mtgnn_layers=None,
+    subgraph_size=None,
+    node_embed_dim=None,
+    dilation_exponential=None,
+    propalpha=None,
     hidden_dim=None,
     embed_dim=None,
     num_layers=None,
@@ -456,6 +544,36 @@ _DEFAULT_ITRANSFORMER_PROFILE = HyperparameterProfile(
     weight_decay=1e-4,
     bounded_output_epsilon=DEFAULT_BOUNDED_OUTPUT_EPSILON,
 )
+_DEFAULT_MTGNN_PROFILE = HyperparameterProfile(
+    batch_size=128,
+    learning_rate=1e-3,
+    max_epochs=DEFAULT_MAX_EPOCHS,
+    early_stopping_patience=DEFAULT_EARLY_STOPPING_PATIENCE,
+    d_model=None,
+    lstm_hidden_dim=None,
+    attention_heads=None,
+    patch_len=None,
+    encoder_layers=None,
+    ff_hidden_dim=None,
+    residual_channels=DEFAULT_RESIDUAL_CHANNELS,
+    skip_channels=DEFAULT_SKIP_CHANNELS,
+    end_channels=DEFAULT_END_CHANNELS,
+    gcn_depth=DEFAULT_GCN_DEPTH,
+    mtgnn_layers=DEFAULT_MTGNN_LAYERS,
+    subgraph_size=DEFAULT_SUBGRAPH_SIZE,
+    node_embed_dim=DEFAULT_NODE_EMBED_DIM,
+    dilation_exponential=DEFAULT_DILATION_EXPONENTIAL,
+    propalpha=DEFAULT_PROPALPHA,
+    hidden_dim=None,
+    embed_dim=None,
+    num_layers=None,
+    cheb_k=None,
+    teacher_forcing_ratio=None,
+    dropout=DEFAULT_DROPOUT,
+    grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
+    weight_decay=DEFAULT_WEIGHT_DECAY,
+    bounded_output_epsilon=DEFAULT_BOUNDED_OUTPUT_EPSILON,
+)
 TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
     "kelmarsh": {
         PERSISTENCE_VARIANT: _DEFAULT_PERSISTENCE_PROFILE,
@@ -464,6 +582,7 @@ TUNED_DEFAULT_HYPERPARAMETERS_BY_DATASET_AND_VARIANT = {
         DGCRN_VARIANT: _DEFAULT_DGCRN_PROFILE,
         CHRONOS_VARIANT: _DEFAULT_PERSISTENCE_PROFILE,
         ITRANSFORMER_VARIANT: _DEFAULT_ITRANSFORMER_PROFILE,
+        MTGNN_VARIANT: _DEFAULT_MTGNN_PROFILE,
     },
 }
 
@@ -514,6 +633,15 @@ def resolve_hyperparameter_profile(
     patch_len: int | None = None,
     encoder_layers: int | None = None,
     ff_hidden_dim: int | None = None,
+    residual_channels: int | None = None,
+    skip_channels: int | None = None,
+    end_channels: int | None = None,
+    gcn_depth: int | None = None,
+    mtgnn_layers: int | None = None,
+    subgraph_size: int | None = None,
+    node_embed_dim: int | None = None,
+    dilation_exponential: int | None = None,
+    propalpha: float | None = None,
     hidden_dim: int | None = None,
     embed_dim: int | None = None,
     num_layers: int | None = None,
@@ -541,6 +669,17 @@ def resolve_hyperparameter_profile(
         patch_len=defaults.patch_len if patch_len is None else patch_len,
         encoder_layers=defaults.encoder_layers if encoder_layers is None else encoder_layers,
         ff_hidden_dim=defaults.ff_hidden_dim if ff_hidden_dim is None else ff_hidden_dim,
+        residual_channels=defaults.residual_channels if residual_channels is None else residual_channels,
+        skip_channels=defaults.skip_channels if skip_channels is None else skip_channels,
+        end_channels=defaults.end_channels if end_channels is None else end_channels,
+        gcn_depth=defaults.gcn_depth if gcn_depth is None else gcn_depth,
+        mtgnn_layers=defaults.mtgnn_layers if mtgnn_layers is None else mtgnn_layers,
+        subgraph_size=defaults.subgraph_size if subgraph_size is None else subgraph_size,
+        node_embed_dim=defaults.node_embed_dim if node_embed_dim is None else node_embed_dim,
+        dilation_exponential=(
+            defaults.dilation_exponential if dilation_exponential is None else dilation_exponential
+        ),
+        propalpha=defaults.propalpha if propalpha is None else propalpha,
         hidden_dim=defaults.hidden_dim if hidden_dim is None else hidden_dim,
         embed_dim=defaults.embed_dim if embed_dim is None else embed_dim,
         num_layers=defaults.num_layers if num_layers is None else num_layers,
@@ -604,6 +743,31 @@ def resolve_hyperparameter_profile(
             raise ValueError(
                 f"teacher_forcing_ratio must be in [0, 1], found {profile.teacher_forcing_ratio!r}."
             )
+    if variant_name == MTGNN_VARIANT:
+        if profile.dropout is None or profile.dropout < 0.0 or profile.dropout >= 1.0:
+            raise ValueError(f"dropout must be in [0, 1), found {profile.dropout!r}.")
+        if profile.bounded_output_epsilon is None:
+            raise ValueError("MTGNN requires bounded_output_epsilon.")
+        if profile.residual_channels is None or profile.residual_channels <= 0:
+            raise ValueError(f"residual_channels must be positive, found {profile.residual_channels!r}.")
+        if profile.skip_channels is None or profile.skip_channels <= 0:
+            raise ValueError(f"skip_channels must be positive, found {profile.skip_channels!r}.")
+        if profile.end_channels is None or profile.end_channels <= 0:
+            raise ValueError(f"end_channels must be positive, found {profile.end_channels!r}.")
+        if profile.gcn_depth is None or profile.gcn_depth <= 0:
+            raise ValueError(f"gcn_depth must be positive, found {profile.gcn_depth!r}.")
+        if profile.mtgnn_layers is None or profile.mtgnn_layers <= 0:
+            raise ValueError(f"mtgnn_layers must be positive, found {profile.mtgnn_layers!r}.")
+        if profile.subgraph_size is None or profile.subgraph_size <= 0:
+            raise ValueError(f"subgraph_size must be positive, found {profile.subgraph_size!r}.")
+        if profile.node_embed_dim is None or profile.node_embed_dim <= 0:
+            raise ValueError(f"node_embed_dim must be positive, found {profile.node_embed_dim!r}.")
+        if profile.dilation_exponential is None or profile.dilation_exponential <= 0:
+            raise ValueError(
+                f"dilation_exponential must be positive, found {profile.dilation_exponential!r}."
+            )
+        if profile.propalpha is None or not (0.0 < profile.propalpha <= 1.0):
+            raise ValueError(f"propalpha must be in (0, 1], found {profile.propalpha!r}.")
     return profile
 
 
@@ -1330,6 +1494,39 @@ if Dataset is not None:
                 return item
             return (*item, np.int64(window_pos))
 
+
+    class GraphWindowDataset(Dataset):
+        def __init__(
+            self,
+            prepared_dataset: state_base.PreparedDataset,
+            windows: world_model_base.FarmWindowDescriptorIndex,
+            *,
+            include_indices: bool = False,
+        ) -> None:
+            self.prepared_dataset = prepared_dataset
+            self.windows = windows
+            self.include_indices = include_indices
+
+        def __len__(self) -> int:
+            return len(self.windows)
+
+        def __getitem__(self, index: int):
+            prepared = self.prepared_dataset
+            window_pos = int(index)
+            target_index = int(self.windows.target_indices[window_pos])
+            history_slice = slice(target_index - prepared.history_steps, target_index)
+            future_slice = slice(target_index, target_index + prepared.forecast_steps)
+            item = (
+                prepared.local_history_tensor[history_slice, :, :].astype(np.float32, copy=True),
+                prepared.context_history_tensor[history_slice, :].astype(np.float32, copy=True),
+                prepared.context_future_tensor[future_slice, :].astype(np.float32, copy=True),
+                prepared.target_pu_filled[future_slice, :, None].astype(np.float32, copy=True),
+                prepared.target_valid_mask[future_slice, :, None].astype(np.float32, copy=True),
+            )
+            if not self.include_indices:
+                return item
+            return (*item, np.int64(window_pos))
+
 else:
 
     class TurbineWindowDataset:  # pragma: no cover
@@ -1343,6 +1540,10 @@ else:
 
 
     class ITransformerWindowDataset:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+    class GraphWindowDataset:  # pragma: no cover
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
 
@@ -1476,6 +1677,36 @@ def _build_itransformer_dataloader(
     generator.manual_seed(seed)
     loader_kwargs: dict[str, object] = {
         "dataset": ITransformerWindowDataset(prepared_dataset, windows, include_indices=include_indices),
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "generator": generator if shuffle else None,
+        "pin_memory": resolved_device == "cuda",
+        "num_workers": resolved_num_workers,
+    }
+    if resolved_num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = DEFAULT_CUDA_PREFETCH_FACTOR
+    return resolved_loader(**loader_kwargs)
+
+
+def _build_graph_dataloader(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    batch_size: int,
+    device: str,
+    shuffle: bool,
+    seed: int,
+    num_workers: int | None = None,
+    include_indices: bool = False,
+):
+    resolved_torch, _, _, resolved_loader, _ = _require_torch()
+    resolved_device = resolve_device(device)
+    resolved_num_workers = resolve_loader_num_workers(device=resolved_device, num_workers=num_workers)
+    generator = resolved_torch.Generator()
+    generator.manual_seed(seed)
+    loader_kwargs: dict[str, object] = {
+        "dataset": GraphWindowDataset(prepared_dataset, windows, include_indices=include_indices),
         "batch_size": batch_size,
         "shuffle": shuffle,
         "generator": generator if shuffle else None,
@@ -1691,6 +1922,214 @@ if nn is not None and F is not None:
             static = static_tokens[:, None, :, :].expand(-1, context_future.shape[1], -1, -1)
             future = context_future[:, :, None, :].expand(-1, -1, node_count, -1)
             decoded = self.output_grn(torch.cat((encoded, static, horizon, future), dim=-1))
+            return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(self.output_head(decoded))
+
+
+    class AdaptiveGraphConstructor(nn.Module):
+        def __init__(self, *, node_count: int, node_embed_dim: int, subgraph_size: int) -> None:
+            super().__init__()
+            self.node_count = node_count
+            self.subgraph_size = subgraph_size
+            self.nodevec1 = nn.Parameter(torch.empty(node_count, node_embed_dim))
+            self.nodevec2 = nn.Parameter(torch.empty(node_count, node_embed_dim))
+            self.alpha = nn.Parameter(torch.tensor(3.0))
+
+        def forward(self):
+            logits = torch.matmul(self.nodevec1, self.nodevec2.transpose(0, 1)) - torch.matmul(
+                self.nodevec2,
+                self.nodevec1.transpose(0, 1),
+            )
+            adjacency = F.relu(torch.tanh(self.alpha * logits))
+            if self.node_count > 1:
+                adjacency = adjacency * (
+                    1.0 - torch.eye(self.node_count, device=adjacency.device, dtype=adjacency.dtype)
+                )
+            effective_k = 1 if self.node_count <= 1 else min(self.subgraph_size, self.node_count - 1)
+            if effective_k > 0:
+                topk_indices = torch.topk(adjacency, k=effective_k, dim=-1).indices
+                mask = torch.zeros_like(adjacency)
+                mask.scatter_(1, topk_indices, 1.0)
+                adjacency = adjacency * mask
+            row_sum = adjacency.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            return adjacency / row_sum
+
+
+    class DilatedInception1D(nn.Module):
+        def __init__(self, in_channels: int, out_channels: int, *, dilation: int) -> None:
+            super().__init__()
+            kernel_sizes = (2, 3, 6, 7)
+            branch_channels = [out_channels // len(kernel_sizes)] * len(kernel_sizes)
+            for index in range(out_channels % len(kernel_sizes)):
+                branch_channels[index] += 1
+            self.branches = nn.ModuleList(
+                [
+                    nn.Conv2d(
+                        in_channels,
+                        branch_channels[index],
+                        kernel_size=(1, kernel_size),
+                        dilation=(1, dilation),
+                    )
+                    for index, kernel_size in enumerate(kernel_sizes)
+                ]
+            )
+            self.paddings = tuple((kernel_size - 1) * dilation for kernel_size in kernel_sizes)
+
+        def forward(self, inputs):
+            outputs = []
+            for branch, padding in zip(self.branches, self.paddings, strict=True):
+                outputs.append(branch(F.pad(inputs, (padding, 0, 0, 0))))
+            return torch.cat(outputs, dim=1)
+
+
+    class MixProp(nn.Module):
+        def __init__(self, channels: int, *, gcn_depth: int, propalpha: float, dropout: float) -> None:
+            super().__init__()
+            self.gcn_depth = gcn_depth
+            self.propalpha = propalpha
+            self.dropout = nn.Dropout(dropout)
+            self.mlp = nn.Conv2d((gcn_depth + 1) * channels, channels, kernel_size=(1, 1))
+
+        def forward(self, inputs, adjacency):
+            states = [inputs]
+            propagated = inputs
+            for _ in range(self.gcn_depth):
+                neighbor_state = torch.einsum("nm,bcmt->bcnt", adjacency, propagated)
+                propagated = self.propalpha * inputs + (1.0 - self.propalpha) * neighbor_state
+                states.append(propagated)
+            stacked = torch.cat(states, dim=1)
+            return self.mlp(self.dropout(stacked))
+
+
+    class MTGNNTemporalBlock(nn.Module):
+        def __init__(
+            self,
+            *,
+            residual_channels: int,
+            skip_channels: int,
+            gcn_depth: int,
+            propalpha: float,
+            dilation: int,
+            dropout: float,
+        ) -> None:
+            super().__init__()
+            self.filter_conv = DilatedInception1D(residual_channels, residual_channels, dilation=dilation)
+            self.gate_conv = DilatedInception1D(residual_channels, residual_channels, dilation=dilation)
+            self.skip_conv = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
+            self.graph_forward = MixProp(residual_channels, gcn_depth=gcn_depth, propalpha=propalpha, dropout=dropout)
+            self.graph_backward = MixProp(
+                residual_channels,
+                gcn_depth=gcn_depth,
+                propalpha=propalpha,
+                dropout=dropout,
+            )
+            self.graph_merge = nn.Conv2d(residual_channels * 2, residual_channels, kernel_size=(1, 1))
+            self.residual_conv = nn.Conv2d(residual_channels, residual_channels, kernel_size=(1, 1))
+            self.norm = nn.LayerNorm(residual_channels)
+            self.dropout = nn.Dropout(dropout)
+
+        def forward(self, inputs, adjacency, reverse_adjacency):
+            gated = torch.tanh(self.filter_conv(inputs)) * torch.sigmoid(self.gate_conv(inputs))
+            gated = self.dropout(gated)
+            skip = self.skip_conv(gated)
+            graph_features = torch.cat(
+                (
+                    self.graph_forward(gated, adjacency),
+                    self.graph_backward(gated, reverse_adjacency),
+                ),
+                dim=1,
+            )
+            outputs = self.residual_conv(self.graph_merge(graph_features)) + inputs
+            outputs = self.norm(outputs.permute(0, 3, 2, 1)).permute(0, 3, 2, 1)
+            return outputs, skip
+
+
+    class MTGNNCalendarGraph(nn.Module):
+        def __init__(
+            self,
+            *,
+            local_input_channels: int,
+            context_history_channels: int,
+            context_future_channels: int,
+            node_count: int,
+            forecast_steps: int,
+            residual_channels: int,
+            skip_channels: int,
+            end_channels: int,
+            gcn_depth: int,
+            mtgnn_layers: int,
+            subgraph_size: int,
+            node_embed_dim: int,
+            dilation_exponential: int,
+            propalpha: float,
+            dropout: float,
+            bounded_output_epsilon: float,
+        ) -> None:
+            super().__init__()
+            self.node_count = node_count
+            self.forecast_steps = forecast_steps
+            self.bounded_output_epsilon = bounded_output_epsilon
+            self.graph_constructor = AdaptiveGraphConstructor(
+                node_count=node_count,
+                node_embed_dim=node_embed_dim,
+                subgraph_size=subgraph_size,
+            )
+            self.input_projection = nn.Conv2d(
+                local_input_channels + context_history_channels,
+                residual_channels,
+                kernel_size=(1, 1),
+            )
+            self.input_skip = nn.Conv2d(residual_channels, skip_channels, kernel_size=(1, 1))
+            self.blocks = nn.ModuleList(
+                [
+                    MTGNNTemporalBlock(
+                        residual_channels=residual_channels,
+                        skip_channels=skip_channels,
+                        gcn_depth=gcn_depth,
+                        propalpha=propalpha,
+                        dilation=dilation_exponential**layer_index,
+                        dropout=dropout,
+                    )
+                    for layer_index in range(mtgnn_layers)
+                ]
+            )
+            self.skip_projection = nn.Sequential(
+                nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1)),
+                nn.SiLU(),
+                nn.Conv2d(end_channels, end_channels, kernel_size=(1, 1)),
+                nn.SiLU(),
+            )
+            self.horizon_embedding = nn.Embedding(forecast_steps, end_channels)
+            self.decoder = FeedForward(
+                (end_channels * 2) + context_future_channels,
+                max(end_channels * 2, residual_channels),
+                end_channels,
+                dropout=dropout,
+            )
+            self.output_head = nn.Linear(end_channels, 1)
+
+        def forward(self, local_history, context_history, future_calendar):
+            local = local_history.permute(0, 3, 2, 1)
+            context = context_history.permute(0, 2, 1).unsqueeze(2).expand(-1, -1, self.node_count, -1)
+            encoded = self.input_projection(torch.cat((local, context), dim=1))
+            adjacency = self.graph_constructor().to(device=encoded.device, dtype=encoded.dtype)
+            reverse_adjacency = adjacency.transpose(0, 1)
+            reverse_adjacency = reverse_adjacency / reverse_adjacency.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            skip = self.input_skip(encoded)
+            for block in self.blocks:
+                encoded, block_skip = block(encoded, adjacency, reverse_adjacency)
+                skip = skip + block_skip
+            state_features = self.skip_projection(skip)[..., -1].permute(0, 2, 1)
+            batch_size = state_features.shape[0]
+            horizon_indices = torch.arange(future_calendar.shape[1], device=future_calendar.device, dtype=torch.long)
+            horizon = self.horizon_embedding(horizon_indices)[None, :, None, :].expand(
+                batch_size,
+                -1,
+                self.node_count,
+                -1,
+            )
+            future_context = future_calendar[:, :, None, :].expand(-1, -1, self.node_count, -1)
+            state = state_features[:, None, :, :].expand(-1, future_calendar.shape[1], -1, -1)
+            decoded = self.decoder(torch.cat((state, future_context, horizon), dim=-1))
             return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(self.output_head(decoded))
 
 
@@ -2080,6 +2519,26 @@ else:
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
 
+    class AdaptiveGraphConstructor:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+    class DilatedInception1D:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+    class MixProp:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+    class MTGNNTemporalBlock:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
+    class MTGNNCalendarGraph:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs) -> None:
+            _require_torch()
+
     class DynamicChebyshevConv:  # pragma: no cover
         def __init__(self, *_args, **_kwargs) -> None:
             _require_torch()
@@ -2151,6 +2610,42 @@ def build_itransformer_model(
         forecast_steps=prepared_dataset.forecast_steps,
         d_model=d_model,
         attention_heads=attention_heads,
+        dropout=dropout,
+        bounded_output_epsilon=bounded_output_epsilon,
+    )
+
+
+def build_mtgnn_model(
+    *,
+    prepared_dataset: state_base.PreparedDataset,
+    residual_channels: int,
+    skip_channels: int,
+    end_channels: int,
+    gcn_depth: int,
+    mtgnn_layers: int,
+    subgraph_size: int,
+    node_embed_dim: int,
+    dilation_exponential: int,
+    propalpha: float,
+    dropout: float,
+    bounded_output_epsilon: float,
+):
+    _require_torch()
+    return MTGNNCalendarGraph(
+        local_input_channels=prepared_dataset.local_input_channels,
+        context_history_channels=prepared_dataset.context_history_channels,
+        context_future_channels=prepared_dataset.context_future_channels,
+        node_count=prepared_dataset.node_count,
+        forecast_steps=prepared_dataset.forecast_steps,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        gcn_depth=gcn_depth,
+        mtgnn_layers=mtgnn_layers,
+        subgraph_size=subgraph_size,
+        node_embed_dim=node_embed_dim,
+        dilation_exponential=dilation_exponential,
+        propalpha=propalpha,
         dropout=dropout,
         bounded_output_epsilon=bounded_output_epsilon,
     )
@@ -2502,6 +2997,95 @@ def evaluate_itransformer_model(
     )
 
 
+def evaluate_mtgnn_model(
+    model,
+    prepared_dataset: state_base.PreparedDataset,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    *,
+    batch_size: int,
+    device: str,
+    seed: int,
+    num_workers: int | None = None,
+    amp_enabled: bool = False,
+    progress_label: str | None = None,
+) -> EvaluationMetrics:
+    resolved_torch, _, _, _, _ = _require_torch()
+    predictions = np.zeros((len(windows), prepared_dataset.forecast_steps, prepared_dataset.node_count, 1), dtype=np.float32)
+    targets = np.zeros_like(predictions, dtype=np.float32)
+    valid = np.zeros_like(predictions, dtype=np.float32)
+    loader = _build_graph_dataloader(
+        prepared_dataset,
+        windows=windows,
+        batch_size=batch_size,
+        device=device,
+        shuffle=False,
+        seed=seed,
+        num_workers=num_workers,
+        include_indices=True,
+    )
+    model.eval()
+    progress = _create_progress_bar(total=_loader_batch_total(loader), desc=progress_label or "evaluate")
+    try:
+        with resolved_torch.no_grad():
+            for raw_batch in loader:
+                (
+                    batch_local_history,
+                    batch_context_history,
+                    batch_future_calendar,
+                    batch_targets,
+                    batch_valid,
+                    batch_window_pos,
+                ) = raw_batch
+                batch_local_history = batch_local_history.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_context_history = batch_context_history.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_future_calendar = batch_future_calendar.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_targets = batch_targets.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                batch_valid = batch_valid.to(
+                    device=device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=device == "cuda",
+                )
+                with _amp_context(torch_module=resolved_torch, device=device, enabled=amp_enabled):
+                    batch_predictions = model(
+                        batch_local_history,
+                        batch_context_history,
+                        batch_future_calendar,
+                    ).float()
+                window_pos = batch_window_pos.detach().cpu().numpy().astype(np.int64, copy=False)
+                batch_predictions_np = batch_predictions.detach().cpu().numpy().astype(np.float32, copy=False)
+                batch_targets_np = batch_targets.detach().cpu().numpy().astype(np.float32, copy=False)
+                batch_valid_np = batch_valid.detach().cpu().numpy().astype(np.float32, copy=False)
+                for row_index, window_id in enumerate(window_pos):
+                    predictions[int(window_id)] = batch_predictions_np[row_index]
+                    targets[int(window_id)] = batch_targets_np[row_index]
+                    valid[int(window_id)] = batch_valid_np[row_index]
+                progress.update(1)
+    finally:
+        progress.close()
+    return _metrics_from_arrays(
+        predictions,
+        targets,
+        valid,
+        rated_power_kw=prepared_dataset.rated_power_kw,
+    )
+
+
 def evaluate_dgcrn_model(
     model,
     prepared_dataset: state_base.PreparedDataset,
@@ -2795,6 +3379,15 @@ def train_tft_model(
                         "patch_len": None,
                         "encoder_layers": None,
                         "ff_hidden_dim": None,
+                        "residual_channels": None,
+                        "skip_channels": None,
+                        "end_channels": None,
+                        "gcn_depth": None,
+                        "mtgnn_layers": None,
+                        "subgraph_size": None,
+                        "node_embed_dim": None,
+                        "dilation_exponential": None,
+                        "propalpha": None,
                         "epoch": epoch_index,
                         "train_loss_mean": train_loss_mean,
                         "train_loss_last": latest_loss,
@@ -3092,6 +3685,15 @@ def train_timexer_model(
                         "patch_len": patch_len,
                         "encoder_layers": encoder_layers,
                         "ff_hidden_dim": ff_hidden_dim,
+                        "residual_channels": None,
+                        "skip_channels": None,
+                        "end_channels": None,
+                        "gcn_depth": None,
+                        "mtgnn_layers": None,
+                        "subgraph_size": None,
+                        "node_embed_dim": None,
+                        "dilation_exponential": None,
+                        "propalpha": None,
                         "epoch": epoch_index,
                         "train_loss_mean": train_loss_mean,
                         "train_loss_last": latest_loss,
@@ -3410,6 +4012,356 @@ def train_itransformer_model(
                         "patch_len": None,
                         "encoder_layers": None,
                         "ff_hidden_dim": None,
+                        "residual_channels": None,
+                        "skip_channels": None,
+                        "end_channels": None,
+                        "gcn_depth": None,
+                        "mtgnn_layers": None,
+                        "subgraph_size": None,
+                        "node_embed_dim": None,
+                        "dilation_exponential": None,
+                        "propalpha": None,
+                        "epoch": epoch_index,
+                        "train_loss_mean": train_loss_mean,
+                        "train_loss_last": latest_loss,
+                        "val_mae_pu": val_mae_pu,
+                        "val_rmse_pu": val_rmse_pu,
+                        "best_val_mae_pu": best_val_mae_pu,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "is_best_epoch": is_best_epoch,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "train_batch_count": train_batch_count,
+                        "train_window_count": len(prepared_dataset.train_windows),
+                        "val_window_count": len(prepared_dataset.val_rolling_windows),
+                        "device": resolved_device,
+                        "seed": seed,
+                        "batch_size": batch_size,
+                        "learning_rate": learning_rate,
+                        "amp_enabled": amp_enabled,
+                    },
+                )
+            should_stop = epochs_without_improvement >= early_stopping_patience or epoch_index >= max_epochs
+            if resolved_checkpoint_path is not None:
+                world_model_base._save_training_checkpoint(
+                    resolved_checkpoint_path,
+                    {
+                        "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
+                        "job": checkpoint_job_identity,
+                        "seed": seed,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "best_state_dict": best_state,
+                        "best_epoch": best_epoch,
+                        "best_val_mae_pu": best_val_mae_pu,
+                        "best_val_rmse_pu": best_val_rmse_pu,
+                        "epochs_without_improvement": epochs_without_improvement,
+                        "epochs_ran": epochs_ran,
+                        "next_epoch": epoch_index + 1,
+                        "training_complete": should_stop,
+                    },
+                )
+            epoch_progress.update(1)
+            epoch_progress.set_postfix_str(
+                f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}"
+            )
+            if should_stop:
+                break
+    finally:
+        epoch_progress.close()
+    if best_state is None:
+        raise RuntimeError("Training completed without a best checkpoint.")
+    model.load_state_dict(best_state)
+    return TrainingOutcome(
+        best_epoch=best_epoch,
+        epochs_ran=epochs_ran,
+        best_val_rmse_pu=best_val_rmse_pu,
+        best_val_mae_pu=best_val_mae_pu,
+        device=resolved_device,
+        amp_enabled=amp_enabled,
+        model=model,
+    )
+
+
+def train_mtgnn_model(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    device: str,
+    seed: int,
+    batch_size: int,
+    eval_batch_size: int | None,
+    learning_rate: float,
+    max_epochs: int,
+    early_stopping_patience: int,
+    residual_channels: int,
+    skip_channels: int,
+    end_channels: int,
+    gcn_depth: int,
+    mtgnn_layers: int,
+    subgraph_size: int,
+    node_embed_dim: int,
+    dilation_exponential: int,
+    propalpha: float,
+    dropout: float,
+    grad_clip_norm: float,
+    weight_decay: float,
+    bounded_output_epsilon: float,
+    num_workers: int | None = None,
+    checkpoint_path: str | Path | None = None,
+    training_history_path: str | Path | None = None,
+    resume_from_checkpoint: bool = False,
+    progress_label: str | None = None,
+    tensorboard_writer=None,
+) -> TrainingOutcome:
+    resolved_torch, _, _, _, _ = _require_torch()
+    _set_random_seed(seed)
+    resolved_device = resolve_device(device)
+    world_model_base._configure_torch_runtime(device=resolved_device, torch_module=resolved_torch)
+    amp_enabled = resolved_device == "cuda"
+    resolved_eval_batch_size = resolve_eval_batch_size(
+        batch_size,
+        device=resolved_device,
+        eval_batch_size=eval_batch_size,
+    )
+    model = build_mtgnn_model(
+        prepared_dataset=prepared_dataset,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        gcn_depth=gcn_depth,
+        mtgnn_layers=mtgnn_layers,
+        subgraph_size=subgraph_size,
+        node_embed_dim=node_embed_dim,
+        dilation_exponential=dilation_exponential,
+        propalpha=propalpha,
+        dropout=dropout,
+        bounded_output_epsilon=bounded_output_epsilon,
+    ).to(device=resolved_device)
+    initialize_model_parameters(model)
+    optimizer = resolved_torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
+    resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
+    resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    best_state: dict[str, Any] | None = None
+    best_epoch = 0
+    best_val_mae_pu = float("inf")
+    best_val_rmse_pu = float("inf")
+    epochs_without_improvement = 0
+    epochs_ran = 0
+    start_epoch = 1
+    if resume_from_checkpoint:
+        if resolved_checkpoint_path is None:
+            raise ValueError("resume_from_checkpoint=True requires checkpoint_path to be set.")
+        if resolved_checkpoint_path.exists():
+            checkpoint_payload = world_model_base._torch_load_checkpoint(
+                resolved_checkpoint_path,
+                map_location=resolved_device,
+            )
+            if checkpoint_payload.get("schema_version") != _TRAINING_CHECKPOINT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Unsupported checkpoint schema at {resolved_checkpoint_path}: "
+                    f"{checkpoint_payload.get('schema_version')!r}."
+                )
+            if checkpoint_payload.get("job") != checkpoint_job_identity:
+                raise RuntimeError(f"Checkpoint at {resolved_checkpoint_path} does not match the active job.")
+            model.load_state_dict(checkpoint_payload["model_state_dict"])
+            optimizer.load_state_dict(checkpoint_payload["optimizer_state_dict"])
+            if "scaler_state_dict" in checkpoint_payload:
+                scaler.load_state_dict(checkpoint_payload["scaler_state_dict"])
+            best_state = checkpoint_payload.get("best_state_dict")
+            best_epoch = int(checkpoint_payload["best_epoch"])
+            best_val_mae_pu = float(checkpoint_payload["best_val_mae_pu"])
+            best_val_rmse_pu = float(checkpoint_payload["best_val_rmse_pu"])
+            epochs_without_improvement = int(checkpoint_payload["epochs_without_improvement"])
+            epochs_ran = int(checkpoint_payload["epochs_ran"])
+            start_epoch = int(checkpoint_payload["next_epoch"])
+            if bool(checkpoint_payload.get("training_complete", False)):
+                if best_state is None:
+                    raise RuntimeError(f"Checkpoint at {resolved_checkpoint_path} has no best state.")
+                model.load_state_dict(best_state)
+                return TrainingOutcome(
+                    best_epoch=best_epoch,
+                    epochs_ran=epochs_ran,
+                    best_val_rmse_pu=best_val_rmse_pu,
+                    best_val_mae_pu=best_val_mae_pu,
+                    device=resolved_device,
+                    amp_enabled=amp_enabled,
+                    model=model,
+                )
+    if resolved_training_history_path is not None:
+        _prune_training_history_for_job(
+            resolved_training_history_path,
+            job_identity=checkpoint_job_identity,
+            min_epoch=start_epoch,
+        )
+    epoch_progress = _create_progress_bar(
+        total=max_epochs,
+        desc=f"{progress_label or prepared_dataset.dataset_id} epochs",
+        leave=True,
+    )
+    try:
+        if start_epoch > 1:
+            epoch_progress.update(start_epoch - 1)
+        for epoch_index in range(start_epoch, max_epochs + 1):
+            model.train()
+            train_loader = _build_graph_dataloader(
+                prepared_dataset,
+                windows=prepared_dataset.train_windows,
+                batch_size=batch_size,
+                device=resolved_device,
+                shuffle=True,
+                seed=seed + epoch_index,
+                num_workers=num_workers,
+            )
+            batch_progress = _create_progress_bar(
+                total=_loader_batch_total(train_loader),
+                desc=f"{progress_label or prepared_dataset.dataset_id} train e{epoch_index}",
+            )
+            train_loss_sum = 0.0
+            train_loss_weight = 0
+            train_batch_count = 0
+            train_valid_sum = 0.0
+            train_target_count = 0
+            latest_loss = float("nan")
+            try:
+                for raw_batch in train_loader:
+                    (
+                        batch_local_history,
+                        batch_context_history,
+                        batch_future_calendar,
+                        batch_targets,
+                        batch_valid,
+                    ) = _move_batch_to_device(raw_batch, torch_module=resolved_torch, device=resolved_device)
+                    optimizer.zero_grad(set_to_none=True)
+                    with _amp_context(torch_module=resolved_torch, device=resolved_device, enabled=amp_enabled):
+                        predictions = model(
+                            batch_local_history,
+                            batch_context_history,
+                            batch_future_calendar,
+                        )
+                        loss = masked_huber_loss(
+                            predictions,
+                            batch_targets,
+                            batch_valid,
+                            torch_module=resolved_torch,
+                        )
+                    if amp_enabled:
+                        scaler.scale(loss).backward()
+                        if grad_clip_norm > 0:
+                            scaler.unscale_(optimizer)
+                            resolved_torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        if grad_clip_norm > 0:
+                            resolved_torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                        optimizer.step()
+                    batch_weight = int(batch_local_history.shape[0])
+                    train_valid_sum += float(batch_valid.sum().item())
+                    train_target_count += int(batch_valid.numel())
+                    latest_loss = float(loss.item())
+                    train_loss_sum += latest_loss * batch_weight
+                    train_loss_weight += batch_weight
+                    train_batch_count += 1
+                    batch_progress.set_postfix_str(f"loss={latest_loss:.4f}")
+                    batch_progress.update(1)
+            finally:
+                batch_progress.close()
+            epochs_ran = epoch_index
+            val_metrics = evaluate_mtgnn_model(
+                model,
+                prepared_dataset,
+                prepared_dataset.val_rolling_windows,
+                batch_size=resolved_eval_batch_size,
+                device=resolved_device,
+                seed=seed,
+                num_workers=num_workers,
+                amp_enabled=amp_enabled,
+                progress_label=f"{progress_label or prepared_dataset.dataset_id} val e{epoch_index}",
+            )
+            val_mae_pu = float(val_metrics.mae_pu)
+            val_rmse_pu = float(val_metrics.rmse_pu)
+            is_best_epoch = False
+            if best_state is None or (
+                math.isfinite(val_mae_pu)
+                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            ):
+                best_val_mae_pu = val_mae_pu
+                best_val_rmse_pu = val_rmse_pu
+                best_epoch = epoch_index
+                best_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+                is_best_epoch = True
+            else:
+                epochs_without_improvement += 1
+            train_loss_mean = train_loss_sum / train_loss_weight if train_loss_weight else math.nan
+            train_valid_fraction = train_valid_sum / train_target_count if train_target_count else math.nan
+            val_valid_fraction = (
+                float(val_metrics.prediction_count)
+                / float(
+                    len(prepared_dataset.val_rolling_windows)
+                    * prepared_dataset.forecast_steps
+                    * prepared_dataset.node_count
+                )
+                if len(prepared_dataset.val_rolling_windows) > 0 and prepared_dataset.node_count > 0
+                else math.nan
+            )
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_mean", train_loss_mean, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/loss_last", latest_loss, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/valid_fraction", train_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/batch_count", train_batch_count, epoch_index)
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "train/learning_rate",
+                optimizer.param_groups[0]["lr"],
+                epoch_index,
+            )
+            _tensorboard_add_scalar(tensorboard_writer, "val/valid_fraction", val_valid_fraction, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_mae_pu", best_val_mae_pu, epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "best/val_rmse_pu", best_val_rmse_pu, epoch_index)
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/epochs_without_improvement",
+                epochs_without_improvement,
+                epoch_index,
+            )
+            _tensorboard_add_scalar(
+                tensorboard_writer,
+                "early_stopping/is_best_epoch",
+                1 if is_best_epoch else 0,
+                epoch_index,
+            )
+            _tensorboard_add_metrics(tensorboard_writer, "val", val_metrics, step=epoch_index)
+            if resolved_training_history_path is not None:
+                _append_training_history_row(
+                    resolved_training_history_path,
+                    {
+                        "dataset_id": prepared_dataset.dataset_id,
+                        "model_id": MODEL_ID,
+                        "model_variant": prepared_dataset.model_variant,
+                        "feature_protocol_id": prepared_dataset.feature_protocol_id,
+                        "task_id": TASK_ID,
+                        "window_protocol": WINDOW_PROTOCOL,
+                        "baseline_type": "mtgnn_calendar_graph",
+                        "hidden_dim": None,
+                        "embed_dim": None,
+                        "num_layers": None,
+                        "cheb_k": None,
+                        "teacher_forcing_ratio": None,
+                        "patch_len": None,
+                        "encoder_layers": None,
+                        "ff_hidden_dim": None,
+                        "residual_channels": residual_channels,
+                        "skip_channels": skip_channels,
+                        "end_channels": end_channels,
+                        "gcn_depth": gcn_depth,
+                        "mtgnn_layers": mtgnn_layers,
+                        "subgraph_size": subgraph_size,
+                        "node_embed_dim": node_embed_dim,
+                        "dilation_exponential": dilation_exponential,
+                        "propalpha": propalpha,
                         "epoch": epoch_index,
                         "train_loss_mean": train_loss_mean,
                         "train_loss_last": latest_loss,
@@ -3706,6 +4658,15 @@ def train_dgcrn_model(
                         "patch_len": None,
                         "encoder_layers": None,
                         "ff_hidden_dim": None,
+                        "residual_channels": None,
+                        "skip_channels": None,
+                        "end_channels": None,
+                        "gcn_depth": None,
+                        "mtgnn_layers": None,
+                        "subgraph_size": None,
+                        "node_embed_dim": None,
+                        "dilation_exponential": None,
+                        "propalpha": None,
                         "epoch": epoch_index,
                         "train_loss_mean": train_loss_mean,
                         "train_loss_last": latest_loss,
@@ -3801,6 +4762,7 @@ def build_result_rows(
     is_timexer = variant_spec.model_variant == TIMEXER_VARIANT
     is_itransformer = variant_spec.model_variant == ITRANSFORMER_VARIANT
     is_dgcrn = variant_spec.model_variant == DGCRN_VARIANT
+    is_mtgnn = variant_spec.model_variant == MTGNN_VARIANT
     base_row = {
         "dataset_id": prepared_dataset.dataset_id,
         "model_id": MODEL_ID,
@@ -3819,7 +4781,7 @@ def build_result_rows(
         "static_feature_count": prepared_dataset.static_feature_count,
         "pairwise_feature_count": prepared_dataset.pairwise_feature_count,
         "baseline_type": variant_spec.baseline_type,
-        "uses_graph": is_dgcrn,
+        "uses_graph": is_dgcrn or is_mtgnn,
         "uses_pairwise": is_dgcrn,
         "uses_global_latent": False,
         "uses_future_observations": False,
@@ -3828,15 +4790,24 @@ def build_result_rows(
         "num_layers": profile.num_layers if is_dgcrn else None,
         "cheb_k": profile.cheb_k if is_dgcrn else None,
         "teacher_forcing_ratio": profile.teacher_forcing_ratio if is_dgcrn else None,
-        "bounded_output_epsilon": profile.bounded_output_epsilon if (is_tft or is_timexer or is_itransformer) else None,
+        "bounded_output_epsilon": profile.bounded_output_epsilon if (is_tft or is_timexer or is_itransformer or is_mtgnn) else None,
         "d_model": profile.d_model if (is_tft or is_timexer or is_itransformer) else None,
         "lstm_hidden_dim": profile.lstm_hidden_dim if is_tft else None,
         "attention_heads": profile.attention_heads if (is_tft or is_timexer or is_itransformer) else None,
         "patch_len": profile.patch_len if is_timexer else None,
         "encoder_layers": profile.encoder_layers if is_timexer else None,
         "ff_hidden_dim": profile.ff_hidden_dim if is_timexer else None,
-        "dropout": profile.dropout if (is_tft or is_timexer or is_itransformer) else None,
-        "weight_decay": profile.weight_decay if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
+        "residual_channels": profile.residual_channels if is_mtgnn else None,
+        "skip_channels": profile.skip_channels if is_mtgnn else None,
+        "end_channels": profile.end_channels if is_mtgnn else None,
+        "gcn_depth": profile.gcn_depth if is_mtgnn else None,
+        "mtgnn_layers": profile.mtgnn_layers if is_mtgnn else None,
+        "subgraph_size": profile.subgraph_size if is_mtgnn else None,
+        "node_embed_dim": profile.node_embed_dim if is_mtgnn else None,
+        "dilation_exponential": profile.dilation_exponential if is_mtgnn else None,
+        "propalpha": profile.propalpha if is_mtgnn else None,
+        "dropout": profile.dropout if (is_tft or is_timexer or is_itransformer or is_mtgnn) else None,
+        "weight_decay": profile.weight_decay if (is_tft or is_timexer or is_itransformer or is_dgcrn or is_mtgnn) else None,
         "amp_enabled": training_outcome.amp_enabled,
         "device": training_outcome.device,
         "runtime_seconds": round(runtime_seconds, 6),
@@ -3848,8 +4819,8 @@ def build_result_rows(
         "best_val_rmse_pu": training_outcome.best_val_rmse_pu,
         "best_val_mae_pu": training_outcome.best_val_mae_pu,
         "seed": seed,
-        "batch_size": profile.batch_size if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
-        "learning_rate": profile.learning_rate if (is_tft or is_timexer or is_itransformer or is_dgcrn) else None,
+        "batch_size": profile.batch_size if (is_tft or is_timexer or is_itransformer or is_dgcrn or is_mtgnn) else None,
+        "learning_rate": profile.learning_rate if (is_tft or is_timexer or is_itransformer or is_dgcrn or is_mtgnn) else None,
     }
     for split_name, eval_protocol, windows, metrics in evaluation_results:
         start_timestamp, end_timestamp = _window_bounds(windows)
@@ -3952,6 +4923,15 @@ def execute_persistence_job(
                 "patch_len": None,
                 "encoder_layers": None,
                 "ff_hidden_dim": None,
+                "residual_channels": None,
+                "skip_channels": None,
+                "end_channels": None,
+                "gcn_depth": None,
+                "mtgnn_layers": None,
+                "subgraph_size": None,
+                "node_embed_dim": None,
+                "dilation_exponential": None,
+                "propalpha": None,
                 "epoch": 0,
                 "train_loss_mean": None,
                 "train_loss_last": None,
@@ -4256,6 +5236,100 @@ def execute_itransformer_job(
     )
 
 
+def execute_mtgnn_job(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    variant_spec: ExperimentVariant,
+    device: str | None,
+    seed: int,
+    profile: HyperparameterProfile,
+    eval_batch_size: int | None,
+    num_workers: int | None,
+    checkpoint_path: str | Path | None,
+    training_history_path: str | Path | None,
+    resume_from_checkpoint: bool,
+    tensorboard_log_dir: str | Path | None,
+) -> list[dict[str, object]]:
+    started = time.monotonic()
+    resolved_device = resolve_device(device)
+    resolved_eval_batch_size = resolve_eval_batch_size(
+        profile.batch_size,
+        device=resolved_device,
+        eval_batch_size=eval_batch_size,
+    )
+    writer = _open_tensorboard_writer(
+        tensorboard_log_dir,
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=variant_spec.model_variant,
+    )
+    _tensorboard_log_run_config(
+        writer,
+        prepared_dataset=prepared_dataset,
+        variant_spec=variant_spec,
+        profile=profile,
+        seed=seed,
+        device=resolved_device,
+        eval_batch_size=resolved_eval_batch_size,
+        num_workers=resolve_loader_num_workers(device=resolved_device, num_workers=num_workers),
+    )
+    try:
+        training_outcome = train_mtgnn_model(
+            prepared_dataset,
+            device=resolved_device,
+            seed=seed,
+            batch_size=profile.batch_size,
+            eval_batch_size=resolved_eval_batch_size,
+            learning_rate=profile.learning_rate,
+            max_epochs=profile.max_epochs,
+            early_stopping_patience=profile.early_stopping_patience,
+            residual_channels=profile.residual_channels,
+            skip_channels=profile.skip_channels,
+            end_channels=profile.end_channels,
+            gcn_depth=profile.gcn_depth,
+            mtgnn_layers=profile.mtgnn_layers,
+            subgraph_size=profile.subgraph_size,
+            node_embed_dim=profile.node_embed_dim,
+            dilation_exponential=profile.dilation_exponential,
+            propalpha=profile.propalpha,
+            dropout=profile.dropout,
+            grad_clip_norm=profile.grad_clip_norm,
+            weight_decay=profile.weight_decay,
+            bounded_output_epsilon=profile.bounded_output_epsilon,
+            num_workers=num_workers,
+            checkpoint_path=checkpoint_path,
+            training_history_path=training_history_path,
+            resume_from_checkpoint=resume_from_checkpoint,
+            progress_label=f"{prepared_dataset.dataset_id}/{variant_spec.model_variant}",
+            tensorboard_writer=writer,
+        )
+        evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
+        for split_name, eval_protocol, windows in iter_evaluation_specs(prepared_dataset):
+            metrics = evaluate_mtgnn_model(
+                training_outcome.model,
+                prepared_dataset,
+                windows,
+                batch_size=resolved_eval_batch_size,
+                device=training_outcome.device,
+                seed=seed,
+                num_workers=num_workers,
+                amp_enabled=training_outcome.amp_enabled,
+                progress_label=f"{prepared_dataset.dataset_id}/{variant_spec.model_variant} {split_name}/{eval_protocol}",
+            )
+            evaluation_results.append((split_name, eval_protocol, windows, metrics))
+        _tensorboard_log_final_evaluations(writer, evaluation_results, step=training_outcome.epochs_ran)
+    finally:
+        _close_tensorboard_writer(writer)
+    return build_result_rows(
+        prepared_dataset,
+        variant_spec=variant_spec,
+        training_outcome=training_outcome,
+        runtime_seconds=time.monotonic() - started,
+        seed=seed,
+        profile=profile,
+        evaluation_results=evaluation_results,
+    )
+
+
 def execute_dgcrn_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
@@ -4415,6 +5489,15 @@ def execute_chronos_zero_shot_job(
                 "patch_len": None,
                 "encoder_layers": None,
                 "ff_hidden_dim": None,
+                "residual_channels": None,
+                "skip_channels": None,
+                "end_channels": None,
+                "gcn_depth": None,
+                "mtgnn_layers": None,
+                "subgraph_size": None,
+                "node_embed_dim": None,
+                "dilation_exponential": None,
+                "propalpha": None,
                 "epoch": 0,
                 "train_loss_mean": None,
                 "train_loss_last": None,
@@ -4471,6 +5554,15 @@ def execute_training_job(
     patch_len: int | None = None,
     encoder_layers: int | None = None,
     ff_hidden_dim: int | None = None,
+    residual_channels: int | None = None,
+    skip_channels: int | None = None,
+    end_channels: int | None = None,
+    gcn_depth: int | None = None,
+    mtgnn_layers: int | None = None,
+    subgraph_size: int | None = None,
+    node_embed_dim: int | None = None,
+    dilation_exponential: int | None = None,
+    propalpha: float | None = None,
     hidden_dim: int | None = None,
     embed_dim: int | None = None,
     num_layers: int | None = None,
@@ -4500,6 +5592,15 @@ def execute_training_job(
         patch_len=patch_len,
         encoder_layers=encoder_layers,
         ff_hidden_dim=ff_hidden_dim,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        gcn_depth=gcn_depth,
+        mtgnn_layers=mtgnn_layers,
+        subgraph_size=subgraph_size,
+        node_embed_dim=node_embed_dim,
+        dilation_exponential=dilation_exponential,
+        propalpha=propalpha,
         hidden_dim=hidden_dim,
         embed_dim=embed_dim,
         num_layers=num_layers,
@@ -4549,6 +5650,20 @@ def execute_training_job(
         )
     if resolved_variant.model_variant == ITRANSFORMER_VARIANT:
         return execute_itransformer_job(
+            prepared_dataset,
+            variant_spec=resolved_variant,
+            device=device,
+            seed=seed,
+            profile=profile,
+            eval_batch_size=eval_batch_size,
+            num_workers=num_workers,
+            checkpoint_path=checkpoint_path,
+            training_history_path=training_history_path,
+            resume_from_checkpoint=resume_from_checkpoint,
+            tensorboard_log_dir=tensorboard_log_dir,
+        )
+    if resolved_variant.model_variant == MTGNN_VARIANT:
+        return execute_mtgnn_job(
             prepared_dataset,
             variant_spec=resolved_variant,
             device=device,
@@ -4884,6 +5999,15 @@ def _build_effective_config(
     patch_len: int | None,
     encoder_layers: int | None,
     ff_hidden_dim: int | None,
+    residual_channels: int | None,
+    skip_channels: int | None,
+    end_channels: int | None,
+    gcn_depth: int | None,
+    mtgnn_layers: int | None,
+    subgraph_size: int | None,
+    node_embed_dim: int | None,
+    dilation_exponential: int | None,
+    propalpha: float | None,
     hidden_dim: int | None,
     embed_dim: int | None,
     num_layers: int | None,
@@ -4928,6 +6052,15 @@ def _build_effective_config(
                             patch_len=patch_len,
                             encoder_layers=encoder_layers,
                             ff_hidden_dim=ff_hidden_dim,
+                            residual_channels=residual_channels,
+                            skip_channels=skip_channels,
+                            end_channels=end_channels,
+                            gcn_depth=gcn_depth,
+                            mtgnn_layers=mtgnn_layers,
+                            subgraph_size=subgraph_size,
+                            node_embed_dim=node_embed_dim,
+                            dilation_exponential=dilation_exponential,
+                            propalpha=propalpha,
                             hidden_dim=hidden_dim,
                             embed_dim=embed_dim,
                             num_layers=num_layers,
@@ -4968,6 +6101,15 @@ def run_experiment(
     patch_len: int | None = None,
     encoder_layers: int | None = None,
     ff_hidden_dim: int | None = None,
+    residual_channels: int | None = None,
+    skip_channels: int | None = None,
+    end_channels: int | None = None,
+    gcn_depth: int | None = None,
+    mtgnn_layers: int | None = None,
+    subgraph_size: int | None = None,
+    node_embed_dim: int | None = None,
+    dilation_exponential: int | None = None,
+    propalpha: float | None = None,
     hidden_dim: int | None = None,
     embed_dim: int | None = None,
     num_layers: int | None = None,
@@ -5015,6 +6157,15 @@ def run_experiment(
         patch_len=patch_len,
         encoder_layers=encoder_layers,
         ff_hidden_dim=ff_hidden_dim,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        gcn_depth=gcn_depth,
+        mtgnn_layers=mtgnn_layers,
+        subgraph_size=subgraph_size,
+        node_embed_dim=node_embed_dim,
+        dilation_exponential=dilation_exponential,
+        propalpha=propalpha,
         hidden_dim=hidden_dim,
         embed_dim=embed_dim,
         num_layers=num_layers,
@@ -5100,6 +6251,15 @@ def run_experiment(
                     patch_len=patch_len,
                     encoder_layers=encoder_layers,
                     ff_hidden_dim=ff_hidden_dim,
+                    residual_channels=residual_channels,
+                    skip_channels=skip_channels,
+                    end_channels=end_channels,
+                    gcn_depth=gcn_depth,
+                    mtgnn_layers=mtgnn_layers,
+                    subgraph_size=subgraph_size,
+                    node_embed_dim=node_embed_dim,
+                    dilation_exponential=dilation_exponential,
+                    propalpha=propalpha,
                     hidden_dim=hidden_dim,
                     embed_dim=embed_dim,
                     num_layers=num_layers,
@@ -5134,6 +6294,15 @@ def run_experiment(
                         patch_len=profile.patch_len,
                         encoder_layers=profile.encoder_layers,
                         ff_hidden_dim=profile.ff_hidden_dim,
+                        residual_channels=profile.residual_channels,
+                        skip_channels=profile.skip_channels,
+                        end_channels=profile.end_channels,
+                        gcn_depth=profile.gcn_depth,
+                        mtgnn_layers=profile.mtgnn_layers,
+                        subgraph_size=profile.subgraph_size,
+                        node_embed_dim=profile.node_embed_dim,
+                        dilation_exponential=profile.dilation_exponential,
+                        propalpha=profile.propalpha,
                         hidden_dim=profile.hidden_dim,
                         embed_dim=profile.embed_dim,
                         num_layers=profile.num_layers,
@@ -5196,6 +6365,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-len", type=int, default=None)
     parser.add_argument("--encoder-layers", type=int, default=None)
     parser.add_argument("--ff-hidden-dim", type=int, default=None)
+    parser.add_argument("--residual-channels", type=int, default=None)
+    parser.add_argument("--skip-channels", type=int, default=None)
+    parser.add_argument("--end-channels", type=int, default=None)
+    parser.add_argument("--gcn-depth", type=int, default=None)
+    parser.add_argument("--mtgnn-layers", type=int, default=None)
+    parser.add_argument("--subgraph-size", type=int, default=None)
+    parser.add_argument("--node-embed-dim", type=int, default=None)
+    parser.add_argument("--dilation-exponential", type=int, default=None)
+    parser.add_argument("--propalpha", type=float, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--embed-dim", type=int, default=None)
     parser.add_argument("--num-layers", type=int, default=None)
@@ -5239,6 +6417,15 @@ def _resolved_record_hyperparameters(
                         patch_len=args.patch_len,
                         encoder_layers=args.encoder_layers,
                         ff_hidden_dim=args.ff_hidden_dim,
+                        residual_channels=args.residual_channels,
+                        skip_channels=args.skip_channels,
+                        end_channels=args.end_channels,
+                        gcn_depth=args.gcn_depth,
+                        mtgnn_layers=args.mtgnn_layers,
+                        subgraph_size=args.subgraph_size,
+                        node_embed_dim=args.node_embed_dim,
+                        dilation_exponential=args.dilation_exponential,
+                        propalpha=args.propalpha,
                         hidden_dim=args.hidden_dim,
                         embed_dim=args.embed_dim,
                         num_layers=args.num_layers,
@@ -5292,6 +6479,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         patch_len=args.patch_len,
         encoder_layers=args.encoder_layers,
         ff_hidden_dim=args.ff_hidden_dim,
+        residual_channels=args.residual_channels,
+        skip_channels=args.skip_channels,
+        end_channels=args.end_channels,
+        gcn_depth=args.gcn_depth,
+        mtgnn_layers=args.mtgnn_layers,
+        subgraph_size=args.subgraph_size,
+        node_embed_dim=args.node_embed_dim,
+        dilation_exponential=args.dilation_exponential,
+        propalpha=args.propalpha,
         hidden_dim=args.hidden_dim,
         embed_dim=args.embed_dim,
         num_layers=args.num_layers,

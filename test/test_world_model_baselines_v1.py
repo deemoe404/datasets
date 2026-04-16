@@ -74,6 +74,10 @@ def _itransformer_variant_spec(module):
     return module.resolve_variant_specs((module.ITRANSFORMER_VARIANT,))[0]
 
 
+def _mtgnn_variant_spec(module):
+    return module.resolve_variant_specs((module.MTGNN_VARIANT,))[0]
+
+
 class _FakeSummaryWriter:
     instances: list["_FakeSummaryWriter"] = []
 
@@ -98,7 +102,7 @@ class _FakeSummaryWriter:
         self.closed = True
 
 
-def test_registry_declares_kelmarsh_only_and_six_variants() -> None:
+def test_registry_declares_kelmarsh_only_and_seven_variants() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
         / "experiment"
@@ -118,6 +122,7 @@ def test_registry_declares_kelmarsh_only_and_six_variants() -> None:
     assert 'world_model_dgcrn_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_chronos_2_zero_shot_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_itransformer_no_graph_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_mtgnn_calendar_graph_v1_farm_sync = "world_model_v1"' in text
 
 
 def test_non_kelmarsh_dataset_is_rejected() -> None:
@@ -173,6 +178,23 @@ def test_itransformer_default_hyperparameters_are_kelmarsh_specific() -> None:
     assert profile.attention_heads == 4
     assert profile.dropout == pytest.approx(0.1)
     assert profile.weight_decay == pytest.approx(1e-4)
+
+
+def test_mtgnn_default_hyperparameters_match_strong_graph_baseline() -> None:
+    module = _load_module()
+    profile = module.resolve_hyperparameter_profile(module.MTGNN_VARIANT, dataset_id="kelmarsh")
+
+    assert profile.batch_size == 128
+    assert profile.learning_rate == pytest.approx(1e-3)
+    assert profile.residual_channels == 32
+    assert profile.skip_channels == 64
+    assert profile.end_channels == 128
+    assert profile.gcn_depth == 2
+    assert profile.mtgnn_layers == 4
+    assert profile.subgraph_size == 4
+    assert profile.node_embed_dim == 16
+    assert profile.dilation_exponential == 2
+    assert profile.propalpha == pytest.approx(0.05)
 
 
 def test_tensorboard_root_uses_output_hash_by_default(tmp_path) -> None:
@@ -444,6 +466,76 @@ def test_itransformer_forward_shape_and_bounded_output(tmp_path, monkeypatch) ->
     assert float(outputs.max().item()) <= 1.05
 
 
+def test_mtgnn_dataset_expands_to_window_graph_samples_without_future_leak(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_mtgnn_variant_spec(module),
+    )
+    dataset = module.GraphWindowDataset(prepared, prepared.val_rolling_windows, include_indices=True)
+    sample = dataset[0]
+
+    assert len(dataset) == len(prepared.val_rolling_windows)
+    assert sample[0].shape == (prepared.history_steps, prepared.node_count, 54)
+    assert sample[1].shape == (prepared.history_steps, 40)
+    assert sample[2].shape == (prepared.forecast_steps, 7)
+    assert sample[3].shape == (prepared.forecast_steps, prepared.node_count, 1)
+    assert sample[4].shape == (prepared.forecast_steps, prepared.node_count, 1)
+    assert int(sample[5]) == 0
+
+    mutated_targets = prepared.target_pu_filled.copy()
+    target_index = int(prepared.val_rolling_windows.target_indices[0])
+    future_slice = slice(target_index, target_index + prepared.forecast_steps)
+    mutated_targets[future_slice] = 1.0 - mutated_targets[future_slice]
+    mutated_prepared = replace(prepared, target_pu_filled=mutated_targets)
+    mutated_sample = module.GraphWindowDataset(mutated_prepared, prepared.val_rolling_windows, include_indices=True)[0]
+
+    assert np.allclose(mutated_sample[0], sample[0])
+    assert np.allclose(mutated_sample[1], sample[1])
+    assert np.allclose(mutated_sample[2], sample[2])
+    assert not np.allclose(mutated_sample[3], sample[3])
+
+
+def test_mtgnn_forward_shape_and_bounded_output(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_spec=_mtgnn_variant_spec(module),
+    )
+    model = module.build_mtgnn_model(
+        prepared_dataset=prepared,
+        residual_channels=8,
+        skip_channels=8,
+        end_channels=16,
+        gcn_depth=2,
+        mtgnn_layers=2,
+        subgraph_size=3,
+        node_embed_dim=4,
+        dilation_exponential=2,
+        propalpha=0.1,
+        dropout=0.0,
+        bounded_output_epsilon=module.DEFAULT_BOUNDED_OUTPUT_EPSILON,
+    )
+    sample = module.GraphWindowDataset(prepared, prepared.val_rolling_windows)[0]
+
+    with torch_module.no_grad():
+        outputs = model(
+            torch_module.from_numpy(sample[0][None]),
+            torch_module.from_numpy(sample[1][None]),
+            torch_module.from_numpy(sample[2][None]),
+        )
+
+    assert outputs.shape == (1, prepared.forecast_steps, prepared.node_count, 1)
+    assert float(outputs.min().item()) >= 0.0
+    assert float(outputs.max().item()) <= 1.05
+
+
 def test_tft_eval_reaggregates_turbine_instances(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -522,6 +614,53 @@ def test_itransformer_eval_reaggregates_full_window_predictions(tmp_path, monkey
 
     monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
     metrics = module.evaluate_itransformer_model(
+        _ZeroModel(),
+        prepared,
+        prepared.val_rolling_windows,
+        batch_size=2,
+        device="cpu",
+        seed=123,
+        num_workers=0,
+    )
+
+    expected_shape = (len(prepared.val_rolling_windows), prepared.forecast_steps, prepared.node_count, 1)
+    assert captured["predictions"] == expected_shape
+    assert captured["targets"] == expected_shape
+    assert captured["valid"] == expected_shape
+    assert metrics.window_count == len(prepared.val_rolling_windows)
+
+
+def test_mtgnn_eval_reaggregates_window_instances(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_mtgnn_variant_spec(module),
+    )
+    captured: dict[str, tuple[int, ...]] = {}
+    original_metrics = module._metrics_from_arrays
+
+    def _capture_metrics(predictions, targets, valid_mask, *, rated_power_kw):
+        captured["predictions"] = predictions.shape
+        captured["targets"] = targets.shape
+        captured["valid"] = valid_mask.shape
+        return original_metrics(predictions, targets, valid_mask, rated_power_kw=rated_power_kw)
+
+    class _ZeroModel(torch_module.nn.Module):
+        def forward(self, local_history, context_history, future_calendar):
+            del local_history, context_history
+            return torch_module.zeros(
+                (future_calendar.shape[0], future_calendar.shape[1], prepared.node_count, 1),
+                dtype=future_calendar.dtype,
+                device=future_calendar.device,
+            )
+
+    monkeypatch.setattr(module, "_metrics_from_arrays", _capture_metrics)
+    metrics = module.evaluate_mtgnn_model(
         _ZeroModel(),
         prepared,
         prepared.val_rolling_windows,
@@ -912,6 +1051,54 @@ def test_itransformer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) 
     assert rows[0]["uses_future_observations"] is False
 
 
+def test_mtgnn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=_mtgnn_variant_spec(module),
+    )
+    history_path = tmp_path / "mtgnn.training_history.csv"
+
+    rows = module.execute_training_job(
+        prepared,
+        variant_spec=_mtgnn_variant_spec(module),
+        device="cpu",
+        seed=123,
+        batch_size=2,
+        eval_batch_size=2,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        residual_channels=8,
+        skip_channels=8,
+        end_channels=16,
+        gcn_depth=2,
+        mtgnn_layers=2,
+        subgraph_size=3,
+        node_embed_dim=4,
+        dilation_exponential=2,
+        propalpha=0.1,
+        dropout=0.0,
+        num_workers=0,
+        training_history_path=history_path,
+    )
+
+    history = pl.read_csv(history_path)
+    assert history["epoch"].to_list() == [1]
+    assert history["baseline_type"].to_list() == ["mtgnn_calendar_graph"]
+    assert history["train_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu"].null_count() == 0
+    assert len(rows) == 148
+    assert rows[0]["model_variant"] == module.MTGNN_VARIANT
+    assert rows[0]["uses_graph"] is True
+    assert rows[0]["residual_channels"] == 8
+
+
 def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
     module = _load_module()
     _require_torch(module)
@@ -985,6 +1172,15 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             patch_len=kwargs["patch_len"],
             encoder_layers=kwargs["encoder_layers"],
             ff_hidden_dim=kwargs["ff_hidden_dim"],
+            residual_channels=kwargs["residual_channels"],
+            skip_channels=kwargs["skip_channels"],
+            end_channels=kwargs["end_channels"],
+            gcn_depth=kwargs["gcn_depth"],
+            mtgnn_layers=kwargs["mtgnn_layers"],
+            subgraph_size=kwargs["subgraph_size"],
+            node_embed_dim=kwargs["node_embed_dim"],
+            dilation_exponential=kwargs["dilation_exponential"],
+            propalpha=kwargs["propalpha"],
             hidden_dim=kwargs["hidden_dim"],
             embed_dim=kwargs["embed_dim"],
             num_layers=kwargs["num_layers"],
@@ -1050,6 +1246,15 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         patch_len=24,
         encoder_layers=1,
         ff_hidden_dim=16,
+        residual_channels=8,
+        skip_channels=8,
+        end_channels=16,
+        gcn_depth=2,
+        mtgnn_layers=2,
+        subgraph_size=3,
+        node_embed_dim=4,
+        dilation_exponential=2,
+        propalpha=0.1,
         hidden_dim=8,
         embed_dim=4,
         num_layers=1,
@@ -1063,7 +1268,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 888
+    assert results.height == 1036
     assert set(results["model_variant"].unique().to_list()) == {
         module.PERSISTENCE_VARIANT,
         module.TFT_VARIANT,
@@ -1071,6 +1276,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         module.DGCRN_VARIANT,
         module.CHRONOS_VARIANT,
         module.ITRANSFORMER_VARIANT,
+        module.MTGNN_VARIANT,
     }
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()

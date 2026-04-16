@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "world_model_baselines_v1"
 display_name = "World-Model Baselines v1"
 status = "prototype"
-summary = "Kelmarsh-only key baseline family for world_model_state_space_v1, including last-value persistence, shared-weight TFT, shared-weight TimeXer without graph inputs, a DGCRN-style dynamic-graph baseline, a Chronos-2 zero-shot baseline, and a no-graph iTransformer baseline."
+summary = "Kelmarsh-only key baseline family for world_model_state_space_v1, including last-value persistence, shared-weight TFT, shared-weight TimeXer without graph inputs, a DGCRN-style dynamic-graph baseline, a Chronos-2 zero-shot baseline, a no-graph iTransformer baseline, and an MTGNN calendar-graph baseline."
 model_family = "world_model_baseline"
 training_mode = "trainable"
 implementation_root = "experiment/families/world_model_baselines_v1"
@@ -22,6 +22,7 @@ implementation_labels = [
   "world_model_dgcrn_v1_farm_sync",
   "world_model_chronos_2_zero_shot_v1_farm_sync",
   "world_model_itransformer_no_graph_v1_farm_sync",
+  "world_model_mtgnn_calendar_graph_v1_farm_sync",
 ]
 model_variants = [
   "world_model_persistence_last_value_v1_farm_sync",
@@ -30,13 +31,15 @@ model_variants = [
   "world_model_dgcrn_v1_farm_sync",
   "world_model_chronos_2_zero_shot_v1_farm_sync",
   "world_model_itransformer_no_graph_v1_farm_sync",
+  "world_model_mtgnn_calendar_graph_v1_farm_sync",
 ]
 notes = [
-  "The family is marked trainable because it includes TFT, TimeXer, DGCRN, and iTransformer baselines; persistence is analytic and writes a synthetic epoch-0 training-history row.",
+  "The family is marked trainable because it includes TFT, TimeXer, DGCRN, iTransformer, and MTGNN baselines; persistence is analytic and writes a synthetic epoch-0 training-history row.",
   "All variants consume the existing world_model_v1 task bundle through the state-space tensor contract and do not introduce a dataset-side feature protocol.",
   "The DGCRN variant keeps the same Kelmarsh-only world_model_v1 bundle contract and adds dynamic graph recurrence with static-node embeddings and pairwise geometry bias.",
   "The Chronos-2 variant adapts the same world_model_v1 tensor contract into zero-shot Chronos payloads without changing dataset-side semantics.",
   "The iTransformer variant consumes full farm windows without graph inputs and predicts all turbines jointly from the same world_model_v1 tensor contract.",
+  "The MTGNN variant consumes the same local-history and calendar tensors while learning an adaptive graph over turbines without introducing new dataset-side features.",
 ]
 
 [task_contract]
@@ -54,3 +57,4 @@ world_model_shared_weight_timexer_no_graph_v1_farm_sync = "world_model_v1"
 world_model_dgcrn_v1_farm_sync = "world_model_v1"
 world_model_chronos_2_zero_shot_v1_farm_sync = "world_model_v1"
 world_model_itransformer_no_graph_v1_farm_sync = "world_model_v1"
+world_model_mtgnn_calendar_graph_v1_farm_sync = "world_model_v1"
