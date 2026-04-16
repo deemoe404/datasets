@@ -1,0 +1,76 @@
+# world_model_baselines_v1
+
+`world_model_baselines_v1` is a Kelmarsh-only baseline family for comparing
+against `world_model_state_space_v1` on the active `next_6h_from_24h` task and
+the existing `world_model_v1` task bundle. It does not modify source data or
+dataset-side protocol semantics.
+
+The first implementation includes:
+
+- `world_model_persistence_last_value_v1_farm_sync`: analytic last-value
+  persistence over the 24-hour history window, with train-only target means as
+  fallback for fully missing histories.
+- `world_model_shared_weight_tft_no_graph_v1_farm_sync`: repo-local PyTorch
+  shared-weight TFT-style model with no graph, no pairwise features, no global
+  latent state, no future observations, and no turbine id embedding.
+
+## Run
+
+```shell
+cd experiment/families/world_model_baselines_v1
+./create_env.sh
+./.conda/bin/python run_world_model_baselines_v1.py
+```
+
+Run only persistence:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --variant world_model_persistence_last_value_v1_farm_sync
+```
+
+Smoke run:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --epochs 1 \
+  --device cpu \
+  --max-train-origins 64 \
+  --max-eval-origins 32 \
+  --output-path ../../artifacts/scratch/world_model_baselines_v1/kelmarsh_smoke.csv \
+  --no-record-run
+```
+
+Default formal output:
+
+- `experiment/artifacts/published/world_model_baselines_v1/latest.csv`
+- `experiment/artifacts/published/world_model_baselines_v1/latest.training_history.csv`
+- `experiment/artifacts/runs/world_model_baselines_v1/<timestamp>/manifest.json`
+
+TensorBoard is enabled by default when the family environment includes the
+`tensorboard` package. The default log root is tied to the output-path hash:
+
+- `experiment/families/world_model_baselines_v1/.work/run_world_model_baselines_v1/<output-hash>/tensorboard/`
+
+View logs with:
+
+```shell
+tensorboard --logdir experiment/families/world_model_baselines_v1/.work/run_world_model_baselines_v1
+```
+
+Or override the log root explicitly:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --tensorboard-log-dir ../../artifacts/scratch/world_model_baselines_v1/tensorboard
+```
+
+## Scope
+
+- Dataset scope: `kelmarsh` only.
+- Feature protocol: `world_model_v1`.
+- Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
+- Registry `training_mode` is `trainable` because the family includes TFT, even
+  though persistence is analytic.
+- Deferred: state-space ablations such as no-dynamic-graph, no-global-state,
+  single-state, linear-head, and no-met-loss variants.

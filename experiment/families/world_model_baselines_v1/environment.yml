@@ -1,0 +1,14 @@
+name: world-model-baselines-v1
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - polars
+  - pyarrow
+  - pytest
+  - tensorboard
+  - tqdm
+  - pip:
+      - torch
