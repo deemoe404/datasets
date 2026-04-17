@@ -79,8 +79,8 @@ The default invocation runs the only active variant on both supported datasets
 and writes:
 
 ```text
-../../artifacts/published/world_model_agcrn_v1/latest.csv
-../../artifacts/published/world_model_agcrn_v1/latest.training_history.csv
+../../artifacts/published/world_model_agcrn_v1/<run_timestamp>.csv
+../../artifacts/published/world_model_agcrn_v1/<run_timestamp>.training_history.csv
 ```
 
 For ad hoc smoke runs, prefer an explicit output path under
@@ -128,7 +128,7 @@ Latest formal publish timestamp: not recorded yet in this changeset.
 runs:
 
 ```bash
-./.conda/bin/python run_world_model_agcrn_v1.py --resume
+./.conda/bin/python run_world_model_agcrn_v1.py --output-path ../../artifacts/published/world_model_agcrn_v1/<run_timestamp>.csv --resume
 ```
 
 Resume state is family-local and keyed by the resolved `--output-path`:
@@ -143,6 +143,8 @@ Resume state is family-local and keyed by the resolved `--output-path`:
 
 `training_history.csv` records one row per completed epoch and is republished
 beside the selected output CSV as `<output-stem>.training_history.csv`.
+For default timestamped publish outputs, both `--resume` and `--force-rerun`
+must pass the exact prior `--output-path`.
 
 Formal run records are written under
 `experiment/artifacts/runs/world_model_agcrn_v1/<timestamp>/manifest.json`

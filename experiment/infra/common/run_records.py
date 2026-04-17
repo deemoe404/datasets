@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Mapping, Sequence
 
 from experiment_registry import load_registry_snapshot
+from published_outputs import generate_run_stem, validate_run_stem
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ def record_cli_run(
     artifacts: Mapping[str, str | Path] | None = None,
     notes: Sequence[str] = (),
     run_label: str | None = None,
+    run_stem: str | None = None,
     runs_root: str | Path | None = None,
 ) -> Path:
     resolved_repo_root = Path(repo_root).resolve()
@@ -83,7 +85,12 @@ def record_cli_run(
         )
 
     run_root = Path(runs_root).resolve() if runs_root is not None else default_runs_root(repo_root=resolved_repo_root)
-    run_dir = _allocate_run_directory(run_root=run_root, family_id=family_id, run_label=run_label)
+    run_dir = _allocate_run_directory(
+        run_root=run_root,
+        family_id=family_id,
+        run_label=run_label,
+        run_stem=run_stem,
+    )
     output_artifact = describe_output_artifact(Path(output_path), repo_root=resolved_repo_root)
     artifact_payload = {
         key: {"path": _display_path(Path(value), repo_root=resolved_repo_root)}
@@ -151,16 +158,23 @@ def describe_output_artifact(path: Path, *, repo_root: Path) -> OutputArtifact:
     )
 
 
-def _allocate_run_directory(*, run_root: Path, family_id: str, run_label: str | None) -> Path:
+def _allocate_run_directory(
+    *,
+    run_root: Path,
+    family_id: str,
+    run_label: str | None,
+    run_stem: str | None = None,
+) -> Path:
     family_root = run_root / family_id
     family_root.mkdir(parents=True, exist_ok=True)
-    stem = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
+    stem = validate_run_stem(run_stem) if run_stem is not None else generate_run_stem()
+    directory_name = stem
     if run_label:
-        stem = f"{stem}-{_sanitize_path_component(run_label)}"
-    candidate = family_root / stem
+        directory_name = f"{stem}-{_sanitize_path_component(run_label)}"
+    candidate = family_root / directory_name
     suffix = 1
     while candidate.exists():
-        candidate = family_root / f"{stem}-{suffix:02d}"
+        candidate = family_root / f"{directory_name}-{suffix:02d}"
         suffix += 1
     candidate.mkdir(parents=True, exist_ok=False)
     return candidate

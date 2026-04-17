@@ -51,6 +51,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert agcrn.status == "pilot"
     assert agcrn.task_contract.granularity == "farm"
     assert agcrn.dataset_scope == ("kelmarsh", "penmanshiel")
+    assert agcrn.default_output_path == "experiment/artifacts/published/agcrn_official_aligned/{run_timestamp}.csv"
     assert agcrn.supported_feature_protocols == (
         "power_only",
         "power_ws_hist",
@@ -76,6 +77,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert agcrn_masked.status == "pilot"
     assert agcrn_masked.task_contract.granularity == "farm"
     assert agcrn_masked.dataset_scope == ("kelmarsh", "penmanshiel")
+    assert agcrn_masked.default_output_path == "experiment/artifacts/published/agcrn_masked/{run_timestamp}.csv"
     assert agcrn_masked.supported_feature_protocols == ("power_wd_yaw_pmean_hist_sincos_masked",)
     assert agcrn_masked.implementation_bindings == {
         "masked_power_wd_yaw_pmean_hist_sincos_farm_sync": "power_wd_yaw_pmean_hist_sincos_masked",
@@ -83,6 +85,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model.status == "pilot"
     assert world_model.task_contract.granularity == "farm"
     assert world_model.dataset_scope == ("kelmarsh", "penmanshiel")
+    assert world_model.default_output_path == "experiment/artifacts/published/world_model_agcrn_v1/{run_timestamp}.csv"
     assert world_model.supported_feature_protocols == ("world_model_v1",)
     assert world_model.implementation_bindings == {
         "world_model_v1_seq2seq_farm_sync": "world_model_v1",
@@ -90,6 +93,10 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model_baselines.status == "prototype"
     assert world_model_baselines.task_contract.granularity == "farm"
     assert world_model_baselines.dataset_scope == ("kelmarsh",)
+    assert (
+        world_model_baselines.default_output_path
+        == "experiment/artifacts/published/world_model_baselines_v1/{run_timestamp}.csv"
+    )
     assert world_model_baselines.supported_feature_protocols == ("world_model_v1",)
     assert world_model_baselines.implementation_bindings == {
         "world_model_persistence_last_value_v1_farm_sync": "world_model_v1",
@@ -103,6 +110,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model_rollout.status == "prototype"
     assert world_model_rollout.task_contract.granularity == "farm"
     assert world_model_rollout.dataset_scope == ("kelmarsh", "penmanshiel")
+    assert world_model_rollout.default_output_path == "experiment/artifacts/published/world_model_rollout_v1/{run_timestamp}.csv"
     assert world_model_rollout.supported_feature_protocols == ("world_model_v1",)
     assert world_model_rollout.implementation_bindings == {
         "world_model_rollout_v1_farm_sync": "world_model_v1",
@@ -110,6 +118,10 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model_state_space.status == "prototype"
     assert world_model_state_space.task_contract.granularity == "farm"
     assert world_model_state_space.dataset_scope == ("kelmarsh",)
+    assert (
+        world_model_state_space.default_output_path
+        == "experiment/artifacts/published/world_model_state_space_v1/{run_timestamp}.csv"
+    )
     assert world_model_state_space.supported_feature_protocols == ("world_model_v1",)
     assert world_model_state_space.implementation_bindings == {
         "world_model_state_space_v1_farm_sync": "world_model_v1",

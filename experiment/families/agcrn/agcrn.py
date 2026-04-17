@@ -62,7 +62,7 @@ if str(COMMON_DIR) not in sys.path:
 
 import window_protocols  # noqa: E402
 from run_records import record_cli_run  # noqa: E402
-from published_outputs import default_family_output_path  # noqa: E402
+from published_outputs import default_family_output_path, default_family_output_template, generate_run_stem  # noqa: E402
 from window_protocols import (  # noqa: E402
     DEFAULT_WINDOW_PROTOCOL,
     HORIZON_METRIC_SCOPE,
@@ -122,7 +122,7 @@ PROFILE_LOG_PREFIX = "[agcrn] "
 
 _REPO_ROOT = EXPERIMENT_ROOT.parent
 _CACHE_ROOT = _REPO_ROOT / "cache"
-_OUTPUT_PATH = default_family_output_path(repo_root=_REPO_ROOT, family_id=FAMILY_ID)
+_OUTPUT_TEMPLATE = default_family_output_template(repo_root=_REPO_ROOT, family_id=FAMILY_ID)
 _RUN_AGCRN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_agcrn"
 _RUN_STATE_SCHEMA_VERSION = "agcrn.run_agcrn.resume.v1"
 _TRAINING_CHECKPOINT_SCHEMA_VERSION = "agcrn.training_checkpoint.v1"
@@ -507,6 +507,26 @@ def _atomic_write_csv(path: Path, frame: pl.DataFrame) -> None:
 
 def _normalize_output_path(output_path: str | Path) -> Path:
     return Path(output_path).expanduser().resolve()
+
+
+def _default_output_path(*, run_stem: str | None = None) -> Path:
+    return default_family_output_path(repo_root=_REPO_ROOT, family_id=FAMILY_ID, run_stem=run_stem)
+
+
+def _resolve_output_path(
+    output_path: str | Path | None,
+    *,
+    run_stem: str | None = None,
+    resume: bool = False,
+    force_rerun: bool = False,
+) -> Path:
+    if output_path is None:
+        if resume or force_rerun:
+            raise ValueError(
+                f"{FAMILY_ID} requires --output-path when --resume or --force-rerun is used because default publish outputs are timestamped."
+            )
+        return _default_output_path(run_stem=run_stem)
+    return _normalize_output_path(output_path)
 
 
 def _resume_paths_for_output(*, output_path: str | Path, work_root: str | Path) -> ResumePaths:
@@ -2579,7 +2599,7 @@ def run_experiment(
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
     variant_names: Sequence[str] | None = None,
     cache_root: str | Path = _CACHE_ROOT,
-    output_path: str | Path = _OUTPUT_PATH,
+    output_path: str | Path | None = None,
     device: str | None = None,
     max_epochs: int | None = None,
     max_train_origins: int | None = None,
@@ -2601,7 +2621,7 @@ def run_experiment(
 ) -> pl.DataFrame:
     variant_specs = resolve_variant_specs(variant_names)
     runner = job_runner or execute_training_job
-    output = _normalize_output_path(output_path)
+    output = _resolve_output_path(output_path, resume=resume, force_rerun=force_rerun)
     resume_paths = _resume_paths_for_output(output_path=output, work_root=work_root)
     effective_config = _build_effective_config(
         dataset_ids=dataset_ids,
@@ -2804,8 +2824,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=_OUTPUT_PATH,
-        help=f"Output CSV path. Defaults to {_OUTPUT_PATH}.",
+        default=None,
+        help=f"Output CSV path. Defaults to a timestamped publish path under {_OUTPUT_TEMPLATE}.",
     )
     parser.add_argument(
         "--max-train-origins",
@@ -2900,6 +2920,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    run_stem = generate_run_stem()
+    try:
+        resolved_output_path = _resolve_output_path(
+            args.output_path,
+            run_stem=run_stem,
+            resume=args.resume,
+            force_rerun=args.force_rerun,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
     resolved_variant_hyperparameters = {
         spec.model_variant: {
@@ -2919,12 +2949,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         for spec in variant_specs
     }
+    print(f"[{FAMILY_ID}] output_path={resolved_output_path}")
     results = run_experiment(
         dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
         variant_names=tuple(spec.model_variant for spec in variant_specs),
         device=args.device,
         max_epochs=args.epochs,
-        output_path=args.output_path,
+        output_path=resolved_output_path,
         max_train_origins=args.max_train_origins,
         max_eval_origins=args.max_eval_origins,
         seed=args.seed,
@@ -2941,6 +2972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not args.no_record_run:
         recorded_args = vars(args).copy()
+        recorded_args["output_path"] = resolved_output_path
         recorded_args["resolved_variant_hyperparameters"] = resolved_variant_hyperparameters
         record_cli_run(
             family_id=FAMILY_ID,
@@ -2948,15 +2980,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             invocation_kind="family_runner",
             entrypoint="experiment/families/agcrn/run_agcrn.py",
             args=recorded_args,
-            output_path=args.output_path,
+            output_path=resolved_output_path,
             result_row_count=results.height,
             dataset_ids=tuple(args.datasets) if args.datasets else DEFAULT_DATASETS,
             feature_protocol_ids=tuple(spec.feature_protocol_id for spec in variant_specs),
             model_variants=tuple(spec.model_variant for spec in variant_specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("val", "test"),
-            artifacts={"training_history": training_history_output_path(args.output_path)},
+            artifacts={"training_history": training_history_output_path(resolved_output_path)},
             run_label=args.run_label,
+            run_stem=run_stem if args.output_path is None else None,
         )
     return 0
 

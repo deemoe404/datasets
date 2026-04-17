@@ -109,6 +109,41 @@ def _build_masked_temp_cache(cache_root: Path, *, dataset_id: str = "toy_dataset
     (task_dir / "task_context.json").write_text(json.dumps(task_context), encoding="utf-8")
 
 
+def test_main_defaults_output_to_timestamped_publish_path(monkeypatch, capsys) -> None:
+    module = _load_module()
+    expected_output_path = (
+        module._REPO_ROOT
+        / "experiment"
+        / "artifacts"
+        / "published"
+        / module.FAMILY_ID
+        / "20260418-070809.csv"
+    )
+    recorded: dict[str, Path] = {}
+
+    monkeypatch.setattr(module, "generate_run_stem", lambda: "20260418-070809")
+
+    def _fake_run_experiment(**kwargs):
+        recorded["output_path"] = kwargs["output_path"]
+        return pl.DataFrame({"row": [1]})
+
+    monkeypatch.setattr(module, "run_experiment", _fake_run_experiment)
+
+    assert module.main(["--no-record-run"]) == 0
+    assert recorded["output_path"] == expected_output_path
+    assert str(expected_output_path) in capsys.readouterr().out
+
+
+def test_main_requires_output_path_for_resume_or_force_rerun(capsys) -> None:
+    module = _load_module()
+
+    for flag in ("--resume", "--force-rerun"):
+        with pytest.raises(SystemExit) as exc:
+            module.main([flag, "--no-record-run"])
+        assert exc.value.code == 2
+        assert "requires --output-path" in capsys.readouterr().err
+
+
 def test_prepare_dataset_builds_finite_masked_source_tensor(tmp_path, monkeypatch) -> None:
     module = _load_module()
     cache_root = tmp_path / "cache"

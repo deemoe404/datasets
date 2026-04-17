@@ -55,8 +55,8 @@ The default invocation runs the only active variant on both supported datasets
 and writes:
 
 ```text
-../../artifacts/published/agcrn_masked/latest.csv
-../../artifacts/published/agcrn_masked/latest.training_history.csv
+../../artifacts/published/agcrn_masked/<run_timestamp>.csv
+../../artifacts/published/agcrn_masked/<run_timestamp>.training_history.csv
 ```
 
 For ad hoc smoke runs, prefer an explicit output path under
@@ -75,7 +75,7 @@ Useful smoke-test options:
 `run_agcrn_masked.py` supports explicit resume for interrupted family runs:
 
 ```bash
-./.conda/bin/python run_agcrn_masked.py --resume
+./.conda/bin/python run_agcrn_masked.py --output-path ../../artifacts/published/agcrn_masked/<run_timestamp>.csv --resume
 ```
 
 Resume state is family-local and keyed by the resolved `--output-path`:
@@ -90,6 +90,8 @@ Resume state is family-local and keyed by the resolved `--output-path`:
 
 `training_history.csv` records one row per completed epoch and is republished
 beside the selected output CSV as `<output-stem>.training_history.csv`.
+For default timestamped publish outputs, both `--resume` and `--force-rerun`
+must pass the exact prior `--output-path`.
 
 Formal run records are written under
 `experiment/artifacts/runs/agcrn_masked/<timestamp>/manifest.json` unless

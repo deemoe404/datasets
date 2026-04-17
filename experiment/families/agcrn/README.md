@@ -174,8 +174,8 @@ for all selected variants.
 This writes:
 
 ```text
-../../artifacts/published/agcrn_official_aligned/latest.csv
-../../artifacts/published/agcrn_official_aligned/latest.training_history.csv
+../../artifacts/published/agcrn_official_aligned/<run_timestamp>.csv
+../../artifacts/published/agcrn_official_aligned/<run_timestamp>.training_history.csv
 ```
 
 For ad hoc smoke/debug runs, prefer an explicit `--output-path` under
@@ -202,7 +202,7 @@ Useful smoke-test options:
 `run_agcrn.py` now supports explicit resume for interrupted family runs:
 
 ```bash
-./.conda/bin/python run_agcrn.py --resume
+./.conda/bin/python run_agcrn.py --output-path ../../artifacts/published/agcrn_official_aligned/<run_timestamp>.csv --resume
 ```
 
 Resume state is family-local and keyed by the resolved `--output-path`:
@@ -218,6 +218,7 @@ Resume state is family-local and keyed by the resolved `--output-path`:
 Behavior:
 
 - `--resume` is required to continue an interrupted run; the default invocation still starts a fresh run
+- `--resume` and `--force-rerun` both require an explicit `--output-path` when you use the default timestamped publish location
 - completed `(dataset_id, model_variant)` jobs are skipped based on `partial_results.csv`
 - completed epochs are recorded in `training_history.csv` and republished beside
   the result CSV as `<output-stem>.training_history.csv`
@@ -350,7 +351,7 @@ For faster iterations, use `--skip-final` or lower `--screen-train-origins` /
 
 ## Output Schema
 
-`../../artifacts/published/agcrn_official_aligned/latest.csv` is a long result file with:
+`../../artifacts/published/agcrn_official_aligned/<run_timestamp>.csv` is a long result file with:
 
 - `split_name in {val, test}`
 - `eval_protocol in {rolling_origin_no_refit, non_overlap}`

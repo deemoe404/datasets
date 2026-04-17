@@ -36,6 +36,41 @@ def _load_module():
     return module
 
 
+def test_main_defaults_output_to_timestamped_publish_path(monkeypatch, capsys) -> None:
+    module = _load_module()
+    expected_output_path = (
+        module._REPO_ROOT
+        / "experiment"
+        / "artifacts"
+        / "published"
+        / module.FAMILY_ID
+        / "20260418-070809.csv"
+    )
+    recorded: dict[str, Path] = {}
+
+    monkeypatch.setattr(module, "generate_run_stem", lambda: "20260418-070809")
+
+    def _fake_run_experiment(**kwargs):
+        recorded["output_path"] = kwargs["output_path"]
+        return pl.DataFrame({"row": [1]})
+
+    monkeypatch.setattr(module, "run_experiment", _fake_run_experiment)
+
+    assert module.main(["--no-record-run", "--disable-tensorboard"]) == 0
+    assert recorded["output_path"] == expected_output_path
+    assert str(expected_output_path) in capsys.readouterr().out
+
+
+def test_main_requires_output_path_for_resume_or_force_rerun(capsys) -> None:
+    module = _load_module()
+
+    for flag in ("--resume", "--force-rerun"):
+        with pytest.raises(SystemExit) as exc:
+            module.main([flag, "--no-record-run", "--disable-tensorboard"])
+        assert exc.value.code == 2
+        assert "requires --output-path" in capsys.readouterr().err
+
+
 def _prepare_temp_dataset(
     module,
     tmp_path: Path,

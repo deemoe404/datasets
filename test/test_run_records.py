@@ -100,11 +100,17 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
         result_splits=("val", "test"),
         artifacts={"cache_root": repo_root / "cache"},
         run_label="kelmarsh-both-variants",
+        run_stem="20260418-070809",
     )
 
     assert manifest_path.exists()
+    assert manifest_path.parent.name == "20260418-070809-kelmarsh-both-variants"
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert payload["family"]["family_id"] == "agcrn_official_aligned"
+    assert (
+        payload["family"]["default_output_path"]
+        == "experiment/artifacts/published/agcrn_official_aligned/{run_timestamp}.csv"
+    )
     assert payload["selection"]["dataset_ids"] == ["kelmarsh"]
     assert payload["selection"]["feature_protocol_ids"] == [
         "power_only",
@@ -132,6 +138,46 @@ def test_record_cli_run_writes_manifest_with_output_checksum(tmp_path) -> None:
     assert payload["artifacts"]["primary_output"]["exists"] is True
     assert payload["artifacts"]["primary_output"]["sha256"]
     assert payload["invocation"]["run_label"] == "kelmarsh-both-variants"
+
+
+def test_record_cli_run_dedupes_conflicting_run_stem_and_label(tmp_path) -> None:
+    module = _load_module()
+    repo_root = Path(__file__).resolve().parents[1]
+    runs_root = tmp_path / "runs"
+    output_path = tmp_path / "results.csv"
+    output_path.write_text("dataset_id,metric\nkelmarsh,1.0\n", encoding="utf-8")
+
+    first = module.record_cli_run(
+        family_id="world_model_state_space_v1",
+        repo_root=repo_root,
+        runs_root=runs_root,
+        invocation_kind="family_runner",
+        entrypoint="experiment/families/world_model_state_space_v1/run_world_model_state_space_v1.py",
+        args={},
+        output_path=output_path,
+        result_row_count=1,
+        dataset_ids=("kelmarsh",),
+        feature_protocol_ids=("world_model_v1",),
+        run_label="repeat",
+        run_stem="20260418-070809",
+    )
+    second = module.record_cli_run(
+        family_id="world_model_state_space_v1",
+        repo_root=repo_root,
+        runs_root=runs_root,
+        invocation_kind="family_runner",
+        entrypoint="experiment/families/world_model_state_space_v1/run_world_model_state_space_v1.py",
+        args={},
+        output_path=output_path,
+        result_row_count=1,
+        dataset_ids=("kelmarsh",),
+        feature_protocol_ids=("world_model_v1",),
+        run_label="repeat",
+        run_stem="20260418-070809",
+    )
+
+    assert first.parent.name == "20260418-070809-repeat"
+    assert second.parent.name == "20260418-070809-repeat-01"
 
 
 def test_record_cli_run_rejects_protocols_not_supported_by_family(tmp_path) -> None:

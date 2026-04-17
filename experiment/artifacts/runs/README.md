@@ -18,7 +18,7 @@ Each run record is intended to capture:
 
 Run records are separate from:
 
-- `experiment/artifacts/published/<family_id>/latest.csv`: family-level published result files
-- `experiment/artifacts/published/<family_id>/latest.training_history.csv`: epoch-level train history for the current result files
+- `experiment/artifacts/published/<family_id>/<run_timestamp>.csv`: family-level published result files
+- `experiment/artifacts/published/<family_id>/<run_timestamp>.training_history.csv`: epoch-level train history for the matching result files
 - `experiment/families/*/.work/`: resume and chunk artifacts
 - `experiment/artifacts/scratch/`: ad hoc smoke/debug outputs

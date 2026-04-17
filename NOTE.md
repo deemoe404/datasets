@@ -86,7 +86,8 @@ cd experiment/families/world_model_baselines_v1
 tensorboard --logdir ./.work/run_world_model_baselines_v1
 ```
 
-正式运行默认会把结果写到 `experiment/artifacts/published/<family_id>/latest.csv`，并在
+正式运行默认会把结果写到 `experiment/artifacts/published/<family_id>/<timestamp>.csv`，并在
 `experiment/artifacts/runs/<family_id>/<timestamp>/manifest.json` 记录本次调用的参数、
-输出和 git 状态。正式 rerun 建议加上 `--run-label` 并在 clean commit
-上执行。
+输出和 git 状态；配套训练历史文件名是 `<timestamp>.training_history.csv`。默认
+`--resume` / `--force-rerun` 现在都必须显式传入那次运行的 `--output-path`。
+正式 rerun 建议加上 `--run-label` 并在 clean commit 上执行。

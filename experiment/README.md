@@ -24,8 +24,8 @@ architecture stabilizes around `tasks/<task_id>/<feature_protocol_id>/...`.
 
 Canonical runtime artifacts:
 
-- `./artifacts/published/<family_id>/latest.csv`: current formal family-level result CSV
-- `./artifacts/published/<family_id>/latest.training_history.csv`: epoch-level training loss and validation RMSE history for the latest formal result
+- `./artifacts/published/<family_id>/<run_timestamp>.csv`: formal family-level result CSV for one invocation
+- `./artifacts/published/<family_id>/<run_timestamp>.training_history.csv`: epoch-level training loss and validation RMSE history for that result
 - `./artifacts/runs/<family_id>/<timestamp>/manifest.json`: immutable run record for one CLI invocation
 - `./artifacts/scratch/<family_id>/...`: ad hoc smoke/debug outputs
 - `./families/<family>/.work/`: family-local resume, chunk, and checkpoint artifacts

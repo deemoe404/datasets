@@ -92,9 +92,12 @@ Smoke run:
 
 Default formal output:
 
-- `experiment/artifacts/published/world_model_baselines_v1/latest.csv`
-- `experiment/artifacts/published/world_model_baselines_v1/latest.training_history.csv`
+- `experiment/artifacts/published/world_model_baselines_v1/<run_timestamp>.csv`
+- `experiment/artifacts/published/world_model_baselines_v1/<run_timestamp>.training_history.csv`
 - `experiment/artifacts/runs/world_model_baselines_v1/<timestamp>/manifest.json`
+
+Default `--resume` and `--force-rerun` flows must pass the exact historical
+`--output-path` because the formal publish path is timestamped per run.
 
 TensorBoard is enabled by default when the family environment includes the
 `tensorboard` package. The default log root is tied to the output-path hash:
