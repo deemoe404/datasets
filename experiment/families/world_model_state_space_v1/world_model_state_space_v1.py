@@ -256,6 +256,8 @@ _TRAINING_HISTORY_COLUMNS = [
     "train_innovation_loss_last",
     "val_mae_pu",
     "val_rmse_pu",
+    "val_rmse_pu_leads_13_24_mean",
+    "val_rmse_pu_leads_25_36_mean",
     "best_val_mae_pu",
     "best_val_rmse_pu",
     "is_best_epoch",
@@ -269,6 +271,16 @@ _TRAINING_HISTORY_COLUMNS = [
     "learning_rate",
     "amp_enabled",
 ]
+_TRAINING_HISTORY_BACKFILLABLE_COLUMNS = frozenset(
+    {
+        "val_rmse_pu_leads_13_24_mean",
+        "val_rmse_pu_leads_25_36_mean",
+    }
+)
+_VAL_RMSE_GROUP_SPECS = (
+    ("val_rmse_pu_leads_13_24_mean", "leads_13_24_mean", 13, 24),
+    ("val_rmse_pu_leads_25_36_mean", "leads_25_36_mean", 25, 36),
+)
 
 
 @dataclass(frozen=True)
@@ -714,15 +726,45 @@ def _tensorboard_add_text(writer, tag: str, text: str, *, step: int = 0) -> None
     writer.add_text(tag, text, global_step=step)
 
 
+def _mean_horizon_values(values: np.ndarray, *, start_lead: int, end_lead: int) -> float:
+    start_index = max(start_lead - 1, 0)
+    end_index = min(end_lead, int(values.shape[0]))
+    if start_index >= end_index:
+        return math.nan
+    window = np.asarray(values[start_index:end_index], dtype=np.float64)
+    if window.size == 0:
+        return math.nan
+    return float(window.mean())
+
+
+def _horizon_rmse_pu_group_means(metrics: EvaluationMetrics) -> dict[str, float]:
+    return {
+        column_name: _mean_horizon_values(
+            metrics.horizon_rmse_pu,
+            start_lead=start_lead,
+            end_lead=end_lead,
+        )
+        for column_name, _tag_name, start_lead, end_lead in _VAL_RMSE_GROUP_SPECS
+    }
+
+
 def _tensorboard_add_metrics(writer, prefix: str, metrics: EvaluationMetrics, *, step: int) -> None:
     if writer is None:
         return
+    horizon_group_means = _horizon_rmse_pu_group_means(metrics)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/mae_pu", metrics.mae_pu, step)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/rmse_pu", metrics.rmse_pu, step)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/mae_kw", metrics.mae_kw, step)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/rmse_kw", metrics.rmse_kw, step)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/window_count", metrics.window_count, step)
     _tensorboard_add_scalar(writer, f"{prefix}/overall/prediction_count", metrics.prediction_count, step)
+    for _column_name, tag_name, _start_lead, _end_lead in _VAL_RMSE_GROUP_SPECS:
+        _tensorboard_add_scalar(
+            writer,
+            f"{prefix}/horizon_group/rmse_pu/{tag_name}",
+            horizon_group_means[_column_name],
+            step,
+        )
     for lead_index in range(len(metrics.horizon_mae_pu)):
         lead_step = lead_index + 1
         lead_tag = f"lead_{lead_step:02d}"
@@ -1809,10 +1851,15 @@ def _read_training_history(path: str | Path) -> pl.DataFrame:
     if not frame.columns:
         return _empty_training_history_frame()
     missing_columns = [column for column in _TRAINING_HISTORY_COLUMNS if column not in frame.columns]
-    if missing_columns:
+    unsupported_columns = [
+        column for column in missing_columns if column not in _TRAINING_HISTORY_BACKFILLABLE_COLUMNS
+    ]
+    if unsupported_columns:
         raise ValueError(
-            f"Training history at {history_path} is missing expected columns: {missing_columns!r}."
+            f"Training history at {history_path} is missing expected columns: {unsupported_columns!r}."
         )
+    if missing_columns:
+        frame = frame.with_columns(*[pl.lit(None).alias(column) for column in missing_columns])
     return sort_training_history_frame(frame.select(_TRAINING_HISTORY_COLUMNS))
 
 
@@ -2275,6 +2322,7 @@ def train_model(
             )
             val_rmse_pu = float(val_metrics.rmse_pu)
             val_mae_pu = float(val_metrics.mae_pu)
+            val_horizon_rmse_group_means = _horizon_rmse_pu_group_means(val_metrics)
             is_best_epoch = False
             if val_rmse_pu < best_val_rmse_pu - 1e-12:
                 best_val_rmse_pu = val_rmse_pu
@@ -2331,6 +2379,8 @@ def train_model(
                         "train_innovation_loss_last": latest_losses.get("innovation"),
                         "val_mae_pu": val_mae_pu,
                         "val_rmse_pu": val_rmse_pu,
+                        "val_rmse_pu_leads_13_24_mean": val_horizon_rmse_group_means["val_rmse_pu_leads_13_24_mean"],
+                        "val_rmse_pu_leads_25_36_mean": val_horizon_rmse_group_means["val_rmse_pu_leads_25_36_mean"],
                         "best_val_mae_pu": best_val_mae_pu,
                         "best_val_rmse_pu": best_val_rmse_pu,
                         "is_best_epoch": is_best_epoch,

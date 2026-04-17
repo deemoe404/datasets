@@ -5,6 +5,7 @@ import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
@@ -29,6 +30,24 @@ def _load_module():
         / "world_model_state_space_v1.py"
     )
     spec = spec_from_file_location("world_model_state_space_v1", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_search_module():
+    _load_module()
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "experiment"
+        / "families"
+        / "world_model_state_space_v1"
+        / "search_world_model_state_space_v1.py"
+    )
+    spec = spec_from_file_location("search_world_model_state_space_v1", module_path)
     assert spec is not None
     assert spec.loader is not None
     module = module_from_spec(spec)
@@ -181,6 +200,29 @@ def test_default_variants_remain_canonical_only() -> None:
     parser = module.build_arg_parser()
     variant_action = next(action for action in parser._actions if action.dest == "variants")
     assert set(variant_action.choices) == set(module.ALL_VARIANTS)
+
+
+def test_horizon_rmse_group_means_cover_expected_ranges() -> None:
+    module = _load_module()
+    metrics = module.EvaluationMetrics(
+        window_count=1,
+        prediction_count=36,
+        mae_kw=0.0,
+        rmse_kw=0.0,
+        mae_pu=0.0,
+        rmse_pu=0.0,
+        horizon_window_count=np.ones((36,), dtype=np.int64),
+        horizon_prediction_count=np.ones((36,), dtype=np.int64),
+        horizon_mae_kw=np.zeros((36,), dtype=np.float64),
+        horizon_rmse_kw=np.zeros((36,), dtype=np.float64),
+        horizon_mae_pu=np.zeros((36,), dtype=np.float64),
+        horizon_rmse_pu=np.arange(1.0, 37.0, dtype=np.float64),
+    )
+
+    summary = module._horizon_rmse_pu_group_means(metrics)
+
+    assert summary["val_rmse_pu_leads_13_24_mean"] == pytest.approx(18.5)
+    assert summary["val_rmse_pu_leads_25_36_mean"] == pytest.approx(30.5)
 
 
 def test_resolve_hyperparameter_profile_applies_ablation_guardrails() -> None:
@@ -425,6 +467,8 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch, varian
     assert history["train_forecast_loss_mean"].null_count() == 0
     assert history["train_hist_recon_loss_mean"].null_count() == 0
     assert history["train_farm_loss_mean"].null_count() == 0
+    assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 0
+    assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 0
     assert len(rows) == 148
     assert {row["split_name"] for row in rows} == {"val", "test"}
     assert rows[0]["model_variant"] == variant_name
@@ -489,9 +533,33 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     assert "train/loss_mean" in scalar_tags
     assert "train/forecast_loss_mean" in scalar_tags
     assert "val/overall/rmse_pu" in scalar_tags
+    assert "val/horizon_group/rmse_pu/leads_13_24_mean" in scalar_tags
     assert "final/test/rolling_origin_no_refit/overall/rmse_pu" in scalar_tags
+    assert "final/test/rolling_origin_no_refit/horizon_group/rmse_pu/leads_25_36_mean" in scalar_tags
     assert "run/config_json" in text_tags
     assert "final/summary_json" in text_tags
+
+
+def test_read_training_history_backfills_new_horizon_columns(tmp_path) -> None:
+    module = _load_module()
+    history_path = tmp_path / "legacy.training_history.csv"
+    legacy_columns = [
+        column
+        for column in module._TRAINING_HISTORY_COLUMNS
+        if column not in {"val_rmse_pu_leads_13_24_mean", "val_rmse_pu_leads_25_36_mean"}
+    ]
+    pl.DataFrame(
+        {
+            column: [1 if column == "epoch" else "x" if column in {"dataset_id", "model_id", "model_variant", "feature_protocol_id", "task_id", "window_protocol", "device"} else 0]
+            for column in legacy_columns
+        }
+    ).write_csv(history_path)
+
+    history = module._read_training_history(history_path)
+
+    assert history.columns == module._TRAINING_HISTORY_COLUMNS
+    assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 1
+    assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 1
 
 
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:
@@ -615,3 +683,201 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
     ).name == f"{prepared.dataset_id}__{prepared.model_variant}.pt"
     state_payload = json.loads(paths.state_path.read_text(encoding="utf-8"))
     assert state_payload["status"] == "complete"
+
+
+def test_search_screen_one_uses_training_device_for_eval_loaders(monkeypatch, tmp_path) -> None:
+    module = _load_module()
+    search_module = _load_search_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_train_origins=2, max_eval_origins=1)
+    loader_devices: list[str] = []
+
+    def _fake_train_model(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(
+            model=object(),
+            device="cuda",
+            amp_enabled=True,
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+        )
+
+    def _fake_build_dataloader(
+        prepared_dataset,
+        *,
+        windows,
+        batch_size,
+        device,
+        shuffle,
+        seed,
+    ):
+        del prepared_dataset, windows, batch_size, shuffle, seed
+        loader_devices.append(device)
+        return object()
+
+    def _fake_evaluate_model(model, loader, *, device, rated_power_kw, forecast_steps, amp_enabled, progress_label):
+        del model, loader, rated_power_kw, forecast_steps, amp_enabled, progress_label
+        assert device == "cuda"
+        return module.EvaluationMetrics(
+            window_count=1,
+            prediction_count=prepared.forecast_steps * prepared.node_count,
+            mae_kw=1.0,
+            rmse_kw=2.0,
+            mae_pu=0.1,
+            rmse_pu=0.2,
+            horizon_window_count=np.ones((prepared.forecast_steps,), dtype=np.int64),
+            horizon_prediction_count=np.ones((prepared.forecast_steps,), dtype=np.int64),
+            horizon_mae_kw=np.ones((prepared.forecast_steps,), dtype=np.float64),
+            horizon_rmse_kw=np.ones((prepared.forecast_steps,), dtype=np.float64),
+            horizon_mae_pu=np.ones((prepared.forecast_steps,), dtype=np.float64) * 0.1,
+            horizon_rmse_pu=np.linspace(0.1, 0.36, prepared.forecast_steps, dtype=np.float64),
+        )
+
+    monkeypatch.setattr(search_module.state_space, "train_model", _fake_train_model)
+    monkeypatch.setattr(search_module.state_space, "_build_dataloader", _fake_build_dataloader)
+    monkeypatch.setattr(search_module.state_space, "evaluate_model", _fake_evaluate_model)
+
+    row = search_module._screen_one(
+        prepared,
+        config=search_module.COMMON_SCREEN_CONFIGS[0],
+        device="auto",
+        seed=42,
+        max_epochs=1,
+        patience=1,
+    )
+
+    assert loader_devices == ["cuda", "cuda"]
+    assert row["device"] == "cuda"
+    assert row["val_rmse_pu_leads_13_24_mean"] > 0.0
+    assert row["val_rmse_pu_leads_25_36_mean"] > row["val_rmse_pu_leads_13_24_mean"]
+
+
+def test_search_harness_writes_selected_defaults(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    search_module = _load_search_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_train_origins=2, max_eval_origins=1)
+    selected_configs = tuple(search_module.COMMON_SCREEN_CONFIGS[:2])
+    metrics_by_config = {
+        selected_configs[0].name: {
+            "best_val_rmse_pu": 0.18,
+            "val_non_overlap_rmse_pu": 0.19,
+            "val_rmse_pu_leads_13_24_mean": 0.21,
+            "val_rmse_pu_leads_25_36_mean": 0.24,
+            "runtime_seconds": 9.0,
+            "test_rolling_rmse_pu": 0.2,
+        },
+        selected_configs[1].name: {
+            "best_val_rmse_pu": 0.22,
+            "val_non_overlap_rmse_pu": 0.23,
+            "val_rmse_pu_leads_13_24_mean": 0.25,
+            "val_rmse_pu_leads_25_36_mean": 0.29,
+            "runtime_seconds": 5.0,
+            "test_rolling_rmse_pu": 0.24,
+        },
+    }
+
+    def _fake_prepare_dataset(dataset_id: str):
+        assert dataset_id == prepared.dataset_id
+        return prepared
+
+    def _screen_row(prepared_dataset, *, config, device, seed, max_epochs, patience):
+        del device, seed, max_epochs, patience
+        values = metrics_by_config[config.name]
+        return {
+            "dataset_id": prepared_dataset.dataset_id,
+            "model_variant": prepared_dataset.model_variant,
+            "feature_protocol_id": prepared_dataset.feature_protocol_id,
+            "stage": "screen",
+            "config_name": config.name,
+            "farm_loss_weight": config.farm_loss_weight,
+            "best_epoch": 1,
+            "epochs_ran": 1,
+            "best_val_rmse_pu": values["best_val_rmse_pu"],
+            "val_rolling_window_count": len(prepared_dataset.val_rolling_windows),
+            "val_non_overlap_window_count": len(prepared_dataset.val_non_overlap_windows),
+            "val_rolling_rmse_pu": values["best_val_rmse_pu"],
+            "val_rolling_mae_pu": values["best_val_rmse_pu"] / 2.0,
+            "val_non_overlap_rmse_pu": values["val_non_overlap_rmse_pu"],
+            "val_non_overlap_mae_pu": values["val_non_overlap_rmse_pu"] / 2.0,
+            "val_rmse_pu_leads_13_24_mean": values["val_rmse_pu_leads_13_24_mean"],
+            "val_rmse_pu_leads_25_36_mean": values["val_rmse_pu_leads_25_36_mean"],
+            "train_window_count": len(prepared_dataset.train_windows),
+            "runtime_seconds": values["runtime_seconds"],
+            "device": "cpu",
+            "seed": 42,
+        }
+
+    def _final_row(prepared_dataset, *, config, device, seed, max_epochs, patience):
+        del device, seed, max_epochs, patience
+        values = metrics_by_config[config.name]
+        summary = {
+            "dataset_id": prepared_dataset.dataset_id,
+            "model_variant": prepared_dataset.model_variant,
+            "feature_protocol_id": prepared_dataset.feature_protocol_id,
+            "stage": "final",
+            "config_name": config.name,
+            "farm_loss_weight": config.farm_loss_weight,
+            "best_epoch": 1,
+            "epochs_ran": 1,
+            "best_val_rmse_pu": values["best_val_rmse_pu"],
+            "train_window_count": len(prepared_dataset.train_windows),
+            "val_rolling_window_count": len(prepared_dataset.val_rolling_windows),
+            "val_non_overlap_window_count": len(prepared_dataset.val_non_overlap_windows),
+            "test_rolling_window_count": len(prepared_dataset.test_rolling_windows),
+            "test_non_overlap_window_count": len(prepared_dataset.test_non_overlap_windows),
+            "val_rolling_rmse_pu": values["best_val_rmse_pu"],
+            "val_rolling_mae_pu": values["best_val_rmse_pu"] / 2.0,
+            "val_non_overlap_rmse_pu": values["val_non_overlap_rmse_pu"],
+            "val_non_overlap_mae_pu": values["val_non_overlap_rmse_pu"] / 2.0,
+            "val_rmse_pu_leads_13_24_mean": values["val_rmse_pu_leads_13_24_mean"],
+            "val_rmse_pu_leads_25_36_mean": values["val_rmse_pu_leads_25_36_mean"],
+            "test_rolling_rmse_pu": values["test_rolling_rmse_pu"],
+            "test_rolling_mae_pu": values["test_rolling_rmse_pu"] / 2.0,
+            "test_non_overlap_rmse_pu": values["test_rolling_rmse_pu"] + 0.01,
+            "test_non_overlap_mae_pu": (values["test_rolling_rmse_pu"] + 0.01) / 2.0,
+            "runtime_seconds": values["runtime_seconds"],
+            "device": "cpu",
+            "seed": 42,
+        }
+        detail_frame = pl.DataFrame(
+            {
+                "dataset_id": [prepared_dataset.dataset_id],
+                "config_name": [config.name],
+                "test_rolling_rmse_pu": [values["test_rolling_rmse_pu"]],
+            }
+        )
+        return summary, detail_frame
+
+    monkeypatch.setattr(search_module, "_prepare_dataset", _fake_prepare_dataset)
+    monkeypatch.setattr(search_module, "_screen_one", _screen_row)
+    monkeypatch.setattr(search_module, "_final_one", _final_row)
+
+    output_dir = tmp_path / "search"
+    screen_frame, final_frame = search_module.run_search(
+        dataset_ids=(prepared.dataset_id,),
+        config_names=tuple(config.name for config in selected_configs),
+        device="cpu",
+        seed=42,
+        screen_epochs=1,
+        screen_patience=1,
+        full_epochs=1,
+        full_patience=1,
+        top_k=1,
+        output_dir=output_dir,
+    )
+
+    assert screen_frame.height == 2
+    assert final_frame.height == 1
+    assert (output_dir / "screen_summary.csv").exists()
+    assert (output_dir / "final_summary.csv").exists()
+    assert (output_dir / "final_detailed_rows.csv").exists()
+    assert (output_dir / "search_plan.json").exists()
+    assert (output_dir / "selected_defaults.json").exists()
+    assert final_frame["config_name"].to_list() == [selected_configs[0].name]
+    assert final_frame["val_rmse_pu_leads_25_36_mean"].to_list() == [0.24]
+
+    selected_defaults = json.loads((output_dir / "selected_defaults.json").read_text(encoding="utf-8"))
+    assert selected_defaults["selection_rule"] == ["best_val_rmse_pu", "config_name"]
+    chosen = selected_defaults["selected_defaults"][prepared.dataset_id][module.MODEL_VARIANT]
+    assert chosen["config_name"] == selected_configs[0].name
+    assert chosen["farm_loss_weight"] == selected_configs[0].farm_loss_weight

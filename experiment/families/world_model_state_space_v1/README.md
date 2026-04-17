@@ -42,6 +42,19 @@ Smoke run:
   --output-path ../../artifacts/scratch/world_model_state_space_v1/kelmarsh_smoke.csv
 ```
 
+Farm-loss sweep:
+
+```shell
+./.conda/bin/python search_world_model_state_space_v1.py
+```
+
+The search harness keeps the canonical variant fixed and screens
+`farm_loss_weight ∈ {0.0, 0.02, 0.05, 0.1}` with a short full-window budget
+before re-running the top 2 candidates with the formal default budget. It
+writes `screen_summary.csv`, `final_summary.csv`, `final_detailed_rows.csv`,
+`search_plan.json`, and `selected_defaults.json` under
+`experiment/artifacts/scratch/world_model_state_space_v1/search_<date>/`.
+
 Default formal output:
 
 - `experiment/artifacts/published/world_model_state_space_v1/latest.csv`
@@ -58,6 +71,5 @@ Default TensorBoard output:
 - Feature protocol: `world_model_v1`.
 - Task: `next_6h_from_24h`, `history_steps=144`, `forecast_steps=36`.
 - Default variant: `world_model_state_space_v1_farm_sync`.
-- Deferred: search harness, multi-seed orchestration, staged training, robust
-  augmentation, learned residual edges, stratified evaluation, and full ablation
-  matrix.
+- Deferred: multi-seed orchestration, staged training, robust augmentation,
+  learned residual edges, stratified evaluation, and full ablation matrix.
