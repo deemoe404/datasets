@@ -43,7 +43,7 @@ kelmarsh 数据集一共有 6 台风机，每个数据间隔 10 分钟。
 \noindent
 \renewcommand{\arraystretch}{1.15}
 \begin{tabularx}{\linewidth}{@{}L{2.8cm}L{1.4cm}X@{}}
-\texttt{target\_kw} & $y^{pu}$ & 机组 10 分钟平均 per-unit 功率，对应原始字段 \texttt{Power (kW)}；下文统一记 $y^{pu}_{i,t}=target\_kw_{i,t}/rated\_power_i$ \\
+\texttt{target\_kw} & $y$ & 机组 10 分钟平均功率（kW），对应原始字段 \texttt{Power (kW)} \\
 \end{tabularx}
 
 \medskip
@@ -444,7 +444,12 @@ m^{raw}_{k,t}\in\{0,1\},\qquad q_{k,t}=1-m^{raw}_{k,t},
 
 \subsubsection{当前机组观测}
 
-沿用第 1 节数据说明表中约定的目标量与本地观测记号，当前机组观测向量写为
+第 1 节中的原始目标列仍记为 \texttt{target\_kw}，对应机组 10 分钟平均功率（kW）。进入模型前，先按机组额定功率做 per-unit 变换：
+\[
+  y_{i,t}=\texttt{target\_kw}_{i,t},\qquad
+  y^{pu}_{i,t}=\frac{y_{i,t}}{rated\_power_i}=\frac{\texttt{target\_kw}_{i,t}}{rated\_power_i}.
+\]
+再按训练集统计量将连续输入缩放为模型实际使用的 $\widetilde{y}^{pu}_{i,t}$。沿用第 1 节数据说明表中的其余本地观测记号，当前机组观测向量写为
 \begin{equation}
   o_{i,t}=\left[
   \begin{aligned}
