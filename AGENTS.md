@@ -2,6 +2,9 @@
 
 本仓库的作用是整理、缓存、测试和使用风电数据集。目标时空序列风功率任务：6H ahead + 24H look back。使用 `./.conda` 管理数据集处理部分的依赖。
 
+主线实验是experiment/families/world_model_state_space_v1，其他都是辅助实验（例如测试、baseline等）。
+如果对主线实验有新增模块（例如新增了一个版本的输出head），请如实记录在plan/wind_farm_design_revised_v3_input_reorg.tex里面
+
 ## 目录定义
 
 - 确保先阅读 `./README.md` 了解数据集和仓库情况。
