@@ -86,6 +86,7 @@ Dataset = world_model_base.Dataset
 MODEL_ID = "WORLD_MODEL"
 FAMILY_ID = "world_model_state_space_v1"
 MODEL_VARIANT = "world_model_state_space_v1_farm_sync"
+RESIDUAL_PERSISTENCE_MODEL_VARIANT = "world_model_state_space_v1_residual_persistence_farm_sync"
 WAKE_OFF_MODEL_VARIANT = "world_model_state_space_v1_wake_off_farm_sync"
 GRAPH_OFF_MODEL_VARIANT = "world_model_state_space_v1_graph_off_farm_sync"
 NO_FARM_AUX_MODEL_VARIANT = "world_model_state_space_v1_no_farm_aux_farm_sync"
@@ -291,6 +292,7 @@ class ExperimentVariant:
     uses_wake_dynamic: bool = True
     uses_farm_aux: bool = True
     uses_met_aux: bool = True
+    uses_persistence_residual_head: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,6 +359,7 @@ class PreparedDataset:
     wake_geometry_tensor: np.ndarray
     target_pu_filled: np.ndarray
     target_valid_mask: np.ndarray
+    persistence_train_fallback_pu: np.ndarray
     train_windows: world_model_base.FarmWindowDescriptorIndex
     val_rolling_windows: world_model_base.FarmWindowDescriptorIndex
     val_non_overlap_windows: world_model_base.FarmWindowDescriptorIndex
@@ -423,6 +426,11 @@ class ModelOutputs:
 
 VARIANT_SPECS = (
     ExperimentVariant(model_variant=MODEL_VARIANT, feature_protocol_id=FEATURE_PROTOCOL_ID),
+    ExperimentVariant(
+        model_variant=RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        uses_persistence_residual_head=True,
+    ),
     ExperimentVariant(
         model_variant=WAKE_OFF_MODEL_VARIANT,
         feature_protocol_id=FEATURE_PROTOCOL_ID,
@@ -997,6 +1005,25 @@ def _build_state_space_tensors(base: rollout_base.PreparedDataset, *, raw_wake_g
     }
 
 
+def _train_history_target_mean(
+    *,
+    local_history_tensor: np.ndarray,
+    train_windows: world_model_base.FarmWindowDescriptorIndex,
+    history_steps: int,
+    node_count: int,
+) -> np.ndarray:
+    sums = np.zeros((node_count,), dtype=np.float64)
+    counts = np.zeros((node_count,), dtype=np.float64)
+    for target_index in train_windows.target_indices:
+        history_slice = slice(int(target_index) - history_steps, int(target_index))
+        values = local_history_tensor[history_slice, :, _LOCAL_VALUE_START]
+        unavailable = local_history_tensor[history_slice, :, _LOCAL_MASK_START]
+        available = unavailable < 0.5
+        sums += np.where(available, values, 0.0).sum(axis=0)
+        counts += available.sum(axis=0)
+    return np.where(counts > 0, sums / np.maximum(counts, 1.0), 0.0).astype(np.float32)
+
+
 def prepare_dataset(
     dataset_id: str,
     *,
@@ -1023,6 +1050,12 @@ def prepare_dataset(
         cache_root=cache_root,
     )
     tensors = _build_state_space_tensors(base, raw_wake_geometry=raw_wake_geometry)
+    persistence_train_fallback_pu = _train_history_target_mean(
+        local_history_tensor=tensors["local_tensor"],  # type: ignore[arg-type]
+        train_windows=base.train_windows,
+        history_steps=base.history_steps,
+        node_count=base.node_count,
+    )
     prepared = PreparedDataset(
         dataset_id=base.dataset_id,
         model_variant=resolved_variant.model_variant,
@@ -1056,6 +1089,7 @@ def prepare_dataset(
         wake_geometry_tensor=tensors["wake_geometry"],  # type: ignore[arg-type]
         target_pu_filled=base.target_pu_filled,
         target_valid_mask=base.target_valid_mask,
+        persistence_train_fallback_pu=persistence_train_fallback_pu,
         train_windows=base.train_windows,
         val_rolling_windows=base.val_rolling_windows,
         val_non_overlap_windows=base.val_non_overlap_windows,
@@ -1180,6 +1214,7 @@ if nn is not None and F is not None:
             turbine_indices: np.ndarray,
             pairwise_tensor: np.ndarray,
             wake_geometry_tensor: np.ndarray,
+            persistence_fallback_pu: np.ndarray,
             z_dim: int,
             h_dim: int,
             global_state_dim: int,
@@ -1195,6 +1230,7 @@ if nn is not None and F is not None:
             dropout: float,
             uses_graph: bool,
             uses_wake_dynamic: bool,
+            uses_persistence_residual_head: bool,
             wake_lambda_x: float,
             wake_lambda_y: float,
             wake_kappa: float,
@@ -1211,6 +1247,7 @@ if nn is not None and F is not None:
             self.edge_message_dim = edge_message_dim
             self.uses_graph = bool(uses_graph)
             self.uses_wake_dynamic = bool(uses_wake_dynamic)
+            self.uses_persistence_residual_head = bool(uses_persistence_residual_head)
             self.wake_lambda_x = wake_lambda_x
             self.wake_lambda_y = wake_lambda_y
             self.wake_kappa = wake_kappa
@@ -1219,6 +1256,10 @@ if nn is not None and F is not None:
             self.register_buffer("turbine_indices", torch.from_numpy(np.asarray(turbine_indices, dtype=np.int64)))
             self.register_buffer("pairwise_features", torch.from_numpy(np.asarray(pairwise_tensor, dtype=np.float32)))
             self.register_buffer("wake_geometry", torch.from_numpy(np.asarray(wake_geometry_tensor, dtype=np.float32)))
+            self.register_buffer(
+                "persistence_fallback_pu",
+                torch.from_numpy(np.asarray(persistence_fallback_pu, dtype=np.float32)),
+            )
             self.register_buffer("farm_weights", torch.full((node_count,), 1.0 / float(node_count), dtype=torch.float32))
             self.register_buffer(
                 "edge_diagonal_mask",
@@ -1371,8 +1412,46 @@ if nn is not None and F is not None:
             batch_size = z.shape[0]
             static_nodes = self._static(batch_size) if static is None else static
             tau = self.tau_embedding(torch.full((batch_size,), tau_index, dtype=torch.long, device=z.device))
-            raw = self.forecast_decoder(torch.cat((self._node_state(z, h), g[:, None, :].expand(-1, self.node_count, -1), static_nodes, tau[:, None, :].expand(-1, self.node_count, -1)), dim=-1))
-            return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(raw)
+            return self.forecast_decoder(
+                torch.cat(
+                    (
+                        self._node_state(z, h),
+                        g[:, None, :].expand(-1, self.node_count, -1),
+                        static_nodes,
+                        tau[:, None, :].expand(-1, self.node_count, -1),
+                    ),
+                    dim=-1,
+                )
+            )
+
+        def _persistence_anchor(self, local_history):
+            target_values = local_history[:, :, :, _LOCAL_VALUE_START]
+            unavailable = local_history[:, :, :, _LOCAL_MASK_START]
+            available = unavailable < 0.5
+            history_positions = torch.arange(target_values.shape[1], device=local_history.device, dtype=torch.int64)[None, :, None]
+            last_valid_positions = torch.where(
+                available,
+                history_positions,
+                torch.full_like(history_positions, -1),
+            ).amax(dim=1)
+            has_valid = last_valid_positions >= 0
+            gathered = target_values.gather(dim=1, index=last_valid_positions.clamp_min(0).unsqueeze(1)).squeeze(1)
+            fallback = self.persistence_fallback_pu.to(device=target_values.device, dtype=target_values.dtype)[None, :].expand(
+                target_values.shape[0],
+                -1,
+            )
+            return torch.where(has_valid, gathered, fallback)
+
+        def _decode_forecast(self, raw, *, persistence_anchor):
+            if not self.uses_persistence_residual_head:
+                return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(raw)
+            if persistence_anchor is None:
+                raise ValueError("Residual-over-persistence head requires a persistence anchor.")
+            return torch.clamp(
+                persistence_anchor[:, :, None] + raw,
+                min=0.0,
+                max=1.0 + self.bounded_output_epsilon,
+            )
 
         def _farm_prediction(self, forecast):
             return self.farm_bias + self.farm_scale * (forecast.squeeze(-1) * self.farm_weights[None]).sum(dim=1, keepdim=True)
@@ -1380,6 +1459,7 @@ if nn is not None and F is not None:
         def forward(self, local_history, context_history, context_future):
             batch_size = local_history.shape[0]
             static = self._static(batch_size)
+            persistence_anchor = self._persistence_anchor(local_history) if self.uses_persistence_residual_head else None
             z, h, g = self._initial_states(
                 batch_size,
                 dtype=local_history.dtype,
@@ -1414,7 +1494,8 @@ if nn is not None and F is not None:
             mets = []
             for horizon_index in range(context_future.shape[1]):
                 z, h, g, met = self._transition(z, h, g, context_future[:, horizon_index], static=static)
-                forecast = self._forecast(z, h, g, horizon_index, static=static)
+                raw_forecast = self._forecast(z, h, g, horizon_index, static=static)
+                forecast = self._decode_forecast(raw_forecast, persistence_anchor=persistence_anchor)
                 forecasts.append(forecast)
                 farms.append(self._farm_prediction(forecast))
                 mets.append(met)
@@ -1448,6 +1529,7 @@ def build_model(
     turbine_indices: np.ndarray,
     pairwise_tensor: np.ndarray,
     wake_geometry_tensor: np.ndarray,
+    persistence_fallback_pu: np.ndarray,
     z_dim: int,
     h_dim: int,
     global_state_dim: int,
@@ -1467,6 +1549,7 @@ def build_model(
     bounded_output_epsilon: float,
     uses_graph: bool = True,
     uses_wake_dynamic: bool = True,
+    uses_persistence_residual_head: bool = False,
 ):
     _require_torch()
     return WorldModelStateSpace(
@@ -1478,6 +1561,7 @@ def build_model(
         turbine_indices=turbine_indices,
         pairwise_tensor=pairwise_tensor,
         wake_geometry_tensor=wake_geometry_tensor,
+        persistence_fallback_pu=persistence_fallback_pu,
         z_dim=z_dim,
         h_dim=h_dim,
         global_state_dim=global_state_dim,
@@ -1493,6 +1577,7 @@ def build_model(
         dropout=dropout,
         uses_graph=uses_graph,
         uses_wake_dynamic=uses_wake_dynamic,
+        uses_persistence_residual_head=uses_persistence_residual_head,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -2148,6 +2233,7 @@ def train_model(
         turbine_indices=prepared_dataset.turbine_indices,
         pairwise_tensor=prepared_dataset.pairwise_tensor,
         wake_geometry_tensor=prepared_dataset.wake_geometry_tensor,
+        persistence_fallback_pu=prepared_dataset.persistence_train_fallback_pu,
         z_dim=z_dim,
         h_dim=h_dim,
         global_state_dim=global_state_dim,
@@ -2163,6 +2249,7 @@ def train_model(
         dropout=dropout,
         uses_graph=variant_spec.uses_graph,
         uses_wake_dynamic=variant_spec.uses_wake_dynamic,
+        uses_persistence_residual_head=variant_spec.uses_persistence_residual_head,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,

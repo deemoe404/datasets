@@ -152,6 +152,7 @@ def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> 
         "turbine_indices": prepared.turbine_indices,
         "pairwise_tensor": prepared.pairwise_tensor,
         "wake_geometry_tensor": prepared.wake_geometry_tensor,
+        "persistence_fallback_pu": prepared.persistence_train_fallback_pu,
         "z_dim": 4,
         "h_dim": 6,
         "global_state_dim": 8,
@@ -167,6 +168,7 @@ def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> 
         "dropout": 0.0,
         "uses_graph": variant_spec.uses_graph,
         "uses_wake_dynamic": variant_spec.uses_wake_dynamic,
+        "uses_persistence_residual_head": variant_spec.uses_persistence_residual_head,
         "wake_lambda_x": module.DEFAULT_WAKE_LAMBDA_X,
         "wake_lambda_y": module.DEFAULT_WAKE_LAMBDA_Y,
         "wake_kappa": module.DEFAULT_WAKE_KAPPA,
@@ -189,6 +191,7 @@ def test_registry_declares_kelmarsh_only() -> None:
     assert 'dataset_scope = ["kelmarsh"]' in text
     assert 'supported_feature_protocols = ["world_model_v1"]' in text
     assert 'world_model_state_space_v1_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_residual_persistence_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_wake_off_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_graph_off_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_no_farm_aux_farm_sync = "world_model_v1"' in text
@@ -227,6 +230,7 @@ def test_default_variants_remain_canonical_only() -> None:
     assert module.DEFAULT_VARIANTS == (module.MODEL_VARIANT,)
     assert set(module.ALL_VARIANTS) == {
         module.MODEL_VARIANT,
+        module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
         module.WAKE_OFF_MODEL_VARIANT,
         module.GRAPH_OFF_MODEL_VARIANT,
         module.NO_FARM_AUX_MODEL_VARIANT,
@@ -308,6 +312,7 @@ def test_prepare_dataset_builds_state_space_contract(tmp_path, monkeypatch) -> N
     assert prepared.context_future_channels == 7
     assert prepared.static_feature_count == 6
     assert prepared.pairwise_feature_count == 7
+    assert prepared.persistence_train_fallback_pu.shape == (prepared.node_count,)
     assert prepared.local_input_feature_names[:17] == ("target_pu", *_LOCAL_OBSERVATION_VALUE_COLUMNS)
     assert prepared.local_input_feature_names[17:34] == (
         "target_kw__mask",
@@ -392,6 +397,96 @@ def test_forward_outputs_shapes_and_bounded_forecast(tmp_path, monkeypatch) -> N
     assert float(outputs.future_predictions.max().item()) <= 1.05
 
 
+def test_residual_persistence_zero_decoder_matches_persistence_anchor(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(module, prepared, variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT)
+    )
+    for parameter in model.forecast_decoder.parameters():
+        parameter.data.zero_()
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    context_history = torch_module.from_numpy(sample[1][None])
+    context_future = torch_module.from_numpy(sample[2][None])
+
+    with torch_module.no_grad():
+        persistence_anchor = model._persistence_anchor(local_history)
+        outputs = model(local_history, context_history, context_future)
+
+    expected = persistence_anchor[:, None, :, None].expand(-1, prepared.forecast_steps, -1, -1)
+    assert torch_module.allclose(outputs.future_predictions, expected)
+
+
+def test_persistence_anchor_backtracks_to_last_available_history_value(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(module, prepared, variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT)
+    )
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    local_history[:, -1, 0, module._LOCAL_MASK_START] = 1.0
+    local_history[:, -2, 0, module._LOCAL_MASK_START] = 0.0
+    local_history[:, -2, 0, module._LOCAL_VALUE_START] = 0.37
+
+    anchor = model._persistence_anchor(local_history)
+
+    assert float(anchor[0, 0].item()) == pytest.approx(0.37)
+
+
+def test_persistence_anchor_uses_train_fallback_when_history_missing(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(module, prepared, variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT)
+    )
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    local_history[:, :, 0, module._LOCAL_MASK_START] = 1.0
+
+    anchor = model._persistence_anchor(local_history)
+
+    assert float(anchor[0, 0].item()) == pytest.approx(float(prepared.persistence_train_fallback_pu[0]))
+
+
+def test_canonical_zero_decoder_keeps_absolute_head_behavior(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    for parameter in model.forecast_decoder.parameters():
+        parameter.data.zero_()
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    context_history = torch_module.from_numpy(sample[1][None])
+    context_future = torch_module.from_numpy(sample[2][None])
+
+    with torch_module.no_grad():
+        outputs = model(local_history, context_history, context_future)
+
+    expected = (1.0 + module.DEFAULT_BOUNDED_OUTPUT_EPSILON) * 0.5
+    assert torch_module.allclose(outputs.future_predictions, torch_module.full_like(outputs.future_predictions, expected))
+
+
 def test_wake_off_zeros_dynamic_wake_but_keeps_graph_path(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -453,6 +548,7 @@ def test_all_missing_node_keeps_prior_in_update(tmp_path, monkeypatch) -> None:
     "variant_name",
     (
         "world_model_state_space_v1_farm_sync",
+        "world_model_state_space_v1_residual_persistence_farm_sync",
         "world_model_state_space_v1_graph_off_farm_sync",
         "world_model_state_space_v1_no_met_aux_farm_sync",
     ),

@@ -14,6 +14,7 @@ SCADA/PMU/global observations are used only as supervised targets.
 Active variants:
 
 - `world_model_state_space_v1_farm_sync`: canonical model.
+- `world_model_state_space_v1_residual_persistence_farm_sync`: predicts an additive residual over the per-turbine last-value persistence anchor.
 - `world_model_state_space_v1_wake_off_farm_sync`: disables only dynamic wake features.
 - `world_model_state_space_v1_graph_off_farm_sync`: bypasses graph aggregation.
 - `world_model_state_space_v1_no_farm_aux_farm_sync`: sets farm auxiliary loss weight to `0.0`.
@@ -21,6 +22,7 @@ Active variants:
 
 The default runner behavior remains canonical-only; ablations must be selected
 explicitly with repeated `--variant` flags.
+The search harness also remains canonical-only in this revision.
 
 ## Run
 
