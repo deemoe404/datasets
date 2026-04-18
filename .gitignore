@@ -10,6 +10,7 @@ plan/latex-tmp/
 plan/*.pdf
 plan/*.synctex.gz
 experiment/*.csv
+experiment/artifacts/published/**/*.log
 experiment/families/*/.conda/
 experiment/families/*/.work*/
 experiment/artifacts/scratch/**
