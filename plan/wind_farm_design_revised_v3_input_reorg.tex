@@ -184,6 +184,20 @@ is\_observed                 & 当前机组行是否观测到     & farm\_is\_fu
                              &                          & farm\_has\_all\_targets      & 是否所有机组都有目标值   \\
 \end{tabularx}
 
+\subsubsection{三维审计位}
+
+除上述原始/聚合字段外，当前任务 bundle 还会额外携带 3 维审计位，用于描述该 turbine-timestamp
+在时间对齐与质量检查之后的可观测性和脏数据状态。这 3 个量由数据处理流水线生成，再由
+feature protocol 与 family 读取，不属于原始 SCADA 物理观测。其定义如下：
+
+\noindent
+\renewcommand{\arraystretch}{1.15}
+\begin{tabularx}{\linewidth}{@{}L{3.2cm}L{4.5cm}X@{}}
+$\chi^{observed}_{i,t}$ & 对应 \texttt{is\_observed} & 该 turbine-timestamp 在统一时间网格上是否真实有观测行。 \\
+$\chi^{row\_bad}_{i,t}$ & 对应 \texttt{quality\_flags} & 该行的目标级质量标记是否非空；非空时记为 1。 \\
+$\chi^{feat\_bad}_{i,t}$ & 对应 \texttt{feature\_quality\_flags} & 该行的特征级质量标记是否非空；非空时记为 1。 \\
+\end{tabularx}
+
 \subsection{v1 数据契约（固定 schema）}
 
 为避免实现阶段因特征选择、时间对齐或缩放方式不同而出现“同一网络、不同数据世界”的问题，v1 版本冻结如下数据契约。所有信号在进入模型前必须先重采样到数据集定义的统一时间步长 $\Delta=10\,\mathrm{min}$，并以该统一时间戳作为唯一的状态更新时刻。因此默认配置中的 $144$ 步 lookback 对应 $24$ 小时历史窗口，$36$ 步 horizon 对应 $6$ 小时未来窗口。除已知未来日历外，任何未来时刻的真实观测都不得作为模型输入。固定契约见表~\ref{tab:data_contract_v1}。
@@ -199,8 +213,7 @@ is\_observed                 & 当前机组行是否观测到     & farm\_is\_fu
 \hline
 节点静态特征 $s_i$ & 全时可见 & 连续量按训练集统计缩放；类别量做 embedding & 仅允许使用文档中声明的几何与额定属性；跨风场实验应谨慎使用 turbine id embedding \\
 边静态几何 $p^{stat}_{i\leftarrow j}$ & 全时可见 & 由坐标预计算；角度转为 $\sin/\cos$；距离建议做 $\log(1+d)$ 与 rotor-diameter 归一化 & 不使用任何未来风向/未来功率参与静态几何构造 \\
-当前机组观测 $o_{i,t}$ & 仅历史/当前可见 & 与统一时间戳 $t$ 对齐；连续量按训练集统计缩放；每维保留原始 mask 与 $\Delta t$ & 不得把 $t+\tau$ 的真实机组量喂入 Transition；缺失插补后仍需保留 mask/time-gap 作为输入 \\
-可选运行状态 $u^{ops}_{i,t}$ & 仅历史/当前可见 & 状态位保留二值形式；限功率/设定值按 per-unit 缩放；离散控制模式做 embedding 或 one-hot & 若数据不可得，则显式置零并将对应 mask 设为 0；实验记录需声明是否启用该组信号 \\
+当前机组观测 $o_{i,t}$ & 仅历史/当前可见 & 与统一时间戳 $t$ 对齐；连续量按训练集统计缩放；每维保留原始 mask 与 $\Delta t$，并附带审计位 $a^{audit}_{i,t}$ & 不得把 $t+\tau$ 的真实机组量喂入 Transition；缺失插补后仍需保留 mask/time-gap/审计位作为输入 \\
 场级 PMU / 场级上下文 & 仅历史/当前可见；未来仅允许由模型内部预测 & 与统一时间戳做因果对齐，并校正不同链路时延；连续量按训练集统计缩放 & 不得直接把未来真实 PMU 当作已知输入；场级量既可作为当前上下文，也可作为辅助监督目标 \\
 已知未来外生量 $u^{known}_{t+\tau}$ & 未来可见 & v1 仅包含日历 $\mathrm{cal}_{t+\tau}$ & 任何额外未来气象量都必须显式声明来源（NWP/预报系统）后才能纳入 \\
 mask / $\Delta t$ / 可用率 & 与各组字段同步可见 & $q=1$ 表示原始值在插补前可用；$\Delta t$ 为距最近一次有效观测的时间；站点级可用率由节点 mask 聚合得到 & mask 与 $\Delta t$ 必须贯穿 node / edge / site 全链路，而不只是用于 loss masking \\
@@ -210,10 +223,10 @@ mask / $\Delta t$ / 可用率 & 与各组字段同步可见 & $q=1$ 表示原始
 
 \subsection{运行状态、脏数据与实现边界}
 
-风电 SCADA/PMU 的难点不只来自气动耦合，还来自限电、停机、故障、检修、人工控制、传感器卡死以及不同链路时延。v1 版本将这些因素分成两类处理：
+风电 SCADA/PMU 的难点不只来自气动耦合，还来自停机、告警、通信异常、传感器卡死以及不同链路时延。当前 v1 实现并未单独引入一条独立的 $u^{ops}$ 输入分支，而是采用如下固定约定：
 \begin{itemize}
-  \item 若数据侧可提供机组运行状态、限功率、控制模式、告警/检修标志，则将其显式作为 $u^{ops}_{i,t}$ 输入，并在实验记录中注明“ops-enabled”。
-  \item 若这些信号不可得，则用全零占位并令对应 mask 为 0，同时在文档和实验结果中明确声明：模型将把 $y^{pu}$、pitch、yaw error 等信号中的运营干预与真实气动效应混合建模，因此性能上限与可解释性都会受限。
+  \item 本地与场级事件摘要（如 `$evt\_*$`、`$farm_evt\_$*`）直接作为观测通道进入 $o_{i,t}$ 与 $f_t$，用于表达停机、警告、信息类事件及其活跃强度。
+  \item 若未来补充限功率、控制模式或更细粒度的运行状态标签，可在后续版本中再单独扩展输入契约；当前 v1 文档不再把这类信号当作已实现输入。
 \end{itemize}
 
 脏数据处理方面，原始数据清洗与模型内 mask-aware 处理必须同时存在：前者负责明显异常点、重复记录、非物理值与时间戳错位的修正；后者负责在保留缺失模式信息的前提下完成状态估计。模型侧不允许把“已经插补后的值”误当作“真实观测”，因此插补、mask、time-gap 需要成组输入网络。
@@ -459,10 +472,15 @@ m^{raw}_{k,t}\in\{0,1\},\qquad q_{k,t}=1-m^{raw}_{k,t},
   e^{evt}_{i,t}
   \right].
 \end{equation*}
-
 \[
 q^{obs}_{i,t}\in\{0,1\}^{d_{obs}},\qquad
-\Delta t^{obs}_{i,t}\ge 0.
+\Delta t^{obs}_{i,t}\ge 0,\qquad
+  a^{audit}_{i,t}=
+  \left[
+    \chi^{observed}_{i,t},\,
+    \chi^{row\_bad}_{i,t},\,
+    \chi^{feat\_bad}_{i,t}
+  \right].
 \]
 
 其中：
@@ -471,7 +489,6 @@ q^{obs}_{i,t}\in\{0,1\}^{d_{obs}},\qquad
   y_{i,t}=\texttt{target\_kw}_{i,t},\qquad
   y^{pu}_{i,t}=\frac{y_{i,t}}{rated\_power_i}.
 \]
-
 \[
   e^{evt}_{i,t}=
   \left[
@@ -485,7 +502,6 @@ q^{obs}_{i,t}\in\{0,1\}^{d_{obs}},\qquad
 \]
 
 \subsubsection{当前场级可见量}
-
 \[
 c_t=\left[
   f_t,\,
@@ -495,7 +511,6 @@ c_t=\left[
   \mathrm{cal}_t
 \right].
 \]
-
 \[
 q^{farm}_t\in\{0,1\}^{d_{farm}},\qquad
 \Delta t^{farm}_t\ge 0.
@@ -514,7 +529,6 @@ e^{farm,evt}_t=
   farm\_evt^{info}_t
 \right].
 \]
-
 \[
 f_t=
 \left[
@@ -538,19 +552,25 @@ f_t=
 \]
 
 \[
-s^{site}_t=
-\left[
-  \widetilde{ws}^{mean}_t,\,
-  \widetilde{wd}^{\cos,mean}_t,\,
-  \widetilde{wd}^{\sin,mean}_t,\,
-  \widetilde{r}^{wd}_t,\,
+\begin{aligned}
+\bar{ws}_t&=\frac{\sum_i q^{ws}_{i,t}\, ws_{i,t}}{\epsilon+\sum_i q^{ws}_{i,t}},\qquad
+\rho^{ws}_t=\frac{1}{N}\sum_i q^{ws}_{i,t}, \qquad \rho^{wd}_t=\frac{1}{N}\sum_i q^{wd}_{i,t}, \\
+C_t&=\frac{\sum_i q^{wd}_{i,t}\, wd^{\cos}_{i,t}}{\epsilon+\sum_i q^{wd}_{i,t}},\qquad
+S_t=\frac{\sum_i q^{wd}_{i,t}\, wd^{\sin}_{i,t}}{\epsilon+\sum_i q^{wd}_{i,t}},\qquad
+R_t=\sqrt{C_t^2+S_t^2}.
+\end{aligned}
+\]
+\[
+s^{site}_t=\left[
+  \widetilde{\bar{ws}}_t,\,
+  C_t,\,
+  S_t,\,
+  R_t,\,
   \rho^{ws}_t,\,
   \rho^{wd}_t
-\right],
+\right].
 \]
 
-其中：$\widetilde{r}^{wd}_t$ 表示风向圆均值的 resultant length，
-$\rho^{ws}_t,\rho^{wd}_t$ 分别表示风速与风向的可用率。
 
 \subsubsection{已知未来外生量}
 
@@ -559,265 +579,238 @@ $\rho^{ws}_t,\rho^{wd}_t$ 分别表示风速与风向的可用率。
 u^{known}_{t+\tau}=\mathrm{cal}_{t+\tau},\qquad u^{known}_{i,t+\tau}=\emptyset,\qquad \tau=1,\ldots,H.
 \]
 
-\subsection{由当前输入与先验状态构造的中间量}
-
-以下量在时刻 $t$ 由当前输入和 prior state 共同构造，用于 Update / message passing；它们服务于模型内部计算，但不属于外部输入。
-
-\subsubsection{源机组子集与源机组摘要}
-
-先从当前观测中选出与 wake 强度最相关的源机组变量：
+\subsection{缺测处理}
+时间缺口特征 $\Delta t^{obs}_{i,t}$ 由最近一次可用观测距离按时间步累计得到，并在
 \[
-x^{src}_{j,t}=\left[\widetilde{y}^{pu}_{j,t},\, \widetilde{ws}_{j,t},\, \widetilde{\theta}^{pitch}_{j,t},\, ye^{\sin}_{j,t},\, ye^{\cos}_{j,t}\right],
+\Delta t_{max}=72\Delta=720\,\mathrm{min}
 \]
-并抽取与其最相关的可选运行状态子集
-\[
-u^{ops,src}_{j,t}=\left[\chi^{avail}_{j,t},\, \chi^{curt}_{j,t},\, \chi^{fault}_{j,t},\, \widetilde{p}^{limit,pu}_{j,t}\right].
-\]
-
-对应的子集 mask 与 time-gap 由完整向量投影得到：
-\[
-q^{src}_{j,t}=\Pi_{src}(q^{obs}_{j,t}),\qquad
-q^{ops,src}_{j,t}=\Pi_{ops,src}(q^{ops}_{j,t}),
-\]
-\[
-\Delta t^{src}_{j,t}=\Pi_{src}(\Delta t^{obs}_{j,t}),\qquad
-\Delta t^{ops,src}_{j,t}=\Pi_{ops,src}(\Delta t^{ops}_{j,t}).
-\]
-
-再通过一个 mask-aware 编码器得到供边网络使用的源机组摘要：
-\[
-v^{src}_{j,t}=\mathrm{Enc}_{src}\left([x^{src,imp}_{j,t},\, u^{ops,src,imp}_{j,t},\, q^{src}_{j,t},\, q^{ops,src}_{j,t},\, \Delta t^{src}_{j,t},\, \Delta t^{ops,src}_{j,t},\, z^-_{j,t},\, h^-_{j,t},\, s_j]\right).
-\]
-
-其中 $x^{src,imp}_{j,t}$ 与 $u^{ops,src,imp}_{j,t}$ 的插补规则与后文 Enc\_obs 小节完全一致。
-
-\subsubsection{Update 阶段的动态边特征}
-
-记当前时刻沿有效风向旋转后的顺风/横风投影距离分别为 $d^{\parallel}_{ij,t}$ 与 $d^{\perp}_{ij,t}$，并以源机组叶轮直径 $D_j$ 做尺度归一化。为避免逆风方向出现指数爆炸，定义平滑的 wake 先验 gate：
-\[
-\psi^{wake}_{ij,t}=\sigma\!\left(\kappa d^{\parallel}_{ij,t}\right)\cdot \exp\!\left(-\frac{\mathrm{ReLU}(d^{\parallel}_{ij,t})}{\lambda_x}\right)\cdot \exp\!\left(-\left(\frac{d^{\perp}_{ij,t}}{\lambda_y}\right)^2\right).
-\]
-
-于是 Update 阶段实际送入边网络的动态特征写为
-\[
-p^{dyn,upd}_{i\leftarrow j,t}=\left[\frac{d^{\parallel}_{ij,t}}{D_j},\, \frac{d^{\perp}_{ij,t}}{D_j},\, \psi^{wake}_{ij,t},\, v^{src}_{j,t}\right].
-\]
-
-\subsubsection{站点级当前上下文}
-
-记 $q^{ws}_{i,t}$ 为风速通道可用标志，$q^{wd}_{i,t}$ 为风向编码成对可用标志；站点级统计只允许使用当前时刻\textbf{真实可用}的节点观测，不使用任何插补值。定义
-\[
-\bar{ws}_t=\frac{\sum_i q^{ws}_{i,t}\, ws_{i,t}}{\epsilon+\sum_i q^{ws}_{i,t}},\qquad \rho^{ws}_t=\frac{1}{N}\sum_i q^{ws}_{i,t},
-\]
-\[
-C_t=\frac{\sum_i q^{wd}_{i,t}\, wd^{\cos}_{i,t}}{\epsilon+\sum_i q^{wd}_{i,t}},\qquad
-S_t=\frac{\sum_i q^{wd}_{i,t}\, wd^{\sin}_{i,t}}{\epsilon+\sum_i q^{wd}_{i,t}},
-\]
-\[
-R_t=\sqrt{C_t^2+S_t^2},\qquad \rho^{wd}_t=\frac{1}{N}\sum_i q^{wd}_{i,t}.
-\]
-
-于是当前时刻送入图网络和全局状态更新的站点级上下文为
-\[
-c_t=\left[\widetilde{\bar{ws}}_t,\, C_t,\, S_t,\, R_t,\, \rho^{ws}_t,\, \rho^{wd}_t,\, f_t,\, q^{farm}_t,\, \mathrm{cal}_t\right].
-\]
-
-\subsection{rollout 阶段的模型内部预测量}
-
-以下量仅在未来窗的 Transition 中由模型内部解码得到；它们不是已知未来输入，也不应与 $u^{known}_{t+\tau}$ 混写。
-
-\subsubsection{未来站点级摘要与未来动态图特征}
-
-\[
-\hat c^{met}_{t+\tau}=\mathrm{Dec}^{met}_g\left(g_{t+\tau-1|t},\, \mathrm{cal}_{t+\tau}\right),\qquad
-\hat c_{t+\tau}=\left[\hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}\right]
-\]
-\[
-\hat\eta^{src}_{j,t+\tau}=\mathrm{MLP}^{pred}_{src}\left([z_{j,t+\tau-1|t},\, h_{j,t+\tau-1|t},\, s_j,\, g_{t+\tau-1|t}]\right)
-\]
-\[
-\hat p^{dyn,pred}_{i\leftarrow j,t+\tau}=\left[\frac{\hat d^{\parallel}_{ij,t+\tau}}{D_j},\, \frac{\hat d^{\perp}_{ij,t+\tau}}{D_j},\, \hat\psi^{wake}_{ij,t+\tau},\, \hat\eta^{src}_{j,t+\tau}\right].
-\]
-
-其中 $\hat d^{\parallel}_{ij,t+\tau}$、$\hat d^{\perp}_{ij,t+\tau}$ 与 $\hat\psi^{wake}_{ij,t+\tau}$ 基于 $\hat c^{met}_{t+\tau}$ 计算得到。语义上，$\hat c^{met}_{t+\tau}$ 被视为\textbf{弱监督的站点级气象摘要}；而 $\hat\eta^{src}_{j,t+\tau}$ 在 v1 中被视为\textbf{仅供边网络使用的 latent source summary}，默认不做逐维直接监督，除非后续实验显式打开 source auxiliary head。
-
-若训练阶段可以从真实未来观测中构造站点级统计量，则定义
-\[
-c^{met,*}_{t+\tau}=\left[\widetilde{\bar{ws}}_{t+\tau},\, C_{t+\tau},\, S_{t+\tau},\, R_{t+\tau},\, \rho^{ws}_{t+\tau},\, \rho^{wd}_{t+\tau}\right]
-\]
-并用其作为 $\hat c^{met}_{t+\tau}$ 的弱监督目标；而 $\hat\eta^{src}_{j,t+\tau}$ 只通过 forecast / graph losses 间接训练，默认不引入额外的 pointwise reconstruction loss。
+处截断。若某节点在时刻 $t$ 的全部本地观测通道都不可用，则该时刻跳过本机 posterior update，直接保留 prior state；全局池化则在有可用节点时只对可用节点求平均，若所有节点都不可用则退回到简单平均。
 
 \subsection{结构详情}
 
-\subsubsection{观测编码 Enc\_obs}
-Enc\_obs 负责把当前连续观测与本机运行状态联合编码成供图聚合和本机更新使用的节点表示。连续观测沿用 GRU-D 风格的缺失感知输入处理：
-$$x_{k,t}^{imp}=q^{obs}_{k,t}x_{k,t}+(1-q^{obs}_{k,t})\left(\gamma^{obs}_{k,t}x_{k,t}^{last}+(1-\gamma^{obs}_{k,t})\bar x_k\right)$$
+\subsubsection{初始化}
+\[
+g^+_{t_0-1}=\frac{1}{N}\sum_{i=1}^{N}\mathrm{MLP}^{init}_g(\tilde s_i)\qquad
+z^+_{i,t_0-1}=W^{init}_z \tilde s_i,\qquad
+h^+_{i,t_0-1}=W^{init}_h \tilde s_i.
+\]
 
-对离散/控制类运行状态，v1 不做双向插值，而是采用 ``last valid hold + mask/time-gap 显式输入''：
-$$u^{ops,imp}_{l,t}=q^{ops}_{l,t}u^{ops}_{l,t}+(1-q^{ops}_{l,t})u^{ops,last}_{l,t}$$
+其中：
+\[
+\tilde s_i=\mathrm{Enc}_{stat}(s_i,\, \mathrm{emb}(i))
+\]
 
-$$\xi^{ops}_{i,t}=\mathrm{LN}\left(\mathrm{MLP}_{ops}\left([u^{ops,imp}_{i,t},\, q^{ops}_{i,t},\, \Delta t^{ops}_{i,t},\, s_i]\right)\right)$$
+\subsubsection{本地观测编码}
+\[
+r_{i,t}=\mathrm{Enc}_{obs}\left([\bar o^{enc}_{i,t},\, s_i]\right).
+\]
 
-$$r_{i,t}=\mathrm{LN}\left(\mathrm{MLP}_{obs}\left([x_{i,t}^{imp},\, \xi^{ops}_{i,t},\, q^{obs}_{i,t},\, q^{ops}_{i,t},\, \Delta t^{obs}_{i,t},\, \Delta t^{ops}_{i,t},\, s_i]\right)\right)$$
+其中：
+\[
+\bar o^{enc}_{i,t}=\left[o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, a^{audit}_{i,t}\right],
+\]
 
-\noindent 其中 $\Delta t^{obs}_{k,t}$ 是第 $k$ 个连续观测变量距离最近一次有效观测的时间，$\Delta t^{ops}_{l,t}$ 是第 $l$ 个运行状态量距离最近一次有效记录的时间，$q$ 为相应 mask，$\gamma^{obs}_{k,t}$ 为随时间间隔衰减的可信度。这样一来，运营干预不仅会进入源机组摘要 $v^{src}$，也会直接作用于本机观测编码与局部状态更新。需要强调的是：$r_{i,t}$ 只是 learned representation；真正用于 filtering correction 的 innovation 仍在原始观测空间中构造，而不是直接在 $r$ 空间中求差。
+\subsubsection{图消息传递与 wake 动态}
+\[
+e_{i\leftarrow j,t}^{upd}=\mathrm{MLP}_e^{upd}\left([s_i,\, s_j,\, p_{i\leftarrow j}^{stat},\, p_{i\leftarrow j,t}^{dyn,upd},\, v^{src}_{j,t},\, g_t^-,\, s^{site}_t,\, \mathrm{cal}_t]\right),
+\]
+\[
+a_{i\leftarrow j,t}^{upd}=\sigma\left(\mathrm{MLP}_a^{upd}\left([s_i,\, s_j,\, p_{i\leftarrow j}^{stat},\, p_{i\leftarrow j,t}^{dyn,upd},\, v^{src}_{j,t},\, g_t^-,\, s^{site}_t,\, \mathrm{cal}_t]\right)\right),
+\]
+\[
+m_{i,t}^{upd}=\frac{\sum_{j\neq i} a^{upd}_{i\leftarrow j,t}e^{upd}_{i\leftarrow j,t}}{\epsilon+\sum_{j\neq i} a^{upd}_{i\leftarrow j,t}}.
+\]
 
-\subsubsection{动态图消息传递 $f_{\theta}$、$\Sigma(\varphi)$、$\Sigma(\psi)$}
-为同时保留“平均邻居画像”和“累计上游负担”，聚合阶段不再只用加权平均，而是并行提取 sum / mean / mass / max 四个通道。
+其中：
+\[
+v^{src}_{j,t}=\mathrm{Enc}^{upd}_{src}\left([\bar o^{enc}_{j,t},\, z^-_{j,t},\, h^-_{j,t},\, s_j]\right).
+\]
 
-Update 阶段：
-$$e_{i\leftarrow j,t}^{upd}=\mathrm{MLP}_e^{upd}\left([s_i,\, s_j,\, p_{i\leftarrow j}^{stat},\, p_{i\leftarrow j,t}^{dyn,upd},\, g_t^-,\, c_t]\right)$$
-
-$$a_{i\leftarrow j,t}^{upd}=\sigma\left(\mathrm{MLP}_a^{upd}\left([s_i,\, s_j,\, p_{i\leftarrow j}^{stat},\, p_{i\leftarrow j,t}^{dyn,upd},\, g_t^-,\, c_t]\right)\right)$$
-
-$$s_{i,t}^{sum}=\sum_{j\in\mathcal N(i)} a^{upd}_{i\leftarrow j,t}e^{upd}_{i\leftarrow j,t},\qquad s_{i,t}^{mean}=\frac{s_{i,t}^{sum}}{\epsilon+\sum_j a^{upd}_{i\leftarrow j,t}}$$
-
-$$s_{i,t}^{mass}=\sum_{j\in\mathcal N(i)} a^{upd}_{i\leftarrow j,t},\qquad s_{i,t}^{max}=\max_{j\in\mathcal N(i)}\left(a^{upd}_{i\leftarrow j,t}e^{upd}_{i\leftarrow j,t}\right)$$
-
-$$m_{i,t}^{upd}=\mathrm{MLP}^{upd}_{\Sigma}\left([r_{i,t},\, s_{i,t}^{sum},\, s_{i,t}^{mean},\, s_{i,t}^{mass},\, s_{i,t}^{max}]\right)$$
-
-Transition 阶段：
-$$e^{pred}_{i\leftarrow j,t+\tau}=\mathrm{MLP}^{pred}_{e}\Big([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, z_{j,t+\tau-1|t},\, h_{j,t+\tau-1|t},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\Big)$$
-
-$$a^{pred}_{i\leftarrow j,t+\tau}=\sigma\Big(\mathrm{MLP}^{pred}_{a}\big([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, z_{j,t+\tau-1|t},\, h_{j,t+\tau-1|t},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\big)\Big)$$
-
-$$\hat s_{i,t+\tau}^{sum}=\sum_{j\in\mathcal N(i)} a^{pred}_{i\leftarrow j,t+\tau}e^{pred}_{i\leftarrow j,t+\tau},\qquad \hat s_{i,t+\tau}^{mean}=\frac{\hat s_{i,t+\tau}^{sum}}{\epsilon+\sum_j a^{pred}_{i\leftarrow j,t+\tau}}$$
-
-$$\hat s_{i,t+\tau}^{mass}=\sum_{j\in\mathcal N(i)} a^{pred}_{i\leftarrow j,t+\tau},\qquad \hat s_{i,t+\tau}^{max}=\max_{j\in\mathcal N(i)}\left(a^{pred}_{i\leftarrow j,t+\tau}e^{pred}_{i\leftarrow j,t+\tau}\right)$$
-
-$$m^{pred}_{i,t+\tau}=\mathrm{MLP}^{pred}_{\Sigma}\left([\hat s_{i,t+\tau}^{sum},\, \hat s_{i,t+\tau}^{mean},\, \hat s_{i,t+\tau}^{mass},\, \hat s_{i,t+\tau}^{max}]\right)$$
-
-\subsubsection{图构造与邻域更新的最终约定}
-v1 将用于几何旋转的风向固定为站点级 masked circular mean：
-$$\theta^{site}_t=\mathrm{atan2}(S_t,\, C_t),\qquad \hat\theta^{site}_{t+\tau}=\mathrm{atan2}(\hat S_{t+\tau},\, \hat C_{t+\tau})$$
-历史窗与未来窗都按该角度对 $(\Delta x,\Delta y)$ 做旋转，得到 $d^{\parallel}$ 与 $d^{\perp}$。为避免每步在全图上重新搜边，v1 先依据静态几何构造一个\textbf{固定候选池}：
-$$\mathcal E^{cand}(i)=\left\{j\neq i\;\middle|\; d^{(RD)}_{ij}\le r_{cand}\right\},\qquad r_{cand}=25.$$
-每个时间步只在 $\mathcal E^{cand}(i)$ 内更新 $d^{\parallel}$、$d^{\perp}$、$\psi^{wake}$ 与动态边特征，并按 wake gate 取物理 top-$K$：
-$$\mathcal N^{phys}_t(i)=\mathrm{TopK}_{j\in \mathcal E^{cand}(i)}\left(\psi^{wake}_{ij,t},\, K\right),\qquad K=8\sim 12.$$
-
-为补充纯几何图无法覆盖的非局地相关性，再引入少量 learned residual edges。其打分由节点嵌入形成的低秩自适应得分给出：
-$$a^{res}_{i\leftarrow j}=\frac{\xi_i^\top \xi_j}{\sqrt{d_{res}}},\qquad \mathcal E^{res}(i)=\mathrm{TopK}_{j\notin \mathcal E^{cand}(i)}\left(a^{res}_{i\leftarrow j},\, K_{res}\right).$$
-最终邻域定义为
-$$\mathcal N_t(i)=\mathcal N^{phys}_t(i)\cup \mathcal E^{res}(i).$$
-
-\noindent v1 默认\textbf{不保留 self-loop}，因为节点自身的信息已经通过 $r_i$、$z_i$、$h_i$ 与 $s_i$ 直接输入 Update / Transition；若同时加入 self-loop，往往会形成重复计数。
+\[
+\psi^{wake}_{ij,t}=\sigma\!\left(\kappa d^{\parallel}_{ij,t}\right)\cdot \exp\!\left(-\frac{\mathrm{ReLU}(d^{\parallel}_{ij,t})}{\lambda_x}\right)\cdot \exp\!\left(-\left(\frac{d^{\perp}_{ij,t}}{\lambda_y}\right)^2\right),
+\]
+\[
+d^{\parallel}_{ij,t}=\Delta x_{ij} C_t+\Delta y_{ij} S_t,
+\qquad
+d^{\perp}_{ij,t}=-\Delta x_{ij} S_t+\Delta y_{ij} C_t.
+\]
+\[
+p^{dyn,upd}_{i\leftarrow j,t}=\left[d^{\parallel}_{ij,t},\, d^{\perp}_{ij,t},\, \psi^{wake}_{ij,t}\right].
+\]
 
 \subsubsection{历史窗口中的 prior propagation 与 filtering 闭环}
-历史窗口中的状态闭环按 ``\textbf{先 Transition 得到 prior，再用真实观测做 Update}'' 执行。为避免训练/推理阶段出现两套不同的状态机，v1 默认\textbf{共享} rollout 阶段的 Transition / Transition$_g$ 参数来完成历史窗的 prior 传播，而不是另外再写一套 history-only dynamics。给定上一时刻后验
-$$\left\{z^+_{i,t-1},\, h^+_{i,t-1}\right\}_{i=1}^N,\qquad g^+_{t-1},$$
-先由上一时刻后验状态解码当前时刻的先验上下文：
-$$\hat c^{met}_{t|t-1}=\mathrm{Dec}^{met}_g\left(g^+_{t-1},\, \mathrm{cal}_{t}\right),\qquad \bar c_{t|t-1}=\left[\hat c^{met}_{t|t-1},\, \mathrm{cal}_{t}\right]$$
-$$\hat\eta^{src}_{j,t|t-1}=\mathrm{MLP}^{pred}_{src}\left([z^+_{j,t-1},\, h^+_{j,t-1},\, s_j,\, g^+_{t-1}]\right)$$
-$$\hat p^{dyn,pred}_{i\leftarrow j,t|t-1}=\left[\frac{\hat d^{\parallel}_{ij,t|t-1}}{D_j},\, \frac{\hat d^{\perp}_{ij,t|t-1}}{D_j},\, \hat\psi^{wake}_{ij,t|t-1},\, \hat\eta^{src}_{j,t|t-1}\right].$$
-随后在当前时刻的候选邻域 $\mathcal N_t(i)$ 内计算先验图消息：
-$$m^{pred}_{i,t|t-1}=\Sigma^{pred}\left(\left\{e^{pred}_{i\leftarrow j,t|t-1}\right\}_{j\in \mathcal N_t(i)}\right).$$
-并用与 rollout 完全相同的局部/全局转移接口完成一步 prior propagation：
-$$\left(z^-_{i,t},\, h^-_{i,t}\right)=\mathrm{Transition}\left(z^+_{i,t-1},\, h^+_{i,t-1},\, m^{pred}_{i,t|t-1},\, g^+_{t-1},\, \bar c_{t|t-1},\, s_i\right)$$
-$$\bar n^{tr}_{t|t-1}=\mathrm{Pool}^{tr}\left(\{z^+_{i,t-1},\, h^+_{i,t-1},\, s_i\}_{i=1}^N\right),\qquad g^-_{t}=\mathrm{Transition}_g\left(g^+_{t-1},\, \bar n^{tr}_{t|t-1},\, \bar c_{t|t-1}\right).$$
-最后再用真实观测执行 posterior correction。这里将局部更新与全局更新显式拆开，以消除 Update / Update$_g$ 接口歧义：
-$$\left\{z^+_{i,t},\, h^+_{i,t}\right\}_{i=1}^N=\mathrm{Update}\left(\left\{z^-_{i,t},\, h^-_{i,t}\right\}_{i=1}^N,\, g^-_t,\, \left\{o_{i,t}\right\}_{i=1}^N,\, \left\{\xi^{ops}_{i,t}\right\}_{i=1}^N,\, c_t,\, \left\{s_i\right\}_{i=1}^N\right)$$
-$$\bar n^+_{t}=\mathrm{Pool}^{+}\left(\{z^+_{i,t},\, h^+_{i,t},\, s_i,\, \rho^{node}_{i,t}\}_{i=1}^N\right),\qquad g^+_{t}=\mathrm{Update}_g\left(g^-_t,\, \bar n^+_t,\, c_t\right).$$
-这样历史窗、验证推理与测试推理使用的是同一套 local/global state machine，只是历史窗在每步 prior 传播之后还会再接入真实观测做一次 posterior correction。
+历史窗口中的状态闭环按 ``\textbf{先 Transition 得到 prior，再用真实观测做 Update}'' 执行。当前实现在第一个历史步 $t_0$ 上直接从初始化状态做 correction；对后续历史步 $t>t_0$，共享 rollout 阶段的 Transition / Transition$_g$ 参数完成 prior propagation，而不是额外再写一套 history-only dynamics。
 
-\subsubsection{初始化与长缺测处理}
-v1 将每个样本窗口的首个时刻记为 $t_0$。初始后验状态由静态特征唯一决定：
-$$z^+_{i,t_0-1}=W^{init}_z s_i,\qquad h^+_{i,t_0-1}=W^{init}_h s_i$$
-$$g^+_{t_0-1}=W^{init}_g\left(\frac{1}{N}\sum_{i=1}^{N}\mathrm{MLP}^{init}_g(s_i)\right).$$
-当首个时间步不存在最近一次有效观测时，固定采用以下初始化规则：
-$$x^{last}_{k,t_0-1}=\bar x_k,\qquad u^{ops,last}_{l,t_0-1}=0,\qquad q^{obs,last}_{k,t_0-1}=0,\qquad q^{ops,last}_{l,t_0-1}=0$$
-$$\Delta t^{obs}_{k,t_0}=\Delta t^{ops}_{l,t_0}=\Delta t_{max},\qquad \Delta t_{max}=72\Delta=720\,\mathrm{min}. $$
-若某台机组在样本窗口中连续 $G_{gap}=36$ 个时间步（即 $6$ 小时）以上对关键局部观测子集 $\{y^{pu},ws,rotor\_rpm,gen\_rpm,pitch\}$ 全部缺失，则对应时间段内停止本机 Update，仅保留 Transition 传播，并强制其池化权重 $\omega^{pool}_{i,t}=0$。若该关键子集在整个 $144$ 步历史窗口内均缺失，则该 turbine-window 不参与 $L_{hist\_recon}$ 与 $L_{forecast}$ 的局部项，只保留其对场级约束的占位影响。
+给定上一时刻后验
+\[
+\left\{z^+_{i,t-1},\, h^+_{i,t-1}\right\}_{i=1}^N,\qquad g^+_{t-1},
+\]
+先由上一时刻全局状态解码当前时刻的先验站点级摘要
+\[
+\hat c^{met}_{t|t-1}=\mathrm{Dec}^{met}_g\left(g^+_{t-1},\, \mathrm{cal}_{t}\right),\qquad
+\hat c_{t|t-1}=\left[\hat c^{met}_{t|t-1},\, \mathrm{cal}_{t}\right],
+\]
+再由上一时刻节点状态构造先验源机组摘要
+\[
+\hat\eta^{src}_{j,t|t-1}=\mathrm{Enc}^{pred}_{src}\left([z^+_{j,t-1},\, h^+_{j,t-1},\, g^+_{t-1},\, s_j]\right).
+\]
+于是历史 prior propagation 阶段的动态图特征写为
+\[
+\hat p^{dyn,pred}_{i\leftarrow j,t|t-1}=\left[\hat d^{\parallel}_{ij,t|t-1},\, \hat d^{\perp}_{ij,t|t-1},\, \hat\psi^{wake}_{ij,t|t-1}\right],
+\]
+并由
+\[
+e^{pred}_{i\leftarrow j,t|t-1}=\mathrm{MLP}_e^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t|t-1},\, \hat\eta^{src}_{j,t|t-1},\, g^+_{t-1},\, \hat c_{t|t-1}]\right),
+\]
+\[
+a^{pred}_{i\leftarrow j,t|t-1}=\sigma\left(\mathrm{MLP}_a^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t|t-1},\, \hat\eta^{src}_{j,t|t-1},\, g^+_{t-1},\, \hat c_{t|t-1}]\right)\right),
+\]
+\[
+m^{pred}_{i,t|t-1}=\frac{\sum_{j\neq i} a^{pred}_{i\leftarrow j,t|t-1}e^{pred}_{i\leftarrow j,t|t-1}}{\epsilon+\sum_{j\neq i} a^{pred}_{i\leftarrow j,t|t-1}}
+\]
+得到先验图消息。随后用共享的 Transition 接口完成一步 prior propagation：
+\[
+z^-_{i,t}=\mathrm{GRU}^{tr}_z\left([m^{pred}_{i,t|t-1},\, g^+_{t-1},\, \hat c^{met}_{t|t-1},\, \mathrm{cal}_t,\, h^+_{i,t-1},\, s_i],\, z^+_{i,t-1}\right),
+\]
+\[
+h^-_{i,t}=\mathrm{GRU}^{tr}_h\left([z^-_{i,t},\, m^{pred}_{i,t|t-1},\, g^+_{t-1},\, \hat c^{met}_{t|t-1},\, \mathrm{cal}_t,\, s_i],\, h^+_{i,t-1}\right).
+\]
+\noindent 同时，全局 prior state 记为 $g_t^-$，其更新方式见后文的 Update$_g$ / Transition$_g$ 小节。
 
-\subsubsection{隐状态的更新与转移}
-Update 阶段的 innovation 在原始观测空间中构造，而不是在 $r$ 空间中直接做差。先用 prior state 预测当前观测：
-$$\hat o^-_{i,t}=\mathrm{Dec}_{obs}\left([z^-_{i,t},\, h^-_{i,t},\, g_t^-,\, s_i]\right)$$
+最后再用真实观测执行 posterior correction。先由 prior state 解码当前观测：
+\[
+\hat o^-_{i,t}=\mathrm{Dec}^{prior}_{obs}\left([z^-_{i,t},\, h^-_{i,t},\, g_t^-,\, s_i]\right),
+\]
+再构造 masked residual 与 innovation：
+\[
+\delta o_{i,t}=q^{obs}_{i,t}\odot\left(o_{i,t}-\hat o^-_{i,t}\right),
+\qquad
+\nu_{i,t}=\mathrm{Enc}_{\nu}\left([\hat o^-_{i,t},\, \delta o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, r_{i,t}]\right).
+\]
+于是局部 posterior update 写为
+\[
+z^+_{i,t}=\mathrm{GRU}^{upd}_z\left([\nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, z^-_{i,t}\right),
+\]
+\[
+h^+_{i,t}=\mathrm{GRU}^{upd}_h\left([z^+_{i,t},\, \nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, h^-_{i,t}\right).
+\]
+\noindent 若该时刻节点 $i$ 没有任何可用本地观测，则保持 $z^+_{i,t}=z^-_{i,t}$、$h^+_{i,t}=h^-_{i,t}$。
 
-再构造 masked residual：
-$$\delta o_{i,t}=q^{obs}_{i,t}\odot\left(o_{i,t}-\hat o^-_{i,t}\right)$$
+\subsubsection{rollout 阶段的 Transition 与内部预测量}
+未来窗不再接入真实观测，只保留 open-loop transition。对每个 horizon 步 $\tau=1,\ldots,H$，先由上一时刻全局状态解码未来站点级摘要：
+\[
+\hat c^{met}_{t+\tau}=\mathrm{Dec}^{met}_g\left(g_{t+\tau-1|t},\, \mathrm{cal}_{t+\tau}\right),\qquad
+\hat c_{t+\tau}=\left[\hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}\right].
+\]
+再由上一时刻节点状态构造供边网络使用的 future source summary：
+\[
+\hat\eta^{src}_{j,t+\tau}=\mathrm{Enc}^{pred}_{src}\left([z_{j,t+\tau-1|t},\, h_{j,t+\tau-1|t},\, g_{t+\tau-1|t},\, s_j]\right).
+\]
+于是 rollout 阶段的动态图特征写为
+\[
+\hat p^{dyn,pred}_{i\leftarrow j,t+\tau}=\left[\hat d^{\parallel}_{ij,t+\tau},\, \hat d^{\perp}_{ij,t+\tau},\, \hat\psi^{wake}_{ij,t+\tau}\right],
+\]
+并由
+\[
+e^{pred}_{i\leftarrow j,t+\tau}=\mathrm{MLP}_e^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, \hat\eta^{src}_{j,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\right),
+\]
+\[
+a^{pred}_{i\leftarrow j,t+\tau}=\sigma\left(\mathrm{MLP}_a^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, \hat\eta^{src}_{j,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\right)\right),
+\]
+\[
+m^{pred}_{i,t+\tau}=\frac{\sum_{j\neq i} a^{pred}_{i\leftarrow j,t+\tau}e^{pred}_{i\leftarrow j,t+\tau}}{\epsilon+\sum_{j\neq i} a^{pred}_{i\leftarrow j,t+\tau}}
+\]
+得到未来图消息。
 
-并将其编码成 innovation：
-$$\nu_{i,t}=\mathrm{Enc}_{\nu}\left([\hat o^-_{i,t},\, \delta o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, r_{i,t},\, \xi^{ops}_{i,t}]\right)$$
+随后用 open-loop Transition 继续推进节点状态：
+\[
+z_{i,t+\tau|t}=\mathrm{GRU}^{tr}_z\left([m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau},\, h_{i,t+\tau-1|t},\, s_i],\, z_{i,t+\tau-1|t}\right),
+\]
+\[
+h_{i,t+\tau|t}=\mathrm{GRU}^{tr}_h\left([z_{i,t+\tau|t},\, m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau},\, s_i],\, h_{i,t+\tau-1|t}\right).
+\]
 
-\noindent 其中 $r_{i,t}$ 只作为辅助表征输入，不再作为 innovation 的主语义坐标系；$\xi^{ops}_{i,t}$ 则确保运营干预会直接进入本机更新路径。
-
-对于快变量：
-$$q_{i,t}^z=\left[z_{i,t}^-,\, \nu_{i,t},\, \xi^{ops}_{i,t},\, m_{i,t}^{upd},\, g_t^-,\, c_t,\, s_i\right]$$
-
-$$\rho_{i,t}^z=\sigma\left(W_r^zq_{i,t}^z+b_r^z\right)$$
-
-$$\tilde z_{i,t}^{upd}=\tanh\left(W_h^z\left[\rho_{i,t}^z\odot z_{i,t}^-,\, \nu_{i,t},\, \xi^{ops}_{i,t},\, m_{i,t}^{upd},\, g_t^-,\, c_t,\, s_i\right]+b_h^z\right)$$
-
-$$\alpha_{i,t}^z=\sigma\left(W_\alpha^zq_{i,t}^z+b_\alpha^z\right)$$
-
-$$z_{i,t}^+=(1-\alpha_{i,t}^z)\odot z_{i,t}^-+\alpha_{i,t}^z\odot \tilde z_{i,t}^{upd}$$
-
-对于慢变量：
-$$\bar \nu_{i,t}=\mathrm{MLP}_{lp}\left([\nu_{i,t},\, \xi^{ops}_{i,t},\, m_{i,t}^{upd},\, z_{i,t}^+-z_{i,t}^-]\right)$$
-
-$$q_{i,t}^h=\left[h_{i,t}^-,\, z_{i,t}^+,\, \bar \nu_{i,t},\, \xi^{ops}_{i,t},\, m_{i,t}^{upd},\, g_t^-,\, c_t,\, s_i\right]$$
-
-$$\rho_{i,t}^h=\sigma\left(W_r^hq_{i,t}^h+b_r^h\right)$$
-
-$$\tilde h_{i,t}^{upd}=\tanh\left(W_h^h\left[\rho_{i,t}^h\odot h_{i,t}^-,\, z_{i,t}^+,\, \bar \nu_{i,t},\, \xi^{ops}_{i,t},\, m_{i,t}^{upd},\, g_t^-,\, c_t,\, s_i\right]+b_h^h\right)$$
-
-$$\alpha_{i,t}^h=\alpha^{h,max}\cdot \sigma\left(W_\alpha^hq_{i,t}^h+b_\alpha^h\right),\qquad \alpha^{h,max}\in [0.05,0.2]$$
-
-$$h_{i,t}^+=(1-\alpha_{i,t}^h)\odot h_{i,t}^-+\alpha_{i,t}^h\odot \tilde h_{i,t}^{upd}$$
-
-Transition 阶段：
-$$q^{z,tr}_{i,t+\tau}=\left[z_{i,t+\tau-1|t},\, h_{i,t+\tau-1|t},\, m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau},\, s_i\right]$$
-
-$$\rho^{z,tr}_{i,t+\tau}=\sigma\left(W^{z,tr}_{r}q^{z,tr}_{i,t+\tau}+b^{z,tr}_{r}\right)$$
-
-$$\tilde z^{tr}_{i,t+\tau}=\tanh\Big(W^{z,tr}_{h}\big[\rho^{z,tr}_{i,t+\tau}\odot z_{i,t+\tau-1|t},\, h_{i,t+\tau-1|t},\, m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau},\, s_i\big]+b^{z,tr}_{h}\Big)$$
-
-$$\beta^{z}_{i,t+\tau}=\sigma\left(W^{z,tr}_{\beta}q^{z,tr}_{i,t+\tau}+b^{z,tr}_{\beta}\right)$$
-
-$$z_{i,t+\tau|t}=(1-\beta^{z}_{i,t+\tau})\odot z_{i,t+\tau-1|t}+\beta^{z}_{i,t+\tau}\odot \tilde z^{tr}_{i,t+\tau}$$
-
-$$q^{h,tr}_{i,t+\tau}=\left[h_{i,t+\tau-1|t},\, z_{i,t+\tau|t},\, m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau},\, s_i\right]$$
-
-$$\tilde h^{tr}_{i,t+\tau}=\tanh\Big(W^{h,tr}_{2}\, \mathrm{SiLU}(W^{h,tr}_{1}q^{h,tr}_{i,t+\tau})\Big)$$
-
-$$\beta^{h}_{i,t+\tau}=\beta^{h,\max}\cdot \sigma\left(W^{h,tr}_{\beta}q^{h,tr}_{i,t+\tau}+b^{h,tr}_{\beta}\right),\qquad \beta^{h,\max}\in[0.05,0.15]$$
-
-$$h_{i,t+\tau|t}=(1-\beta^{h}_{i,t+\tau})\odot h_{i,t+\tau-1|t}+\beta^{h}_{i,t+\tau}\odot \tilde h^{tr}_{i,t+\tau}$$
+\noindent 语义上，$\hat c^{met}_{t+\tau}$ 是未来站点级摘要的内部预测量。若训练阶段可以从真实未来观测构造站点级统计量，则定义
+\[
+c^{met,*}_{t+\tau}=\left[\widetilde{\bar{ws}}_{t+\tau},\, C_{t+\tau},\, S_{t+\tau},\, R_{t+\tau},\, \rho^{ws}_{t+\tau},\, \rho^{wd}_{t+\tau}\right]
+\]
+并用其作为 $\hat c^{met}_{t+\tau}$ 的弱监督目标；$\hat\eta^{src}_{j,t+\tau}$ 则仅作为 latent source summary，通过 forecast / graph losses 间接训练。
 
 \subsubsection{全局状态 Update\_g / Transition\_g}
-为避免实现者写出两套不同的 global dynamics，v1 明确固定两个接口：
-$$g_t^+=\mathrm{Update}_g\left(g_t^-,\, \bar n_t^+,\, c_t\right),\qquad g' = \mathrm{Transition}_g\left(g,\, \bar n^{tr},\, \bar c\right).$$
-其中 Update$_g$ 只在历史窗的 posterior correction 之后调用；Transition$_g$ 同时用于历史窗 prior propagation 和未来 rollout，输入签名在两种场景下保持完全一致。
+历史窗的 posterior correction 之后，当前实现先对节点后验状态做带可用性掩码的平均池化，再更新全局状态。记
+\[
+\rho^{node}_{i,t}=
+\begin{cases}
+1, & \text{节点 } i \text{ 在时刻 } t \text{ 至少存在一个可用本地观测},\\
+0, & \text{否则},
+\end{cases}
+\]
+则
+\[
+\bar n_t^+=\frac{\sum_i \rho^{node}_{i,t}\,[z^+_{i,t},\, h^+_{i,t}]}{\epsilon+\sum_i \rho^{node}_{i,t}},\qquad
+g_t^+=\mathrm{GRU}^{upd}_g\left([\bar n_t^+,\, c_t],\, g_t^-\right).
+\]
+\noindent 若当前时刻所有节点都没有可用本地观测，则退回到简单平均池化。
 
-先定义节点级可用率
-$$\rho^{node}_{i,t}=\frac{1}{d_{obs}}\sum_{k=1}^{d_{obs}} q^{obs}_{i,t,k}$$
-以及 posterior pooling 所需的节点摘要
-$$u^{pool,+}_{i,t}=\mathrm{MLP}^{+}_{pool}\left([h_i^+,\, z_i^+,\, s_i,\, \rho^{node}_{i,t}]\right).$$
-
-再用一个依赖可用率的 gate 进行集合池化：
-$$\omega^{pool,+}_{i,t}=\sigma\left(\mathrm{MLP}^{a,+}_{pool}\left([u^{pool,+}_{i,t},\, \rho^{node}_{i,t},\, s_i]\right)\right),\qquad \bar n^+_t=\frac{\sum_i \omega^{pool,+}_{i,t}u^{pool,+}_{i,t}}{\epsilon+\sum_i \omega^{pool,+}_{i,t}}$$
-
-$$g_t^+=\mathrm{Update}_g\left(g_t^-,\, \bar n^+_t,\, c_t\right).$$
-
-在 prior propagation / rollout 阶段，先从上一时刻全局状态解码未来站点级气象摘要，再用其参与动态图构造：
-$$\hat c^{met}_{t+\tau}=\mathrm{Dec}^{met}_g\left(g_{t+\tau-1|t},\, \mathrm{cal}_{t+\tau}\right),\qquad \hat c_{t+\tau}=\left[\hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}\right]$$
-
-并定义统一的 prior/rollout pooling：
-$$u^{pool,tr}_{i,t+\tau}=\mathrm{MLP}^{tr}_{pool}\left([h_{i,t+\tau|t},\, z_{i,t+\tau|t},\, s_i]\right),\qquad \omega^{pool,tr}_{i,t+\tau}=\sigma\left(\mathrm{MLP}^{a,tr}_{pool}\left([u^{pool,tr}_{i,t+\tau},\, s_i]\right)\right)$$
-
-$$\bar n^{tr}_{t+\tau}=\frac{\sum_i \omega^{pool,tr}_{i,t+\tau}u^{pool,tr}_{i,t+\tau}}{\epsilon+\sum_i \omega^{pool,tr}_{i,t+\tau}},\qquad g_{t+\tau|t}=\mathrm{Transition}_g\left(g_{t+\tau-1|t},\, \bar n^{tr}_{t+\tau},\, \hat c_{t+\tau}\right).$$
+在历史窗 prior propagation 和未来 rollout 阶段，全局转移共用同一接口。记
+\[
+\bar n^{tr}_{t+\tau}=\frac{1}{N}\sum_{i=1}^{N}[z_{i,t+\tau|t},\, h_{i,t+\tau|t}],
+\]
+则
+\[
+g_{t+\tau|t}=\mathrm{GRU}^{tr}_g\left([\bar n^{tr}_{t+\tau},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}],\, g_{t+\tau-1|t}\right).
+\]
+\noindent 因而历史窗 prior propagation 与未来窗 rollout 在 local/global transition 上使用的是同一套状态机。
 
 \subsubsection{Decode 与输出约束}
-先由局部/全局隐状态产生未约束输出：
-$$\hat y^{raw}_{i,t+\tau|t}=\mathrm{MLP}^{raw}_{dec}\left([h_{i,t+\tau|t},\, z_{i,t+\tau|t},\, g_{t+\tau|t},\, \mathrm{emb}(\tau),\, s_i]\right)$$
-再通过有界映射得到 per-unit 功率预测：
-$$\hat y^{pu}_{i,t+\tau|t}=(1+\epsilon_y)\,\sigma\left(\hat y^{raw}_{i,t+\tau|t}\right),\qquad \epsilon_y=0.05.$$
+\[
+\hat y^{farm,pu}_{t+\tau|t}
+=
+b_0+b_1\cdot \frac{1}{N}\sum_{i=1}^N \hat y^{pu}_{i,t+\tau|t},
+\qquad b_0\leftarrow 0,\; b_1\leftarrow 1
+\]
 
-\noindent 训练与推理都直接使用该有界输出头，不再额外对预测值做后处理 clip；这样单机输出天然落在 $[0,1+\epsilon_y]$ 范围内，既避免负功率，也允许少量超额定冗余来吸收测量与标定误差。
+其中：
 
-场级一致性头采用一个可学习的仿射校正：
-$$\hat P^{farm}_{t+\tau|t}=b_0+b_1\sum_{i=1}^N rated\_power_i\cdot \hat y^{pu}_{i,t+\tau|t},\qquad b_0\leftarrow 0,\; b_1\leftarrow 1.$$
+\paragraph{bounded absolute}
+\[
+\hat y^{raw}_{i,t+\tau|t}
+=
+\mathrm{MLP}^{raw}_{dec}\left(
+[h_{i,t+\tau|t},\, z_{i,t+\tau|t},\, g_{t+\tau|t},\, \mathrm{emb}(\tau),\, s_i]
+\right)
+\]
+\[
+\hat y^{pu}_{i,t+\tau|t}
+=
+(1+\epsilon_y)\,\sigma\left(\hat y^{raw}_{i,t+\tau|t}\right),
+\qquad \epsilon_y=0.05
+\]
 
-\noindent 其中 $b_0,b_1$ 为可学习标量，用于吸收线路损耗、PMU 标定偏差与 turbine-sum 到 farm-level power 之间的固定偏移。若后续实验确认还有额外收益，可再叠加独立的场级 auxiliary head；但 v1 默认只启用上述仿射一致性头，以减少实现歧义。
+
+\paragraph{residual-over-persistence (\texttt{residual\_persistence})}
+\[
+\hat y^{raw}_{i,t+\tau|t}
+=
+\mathrm{MLP}^{raw}_{dec}\left(
+[h_{i,t+\tau|t},\, z_{i,t+\tau|t},\, g_{t+\tau|t},\, \mathrm{emb}(\tau),\, s_i]
+\right)
+\]
+\[
+y^{anchor}_{i,t}
+=
+\text{最后一个有效历史 } y^{pu}_{i,\cdot}
+\]
+\[
+\hat y^{pu}_{i,t+\tau|t}
+=
+\mathrm{clip}\!\left(
+y^{anchor}_{i,t}+\hat y^{raw}_{i,t+\tau|t},
+\,0,\,
+1+\epsilon_y
+\right),
+\qquad \epsilon_y=0.05
+\]
 
 \section{可直接启动的超参数与训练策略}
 
@@ -837,21 +830,20 @@ Static encoder 输出维度                & 32                                 
 Observation encoder 输出 \(r\)         & 64                                                                                \\
 Source summary \(v^{src}\)             & 32                                                                                \\
 Innovation encoder 输出 \(\nu\)        & 32                                                                                \\
-可选运行状态输入 $u^{ops}$            & 若存在则建议压缩到 8\(\sim\)16 维；否则用零向量和 mask 占位                               \\
 Edge message 维度                      & 64                                                                                \\
 局部隐状态 \(z\)                       & 32                                                                                \\
 局部记忆状态 \(h\)                     & 64                                                                                \\
 全局状态 \(g\)                         & 48                                                                                \\
 Horizon embedding                      & 16                                                                                \\
-$\mathrm{MLP}^{upd}_{\Sigma}$ / $\mathrm{MLP}^{pred}_{\Sigma}$ hidden & 128                                     \\
+Edge / gate MLP hidden                 & 128                                                                                \\
 $\alpha^{h,max}$                       & 0.1                                                                               \\
 $\beta^{h,max}$                        & 0.1                                                                               \\
 Wake prior \(\lambda_x\)              & 4\(\sim\)8（顺风衰减尺度，建议以 rotor-diameter 归一化后调参）                    \\
 Wake prior \(\lambda_y\)              & 1.5\(\sim\)3（横风衰减尺度）                                                      \\
 Wake gate 斜率 \(\kappa\)             & 1\(\sim\)3                                                                       \\
 每时间步 message passing 层数          & 1；最多不超过 2                                                                    \\
-候选邻居数                             & 先用静态几何构造候选池 \(d^{(RD)}\le 25\)，再在候选池内按 wake gate 取 top-\(K=8\sim12\) \\
-Learned residual edges                 & 2\(\sim\)4 条；仅在候选池外由低秩自适应得分 $a^{res}_{i\leftarrow j}$ 选出           \\
+图连接方式                             & 全连接有向图去掉 self-loop                                                        \\
+缺失 time-gap 上限                     & 72 steps（即 12 小时）                                                             \\
 输出上界 $\epsilon_y$                 & 0.05（若数据中存在稳定过额定发电，可上调）                                             \\
 Activation                             & SiLU                                                                              \\
 Normalization                          & LayerNorm                                                                         \\
@@ -1013,11 +1005,11 @@ L
   \item \textbf{切分方式：}仅允许按时间连续块切分 train / validation / test，禁止随机打散；若数据覆盖多个季节，至少额外报告一次 rolling-origin 的跨季节回测结果。
   \item \textbf{主指标：}报告 turbine-level 与 farm-level 两组指标，至少包含 MAE、RMSE；同时给出 per-unit 口径与 kW 口径；对未来 $36$ 步逐 horizon 报告，并汇总成短期（1--12 步）、中期（13--24 步）、长期（25--36 步）三档结果。
   \item \textbf{分组评估：}按风向扇区、可用率高低、正常工况/限电工况（若有标签）分别汇报，避免单一平均指标掩盖关键工况退化。
-  \item \textbf{内部基线与消融：}至少包含 persistence / last-value baseline、无动态图版本、无 global state 版本、单状态（以单个 local state 替代 $z+h$）版本；同时比较去掉 $u^{ops}$、去掉 $L_{met}$、去掉 learned residual edges、去掉 PMU、将输出头从有界形式改为无界线性头等开关。
+  \item \textbf{内部基线与消融：}至少包含 persistence / last-value baseline，以及当前 v1 已实现的 \texttt{graph\_off}、\texttt{wake\_off}、\texttt{no\_farm\_aux}、\texttt{no\_met\_aux}、\texttt{residual\_persistence} 等消融；同时可进一步比较去掉 PMU、将局部双状态 $(z,h)$ 合并为单状态等结构性变体。
 \end{itemize}
 
 \paragraph{强非图神经基线（固定）}
-为严格评估动态图的净收益，v1 额外固定一个强的非图神经基线：\textbf{shared-weight TFT-no-graph}。该基线以每台机组为一个样本实例，输入同一套历史局部观测 $o_{i,t-L+1:t}$、可选运行状态 $u^{ops}_{i,t-L+1:t}$、静态属性 $s_i$、站点级上下文 $c_{t-L+1:t}$ 与已知未来日历 $\mathrm{cal}_{t+1:t+H}$，但\textbf{不使用任何图边、邻机消息传递、局部/全局 latent state 分解或显式的 farm global state}。模型参数在所有机组间共享，训练窗口、数据切分、早停规则和主预测损失与主模型保持一致。这样在结果表中可以直接比较 ``shared covariate model'' 与 ``wake-aware dynamic graph model'' 之间的差异。
+为严格评估动态图的净收益，v1 额外固定一个强的非图神经基线：\textbf{shared-weight TFT-no-graph}。该基线以每台机组为一个样本实例，输入同一套历史局部观测 $o_{i,t-L+1:t}$、静态属性 $s_i$、共享上下文 $c_{t-L+1:t}$ 与已知未来日历 $\mathrm{cal}_{t+1:t+H}$，但\textbf{不使用任何图边、邻机消息传递、局部/全局 latent state 分解或显式的 farm global state}。模型参数在所有机组间共享，训练窗口、数据切分、早停规则和主预测损失与主模型保持一致。这样在结果表中可以直接比较 ``shared covariate model'' 与 ``wake-aware dynamic graph model'' 之间的差异。
 
 \paragraph{复现实验规范（固定）}
 设全数据按时间排序后共有 $M$ 个统一时间步，默认固定连续切分边界为
@@ -1156,6 +1148,18 @@ G=L+H=180\ \mathrm{steps}=30\ \mathrm{hours}.
   \item 若采用 V-search，则先将候选方向 rollout 一步得到子状态，再用 V 网络对子状态进行评估和剪枝。
   \item 至于最终采用“先 Q-search 预筛，再 rollout”，还是“先 rollout，再 V-search 剪枝”，需要通过实验比较其效果与计算代价。
   \item 一个关键实验指标是 oracle best-of-$K$ 相对 baseline 的提升幅度，它决定了后续 scorer / search 是否值得做。
+\end{itemize}
+
+\subsection{结构扩展与更强图构造}
+
+下列方向在概念上仍然有研究价值，但当前 v1 实现并未将其作为主干结构固定下来，因此不再放在前文主公式中，而统一留作后续扩展方向：
+
+\begin{itemize}
+  \item \textbf{独立的运行状态输入分支：}若后续数据侧能够稳定提供限功率、控制模式、检修/故障标签等信号，可重新引入单独的 $u^{ops}$ 分支，并比较“作为独立输入支路”与“仅通过事件摘要通道表达”两种方案的收益和实现复杂度。
+  \item \textbf{稀疏物理邻域：}当前实现直接在全体有向边 $j\neq i$ 上做聚合。后续可进一步测试先用静态几何构造候选池、再按 wake gate 选取 top-$K$ 物理邻域的稀疏图方案，以降低计算量并强化局部物理归纳偏置。
+  \item \textbf{learned residual edges：}纯几何 wake 图可能覆盖不了非局地相关性。未来可以在物理图之外增设少量 learned residual edges，用于补充通信异常、共模控制、场级限电等几何难以直接表达的相关结构。
+  \item \textbf{更丰富的聚合统计：}当前实现的图聚合是门控加权平均。未来可比较更强的聚合器，例如并行保留 sum / mean / mass / max 多路统计，再由额外的聚合 MLP 生成最终消息，检验其是否能提升对上游负担强度和邻居异质性的表达能力。
+  \item \textbf{更细粒度的 source summary 设计：}当前 source summary 由共享编码器直接学习得到。未来可测试显式子集投影、事件特征单独通路、或区分 update-source 与 transition-source 的更强参数化形式，以判断 source summary 是否值得从“隐式 learned summary”升级为“带结构约束的中间表示”。
 \end{itemize}
 
 \subsection{显式记忆为基础的时延传播}
