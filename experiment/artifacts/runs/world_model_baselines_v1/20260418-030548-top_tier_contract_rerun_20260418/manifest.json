@@ -1,0 +1,154 @@
+{
+  "args": {
+    "attention_heads": null,
+    "batch_size": 512,
+    "bounded_output_epsilon": null,
+    "cheb_k": null,
+    "d_model": null,
+    "datasets": null,
+    "device": "cuda",
+    "dilation_exponential": null,
+    "disable_tensorboard": false,
+    "dropout": null,
+    "embed_dim": 16,
+    "encoder_layers": null,
+    "end_channels": null,
+    "epochs": null,
+    "eval_batch_size": null,
+    "ff_hidden_dim": null,
+    "force_rerun": false,
+    "gcn_depth": null,
+    "grad_clip_norm": null,
+    "hidden_dim": 64,
+    "learning_rate": 0.0005,
+    "lstm_hidden_dim": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "mtgnn_layers": null,
+    "no_record_run": false,
+    "node_embed_dim": null,
+    "num_layers": null,
+    "num_workers": 2,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_baselines_v1/top_tier_contract_rerun_20260418/world_model_dgcrn_v1_farm_sync__val_rmse_pu.csv",
+    "patch_len": null,
+    "patience": null,
+    "propalpha": null,
+    "residual_channels": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_dgcrn_v1_farm_sync": {
+          "attention_heads": null,
+          "baseline_type": "dgcrn_dynamic_graph",
+          "batch_size": 512,
+          "bounded_output_epsilon": null,
+          "cheb_k": 2,
+          "d_model": null,
+          "dilation_exponential": null,
+          "dropout": null,
+          "early_stopping_patience": 5,
+          "embed_dim": 16,
+          "encoder_layers": null,
+          "end_channels": null,
+          "feature_protocol_id": "world_model_v1",
+          "ff_hidden_dim": null,
+          "gcn_depth": null,
+          "grad_clip_norm": 5.0,
+          "hidden_dim": 64,
+          "learning_rate": 0.0005,
+          "lstm_hidden_dim": null,
+          "max_epochs": 20,
+          "mtgnn_layers": null,
+          "node_embed_dim": null,
+          "num_layers": 2,
+          "patch_len": null,
+          "propalpha": null,
+          "residual_channels": null,
+          "skip_channels": null,
+          "subgraph_size": null,
+          "teacher_forcing_ratio": 0.25,
+          "weight_decay": 0.0
+        }
+      }
+    },
+    "resume": false,
+    "run_label": "top_tier_contract_rerun_20260418",
+    "seed": 3407,
+    "selection_metrics": [
+      "val_rmse_pu"
+    ],
+    "skip_channels": null,
+    "subgraph_size": null,
+    "teacher_forcing_ratio": 0.25,
+    "tensorboard_log_dir": null,
+    "variants": [
+      "world_model_dgcrn_v1_farm_sync"
+    ],
+    "weight_decay": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_baselines_v1/top_tier_contract_rerun_20260418/world_model_dgcrn_v1_farm_sync__val_rmse_pu.csv",
+      "sha256": "bb3b240751773edccdac56b61c07e8754b4591a6c2370ddc15f49f1546031208",
+      "size_bytes": 76931
+    },
+    "tensorboard_root": {
+      "path": "experiment/families/world_model_baselines_v1/.work/run_world_model_baselines_v1/1341a43886551a777be2c7f7fc776f9693a21b0098542c3c65339d5ef19ac9d5/tensorboard"
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_baselines_v1/top_tier_contract_rerun_20260418/world_model_dgcrn_v1_farm_sync__val_rmse_pu.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-18T03:05:48.236502+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_baselines_v1/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_baselines_v1.long_metrics.v1",
+    "display_name": "World-Model Baselines v1",
+    "family_id": "world_model_baselines_v1",
+    "implementation_root": "experiment/families/world_model_baselines_v1",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_baselines_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_baselines_v1/run_world_model_baselines_v1.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "4cfbaa587bbc9c2dbbfc8c9e5fde20d8f25e6660",
+    "is_dirty": true,
+    "status_short": [
+      "?? experiment/artifacts/published/world_model_baselines_v1/top_tier_contract_rerun_20260418/",
+      "?? plan/world_model_baselines_v1_audit.md"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_baselines_v1/run_world_model_baselines_v1.py",
+    "kind": "family_runner",
+    "run_label": "top_tier_contract_rerun_20260418"
+  },
+  "notes": [],
+  "result": {
+    "row_count": 148
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_dgcrn_v1_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}
