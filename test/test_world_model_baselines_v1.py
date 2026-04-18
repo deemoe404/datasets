@@ -46,18 +46,20 @@ def test_main_defaults_output_to_timestamped_publish_path(monkeypatch, capsys) -
         / module.FAMILY_ID
         / "20260418-070809.csv"
     )
-    recorded: dict[str, Path] = {}
+    recorded: dict[str, object] = {}
 
     monkeypatch.setattr(module, "generate_run_stem", lambda: "20260418-070809")
 
     def _fake_run_experiment(**kwargs):
         recorded["output_path"] = kwargs["output_path"]
+        recorded["selection_metrics"] = kwargs["selection_metrics"]
         return pl.DataFrame({"row": [1]})
 
     monkeypatch.setattr(module, "run_experiment", _fake_run_experiment)
 
     assert module.main(["--no-record-run", "--disable-tensorboard"]) == 0
     assert recorded["output_path"] == expected_output_path
+    assert recorded["selection_metrics"] == module.DEFAULT_SELECTION_METRICS
     assert str(expected_output_path) in capsys.readouterr().out
 
 
@@ -69,6 +71,32 @@ def test_main_requires_output_path_for_resume_or_force_rerun(capsys) -> None:
             module.main([flag, "--no-record-run", "--disable-tensorboard"])
         assert exc.value.code == 2
         assert "requires --output-path" in capsys.readouterr().err
+
+
+def test_main_passes_explicit_selection_metrics_subset(monkeypatch) -> None:
+    module = _load_module()
+    recorded: dict[str, object] = {}
+
+    monkeypatch.setattr(module, "generate_run_stem", lambda: "20260418-070809")
+
+    def _fake_run_experiment(**kwargs):
+        recorded["selection_metrics"] = kwargs["selection_metrics"]
+        return pl.DataFrame({"row": [1]})
+
+    monkeypatch.setattr(module, "run_experiment", _fake_run_experiment)
+
+    assert (
+        module.main(
+            [
+                "--no-record-run",
+                "--disable-tensorboard",
+                "--selection-metric",
+                module.SELECTION_METRIC_MAE,
+            ]
+        )
+        == 0
+    )
+    assert recorded["selection_metrics"] == (module.SELECTION_METRIC_MAE,)
 
 
 def _prepare_temp_dataset(
@@ -111,6 +139,35 @@ def _itransformer_variant_spec(module):
 
 def _mtgnn_variant_spec(module):
     return module.resolve_variant_specs((module.MTGNN_VARIANT,))[0]
+
+
+def _make_eval_metrics(module, prepared_dataset, *, mae_pu: float, rmse_pu: float):
+    return module.EvaluationMetrics(
+        window_count=1,
+        prediction_count=prepared_dataset.forecast_steps * prepared_dataset.node_count,
+        mae_kw=float(mae_pu) * prepared_dataset.rated_power_kw,
+        rmse_kw=float(rmse_pu) * prepared_dataset.rated_power_kw,
+        mae_pu=float(mae_pu),
+        rmse_pu=float(rmse_pu),
+        horizon_window_count=np.ones((prepared_dataset.forecast_steps,), dtype=np.int64),
+        horizon_prediction_count=np.full(
+            (prepared_dataset.forecast_steps,),
+            prepared_dataset.node_count,
+            dtype=np.int64,
+        ),
+        horizon_mae_kw=np.full(
+            (prepared_dataset.forecast_steps,),
+            float(mae_pu) * prepared_dataset.rated_power_kw,
+            dtype=np.float64,
+        ),
+        horizon_rmse_kw=np.full(
+            (prepared_dataset.forecast_steps,),
+            float(rmse_pu) * prepared_dataset.rated_power_kw,
+            dtype=np.float64,
+        ),
+        horizon_mae_pu=np.full((prepared_dataset.forecast_steps,), float(mae_pu), dtype=np.float64),
+        horizon_rmse_pu=np.full((prepared_dataset.forecast_steps,), float(rmse_pu), dtype=np.float64),
+    )
 
 
 class _FakeSummaryWriter:
@@ -826,17 +883,20 @@ def test_persistence_job_writes_synthetic_training_history(tmp_path, monkeypatch
     rows = module.execute_training_job(
         prepared,
         variant_spec=module.VARIANT_SPECS[0],
+        selection_metric=module.SELECTION_METRIC_RMSE,
         seed=123,
         training_history_path=history_path,
     )
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [0]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["persistence_last_value"]
     assert history["train_loss_mean"].null_count() == 1
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.PERSISTENCE_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["uses_graph"] is False
 
 
@@ -897,6 +957,7 @@ def test_chronos_zero_shot_job_reaggregates_batches_and_writes_synthetic_history
     rows = module.execute_training_job(
         prepared,
         variant_spec=_chronos_variant_spec(module),
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=3,
@@ -913,11 +974,13 @@ def test_chronos_zero_shot_job_reaggregates_batches_and_writes_synthetic_history
     assert all(call["cross_learning"] is False for call in fake_pipeline.calls)
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [0]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["chronos_2_zero_shot"]
     assert history["train_loss_mean"].null_count() == 1
     assert history["device"].to_list() == ["cpu"]
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.CHRONOS_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["baseline_type"] == "chronos_2_zero_shot"
 
 
@@ -938,6 +1001,7 @@ def test_persistence_logs_tensorboard_scalars_with_fake_writer(tmp_path, monkeyp
     module.execute_training_job(
         prepared,
         variant_spec=module.VARIANT_SPECS[0],
+        selection_metric=module.SELECTION_METRIC_RMSE,
         seed=123,
         tensorboard_log_dir=log_dir,
     )
@@ -970,6 +1034,7 @@ def test_tft_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
     rows = module.execute_training_job(
         prepared,
         variant_spec=module.VARIANT_SPECS[1],
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=3,
@@ -987,13 +1052,73 @@ def test_tft_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [1]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["shared_weight_tft_no_graph"]
     assert history["train_loss_mean"].null_count() == 0
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.TFT_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["d_model"] == 8
     assert rows[0]["uses_future_observations"] is False
+
+
+def test_tft_selection_metric_changes_best_epoch(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=module.VARIANT_SPECS[1],
+    )
+
+    def _run(selection_metric: str, history_path: Path):
+        metric_pairs = [(0.10, 0.30), (0.20, 0.10)]
+
+        def _fake_evaluate(*_args, **_kwargs):
+            mae_pu, rmse_pu = metric_pairs.pop(0)
+            return _make_eval_metrics(module, prepared, mae_pu=mae_pu, rmse_pu=rmse_pu)
+
+        monkeypatch.setattr(module, "evaluate_tft_model", _fake_evaluate)
+        outcome = module.train_tft_model(
+            prepared,
+            selection_metric=selection_metric,
+            device="cpu",
+            seed=123,
+            batch_size=2,
+            eval_batch_size=2,
+            learning_rate=1e-3,
+            max_epochs=2,
+            early_stopping_patience=2,
+            d_model=8,
+            lstm_hidden_dim=8,
+            attention_heads=2,
+            dropout=0.0,
+            grad_clip_norm=0.0,
+            weight_decay=0.0,
+            bounded_output_epsilon=0.05,
+            num_workers=0,
+            training_history_path=history_path,
+        )
+        return outcome, pl.read_csv(history_path)
+
+    rmse_outcome, rmse_history = _run(module.SELECTION_METRIC_RMSE, tmp_path / "tft.rmse.training_history.csv")
+    mae_outcome, mae_history = _run(module.SELECTION_METRIC_MAE, tmp_path / "tft.mae.training_history.csv")
+
+    assert rmse_outcome.best_epoch == 2
+    assert rmse_outcome.best_val_rmse_pu == pytest.approx(0.10)
+    assert rmse_outcome.best_val_mae_pu == pytest.approx(0.20)
+    assert rmse_history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE, module.SELECTION_METRIC_RMSE]
+    assert rmse_history["is_best_epoch"].to_list() == [True, True]
+
+    assert mae_outcome.best_epoch == 1
+    assert mae_outcome.best_val_mae_pu == pytest.approx(0.10)
+    assert mae_outcome.best_val_rmse_pu == pytest.approx(0.30)
+    assert mae_history["selection_metric"].to_list() == [module.SELECTION_METRIC_MAE, module.SELECTION_METRIC_MAE]
+    assert mae_history["is_best_epoch"].to_list() == [True, False]
 
 
 def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None:
@@ -1012,6 +1137,7 @@ def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> No
     rows = module.execute_training_job(
         prepared,
         variant_spec=_timexer_variant_spec(module),
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=3,
@@ -1031,6 +1157,7 @@ def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> No
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [1]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["shared_weight_timexer_no_graph"]
     assert history["patch_len"].to_list() == [24]
     assert history["encoder_layers"].to_list() == [1]
@@ -1039,6 +1166,7 @@ def test_timexer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> No
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.TIMEXER_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["patch_len"] == 24
     assert rows[0]["encoder_layers"] == 1
     assert rows[0]["ff_hidden_dim"] == 16
@@ -1060,6 +1188,7 @@ def test_itransformer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) 
     rows = module.execute_training_job(
         prepared,
         variant_spec=_itransformer_variant_spec(module),
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=2,
@@ -1076,11 +1205,13 @@ def test_itransformer_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) 
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [1]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["itransformer_no_graph"]
     assert history["train_loss_mean"].null_count() == 0
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.ITRANSFORMER_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["d_model"] == 8
     assert rows[0]["lstm_hidden_dim"] is None
     assert rows[0]["uses_future_observations"] is False
@@ -1102,6 +1233,7 @@ def test_mtgnn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None
     rows = module.execute_training_job(
         prepared,
         variant_spec=_mtgnn_variant_spec(module),
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=2,
@@ -1125,11 +1257,13 @@ def test_mtgnn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [1]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["mtgnn_calendar_graph"]
     assert history["train_loss_mean"].null_count() == 0
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.MTGNN_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["uses_graph"] is True
     assert rows[0]["residual_channels"] == 8
 
@@ -1150,6 +1284,7 @@ def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None
     rows = module.execute_training_job(
         prepared,
         variant_spec=_dgcrn_variant_spec(module),
+        selection_metric=module.SELECTION_METRIC_RMSE,
         device="cpu",
         seed=123,
         batch_size=2,
@@ -1168,6 +1303,7 @@ def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None
 
     history = pl.read_csv(history_path)
     assert history["epoch"].to_list() == [1]
+    assert history["selection_metric"].to_list() == [module.SELECTION_METRIC_RMSE]
     assert history["baseline_type"].to_list() == ["dgcrn_dynamic_graph"]
     assert history["hidden_dim"].to_list() == [8]
     assert history["embed_dim"].to_list() == [4]
@@ -1178,6 +1314,7 @@ def test_dgcrn_one_epoch_cpu_smoke_writes_history(tmp_path, monkeypatch) -> None
     assert history["val_rmse_pu"].null_count() == 0
     assert len(rows) == 148
     assert rows[0]["model_variant"] == module.DGCRN_VARIANT
+    assert rows[0]["selection_metric"] == module.SELECTION_METRIC_RMSE
     assert rows[0]["hidden_dim"] == 8
     assert rows[0]["uses_graph"] is True
     assert rows[0]["uses_pairwise"] is True
@@ -1226,24 +1363,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             weight_decay=kwargs["weight_decay"],
             bounded_output_epsilon=kwargs["bounded_output_epsilon"],
         )
-        metrics = module.EvaluationMetrics(
-            window_count=1,
-            prediction_count=prepared_dataset.forecast_steps * prepared_dataset.node_count,
-            mae_kw=1.0,
-            rmse_kw=2.0,
-            mae_pu=0.1,
-            rmse_pu=0.2,
-            horizon_window_count=np.ones((prepared_dataset.forecast_steps,), dtype=np.int64),
-            horizon_prediction_count=np.full(
-                (prepared_dataset.forecast_steps,),
-                prepared_dataset.node_count,
-                dtype=np.int64,
-            ),
-            horizon_mae_kw=np.ones((prepared_dataset.forecast_steps,), dtype=np.float64),
-            horizon_rmse_kw=np.full((prepared_dataset.forecast_steps,), 2.0, dtype=np.float64),
-            horizon_mae_pu=np.full((prepared_dataset.forecast_steps,), 0.1, dtype=np.float64),
-            horizon_rmse_pu=np.full((prepared_dataset.forecast_steps,), 0.2, dtype=np.float64),
-        )
+        metrics = _make_eval_metrics(module, prepared_dataset, mae_pu=0.1, rmse_pu=0.2)
         evaluation_results = [
             (split_name, eval_protocol, windows, metrics)
             for split_name, eval_protocol, windows in module.iter_evaluation_specs(prepared_dataset)
@@ -1260,6 +1380,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         return module.build_result_rows(
             prepared_dataset,
             variant_spec=variant_spec,
+            selection_metric=kwargs["selection_metric"],
             training_outcome=training_outcome,
             runtime_seconds=0.5,
             seed=kwargs["seed"],
@@ -1303,7 +1424,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
 
     assert output_path.exists()
     assert module.training_history_output_path(output_path).exists()
-    assert results.height == 1036
+    assert results.height == 2072
     assert set(results["model_variant"].unique().to_list()) == {
         module.PERSISTENCE_VARIANT,
         module.TFT_VARIANT,
@@ -1313,15 +1434,206 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         module.ITRANSFORMER_VARIANT,
         module.MTGNN_VARIANT,
     }
+    summary_rows = results.filter(
+        (pl.col("split_name") == "val")
+        & (pl.col("eval_protocol") == module.ROLLING_EVAL_PROTOCOL)
+        & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+    ).select(["model_variant", "selection_metric"])
+    assert list(summary_rows.iter_rows()) == [
+        (module.PERSISTENCE_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.PERSISTENCE_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.TFT_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.TFT_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.TIMEXER_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.TIMEXER_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.DGCRN_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.DGCRN_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.CHRONOS_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.CHRONOS_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.ITRANSFORMER_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.ITRANSFORMER_VARIANT, module.SELECTION_METRIC_MAE),
+        (module.MTGNN_VARIANT, module.SELECTION_METRIC_RMSE),
+        (module.MTGNN_VARIANT, module.SELECTION_METRIC_MAE),
+    ]
+    identical_contract_rows = list(
+        results.filter(
+            (pl.col("split_name") == "test")
+            & (pl.col("eval_protocol") == module.ROLLING_EVAL_PROTOCOL)
+            & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+            & pl.col("model_variant").is_in([module.PERSISTENCE_VARIANT, module.CHRONOS_VARIANT])
+        )
+        .sort(["model_variant", "selection_metric"])
+        .select(["model_variant", "selection_metric", "mae_pu", "rmse_pu"])
+        .iter_rows()
+    )
+    assert identical_contract_rows == [
+        (module.CHRONOS_VARIANT, module.SELECTION_METRIC_MAE, 0.1, 0.2),
+        (module.CHRONOS_VARIANT, module.SELECTION_METRIC_RMSE, 0.1, 0.2),
+        (module.PERSISTENCE_VARIANT, module.SELECTION_METRIC_MAE, 0.1, 0.2),
+        (module.PERSISTENCE_VARIANT, module.SELECTION_METRIC_RMSE, 0.1, 0.2),
+    ]
     paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
     expected_slot = hashlib.sha256(str(output_path.resolve()).encode("utf-8")).hexdigest()
     assert paths.slot_dir.name == expected_slot
     assert paths.partial_results_path.exists()
     assert paths.checkpoints_dir.exists()
+    assert "selection_metric" in pl.read_csv(module.training_history_output_path(output_path)).columns
     assert module._job_checkpoint_path(
         paths,
         dataset_id=prepared.dataset_id,
         model_variant=module.TFT_VARIANT,
-    ).name == f"{prepared.dataset_id}__{module.TFT_VARIANT}.pt"
+        selection_metric=module.SELECTION_METRIC_RMSE,
+    ).name == f"{prepared.dataset_id}__{module.TFT_VARIANT}__{module.SELECTION_METRIC_RMSE}.pt"
     state_payload = json.loads(paths.state_path.read_text(encoding="utf-8"))
     assert state_payload["status"] == "complete"
+
+
+def test_run_experiment_resume_skips_only_completed_selection_metric_jobs(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=module.VARIANT_SPECS[1],
+    )
+    output_path = tmp_path / "published" / "latest.csv"
+    work_root = tmp_path / ".work"
+    variant_spec = module.VARIANT_SPECS[1]
+    profile = module.resolve_hyperparameter_profile(
+        variant_spec.model_variant,
+        dataset_id=prepared.dataset_id,
+        batch_size=2,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        d_model=8,
+        lstm_hidden_dim=8,
+        attention_heads=2,
+        dropout=0.0,
+    )
+    evaluation_results = [
+        (split_name, eval_protocol, windows, _make_eval_metrics(module, prepared, mae_pu=0.1, rmse_pu=0.2))
+        for split_name, eval_protocol, windows in module.iter_evaluation_specs(prepared)
+    ]
+    training_outcome = module.TrainingOutcome(
+        best_epoch=0,
+        epochs_ran=0,
+        best_val_rmse_pu=0.2,
+        best_val_mae_pu=0.1,
+        device="cpu",
+        amp_enabled=False,
+        model=None,
+    )
+    resume_paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
+    effective_config = module._build_effective_config(
+        dataset_ids=(prepared.dataset_id,),
+        variant_specs=(variant_spec,),
+        selection_metrics=module.DEFAULT_SELECTION_METRICS,
+        device="cpu",
+        seed=7,
+        max_train_origins=None,
+        max_eval_origins=None,
+        batch_size=2,
+        eval_batch_size=None,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        d_model=8,
+        lstm_hidden_dim=8,
+        attention_heads=2,
+        patch_len=None,
+        encoder_layers=None,
+        ff_hidden_dim=None,
+        residual_channels=None,
+        skip_channels=None,
+        end_channels=None,
+        gcn_depth=None,
+        mtgnn_layers=None,
+        subgraph_size=None,
+        node_embed_dim=None,
+        dilation_exponential=None,
+        propalpha=None,
+        hidden_dim=None,
+        embed_dim=None,
+        num_layers=None,
+        cheb_k=None,
+        teacher_forcing_ratio=None,
+        dropout=0.0,
+        grad_clip_norm=None,
+        weight_decay=None,
+        bounded_output_epsilon=None,
+        num_workers=None,
+        tensorboard_root=None,
+        disable_tensorboard=True,
+    )
+    module._reset_resume_slot(resume_paths, effective_config=effective_config)
+    partial_rows = module.build_result_rows(
+        prepared,
+        variant_spec=variant_spec,
+        selection_metric=module.SELECTION_METRIC_RMSE,
+        training_outcome=training_outcome,
+        runtime_seconds=0.5,
+        seed=7,
+        profile=profile,
+        evaluation_results=evaluation_results,
+    )
+    module._write_partial_results(resume_paths, module._result_frame_from_rows(partial_rows))
+    module._write_resume_state(
+        resume_paths,
+        status="running",
+        effective_config=effective_config,
+        active_job=None,
+    )
+
+    calls: list[str] = []
+
+    def _dataset_loader(*_args, **_kwargs):
+        return prepared
+
+    def _job_runner(prepared_dataset, **kwargs):
+        calls.append(kwargs["selection_metric"])
+        return module.build_result_rows(
+            prepared_dataset,
+            variant_spec=kwargs["variant_spec"],
+            selection_metric=kwargs["selection_metric"],
+            training_outcome=training_outcome,
+            runtime_seconds=0.5,
+            seed=kwargs["seed"],
+            profile=profile,
+            evaluation_results=evaluation_results,
+        )
+
+    results = module.run_experiment(
+        dataset_ids=(prepared.dataset_id,),
+        variant_names=(variant_spec.model_variant,),
+        selection_metrics=module.DEFAULT_SELECTION_METRICS,
+        output_path=output_path,
+        device="cpu",
+        max_epochs=1,
+        early_stopping_patience=1,
+        seed=7,
+        batch_size=2,
+        learning_rate=1e-3,
+        d_model=8,
+        lstm_hidden_dim=8,
+        attention_heads=2,
+        dropout=0.0,
+        disable_tensorboard=True,
+        work_root=work_root,
+        dataset_loader=_dataset_loader,
+        job_runner=_job_runner,
+        resume=True,
+    )
+
+    assert calls == [module.SELECTION_METRIC_MAE]
+    summary_rows = results.filter(
+        (pl.col("split_name") == "val")
+        & (pl.col("eval_protocol") == module.ROLLING_EVAL_PROTOCOL)
+        & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+    ).sort("selection_metric")
+    assert summary_rows["selection_metric"].to_list() == [
+        module.SELECTION_METRIC_MAE,
+        module.SELECTION_METRIC_RMSE,
+    ]

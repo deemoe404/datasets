@@ -140,8 +140,8 @@ _REPO_ROOT = EXPERIMENT_ROOT.parent
 _CACHE_ROOT = _REPO_ROOT / "cache"
 _OUTPUT_TEMPLATE = default_family_output_template(repo_root=_REPO_ROOT, family_id=FAMILY_ID)
 _RUN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_world_model_baselines_v1"
-_RUN_STATE_SCHEMA_VERSION = "world_model_baselines_v1.run.resume.v1"
-_TRAINING_CHECKPOINT_SCHEMA_VERSION = "world_model_baselines_v1.training_checkpoint.v1"
+_RUN_STATE_SCHEMA_VERSION = "world_model_baselines_v1.run.resume.v2"
+_TRAINING_CHECKPOINT_SCHEMA_VERSION = "world_model_baselines_v1.training_checkpoint.v2"
 _DATASET_ORDER = {"kelmarsh": 0}
 _MODEL_VARIANT_ORDER = {
     PERSISTENCE_VARIANT: 0,
@@ -152,6 +152,16 @@ _MODEL_VARIANT_ORDER = {
     ITRANSFORMER_VARIANT: 5,
     MTGNN_VARIANT: 6,
 }
+SELECTION_METRIC_RMSE = "val_rmse_pu"
+SELECTION_METRIC_MAE = "val_mae_pu"
+DEFAULT_SELECTION_METRICS = (
+    SELECTION_METRIC_RMSE,
+    SELECTION_METRIC_MAE,
+)
+_SELECTION_METRIC_ORDER = {
+    SELECTION_METRIC_RMSE: 0,
+    SELECTION_METRIC_MAE: 1,
+}
 _SPLIT_ORDER = {"val": 0, "test": 1}
 _EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
 _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
@@ -160,6 +170,7 @@ _RESULT_COLUMNS = [
     "dataset_id",
     "model_id",
     "model_variant",
+    "selection_metric",
     "task_id",
     "window_protocol",
     "history_steps",
@@ -232,6 +243,7 @@ _TRAINING_HISTORY_COLUMNS = [
     "dataset_id",
     "model_id",
     "model_variant",
+    "selection_metric",
     "feature_protocol_id",
     "task_id",
     "window_protocol",
@@ -353,6 +365,59 @@ class TimeXerFeatureLayout:
     endogenous_history_names: tuple[str, ...]
     exogenous_history_names: tuple[str, ...]
     history_mark_names: tuple[str, ...]
+
+
+def resolve_selection_metrics(selection_metrics: Sequence[str] | None) -> tuple[str, ...]:
+    if not selection_metrics:
+        return DEFAULT_SELECTION_METRICS
+    resolved: list[str] = []
+    for selection_metric in selection_metrics:
+        if selection_metric not in _SELECTION_METRIC_ORDER:
+            raise ValueError(
+                f"Unsupported selection_metric {selection_metric!r}. "
+                f"Expected one of {sorted(_SELECTION_METRIC_ORDER)!r}."
+            )
+        if selection_metric not in resolved:
+            resolved.append(selection_metric)
+    return tuple(resolved)
+
+
+def _selection_metric_value(
+    selection_metric: str,
+    *,
+    val_mae_pu: float,
+    val_rmse_pu: float,
+) -> float:
+    if selection_metric == SELECTION_METRIC_MAE:
+        return float(val_mae_pu)
+    if selection_metric == SELECTION_METRIC_RMSE:
+        return float(val_rmse_pu)
+    raise ValueError(f"Unsupported selection_metric {selection_metric!r}.")
+
+
+def _selection_metric_label(selection_metric: str) -> str:
+    return selection_metric.replace("_pu", "")
+
+
+def _selection_metric_improved(
+    selection_metric: str,
+    *,
+    val_mae_pu: float,
+    val_rmse_pu: float,
+    best_val_mae_pu: float,
+    best_val_rmse_pu: float,
+) -> bool:
+    current_value = _selection_metric_value(
+        selection_metric,
+        val_mae_pu=val_mae_pu,
+        val_rmse_pu=val_rmse_pu,
+    )
+    best_value = _selection_metric_value(
+        selection_metric,
+        val_mae_pu=best_val_mae_pu,
+        val_rmse_pu=best_val_rmse_pu,
+    )
+    return math.isfinite(current_value) and (not math.isfinite(best_value) or current_value < best_value - 1e-12)
 
 
 VARIANT_SPECS = (
@@ -818,8 +883,9 @@ def _tensorboard_job_log_dir(
     *,
     dataset_id: str,
     model_variant: str,
+    selection_metric: str,
 ) -> Path:
-    return Path(tensorboard_root) / dataset_id / model_variant
+    return Path(tensorboard_root) / dataset_id / model_variant / selection_metric
 
 
 def _open_tensorboard_writer(
@@ -827,6 +893,7 @@ def _open_tensorboard_writer(
     *,
     dataset_id: str,
     model_variant: str,
+    selection_metric: str,
 ):
     if tensorboard_log_dir is None:
         return None
@@ -836,6 +903,7 @@ def _open_tensorboard_writer(
             dataset_id,
             "tensorboard_unavailable",
             model_variant=model_variant,
+            selection_metric=selection_metric,
             log_dir=str(resolved_dir),
             reason="tensorboard package is not installed in the family environment",
         )
@@ -845,6 +913,7 @@ def _open_tensorboard_writer(
         dataset_id,
         "tensorboard_enabled",
         model_variant=model_variant,
+        selection_metric=selection_metric,
         log_dir=str(resolved_dir),
     )
     return SummaryWriter(log_dir=str(resolved_dir), flush_secs=10)
@@ -895,6 +964,7 @@ def _tensorboard_log_run_config(
     *,
     prepared_dataset: state_base.PreparedDataset,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     profile: HyperparameterProfile,
     seed: int,
     device: str,
@@ -906,6 +976,7 @@ def _tensorboard_log_run_config(
     config = {
         "dataset_id": prepared_dataset.dataset_id,
         "model_variant": variant_spec.model_variant,
+        "selection_metric": selection_metric,
         "baseline_type": variant_spec.baseline_type,
         "feature_protocol_id": prepared_dataset.feature_protocol_id,
         "task_id": TASK_ID,
@@ -3147,6 +3218,7 @@ def evaluate_dgcrn_model(
 def train_tft_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
+    selection_metric: str,
     device: str,
     seed: int,
     batch_size: int,
@@ -3187,7 +3259,10 @@ def train_tft_model(
     scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_mae_pu = float("inf")
@@ -3319,9 +3394,12 @@ def train_tft_model(
             val_mae_pu = float(val_metrics.mae_pu)
             val_rmse_pu = float(val_metrics.rmse_pu)
             is_best_epoch = False
-            if best_state is None or (
-                math.isfinite(val_mae_pu)
-                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            if best_state is None or _selection_metric_improved(
+                selection_metric,
+                val_mae_pu=val_mae_pu,
+                val_rmse_pu=val_rmse_pu,
+                best_val_mae_pu=best_val_mae_pu,
+                best_val_rmse_pu=best_val_rmse_pu,
             ):
                 best_val_mae_pu = val_mae_pu
                 best_val_rmse_pu = val_rmse_pu
@@ -3367,6 +3445,7 @@ def train_tft_model(
                         "dataset_id": prepared_dataset.dataset_id,
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
+                        "selection_metric": selection_metric,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
@@ -3414,6 +3493,7 @@ def train_tft_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -3429,7 +3509,17 @@ def train_tft_model(
                     },
                 )
             epoch_progress.update(1)
-            epoch_progress.set_postfix_str(f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}")
+            epoch_progress.set_postfix_str(
+                " ".join(
+                    [
+                        f"loss={latest_loss:.4f}",
+                        f"{_selection_metric_label(selection_metric)}="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=val_mae_pu, val_rmse_pu=val_rmse_pu):.4f}",
+                        "best="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=best_val_mae_pu, val_rmse_pu=best_val_rmse_pu):.4f}",
+                    ]
+                )
+            )
             if should_stop:
                 break
     finally:
@@ -3451,6 +3541,7 @@ def train_tft_model(
 def train_timexer_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
+    selection_metric: str,
     device: str,
     seed: int,
     batch_size: int,
@@ -3495,7 +3586,10 @@ def train_timexer_model(
     scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_mae_pu = float("inf")
@@ -3625,9 +3719,12 @@ def train_timexer_model(
             val_mae_pu = float(val_metrics.mae_pu)
             val_rmse_pu = float(val_metrics.rmse_pu)
             is_best_epoch = False
-            if best_state is None or (
-                math.isfinite(val_mae_pu)
-                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            if best_state is None or _selection_metric_improved(
+                selection_metric,
+                val_mae_pu=val_mae_pu,
+                val_rmse_pu=val_rmse_pu,
+                best_val_mae_pu=best_val_mae_pu,
+                best_val_rmse_pu=best_val_rmse_pu,
             ):
                 best_val_mae_pu = val_mae_pu
                 best_val_rmse_pu = val_rmse_pu
@@ -3673,6 +3770,7 @@ def train_timexer_model(
                         "dataset_id": prepared_dataset.dataset_id,
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
+                        "selection_metric": selection_metric,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
@@ -3720,6 +3818,7 @@ def train_timexer_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -3735,7 +3834,17 @@ def train_timexer_model(
                     },
                 )
             epoch_progress.update(1)
-            epoch_progress.set_postfix_str(f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}")
+            epoch_progress.set_postfix_str(
+                " ".join(
+                    [
+                        f"loss={latest_loss:.4f}",
+                        f"{_selection_metric_label(selection_metric)}="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=val_mae_pu, val_rmse_pu=val_rmse_pu):.4f}",
+                        "best="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=best_val_mae_pu, val_rmse_pu=best_val_rmse_pu):.4f}",
+                    ]
+                )
+            )
             if should_stop:
                 break
     finally:
@@ -3757,6 +3866,7 @@ def train_timexer_model(
 def train_itransformer_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
+    selection_metric: str,
     device: str,
     seed: int,
     batch_size: int,
@@ -3799,7 +3909,10 @@ def train_itransformer_model(
     scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_mae_pu = float("inf")
@@ -3943,9 +4056,12 @@ def train_itransformer_model(
             val_mae_pu = float(val_metrics.mae_pu)
             val_rmse_pu = float(val_metrics.rmse_pu)
             is_best_epoch = False
-            if best_state is None or (
-                math.isfinite(val_mae_pu)
-                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            if best_state is None or _selection_metric_improved(
+                selection_metric,
+                val_mae_pu=val_mae_pu,
+                val_rmse_pu=val_rmse_pu,
+                best_val_mae_pu=best_val_mae_pu,
+                best_val_rmse_pu=best_val_rmse_pu,
             ):
                 best_val_mae_pu = val_mae_pu
                 best_val_rmse_pu = val_rmse_pu
@@ -4000,6 +4116,7 @@ def train_itransformer_model(
                         "dataset_id": prepared_dataset.dataset_id,
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
+                        "selection_metric": selection_metric,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
@@ -4047,6 +4164,7 @@ def train_itransformer_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -4063,7 +4181,15 @@ def train_itransformer_model(
                 )
             epoch_progress.update(1)
             epoch_progress.set_postfix_str(
-                f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}"
+                " ".join(
+                    [
+                        f"loss={latest_loss:.4f}",
+                        f"{_selection_metric_label(selection_metric)}="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=val_mae_pu, val_rmse_pu=val_rmse_pu):.4f}",
+                        "best="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=best_val_mae_pu, val_rmse_pu=best_val_rmse_pu):.4f}",
+                    ]
+                )
             )
             if should_stop:
                 break
@@ -4086,6 +4212,7 @@ def train_itransformer_model(
 def train_mtgnn_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
+    selection_metric: str,
     device: str,
     seed: int,
     batch_size: int,
@@ -4142,7 +4269,10 @@ def train_mtgnn_model(
     scaler = _make_grad_scaler(resolved_torch, enabled=amp_enabled)
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_mae_pu = float("inf")
@@ -4284,9 +4414,12 @@ def train_mtgnn_model(
             val_mae_pu = float(val_metrics.mae_pu)
             val_rmse_pu = float(val_metrics.rmse_pu)
             is_best_epoch = False
-            if best_state is None or (
-                math.isfinite(val_mae_pu)
-                and (not math.isfinite(best_val_mae_pu) or val_mae_pu < best_val_mae_pu - 1e-12)
+            if best_state is None or _selection_metric_improved(
+                selection_metric,
+                val_mae_pu=val_mae_pu,
+                val_rmse_pu=val_rmse_pu,
+                best_val_mae_pu=best_val_mae_pu,
+                best_val_rmse_pu=best_val_rmse_pu,
             ):
                 best_val_mae_pu = val_mae_pu
                 best_val_rmse_pu = val_rmse_pu
@@ -4341,6 +4474,7 @@ def train_mtgnn_model(
                         "dataset_id": prepared_dataset.dataset_id,
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
+                        "selection_metric": selection_metric,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
@@ -4388,6 +4522,7 @@ def train_mtgnn_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -4404,7 +4539,15 @@ def train_mtgnn_model(
                 )
             epoch_progress.update(1)
             epoch_progress.set_postfix_str(
-                f"loss={latest_loss:.4f} val_mae={val_mae_pu:.4f} best={best_val_mae_pu:.4f}"
+                " ".join(
+                    [
+                        f"loss={latest_loss:.4f}",
+                        f"{_selection_metric_label(selection_metric)}="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=val_mae_pu, val_rmse_pu=val_rmse_pu):.4f}",
+                        "best="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=best_val_mae_pu, val_rmse_pu=best_val_rmse_pu):.4f}",
+                    ]
+                )
             )
             if should_stop:
                 break
@@ -4427,6 +4570,7 @@ def train_mtgnn_model(
 def train_dgcrn_model(
     prepared_dataset: state_base.PreparedDataset,
     *,
+    selection_metric: str,
     device: str,
     seed: int,
     batch_size: int,
@@ -4469,7 +4613,10 @@ def train_dgcrn_model(
     optimizer = resolved_torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_mae_pu = float("inf")
@@ -4598,9 +4745,12 @@ def train_dgcrn_model(
             val_mae_pu = float(val_metrics.mae_pu)
             val_rmse_pu = float(val_metrics.rmse_pu)
             is_best_epoch = False
-            if best_state is None or (
-                math.isfinite(val_rmse_pu)
-                and (not math.isfinite(best_val_rmse_pu) or val_rmse_pu < best_val_rmse_pu - 1e-12)
+            if best_state is None or _selection_metric_improved(
+                selection_metric,
+                val_mae_pu=val_mae_pu,
+                val_rmse_pu=val_rmse_pu,
+                best_val_mae_pu=best_val_mae_pu,
+                best_val_rmse_pu=best_val_rmse_pu,
             ):
                 best_val_mae_pu = val_mae_pu
                 best_val_rmse_pu = val_rmse_pu
@@ -4646,6 +4796,7 @@ def train_dgcrn_model(
                         "dataset_id": prepared_dataset.dataset_id,
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
+                        "selection_metric": selection_metric,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
@@ -4693,6 +4844,7 @@ def train_dgcrn_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -4708,7 +4860,15 @@ def train_dgcrn_model(
                 )
             epoch_progress.update(1)
             epoch_progress.set_postfix_str(
-                f"loss={latest_loss:.4f} val_rmse={val_rmse_pu:.4f} best={best_val_rmse_pu:.4f}"
+                " ".join(
+                    [
+                        f"loss={latest_loss:.4f}",
+                        f"{_selection_metric_label(selection_metric)}="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=val_mae_pu, val_rmse_pu=val_rmse_pu):.4f}",
+                        "best="
+                        f"{_selection_metric_value(selection_metric, val_mae_pu=best_val_mae_pu, val_rmse_pu=best_val_rmse_pu):.4f}",
+                    ]
+                )
             )
             if should_stop:
                 break
@@ -4751,6 +4911,7 @@ def build_result_rows(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     training_outcome: TrainingOutcome,
     runtime_seconds: float,
     seed: int,
@@ -4767,6 +4928,7 @@ def build_result_rows(
         "dataset_id": prepared_dataset.dataset_id,
         "model_id": MODEL_ID,
         "model_variant": variant_spec.model_variant,
+        "selection_metric": selection_metric,
         "task_id": TASK_ID,
         "window_protocol": WINDOW_PROTOCOL,
         "history_steps": prepared_dataset.history_steps,
@@ -4869,6 +5031,7 @@ def execute_persistence_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     seed: int,
     profile: HyperparameterProfile,
     training_history_path: str | Path | None = None,
@@ -4879,11 +5042,13 @@ def execute_persistence_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device="analytic",
@@ -4911,6 +5076,7 @@ def execute_persistence_job(
                 "dataset_id": prepared_dataset.dataset_id,
                 "model_id": MODEL_ID,
                 "model_variant": variant_spec.model_variant,
+                "selection_metric": selection_metric,
                 "feature_protocol_id": prepared_dataset.feature_protocol_id,
                 "task_id": TASK_ID,
                 "window_protocol": WINDOW_PROTOCOL,
@@ -4963,6 +5129,7 @@ def execute_persistence_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -4975,6 +5142,7 @@ def execute_tft_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -4996,11 +5164,13 @@ def execute_tft_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5010,6 +5180,7 @@ def execute_tft_job(
     try:
         training_outcome = train_tft_model(
             prepared_dataset,
+            selection_metric=selection_metric,
             device=resolved_device,
             seed=seed,
             batch_size=profile.batch_size,
@@ -5051,6 +5222,7 @@ def execute_tft_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=training_outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5063,6 +5235,7 @@ def execute_timexer_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -5084,11 +5257,13 @@ def execute_timexer_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5098,6 +5273,7 @@ def execute_timexer_job(
     try:
         training_outcome = train_timexer_model(
             prepared_dataset,
+            selection_metric=selection_metric,
             device=resolved_device,
             seed=seed,
             batch_size=profile.batch_size,
@@ -5141,6 +5317,7 @@ def execute_timexer_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=training_outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5153,6 +5330,7 @@ def execute_itransformer_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -5174,11 +5352,13 @@ def execute_itransformer_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5188,6 +5368,7 @@ def execute_itransformer_job(
     try:
         training_outcome = train_itransformer_model(
             prepared_dataset,
+            selection_metric=selection_metric,
             device=resolved_device,
             seed=seed,
             batch_size=profile.batch_size,
@@ -5228,6 +5409,7 @@ def execute_itransformer_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=training_outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5240,6 +5422,7 @@ def execute_mtgnn_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -5261,11 +5444,13 @@ def execute_mtgnn_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5275,6 +5460,7 @@ def execute_mtgnn_job(
     try:
         training_outcome = train_mtgnn_model(
             prepared_dataset,
+            selection_metric=selection_metric,
             device=resolved_device,
             seed=seed,
             batch_size=profile.batch_size,
@@ -5322,6 +5508,7 @@ def execute_mtgnn_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=training_outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5334,6 +5521,7 @@ def execute_dgcrn_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -5355,11 +5543,13 @@ def execute_dgcrn_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5369,6 +5559,7 @@ def execute_dgcrn_job(
     try:
         training_outcome = train_dgcrn_model(
             prepared_dataset,
+            selection_metric=selection_metric,
             device=resolved_device,
             seed=seed,
             batch_size=profile.batch_size,
@@ -5409,6 +5600,7 @@ def execute_dgcrn_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=training_outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5421,6 +5613,7 @@ def execute_chronos_zero_shot_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant,
+    selection_metric: str,
     device: str | None,
     seed: int,
     profile: HyperparameterProfile,
@@ -5439,11 +5632,13 @@ def execute_chronos_zero_shot_job(
         tensorboard_log_dir,
         dataset_id=prepared_dataset.dataset_id,
         model_variant=variant_spec.model_variant,
+        selection_metric=selection_metric,
     )
     _tensorboard_log_run_config(
         writer,
         prepared_dataset=prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         profile=profile,
         seed=seed,
         device=resolved_device,
@@ -5477,6 +5672,7 @@ def execute_chronos_zero_shot_job(
                 "dataset_id": prepared_dataset.dataset_id,
                 "model_id": MODEL_ID,
                 "model_variant": prepared_dataset.model_variant,
+                "selection_metric": selection_metric,
                 "feature_protocol_id": prepared_dataset.feature_protocol_id,
                 "task_id": TASK_ID,
                 "window_protocol": WINDOW_PROTOCOL,
@@ -5529,6 +5725,7 @@ def execute_chronos_zero_shot_job(
     return build_result_rows(
         prepared_dataset,
         variant_spec=variant_spec,
+        selection_metric=selection_metric,
         training_outcome=outcome,
         runtime_seconds=time.monotonic() - started,
         seed=seed,
@@ -5541,6 +5738,7 @@ def execute_training_job(
     prepared_dataset: state_base.PreparedDataset,
     *,
     variant_spec: ExperimentVariant | None = None,
+    selection_metric: str = SELECTION_METRIC_RMSE,
     device: str | None = None,
     seed: int = DEFAULT_SEED,
     batch_size: int | None = None,
@@ -5579,6 +5777,7 @@ def execute_training_job(
     tensorboard_log_dir: str | Path | None = None,
 ) -> list[dict[str, object]]:
     resolved_variant = variant_spec or _VARIANT_SPECS_BY_NAME.get(prepared_dataset.model_variant, VARIANT_SPECS[0])
+    resolved_selection_metric = resolve_selection_metrics((selection_metric,))[0]
     profile = resolve_hyperparameter_profile(
         resolved_variant.model_variant,
         dataset_id=prepared_dataset.dataset_id,
@@ -5615,6 +5814,7 @@ def execute_training_job(
         return execute_persistence_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             seed=seed,
             profile=profile,
             training_history_path=training_history_path,
@@ -5624,6 +5824,7 @@ def execute_training_job(
         return execute_tft_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5638,6 +5839,7 @@ def execute_training_job(
         return execute_timexer_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5652,6 +5854,7 @@ def execute_training_job(
         return execute_itransformer_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5666,6 +5869,7 @@ def execute_training_job(
         return execute_mtgnn_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5680,6 +5884,7 @@ def execute_training_job(
         return execute_dgcrn_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5694,6 +5899,7 @@ def execute_training_job(
         return execute_chronos_zero_shot_job(
             prepared_dataset,
             variant_spec=resolved_variant,
+            selection_metric=resolved_selection_metric,
             device=device,
             seed=seed,
             profile=profile,
@@ -5800,28 +6006,34 @@ def resolve_tensorboard_root(
     return tensorboard_root_path(output_path, work_root=work_root)
 
 
-def _job_key(dataset_id: str, model_variant: str) -> tuple[str, str]:
-    return dataset_id, model_variant
+def _job_key(dataset_id: str, model_variant: str, selection_metric: str) -> tuple[str, str, str]:
+    return dataset_id, model_variant, selection_metric
 
 
-def _job_identity(*, dataset_id: str, model_variant: str, feature_protocol_id: str) -> dict[str, str]:
+def _job_identity(*, dataset_id: str, model_variant: str, selection_metric: str, feature_protocol_id: str) -> dict[str, str]:
     return {
         "dataset_id": dataset_id,
         "model_variant": model_variant,
+        "selection_metric": selection_metric,
         "feature_protocol_id": feature_protocol_id,
     }
 
 
-def _job_identity_for_prepared_dataset(prepared_dataset: state_base.PreparedDataset) -> dict[str, str]:
+def _job_identity_for_prepared_dataset(
+    prepared_dataset: state_base.PreparedDataset,
+    *,
+    selection_metric: str,
+) -> dict[str, str]:
     return _job_identity(
         dataset_id=prepared_dataset.dataset_id,
         model_variant=prepared_dataset.model_variant,
+        selection_metric=selection_metric,
         feature_protocol_id=prepared_dataset.feature_protocol_id,
     )
 
 
-def _job_checkpoint_path(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> Path:
-    return paths.checkpoints_dir / f"{dataset_id}__{model_variant}.pt"
+def _job_checkpoint_path(paths: ResumePaths, *, dataset_id: str, model_variant: str, selection_metric: str) -> Path:
+    return paths.checkpoints_dir / f"{dataset_id}__{model_variant}__{selection_metric}.pt"
 
 
 def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
@@ -5832,13 +6044,36 @@ def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .with_columns(
             pl.col("dataset_id").replace_strict(_DATASET_ORDER, default=len(_DATASET_ORDER)).alias("__dataset_order"),
             pl.col("model_variant").replace_strict(_MODEL_VARIANT_ORDER, default=len(_MODEL_VARIANT_ORDER)).alias("__model_variant_order"),
+            pl.col("selection_metric")
+            .replace_strict(_SELECTION_METRIC_ORDER, default=len(_SELECTION_METRIC_ORDER))
+            .alias("__selection_metric_order"),
             pl.col("split_name").replace_strict(_SPLIT_ORDER, default=len(_SPLIT_ORDER)).alias("__split_order"),
             pl.col("eval_protocol").replace_strict(_EVAL_PROTOCOL_ORDER, default=len(_EVAL_PROTOCOL_ORDER)).alias("__eval_protocol_order"),
             pl.col("metric_scope").replace_strict(_METRIC_SCOPE_ORDER, default=len(_METRIC_SCOPE_ORDER)).alias("__metric_scope_order"),
             pl.col("lead_step").fill_null(0).alias("__lead_order"),
         )
-        .sort(["__dataset_order", "__model_variant_order", "__split_order", "__eval_protocol_order", "__metric_scope_order", "__lead_order"])
-        .drop(["__dataset_order", "__model_variant_order", "__split_order", "__eval_protocol_order", "__metric_scope_order", "__lead_order"])
+        .sort(
+            [
+                "__dataset_order",
+                "__model_variant_order",
+                "__selection_metric_order",
+                "__split_order",
+                "__eval_protocol_order",
+                "__metric_scope_order",
+                "__lead_order",
+            ]
+        )
+        .drop(
+            [
+                "__dataset_order",
+                "__model_variant_order",
+                "__selection_metric_order",
+                "__split_order",
+                "__eval_protocol_order",
+                "__metric_scope_order",
+                "__lead_order",
+            ]
+        )
     )
 
 
@@ -5850,9 +6085,12 @@ def sort_training_history_frame(frame: pl.DataFrame) -> pl.DataFrame:
         .with_columns(
             pl.col("dataset_id").replace_strict(_DATASET_ORDER, default=len(_DATASET_ORDER)).alias("__dataset_order"),
             pl.col("model_variant").replace_strict(_MODEL_VARIANT_ORDER, default=len(_MODEL_VARIANT_ORDER)).alias("__model_variant_order"),
+            pl.col("selection_metric")
+            .replace_strict(_SELECTION_METRIC_ORDER, default=len(_SELECTION_METRIC_ORDER))
+            .alias("__selection_metric_order"),
         )
-        .sort(["__dataset_order", "__model_variant_order", "epoch"])
-        .drop(["__dataset_order", "__model_variant_order"])
+        .sort(["__dataset_order", "__model_variant_order", "__selection_metric_order", "epoch"])
+        .drop(["__dataset_order", "__model_variant_order", "__selection_metric_order"])
     )
 
 
@@ -5927,6 +6165,7 @@ def _training_history_job_expr(job_identity: dict[str, str]) -> pl.Expr:
     return (
         (pl.col("dataset_id") == job_identity["dataset_id"])
         & (pl.col("model_variant") == job_identity["model_variant"])
+        & (pl.col("selection_metric") == job_identity["selection_metric"])
         & (pl.col("feature_protocol_id") == job_identity["feature_protocol_id"])
     )
 
@@ -5949,6 +6188,7 @@ def _append_training_history_row(path: str | Path, row: dict[str, object]) -> No
     job_identity = {
         "dataset_id": str(row["dataset_id"]),
         "model_variant": str(row["model_variant"]),
+        "selection_metric": str(row["selection_metric"]),
         "feature_protocol_id": str(row["feature_protocol_id"]),
     }
     if frame.is_empty():
@@ -5975,8 +6215,19 @@ def _reset_resume_slot(paths: ResumePaths, *, effective_config: dict[str, object
     _write_resume_state(paths, status="running", effective_config=effective_config, active_job=None)
 
 
-def _delete_job_checkpoint(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> None:
-    _job_checkpoint_path(paths, dataset_id=dataset_id, model_variant=model_variant).unlink(missing_ok=True)
+def _delete_job_checkpoint(
+    paths: ResumePaths,
+    *,
+    dataset_id: str,
+    model_variant: str,
+    selection_metric: str,
+) -> None:
+    _job_checkpoint_path(
+        paths,
+        dataset_id=dataset_id,
+        model_variant=model_variant,
+        selection_metric=selection_metric,
+    ).unlink(missing_ok=True)
 
 
 def _clear_checkpoint_dir(paths: ResumePaths) -> None:
@@ -5985,12 +6236,16 @@ def _clear_checkpoint_dir(paths: ResumePaths) -> None:
     paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _completed_job_keys(frame: pl.DataFrame) -> set[tuple[str, str]]:
+def _completed_job_keys(frame: pl.DataFrame) -> set[tuple[str, str, str]]:
     if frame.is_empty():
         return set()
     return {
-        _job_key(dataset_id, model_variant)
-        for dataset_id, model_variant in frame.select(["dataset_id", "model_variant"]).unique().iter_rows()
+        _job_key(dataset_id, model_variant, selection_metric)
+        for dataset_id, model_variant, selection_metric in frame.select(
+            ["dataset_id", "model_variant", "selection_metric"]
+        )
+        .unique()
+        .iter_rows()
     }
 
 
@@ -6004,6 +6259,7 @@ def _build_effective_config(
     *,
     dataset_ids: Sequence[str],
     variant_specs: Sequence[ExperimentVariant],
+    selection_metrics: Sequence[str],
     device: str | None,
     seed: int,
     max_train_origins: int | None,
@@ -6045,6 +6301,7 @@ def _build_effective_config(
     return {
         "dataset_ids": list(dataset_ids),
         "variant_names": [spec.model_variant for spec in variant_specs],
+        "selection_metrics": list(selection_metrics),
         "device": resolved_device,
         "seed": seed,
         "max_train_origins": max_train_origins,
@@ -6104,6 +6361,7 @@ def run_experiment(
     *,
     dataset_ids: Sequence[str] = DEFAULT_DATASETS,
     variant_names: Sequence[str] | None = None,
+    selection_metrics: Sequence[str] | None = None,
     cache_root: str | Path = _CACHE_ROOT,
     output_path: str | Path | None = None,
     device: str | None = None,
@@ -6150,6 +6408,7 @@ def run_experiment(
 ) -> pl.DataFrame:
     resolved_dataset_ids = _validate_dataset_ids(dataset_ids)
     variant_specs = resolve_variant_specs(variant_names)
+    resolved_selection_metrics = resolve_selection_metrics(selection_metrics)
     runner = job_runner or execute_training_job
     output = _resolve_output_path(output_path, resume=resume, force_rerun=force_rerun)
     resume_paths = _resume_paths_for_output(output_path=output, work_root=work_root)
@@ -6162,6 +6421,7 @@ def run_experiment(
     effective_config = _build_effective_config(
         dataset_ids=resolved_dataset_ids,
         variant_specs=variant_specs,
+        selection_metrics=resolved_selection_metrics,
         device=device,
         seed=seed,
         max_train_origins=max_train_origins,
@@ -6224,22 +6484,13 @@ def run_experiment(
     partial_results = _read_partial_results(resume_paths)
     rows: list[dict[str, object]] = partial_results.to_dicts()
     completed_job_keys = _completed_job_keys(partial_results)
-    total_jobs = len(resolved_dataset_ids) * len(variant_specs)
+    total_jobs = len(resolved_dataset_ids) * len(variant_specs) * len(resolved_selection_metrics)
     resume_active_job = None if existing_state is None else existing_state.get("active_job")
     prepared_cache: dict[str, state_base.PreparedDataset] = {}
     job_progress = _create_progress_bar(total=total_jobs, desc=f"{FAMILY_ID} jobs", leave=True)
     try:
         for dataset_id in resolved_dataset_ids:
             for variant_spec in variant_specs:
-                current_job_key = _job_key(dataset_id, variant_spec.model_variant)
-                current_job_identity = _job_identity(
-                    dataset_id=dataset_id,
-                    model_variant=variant_spec.model_variant,
-                    feature_protocol_id=variant_spec.feature_protocol_id,
-                )
-                if current_job_key in completed_job_keys:
-                    job_progress.update(1)
-                    continue
                 if dataset_loader is None:
                     if dataset_id not in prepared_cache:
                         prepared_cache[dataset_id] = prepare_dataset(
@@ -6290,71 +6541,95 @@ def run_experiment(
                     weight_decay=weight_decay,
                     bounded_output_epsilon=bounded_output_epsilon,
                 )
-                checkpoint_path = _job_checkpoint_path(
-                    resume_paths,
-                    dataset_id=dataset_id,
-                    model_variant=variant_spec.model_variant,
-                )
-                resume_from_checkpoint = resume_active_job == current_job_identity and checkpoint_path.exists()
-                _write_resume_state(resume_paths, status="running", effective_config=effective_config, active_job=current_job_identity)
-                rows.extend(
-                    runner(
-                        prepared,
-                        variant_spec=variant_spec,
-                        device=device,
-                        seed=seed,
-                        batch_size=profile.batch_size,
-                        eval_batch_size=eval_batch_size,
-                        learning_rate=profile.learning_rate,
-                        max_epochs=profile.max_epochs,
-                        early_stopping_patience=profile.early_stopping_patience,
-                        d_model=profile.d_model,
-                        lstm_hidden_dim=profile.lstm_hidden_dim,
-                        attention_heads=profile.attention_heads,
-                        patch_len=profile.patch_len,
-                        encoder_layers=profile.encoder_layers,
-                        ff_hidden_dim=profile.ff_hidden_dim,
-                        residual_channels=profile.residual_channels,
-                        skip_channels=profile.skip_channels,
-                        end_channels=profile.end_channels,
-                        gcn_depth=profile.gcn_depth,
-                        mtgnn_layers=profile.mtgnn_layers,
-                        subgraph_size=profile.subgraph_size,
-                        node_embed_dim=profile.node_embed_dim,
-                        dilation_exponential=profile.dilation_exponential,
-                        propalpha=profile.propalpha,
-                        hidden_dim=profile.hidden_dim,
-                        embed_dim=profile.embed_dim,
-                        num_layers=profile.num_layers,
-                        cheb_k=profile.cheb_k,
-                        teacher_forcing_ratio=profile.teacher_forcing_ratio,
-                        dropout=profile.dropout,
-                        grad_clip_norm=profile.grad_clip_norm,
-                        weight_decay=profile.weight_decay,
-                        bounded_output_epsilon=profile.bounded_output_epsilon,
-                        num_workers=num_workers,
-                        checkpoint_path=checkpoint_path,
-                        training_history_path=resume_paths.training_history_path,
-                        resume_from_checkpoint=resume_from_checkpoint,
-                        tensorboard_log_dir=(
-                            None
-                            if resolved_tensorboard_root is None
-                            else _tensorboard_job_log_dir(
-                                resolved_tensorboard_root,
-                                dataset_id=dataset_id,
-                                model_variant=variant_spec.model_variant,
-                            )
-                        ),
+                for selection_metric in resolved_selection_metrics:
+                    current_job_key = _job_key(dataset_id, variant_spec.model_variant, selection_metric)
+                    current_job_identity = _job_identity(
+                        dataset_id=dataset_id,
+                        model_variant=variant_spec.model_variant,
+                        selection_metric=selection_metric,
+                        feature_protocol_id=variant_spec.feature_protocol_id,
                     )
-                )
-                partial_results = _result_frame_from_rows(rows)
-                _write_partial_results(resume_paths, partial_results)
-                completed_job_keys.add(current_job_key)
-                _delete_job_checkpoint(resume_paths, dataset_id=dataset_id, model_variant=variant_spec.model_variant)
-                _write_resume_state(resume_paths, status="running", effective_config=effective_config, active_job=None)
-                resume_active_job = None
-                job_progress.set_postfix_str(f"{dataset_id}/{variant_spec.model_variant}")
-                job_progress.update(1)
+                    if current_job_key in completed_job_keys:
+                        job_progress.update(1)
+                        continue
+                    checkpoint_path = _job_checkpoint_path(
+                        resume_paths,
+                        dataset_id=dataset_id,
+                        model_variant=variant_spec.model_variant,
+                        selection_metric=selection_metric,
+                    )
+                    resume_from_checkpoint = resume_active_job == current_job_identity and checkpoint_path.exists()
+                    _write_resume_state(
+                        resume_paths,
+                        status="running",
+                        effective_config=effective_config,
+                        active_job=current_job_identity,
+                    )
+                    rows.extend(
+                        runner(
+                            prepared,
+                            variant_spec=variant_spec,
+                            selection_metric=selection_metric,
+                            device=device,
+                            seed=seed,
+                            batch_size=profile.batch_size,
+                            eval_batch_size=eval_batch_size,
+                            learning_rate=profile.learning_rate,
+                            max_epochs=profile.max_epochs,
+                            early_stopping_patience=profile.early_stopping_patience,
+                            d_model=profile.d_model,
+                            lstm_hidden_dim=profile.lstm_hidden_dim,
+                            attention_heads=profile.attention_heads,
+                            patch_len=profile.patch_len,
+                            encoder_layers=profile.encoder_layers,
+                            ff_hidden_dim=profile.ff_hidden_dim,
+                            residual_channels=profile.residual_channels,
+                            skip_channels=profile.skip_channels,
+                            end_channels=profile.end_channels,
+                            gcn_depth=profile.gcn_depth,
+                            mtgnn_layers=profile.mtgnn_layers,
+                            subgraph_size=profile.subgraph_size,
+                            node_embed_dim=profile.node_embed_dim,
+                            dilation_exponential=profile.dilation_exponential,
+                            propalpha=profile.propalpha,
+                            hidden_dim=profile.hidden_dim,
+                            embed_dim=profile.embed_dim,
+                            num_layers=profile.num_layers,
+                            cheb_k=profile.cheb_k,
+                            teacher_forcing_ratio=profile.teacher_forcing_ratio,
+                            dropout=profile.dropout,
+                            grad_clip_norm=profile.grad_clip_norm,
+                            weight_decay=profile.weight_decay,
+                            bounded_output_epsilon=profile.bounded_output_epsilon,
+                            num_workers=num_workers,
+                            checkpoint_path=checkpoint_path,
+                            training_history_path=resume_paths.training_history_path,
+                            resume_from_checkpoint=resume_from_checkpoint,
+                            tensorboard_log_dir=(
+                                None
+                                if resolved_tensorboard_root is None
+                                else _tensorboard_job_log_dir(
+                                    resolved_tensorboard_root,
+                                    dataset_id=dataset_id,
+                                    model_variant=variant_spec.model_variant,
+                                    selection_metric=selection_metric,
+                                )
+                            ),
+                        )
+                    )
+                    partial_results = _result_frame_from_rows(rows)
+                    _write_partial_results(resume_paths, partial_results)
+                    completed_job_keys.add(current_job_key)
+                    _delete_job_checkpoint(
+                        resume_paths,
+                        dataset_id=dataset_id,
+                        model_variant=variant_spec.model_variant,
+                        selection_metric=selection_metric,
+                    )
+                    _write_resume_state(resume_paths, status="running", effective_config=effective_config, active_job=None)
+                    resume_active_job = None
+                    job_progress.set_postfix_str(f"{dataset_id}/{variant_spec.model_variant}/{selection_metric}")
+                    job_progress.update(1)
     finally:
         job_progress.close()
     results = _result_frame_from_rows(rows)
@@ -6369,6 +6644,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run world_model_baselines_v1 on Kelmarsh.")
     parser.add_argument("--dataset", action="append", choices=list(DEFAULT_DATASETS), dest="datasets")
     parser.add_argument("--variant", action="append", choices=list(DEFAULT_VARIANTS), dest="variants")
+    parser.add_argument(
+        "--selection-metric",
+        action="append",
+        choices=list(DEFAULT_SELECTION_METRICS),
+        dest="selection_metrics",
+        help="Selection metric contract to run. Repeat to run multiple contracts; defaults to both val_rmse_pu then val_mae_pu.",
+    )
     parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None)
@@ -6484,6 +6766,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
     resolved_dataset_ids = _validate_dataset_ids(tuple(args.datasets) if args.datasets else DEFAULT_DATASETS)
     variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
+    resolved_selection_metrics = resolve_selection_metrics(tuple(args.selection_metrics) if args.selection_metrics else None)
     resolved_tensorboard_root = resolve_tensorboard_root(
         output_path=resolved_output_path,
         work_root=_RUN_WORK_ROOT,
@@ -6499,6 +6782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = run_experiment(
         dataset_ids=resolved_dataset_ids,
         variant_names=tuple(spec.model_variant for spec in variant_specs),
+        selection_metrics=resolved_selection_metrics,
         device=args.device,
         max_epochs=args.epochs,
         output_path=resolved_output_path,
@@ -6542,6 +6826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.no_record_run:
         recorded_args = vars(args).copy()
         recorded_args["output_path"] = resolved_output_path
+        recorded_args["selection_metrics"] = list(resolved_selection_metrics)
         recorded_args["resolved_dataset_variant_hyperparameters"] = resolved_dataset_variant_hyperparameters
         record_cli_run(
             family_id=FAMILY_ID,

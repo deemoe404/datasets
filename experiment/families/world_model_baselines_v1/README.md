@@ -5,6 +5,11 @@ against `world_model_state_space_v1` on the active `next_6h_from_24h` task and
 the existing `world_model_v1` task bundle. It does not modify source data or
 dataset-side protocol semantics.
 
+The family now publishes contract-separated results in a single CSV/history
+surface via `selection_metric`. This patch standardizes checkpoint selection,
+early stopping, and reporting only; it does not change model losses, feature
+budgets, or dataset-side inputs.
+
 The first implementation includes:
 
 - `world_model_persistence_last_value_v1_farm_sync`: analytic last-value
@@ -41,6 +46,33 @@ The first implementation includes:
 cd experiment/families/world_model_baselines_v1
 ./create_env.sh
 ./.conda/bin/python run_world_model_baselines_v1.py
+```
+
+Default runs both selection contracts in order:
+
+- `selection_metric=val_rmse_pu`
+- `selection_metric=val_mae_pu`
+
+Run RMSE-only:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --selection-metric val_rmse_pu
+```
+
+Run MAE-only:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --selection-metric val_mae_pu
+```
+
+Run only DGCRN under the RMSE contract:
+
+```shell
+./.conda/bin/python run_world_model_baselines_v1.py \
+  --variant world_model_dgcrn_v1_farm_sync \
+  --selection-metric val_rmse_pu
 ```
 
 Run only persistence:
@@ -95,6 +127,10 @@ Default formal output:
 - `experiment/artifacts/published/world_model_baselines_v1/<run_timestamp>.csv`
 - `experiment/artifacts/published/world_model_baselines_v1/<run_timestamp>.training_history.csv`
 - `experiment/artifacts/runs/world_model_baselines_v1/<timestamp>/manifest.json`
+
+Published result uniqueness is now keyed by:
+
+- `(dataset_id, model_variant, selection_metric, split_name, eval_protocol, metric_scope, lead_step)`
 
 Default `--resume` and `--force-rerun` flows must pass the exact historical
 `--output-path` because the formal publish path is timestamped per run.
