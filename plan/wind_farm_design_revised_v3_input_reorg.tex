@@ -419,82 +419,142 @@ $\odot$           & 逐元素乘法 \\
 \end{tabular}
 \end{minipage}
 
-
-\subsection{输入}
-
-本节只定义模型在时刻 $t$ 可直接获得的\textbf{外部输入}。凡是需要结合当前隐状态、编码器或站点聚合后才得到的量，都不再记为“输入”，而在后续小节中单独定义。尤其是 rollout 阶段由模型内部解码得到的未来站点级摘要和未来源机组摘要，属于 latent prediction，而不是已知未来输入。
-
-原始数据中的 companion mask 采用 ``$1$ 表示不可用、$0$ 表示可用'' 的存储约定。为与后续公式保持一致，进入模型前统一转换为
+需要注意的是，原始数据中的 companion mask 采用 ``$1$ 表示不可用、$0$ 表示可用'' 的存储约定。为与后续公式保持一致，进入模型前统一转换为
 \[
 m^{raw}_{k,t}\in\{0,1\},\qquad q_{k,t}=1-m^{raw}_{k,t},
 \]
 其中 $q_{k,t}=1$ 表示该维当前可用。下文所有网络公式一律使用 $q$，不再直接使用原始 schema 中的 mask 极性。
 
+\subsection{输入}
+
+本节只定义模型在时刻 $t$ 可直接获得的外部输入。
+
 \subsubsection{节点静态特征}
 
-\begin{equation}
+\begin{equation*}
   s_i=\left[\mathrm{Emb}(\mathrm{turbine\_index}_i),\, \widetilde{coord\_x_i},\, \widetilde{coord\_y_i},\, \widetilde{elevation_i},\, \widetilde{rated\_power_i},\, \widetilde{hub\_height_i},\, \widetilde{rotor\_diameter_i}\right]
-\end{equation}
+\end{equation*}
 
 \subsubsection{边静态几何特征}
 
-\begin{equation}
+\begin{equation*}
   p_{i\leftarrow j}^{stat}=\left[\widetilde{\Delta x_{ij}},\, \widetilde{\Delta y_{ij}},\, \widetilde{\log(1+d_{ij})},\, \widetilde{d^{(RD)}_{ij}},\, \sin(\beta_{ij}),\, \cos(\beta_{ij}),\, \widetilde{\Delta{h}_{ij}} \right]
-\end{equation}
+\end{equation*}
 
 \subsubsection{当前机组观测}
 
-第 1 节中的原始目标列仍记为 \texttt{target\_kw}，对应机组 10 分钟平均功率（kW）。进入模型前，先按机组额定功率做 per-unit 变换：
+\begin{equation*}
+  o_{i,t}=\left[
+  \widetilde{y}^{pu}_{i,t},\,
+  \widetilde{ws}_{i,t},\,
+  \widetilde{\omega}^{rot}_{i,t},\,
+  \widetilde{\omega}^{gen}_{i,t},\,
+  \widetilde{T}^{amb}_{i,t},\,
+  \widetilde{T}^{nac}_{i,t},\,
+  \widetilde{\theta}^{pitch}_{i,t},\,
+  wd^{\sin}_{i,t},\,
+  wd^{\cos}_{i,t},\,
+  ye^{\sin}_{i,t},\,
+  ye^{\cos}_{i,t},\,
+  e^{evt}_{i,t}
+  \right].
+\end{equation*}
+
+\[
+q^{obs}_{i,t}\in\{0,1\}^{d_{obs}},\qquad
+\Delta t^{obs}_{i,t}\ge 0.
+\]
+
+其中：
+
 \[
   y_{i,t}=\texttt{target\_kw}_{i,t},\qquad
-  y^{pu}_{i,t}=\frac{y_{i,t}}{rated\_power_i}=\frac{\texttt{target\_kw}_{i,t}}{rated\_power_i}.
+  y^{pu}_{i,t}=\frac{y_{i,t}}{rated\_power_i}.
 \]
-再按训练集统计量将连续输入缩放为模型实际使用的 $\widetilde{y}^{pu}_{i,t}$。沿用第 1 节数据说明表中的其余本地观测记号，当前机组观测向量写为
-\begin{equation}
-  o_{i,t}=\left[
-  \begin{aligned}
-  &\widetilde{y}^{pu}_{i,t},\, \widetilde{ws}_{i,t},\, \widetilde{\omega}^{rot}_{i,t},\, \widetilde{\omega}^{gen}_{i,t},\, \widetilde{T}^{amb}_{i,t},\, \widetilde{T}^{nac}_{i,t},\, \widetilde{\theta}^{pitch}_{i,t}, \\
-  &wd^{\sin}_{i,t},\, wd^{\cos}_{i,t},\, ye^{\sin}_{i,t},\, ye^{\cos}_{i,t}
-  \end{aligned}
-  \right]
-\end{equation}
 
-对应的可用性与 time-gap 记为
 \[
-q^{obs}_{i,t}\in\{0,1\}^{d_{obs}},\qquad \Delta t^{obs}_{i,t}\ge 0.
+  e^{evt}_{i,t}=
+  \left[
+    evt^{any}_{i,t},\,
+    \widetilde{evt}^{count}_{i,t},\,
+    \widetilde{evt}^{overlap}_{i,t},\,
+    evt^{stop}_{i,t},\,
+    evt^{warn}_{i,t},\,
+    evt^{info}_{i,t}
+  \right].
 \]
-
-\subsubsection{可选的机组运行状态 / 控制输入}
-
-若数据侧可提供运营干预与状态量，则将其作为单独一组输入，而不是与连续观测混在一起。定义
-\[
-u^{ops}_{i,t}=\left[\chi^{avail}_{i,t},\, \chi^{curt}_{i,t},\, \chi^{fault}_{i,t},\, \chi^{maint}_{i,t},\, \widetilde{p}^{limit,pu}_{i,t},\, \mathrm{emb}(ctrl\_mode_{i,t})\right].
-\]
-
-对应的可用性与 time-gap 记为
-\[
-q^{ops}_{i,t}\in\{0,1\}^{d_{ops}},\qquad \Delta t^{ops}_{i,t}\ge 0.
-\]
-
-若部分或全部运行状态信号不可得，则以全零占位，并令相应 mask $q^{ops}_{i,t}=0$。所有实验都应显式记录“是否启用 $u^{ops}$”。
 
 \subsubsection{当前场级可见量}
 
-v1 主模型在当前时刻直接使用的场级外部输入仅包含 PMU 三通道与日历编码。定义
 \[
-f_t=\left[\widetilde{I}^{farm}_t,\, \widetilde{Q}^{farm}_t,\, \widetilde{P}^{farm}_t\right],\qquad
-q^{farm}_t=\left[q^I_t,\, q^Q_t,\, q^P_t\right],
-\]
-以及
-\[
-\mathrm{cal}_t=\left[hour^{\sin}_t,\, hour^{\cos}_t,\, weekday^{\sin}_t,\, weekday^{\cos}_t,\, month^{\sin}_t,\, month^{\cos}_t,\, \chi^{weekend}_t\right].
+c_t=\left[
+  f_t,\,
+  q^{farm}_t,\,
+  \Delta t^{farm}_t,\,
+  s^{site}_t,\,
+  \mathrm{cal}_t
+\right].
 \]
 
-场级事件标记若后续需要启用，可作为 $f_t$ 的附加通道并同步扩展 $q^{farm}_t$；但在 v1 主公式中默认不纳入 $c_t$ 的定义。
+\[
+q^{farm}_t\in\{0,1\}^{d_{farm}},\qquad
+\Delta t^{farm}_t\ge 0.
+\]
+
+其中：
+
+\[
+e^{farm,evt}_t=
+\left[
+  farm\_evt^{any}_t,\,
+  \widetilde{farm\_evt}^{count}_t,\,
+  \widetilde{farm\_evt}^{overlap}_t,\,
+  farm\_evt^{stop}_t,\,
+  farm\_evt^{warn}_t,\,
+  farm\_evt^{info}_t
+\right].
+\]
+
+\[
+f_t=
+\left[
+  \widetilde{I}^{farm}_t,\,
+  \widetilde{P}^{farm}_t,\,
+  \widetilde{Q}^{farm}_t,\,
+  e^{farm,evt}_t
+\right].
+\]
+
+\[
+\mathrm{cal}_t=\left[
+  hour^{\sin}_t,\,
+  hour^{\cos}_t,\,
+  weekday^{\sin}_t,\,
+  weekday^{\cos}_t,\,
+  month^{\sin}_t,\,
+  month^{\cos}_t,\,
+  \chi^{weekend}_t
+\right].
+\]
+
+\[
+s^{site}_t=
+\left[
+  \widetilde{ws}^{mean}_t,\,
+  \widetilde{wd}^{\cos,mean}_t,\,
+  \widetilde{wd}^{\sin,mean}_t,\,
+  \widetilde{r}^{wd}_t,\,
+  \rho^{ws}_t,\,
+  \rho^{wd}_t
+\right],
+\]
+
+其中：$\widetilde{r}^{wd}_t$ 表示风向圆均值的 resultant length，
+$\rho^{ws}_t,\rho^{wd}_t$ 分别表示风速与风向的可用率。
 
 \subsubsection{已知未来外生量}
 
-未来时刻唯一允许直接输入模型的外生量仍然只有日历：
+未来时刻唯一允许直接输入模型的外生量只有日历：
 \[
 u^{known}_{t+\tau}=\mathrm{cal}_{t+\tau},\qquad u^{known}_{i,t+\tau}=\emptyset,\qquad \tau=1,\ldots,H.
 \]
@@ -758,7 +818,8 @@ $$\hat y^{pu}_{i,t+\tau|t}=(1+\epsilon_y)\,\sigma\left(\hat y^{raw}_{i,t+\tau|t}
 $$\hat P^{farm}_{t+\tau|t}=b_0+b_1\sum_{i=1}^N rated\_power_i\cdot \hat y^{pu}_{i,t+\tau|t},\qquad b_0\leftarrow 0,\; b_1\leftarrow 1.$$
 
 \noindent 其中 $b_0,b_1$ 为可学习标量，用于吸收线路损耗、PMU 标定偏差与 turbine-sum 到 farm-level power 之间的固定偏移。若后续实验确认还有额外收益，可再叠加独立的场级 auxiliary head；但 v1 默认只启用上述仿射一致性头，以减少实现歧义。
-\subsection{可直接启动的超参数与训练策略}
+
+\section{可直接启动的超参数与训练策略}
 
 基于当前网络结构，一个可直接启动且实现风险较低的配置如下。整体上，模型容量应优先控制在“足以表达局部时空交互，但不过早引入过强自由度”的范围内，以便先验证动态图建模与全局状态建模是否能够稳定带来收益。在固定单风场设定下，可保留 turbine id embedding；若目标是跨风场泛化，则更建议直接移除该项，以避免模型对风机身份索引产生过强依赖。局部状态采用 \(z/h\) 双变量形式，其中 \(z\) 用于刻画相对快速变化的局部隐变量，\(h\) 用于承载相对平滑的记忆状态；全场摘要状态 \(g\) 则用于建模跨机组的全局背景与场级约束。推荐的启动超参数见表~\ref{tab:hyperparams_startup}。
 
@@ -1080,223 +1141,6 @@ G=L+H=180\ \mathrm{steps}=30\ \mathrm{hours}.
 
 \medskip
 
-\noindent 上图保留为前期草图，便于和既有讨论记录对应。为与当前 v1 正文公式严格对齐，下图另给出一张新版结构总览。
-
-\begin{figure}[t]
-\centering
-{\footnotesize\bfseries Historical window: filtering / assimilation\par}
-\vspace{1mm}
-\resizebox{0.97\linewidth}{!}{%
-\begin{tikzpicture}[
-    >=Latex,
-    semithick,
-    font=\scriptsize,
-    net/.style={
-        draw,
-        rounded corners=2pt,
-        fill=yellow!25,
-        align=center,
-        text width=12mm,
-        minimum height=8mm,
-        inner sep=1.5pt
-    },
-    state/.style={
-        draw,
-        rounded corners=2pt,
-        fill=blue!6,
-        align=center,
-        text width=21mm,
-        minimum height=9mm,
-        inner sep=1.5pt
-    },
-    io/.style={
-        draw,
-        rounded corners=2pt,
-        fill=green!8,
-        align=center,
-        text width=26mm,
-        minimum height=9mm,
-        inner sep=1.5pt
-    },
-    aux/.style={
-        draw,
-        rounded corners=2pt,
-        fill=white,
-        align=center,
-        text width=11mm,
-        minimum height=6mm,
-        inner sep=1.5pt
-    },
-    flow/.style={->},
-    lab/.style={font=\scriptsize, fill=white, inner sep=1pt}
-]
-\node[state] (histprev)  at (0.0, 0.0)  {prev posterior\\$\{z^+_{i,t-1},\,h^+_{i,t-1}\},\,g^+_{t-1}$};
-\node[aux]   (cal_h)     at (2.2, 1.8)  {$\mathrm{cal}_{t}$};
-\node[net]   (decg_h)    at (2.2, 0.0)  {$\mathrm{Dec}^{met}_g$};
-\node[net]   (src_h)     at (3.9, 0.0)  {$\mathrm{MLP}^{pred}_{src}$};
-\node[net]   (ep_h)      at (5.6, 0.0)  {$\mathrm{MLP}^{pred}_e$};
-\node[net]   (ap_h)      at (7.3, 0.0)  {$\mathrm{MLP}^{pred}_a$};
-\node[net]   (sp_h)      at (9.0, 0.0)  {$\mathrm{MLP}^{pred}_{\Sigma}$};
-\node[net]   (tr_h)      at (9.0,-2.2)  {Transition};
-\node[net]   (pt_h)      at (10.7,-2.2) {$\mathrm{MLP}^{tr}_{pool}$};
-\node[net]   (pat_h)     at (12.4,-2.2) {$\mathrm{MLP}^{a,tr}_{pool}$};
-\node[net]   (tg_h)      at (14.1,-2.2) {Transition$_g$};
-\node[state] (histprior) at (16.6,-2.2) {prior state\\$\{z^-_{i,t},\,h^-_{i,t}\},\,g^-_{t}$};
-
-\node[io]    (histin)    at (0.0,-5.5)  {current inputs\\$o_{i,t},\,u^{ops}_{i,t},\,q_t,\,\Delta t_t,\,s_i$};
-\node[net]   (mops)      at (2.4,-5.5)  {$\mathrm{MLP}_{ops}$};
-\node[net]   (mobs)      at (4.1,-5.5)  {$\mathrm{MLP}_{obs}$};
-\node[net]   (esrc)      at (5.8,-5.5)  {Enc$_{src}$};
-\node[net]   (eu)        at (7.5,-5.5)  {$\mathrm{MLP}^{upd}_e$};
-\node[net]   (au)        at (9.2,-5.5)  {$\mathrm{MLP}^{upd}_a$};
-\node[net]   (su)        at (10.9,-5.5) {$\mathrm{MLP}^{upd}_{\Sigma}$};
-\node[aux]   (ctxt)      at (9.2,-7.2)  {$c_t$};
-\node[net]   (dobs)      at (13.7,-5.5) {Dec$_{obs}$};
-\node[net]   (env)       at (15.4,-5.5) {Enc$_{\nu}$};
-\node[net]   (upd)       at (17.1,-5.5) {Update};
-\node[net]   (pp)        at (18.8,-5.5) {$\mathrm{MLP}^{+}_{pool}$};
-\node[net]   (pap)       at (20.5,-5.5) {$\mathrm{MLP}^{a,+}_{pool}$};
-\node[net]   (ug)        at (22.2,-5.5) {Update$_g$};
-\node[state] (histpost)  at (24.7,-5.5) {posterior state\\$\{z^+_{i,t},\,h^+_{i,t}\},\,g^+_{t}$};
-
-\draw[flow] (histprev) -- (decg_h);
-\draw[flow] (cal_h) -- (decg_h);
-\draw[flow] (decg_h) -- (src_h);
-\draw[flow] (src_h) -- (ep_h);
-\draw[flow] (ep_h) -- (ap_h);
-\draw[flow] (ap_h) -- (sp_h);
-\draw[flow] (sp_h) -- (tr_h);
-\draw[flow] (tr_h) -- (pt_h);
-\draw[flow] (pt_h) -- (pat_h);
-\draw[flow] (pat_h) -- (tg_h);
-\draw[flow] (tg_h) -- (histprior);
-
-\draw[flow] (histin) -- (mops);
-\draw[flow] (mops) -- (mobs);
-\draw[flow] (mobs) -- (esrc);
-\draw[flow] (esrc) -- (eu);
-\draw[flow] (eu) -- (au);
-\draw[flow] (au) -- (su);
-\draw[flow] (ctxt) -- (au);
-\draw[flow] (dobs) -- (env);
-\draw[flow] (env) -- (upd);
-\draw[flow] (upd) -- (pp);
-\draw[flow] (pp) -- (pap);
-\draw[flow] (pap) -- (ug);
-\draw[flow] (ug) -- (histpost);
-\draw[flow] (histprior.south) -- ++(0,-0.7) -| (dobs.north);
-\draw[flow] (mobs.south) -- ++(0,-0.7) -| (env.north);
-\draw[flow] (su.south) -- ++(0,-0.7) |- (upd.north);
-
-\node[
-    draw,
-    dashed,
-    rounded corners=3pt,
-    inner sep=5pt,
-    fit=(histprev)(cal_h)(decg_h)(src_h)(ep_h)(ap_h)(sp_h)(tr_h)(pt_h)(pat_h)(tg_h)(histprior)(histin)(mops)(mobs)(esrc)(eu)(au)(su)(ctxt)(dobs)(env)(upd)(pp)(pap)(ug)(histpost)
-] {};
-\end{tikzpicture}%
-}
-
-\vspace{1mm}
-{\footnotesize rollout initialization at $\tau=1$:
-$\{z_{i,t|t},\,h_{i,t|t},\,g_{t|t}\}\equiv\{z^+_{i,t},\,h^+_{i,t},\,g^+_t\}$\par}
-\vspace{1mm}
-{\footnotesize\bfseries Future window: open-loop rollout\par}
-\vspace{1mm}
-\resizebox{0.97\linewidth}{!}{%
-\begin{tikzpicture}[
-    >=Latex,
-    semithick,
-    font=\scriptsize,
-    net/.style={
-        draw,
-        rounded corners=2pt,
-        fill=yellow!25,
-        align=center,
-        text width=12mm,
-        minimum height=8mm,
-        inner sep=1.5pt
-    },
-    state/.style={
-        draw,
-        rounded corners=2pt,
-        fill=blue!6,
-        align=center,
-        text width=21mm,
-        minimum height=9mm,
-        inner sep=1.5pt
-    },
-    io/.style={
-        draw,
-        rounded corners=2pt,
-        fill=green!8,
-        align=center,
-        text width=16mm,
-        minimum height=9mm,
-        inner sep=1.5pt
-    },
-    aux/.style={
-        draw,
-        rounded corners=2pt,
-        fill=white,
-        align=center,
-        text width=11mm,
-        minimum height=6mm,
-        inner sep=1.5pt
-    },
-    flow/.style={->}
-]
-\node[state] (rollprev) at (0.0, 0.0) {prev rollout state\\$\{z_{i,t+\tau-1|t},\,h_{i,t+\tau-1|t}\},\,g_{t+\tau-1|t}$};
-\node[aux]   (cal)     at (2.3, 1.8) {$\mathrm{cal}_{t+\tau}$};
-\node[net]   (decg_f)  at (2.3, 0.0) {$\mathrm{Dec}^{met}_g$};
-\node[net]   (src_f)   at (4.0, 0.0) {$\mathrm{MLP}^{pred}_{src}$};
-\node[net]   (ep_f)    at (5.7, 0.0) {$\mathrm{MLP}^{pred}_e$};
-\node[net]   (ap_f)    at (7.4, 0.0) {$\mathrm{MLP}^{pred}_a$};
-\node[net]   (sp_f)    at (9.1, 0.0) {$\mathrm{MLP}^{pred}_{\Sigma}$};
-\node[net]   (tr_f)    at (9.1,-2.2) {Transition};
-\node[net]   (pt_f)    at (10.8,-2.2) {$\mathrm{MLP}^{tr}_{pool}$};
-\node[net]   (pat_f)   at (12.5,-2.2) {$\mathrm{MLP}^{a,tr}_{pool}$};
-\node[net]   (tg_f)    at (14.2,-2.2) {Transition$_g$};
-\node[state] (rollnext) at (16.8,-2.2) {next rollout state\\$\{z_{i,t+\tau|t},\,h_{i,t+\tau|t}\},\,g_{t+\tau|t}$};
-\node[net]   (mdec)    at (19.2,-2.2) {$\mathrm{MLP}^{raw}_{dec}$};
-\node[io]    (yhat)    at (21.3,-2.2) {forecast\\$\hat y_{i,t+\tau|t}$};
-
-\draw[flow] (rollprev) -- (decg_f);
-\draw[flow] (cal) -- (decg_f);
-\draw[flow] (decg_f) -- (src_f);
-\draw[flow] (src_f) -- (ep_f);
-\draw[flow] (ep_f) -- (ap_f);
-\draw[flow] (ap_f) -- (sp_f);
-\draw[flow] (sp_f) -- (tr_f);
-\draw[flow] (tr_f) -- (pt_f);
-\draw[flow] (pt_f) -- (pat_f);
-\draw[flow] (pat_f) -- (tg_f);
-\draw[flow] (tg_f) -- (rollnext);
-\draw[flow] (rollnext) -- (mdec);
-\draw[flow] (mdec) -- (yhat);
-
-\node[
-    draw,
-    dashed,
-    rounded corners=3pt,
-    inner sep=5pt,
-    fit=(rollprev)(cal)(decg_f)(src_f)(ep_f)(ap_f)(sp_f)(tr_f)(pt_f)(pat_f)(tg_f)(rollnext)(mdec)(yhat)
-] {};
-\end{tikzpicture}%
-}
-\caption{新版 v1 结构总览：上图为历史窗 filtering / assimilation，下图为未来窗 open-loop rollout。}
-\label{fig:structure_overview_v1}
-\end{figure}
-
-\noindent 新增图中，每个黄色框都对应一个\textbf{独立命名的神经网络模块}。历史窗 prior propagation 显式拆成
-Dec$_g^{met}$、$\mathrm{MLP}^{pred}_{src}$、$\mathrm{MLP}^{pred}_e$、$\mathrm{MLP}^{pred}_a$、
-$\mathrm{MLP}^{pred}_{\Sigma}$、Transition、$\mathrm{MLP}^{tr}_{pool}$、
-$\mathrm{MLP}^{a,tr}_{pool}$ 与 Transition$_g$；posterior correction 则显式拆成
-$\mathrm{MLP}_{ops}$、$\mathrm{MLP}_{obs}$、Enc$_{src}$、$\mathrm{MLP}^{upd}_e$、
-$\mathrm{MLP}^{upd}_a$、$\mathrm{MLP}^{upd}_{\Sigma}$、Dec$_{obs}$、Enc$_\nu$、Update、
-$\mathrm{MLP}^{+}_{pool}$、$\mathrm{MLP}^{a,+}_{pool}$ 与 Update$_g$。未来窗沿用对应的 pred / tr 模块，并将 Decode 明确写成 $\mathrm{MLP}^{raw}_{dec}$；其中 $\hat c_{t+\tau}$ 仍表示
-$[\hat c^{met}_{t+\tau},\,\mathrm{cal}_{t+\tau}]$。
 
 \section{未来可能的方向}
 
