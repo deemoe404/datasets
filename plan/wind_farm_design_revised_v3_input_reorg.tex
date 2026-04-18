@@ -420,6 +420,7 @@ $SiLU$                & Sigmoid Linear Unit \\
 \begin{tabular}{@{}l@{\hspace{0.8em}}l@{}}
 $q$               & 可用性 mask（有值为 1，无值为 0） \\
 $\Delta t$        & 距离最近一次有效观测的时间间隔 \\
+$\epsilon$        & 分母平滑用的小正数常量 \\
 $a$               & 动态边 gate / 有向边权重 \\
 $e$               & 有向边消息 \\
 $m$               & 节点聚合消息 \\
@@ -579,13 +580,6 @@ s^{site}_t=\left[
 u^{known}_{t+\tau}=\mathrm{cal}_{t+\tau},\qquad u^{known}_{i,t+\tau}=\emptyset,\qquad \tau=1,\ldots,H.
 \]
 
-\subsection{缺测处理}
-时间缺口特征 $\Delta t^{obs}_{i,t}$ 由最近一次可用观测距离按时间步累计得到，并在
-\[
-\Delta t_{max}=72\Delta=720\,\mathrm{min}
-\]
-处截断。若某节点在时刻 $t$ 的全部本地观测通道都不可用，则该时刻跳过本机 posterior update，直接保留 prior state；全局池化则在有可用节点时只对可用节点求平均，若所有节点都不可用则退回到简单平均。
-
 \subsection{结构详情}
 
 \subsubsection{初始化}
@@ -602,15 +596,35 @@ h^+_{i,t_0-1}=W^{init}_h \tilde s_i.
 
 \subsubsection{本地观测编码}
 \[
-r_{i,t}=\mathrm{Enc}_{obs}\left([\bar o^{enc}_{i,t},\, s_i]\right).
-\]
-
-其中：
-\[
-\bar o^{enc}_{i,t}=\left[o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, a^{audit}_{i,t}\right],
+r_{i,t}=\mathrm{Enc}_{obs}\left([o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, a^{audit}_{i,t},\, s_i]\right).
 \]
 
 \subsubsection{图消息传递与 wake 动态}
+当前时刻的 update-stage 源机组摘要写为
+\[
+v^{src}_{j,t}=\mathrm{Enc}^{upd}_{src}\left([o_{j,t},\, q^{obs}_{j,t},\, \Delta t^{obs}_{j,t},\, a^{audit}_{j,t},\, z^-_{j,t},\, h^-_{j,t},\, s_j]\right).
+\]
+
+若原始 wake geometry 为边 $j\to i$ 提供二维坐标差与 rotor-diameter 距离
+\[
+(\Delta x_{ij},\, \Delta y_{ij},\, d^{(RD)}_{ij}),
+\]
+则当前风向下的动态 wake 特征定义为
+\[
+d^{\parallel}_{ij,t}=\frac{\Delta x_{ij} C_t+\Delta y_{ij} S_t}{d^{(RD)}_{ij}},
+\qquad
+d^{\perp}_{ij,t}=\frac{-\Delta x_{ij} S_t+\Delta y_{ij} C_t}{d^{(RD)}_{ij}},
+\]
+\[
+\psi^{wake}_{ij,t}=\sigma\!\left(\kappa d^{\parallel}_{ij,t}\right)\cdot
+\exp\!\left(-\frac{\mathrm{ReLU}(d^{\parallel}_{ij,t})}{\lambda_x}\right)\cdot
+\exp\!\left(-\left(\frac{d^{\perp}_{ij,t}}{\lambda_y}\right)^2\right),
+\]
+\[
+p^{dyn,upd}_{i\leftarrow j,t}=\left[d^{\parallel}_{ij,t},\, d^{\perp}_{ij,t},\, \psi^{wake}_{ij,t}\right].
+\]
+
+于是 update-stage 的边消息与门控写为
 \[
 e_{i\leftarrow j,t}^{upd}=\mathrm{MLP}_e^{upd}\left([s_i,\, s_j,\, p_{i\leftarrow j}^{stat},\, p_{i\leftarrow j,t}^{dyn,upd},\, v^{src}_{j,t},\, g_t^-,\, s^{site}_t,\, \mathrm{cal}_t]\right),
 \]
@@ -621,65 +635,87 @@ a_{i\leftarrow j,t}^{upd}=\sigma\left(\mathrm{MLP}_a^{upd}\left([s_i,\, s_j,\, p
 m_{i,t}^{upd}=\frac{\sum_{j\neq i} a^{upd}_{i\leftarrow j,t}e^{upd}_{i\leftarrow j,t}}{\epsilon+\sum_{j\neq i} a^{upd}_{i\leftarrow j,t}}.
 \]
 
-其中：
+\subsubsection{共享的 pred-transition kernel}
+历史窗中的 prior propagation 与未来窗中的 open-loop rollout 共用同一套
+Transition / Transition$_g$ 参数。给定某一步 transition 之前的节点/全局状态
 \[
-v^{src}_{j,t}=\mathrm{Enc}^{upd}_{src}\left([\bar o^{enc}_{j,t},\, z^-_{j,t},\, h^-_{j,t},\, s_j]\right).
+\left\{z_i,\, h_i\right\}_{i=1}^N,\qquad g,
 \]
-
+以及该步目标时刻的日历编码 $\mathrm{cal}_{next}$，先由全局状态解码下一步站点级摘要
 \[
-\psi^{wake}_{ij,t}=\sigma\!\left(\kappa d^{\parallel}_{ij,t}\right)\cdot \exp\!\left(-\frac{\mathrm{ReLU}(d^{\parallel}_{ij,t})}{\lambda_x}\right)\cdot \exp\!\left(-\left(\frac{d^{\perp}_{ij,t}}{\lambda_y}\right)^2\right),
+\hat c^{met}_{next}=\mathrm{Dec}^{met}_g\left(g,\, \mathrm{cal}_{next}\right),\qquad
+\hat c_{next}=\left[\hat c^{met}_{next},\, \mathrm{cal}_{next}\right].
 \]
+记
 \[
-d^{\parallel}_{ij,t}=\Delta x_{ij} C_t+\Delta y_{ij} S_t,
+\hat c^{met}_{next}=
+\left[
+  \hat{\bar{ws}}_{next},\,
+  \hat C_{next},\,
+  \hat S_{next},\,
+  \hat R_{next},\,
+  \hat\rho^{ws}_{next},\,
+  \hat\rho^{wd}_{next}
+\right],
+\]
+再由当前节点状态构造 source summary
+\[
+\hat\eta^{src}_{j,next}=\mathrm{Enc}^{pred}_{src}\left([z_j,\, h_j,\, g,\, s_j]\right).
+\]
+对应的预测期 wake 动态写为
+\[
+\hat d^{\parallel}_{ij,next}=\frac{\Delta x_{ij}\hat C_{next}+\Delta y_{ij}\hat S_{next}}{d^{(RD)}_{ij}},
 \qquad
-d^{\perp}_{ij,t}=-\Delta x_{ij} S_t+\Delta y_{ij} C_t.
+\hat d^{\perp}_{ij,next}=\frac{-\Delta x_{ij}\hat S_{next}+\Delta y_{ij}\hat C_{next}}{d^{(RD)}_{ij}},
 \]
 \[
-p^{dyn,upd}_{i\leftarrow j,t}=\left[d^{\parallel}_{ij,t},\, d^{\perp}_{ij,t},\, \psi^{wake}_{ij,t}\right].
+\hat\psi^{wake}_{ij,next}=\sigma\!\left(\kappa \hat d^{\parallel}_{ij,next}\right)\cdot
+\exp\!\left(-\frac{\mathrm{ReLU}(\hat d^{\parallel}_{ij,next})}{\lambda_x}\right)\cdot
+\exp\!\left(-\left(\frac{\hat d^{\perp}_{ij,next}}{\lambda_y}\right)^2\right),
+\]
+\[
+\hat p^{dyn,pred}_{i\leftarrow j,next}=\left[\hat d^{\parallel}_{ij,next},\, \hat d^{\perp}_{ij,next},\, \hat\psi^{wake}_{ij,next}\right].
 \]
 
-\subsubsection{历史窗口中的 prior propagation 与 filtering 闭环}
-历史窗口中的状态闭环按 ``\textbf{先 Transition 得到 prior，再用真实观测做 Update}'' 执行。当前实现在第一个历史步 $t_0$ 上直接从初始化状态做 correction；对后续历史步 $t>t_0$，共享 rollout 阶段的 Transition / Transition$_g$ 参数完成 prior propagation，而不是额外再写一套 history-only dynamics。
+由此得到 pred-stage 的图消息
+\[
+e^{pred}_{i\leftarrow j,next}=\mathrm{MLP}_e^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,next},\, \hat\eta^{src}_{j,next},\, g,\, \hat c_{next}]\right),
+\]
+\[
+a^{pred}_{i\leftarrow j,next}=\sigma\left(\mathrm{MLP}_a^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,next},\, \hat\eta^{src}_{j,next},\, g,\, \hat c_{next}]\right)\right),
+\]
+\[
+m^{pred}_{i,next}=\frac{\sum_{j\neq i} a^{pred}_{i\leftarrow j,next}e^{pred}_{i\leftarrow j,next}}{\epsilon+\sum_{j\neq i} a^{pred}_{i\leftarrow j,next}}.
+\]
 
-给定上一时刻后验
+随后用共享的 local/global transition 推进一步状态：
 \[
-\left\{z^+_{i,t-1},\, h^+_{i,t-1}\right\}_{i=1}^N,\qquad g^+_{t-1},
-\]
-先由上一时刻全局状态解码当前时刻的先验站点级摘要
-\[
-\hat c^{met}_{t|t-1}=\mathrm{Dec}^{met}_g\left(g^+_{t-1},\, \mathrm{cal}_{t}\right),\qquad
-\hat c_{t|t-1}=\left[\hat c^{met}_{t|t-1},\, \mathrm{cal}_{t}\right],
-\]
-再由上一时刻节点状态构造先验源机组摘要
-\[
-\hat\eta^{src}_{j,t|t-1}=\mathrm{Enc}^{pred}_{src}\left([z^+_{j,t-1},\, h^+_{j,t-1},\, g^+_{t-1},\, s_j]\right).
-\]
-于是历史 prior propagation 阶段的动态图特征写为
-\[
-\hat p^{dyn,pred}_{i\leftarrow j,t|t-1}=\left[\hat d^{\parallel}_{ij,t|t-1},\, \hat d^{\perp}_{ij,t|t-1},\, \hat\psi^{wake}_{ij,t|t-1}\right],
-\]
-并由
-\[
-e^{pred}_{i\leftarrow j,t|t-1}=\mathrm{MLP}_e^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t|t-1},\, \hat\eta^{src}_{j,t|t-1},\, g^+_{t-1},\, \hat c_{t|t-1}]\right),
+z'_i=\mathrm{GRU}^{tr}_z\left([m^{pred}_{i,next},\, g,\, \hat c^{met}_{next},\, \mathrm{cal}_{next},\, h_i,\, s_i],\, z_i\right),
 \]
 \[
-a^{pred}_{i\leftarrow j,t|t-1}=\sigma\left(\mathrm{MLP}_a^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t|t-1},\, \hat\eta^{src}_{j,t|t-1},\, g^+_{t-1},\, \hat c_{t|t-1}]\right)\right),
+h'_i=\mathrm{GRU}^{tr}_h\left([z'_i,\, m^{pred}_{i,next},\, g,\, \hat c^{met}_{next},\, \mathrm{cal}_{next},\, s_i],\, h_i\right),
 \]
 \[
-m^{pred}_{i,t|t-1}=\frac{\sum_{j\neq i} a^{pred}_{i\leftarrow j,t|t-1}e^{pred}_{i\leftarrow j,t|t-1}}{\epsilon+\sum_{j\neq i} a^{pred}_{i\leftarrow j,t|t-1}}
+\bar n^{tr}_{next}=\frac{1}{N}\sum_{i=1}^{N}[z'_i,\, h'_i],\qquad
+g'=\mathrm{GRU}^{tr}_g\left([\bar n^{tr}_{next},\, \hat c^{met}_{next},\, \mathrm{cal}_{next}],\, g\right).
 \]
-得到先验图消息。随后用共享的 Transition 接口完成一步 prior propagation：
+\noindent 在历史 prior propagation 中，上述 generic 变量替换为
 \[
-z^-_{i,t}=\mathrm{GRU}^{tr}_z\left([m^{pred}_{i,t|t-1},\, g^+_{t-1},\, \hat c^{met}_{t|t-1},\, \mathrm{cal}_t,\, h^+_{i,t-1},\, s_i],\, z^+_{i,t-1}\right),
+(z_i,\, h_i,\, g,\, \mathrm{cal}_{next})=(z^+_{i,t-1},\, h^+_{i,t-1},\, g^+_{t-1},\, \mathrm{cal}_{t}),
 \]
+而在未来 rollout 中替换为
 \[
-h^-_{i,t}=\mathrm{GRU}^{tr}_h\left([z^-_{i,t},\, m^{pred}_{i,t|t-1},\, g^+_{t-1},\, \hat c^{met}_{t|t-1},\, \mathrm{cal}_t,\, s_i],\, h^+_{i,t-1}\right).
+(z_i,\, h_i,\, g,\, \mathrm{cal}_{next})=(z_{i,t+\tau-1|t},\, h_{i,t+\tau-1|t},\, g_{t+\tau-1|t},\, \mathrm{cal}_{t+\tau}).
 \]
-\noindent 同时，全局 prior state 记为 $g_t^-$，其更新方式见后文的 Update$_g$ / Transition$_g$ 小节。
 
-最后再用真实观测执行 posterior correction。先由 prior state 解码当前观测：
+\subsubsection{共享的 posterior correction kernel}
+给定时刻 $t$ 的 prior state
 \[
-\hat o^-_{i,t}=\mathrm{Dec}^{prior}_{obs}\left([z^-_{i,t},\, h^-_{i,t},\, g_t^-,\, s_i]\right),
+\left\{z^-_{i,t},\, h^-_{i,t}\right\}_{i=1}^N,\qquad g_t^-,
+\]
+先由 prior state 解码当前观测：
+\[
+\hat o^-_{i,t}=\mathrm{Dec}^{prior}_{obs}\left([z^-_{i,t},\, h^-_{i,t},\, g_t^-,\, s_i]\right).
 \]
 再构造 masked residual 与 innovation：
 \[
@@ -687,57 +723,14 @@ h^-_{i,t}=\mathrm{GRU}^{tr}_h\left([z^-_{i,t},\, m^{pred}_{i,t|t-1},\, g^+_{t-1}
 \qquad
 \nu_{i,t}=\mathrm{Enc}_{\nu}\left([\hat o^-_{i,t},\, \delta o_{i,t},\, q^{obs}_{i,t},\, \Delta t^{obs}_{i,t},\, r_{i,t}]\right).
 \]
-于是局部 posterior update 写为
+局部 posterior update 的候选状态写为
 \[
-z^+_{i,t}=\mathrm{GRU}^{upd}_z\left([\nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, z^-_{i,t}\right),
+\tilde z^+_{i,t}=\mathrm{GRU}^{upd}_z\left([\nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, z^-_{i,t}\right),
 \]
 \[
-h^+_{i,t}=\mathrm{GRU}^{upd}_h\left([z^+_{i,t},\, \nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, h^-_{i,t}\right).
+\tilde h^+_{i,t}=\mathrm{GRU}^{upd}_h\left([\tilde z^+_{i,t},\, \nu_{i,t},\, m^{upd}_{i,t},\, g_t^-,\, c_t,\, s_i],\, h^-_{i,t}\right).
 \]
-\noindent 若该时刻节点 $i$ 没有任何可用本地观测，则保持 $z^+_{i,t}=z^-_{i,t}$、$h^+_{i,t}=h^-_{i,t}$。
-
-\subsubsection{rollout 阶段的 Transition 与内部预测量}
-未来窗不再接入真实观测，只保留 open-loop transition。对每个 horizon 步 $\tau=1,\ldots,H$，先由上一时刻全局状态解码未来站点级摘要：
-\[
-\hat c^{met}_{t+\tau}=\mathrm{Dec}^{met}_g\left(g_{t+\tau-1|t},\, \mathrm{cal}_{t+\tau}\right),\qquad
-\hat c_{t+\tau}=\left[\hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}\right].
-\]
-再由上一时刻节点状态构造供边网络使用的 future source summary：
-\[
-\hat\eta^{src}_{j,t+\tau}=\mathrm{Enc}^{pred}_{src}\left([z_{j,t+\tau-1|t},\, h_{j,t+\tau-1|t},\, g_{t+\tau-1|t},\, s_j]\right).
-\]
-于是 rollout 阶段的动态图特征写为
-\[
-\hat p^{dyn,pred}_{i\leftarrow j,t+\tau}=\left[\hat d^{\parallel}_{ij,t+\tau},\, \hat d^{\perp}_{ij,t+\tau},\, \hat\psi^{wake}_{ij,t+\tau}\right],
-\]
-并由
-\[
-e^{pred}_{i\leftarrow j,t+\tau}=\mathrm{MLP}_e^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, \hat\eta^{src}_{j,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\right),
-\]
-\[
-a^{pred}_{i\leftarrow j,t+\tau}=\sigma\left(\mathrm{MLP}_a^{pred}\left([s_i,\, s_j,\, p^{stat}_{i\leftarrow j},\, \hat p^{dyn,pred}_{i\leftarrow j,t+\tau},\, \hat\eta^{src}_{j,t+\tau},\, g_{t+\tau-1|t},\, \hat c_{t+\tau}]\right)\right),
-\]
-\[
-m^{pred}_{i,t+\tau}=\frac{\sum_{j\neq i} a^{pred}_{i\leftarrow j,t+\tau}e^{pred}_{i\leftarrow j,t+\tau}}{\epsilon+\sum_{j\neq i} a^{pred}_{i\leftarrow j,t+\tau}}
-\]
-得到未来图消息。
-
-随后用 open-loop Transition 继续推进节点状态：
-\[
-z_{i,t+\tau|t}=\mathrm{GRU}^{tr}_z\left([m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau},\, h_{i,t+\tau-1|t},\, s_i],\, z_{i,t+\tau-1|t}\right),
-\]
-\[
-h_{i,t+\tau|t}=\mathrm{GRU}^{tr}_h\left([z_{i,t+\tau|t},\, m^{pred}_{i,t+\tau},\, g_{t+\tau-1|t},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau},\, s_i],\, h_{i,t+\tau-1|t}\right).
-\]
-
-\noindent 语义上，$\hat c^{met}_{t+\tau}$ 是未来站点级摘要的内部预测量。若训练阶段可以从真实未来观测构造站点级统计量，则定义
-\[
-c^{met,*}_{t+\tau}=\left[\widetilde{\bar{ws}}_{t+\tau},\, C_{t+\tau},\, S_{t+\tau},\, R_{t+\tau},\, \rho^{ws}_{t+\tau},\, \rho^{wd}_{t+\tau}\right]
-\]
-并用其作为 $\hat c^{met}_{t+\tau}$ 的弱监督目标；$\hat\eta^{src}_{j,t+\tau}$ 则仅作为 latent source summary，通过 forecast / graph losses 间接训练。
-
-\subsubsection{全局状态 Update\_g / Transition\_g}
-历史窗的 posterior correction 之后，当前实现先对节点后验状态做带可用性掩码的平均池化，再更新全局状态。记
+记
 \[
 \rho^{node}_{i,t}=
 \begin{cases}
@@ -745,22 +738,74 @@ c^{met,*}_{t+\tau}=\left[\widetilde{\bar{ws}}_{t+\tau},\, C_{t+\tau},\, S_{t+\ta
 0, & \text{否则},
 \end{cases}
 \]
-则
+则实际 posterior state 写为
+\[
+z^+_{i,t}=\rho^{node}_{i,t}\tilde z^+_{i,t}+\left(1-\rho^{node}_{i,t}\right)z^-_{i,t},
+\]
+\[
+h^+_{i,t}=\rho^{node}_{i,t}\tilde h^+_{i,t}+\left(1-\rho^{node}_{i,t}\right)h^-_{i,t}.
+\]
+随后对节点 posterior state 做池化并更新全局状态：
 \[
 \bar n_t^+=\frac{\sum_i \rho^{node}_{i,t}\,[z^+_{i,t},\, h^+_{i,t}]}{\epsilon+\sum_i \rho^{node}_{i,t}},\qquad
 g_t^+=\mathrm{GRU}^{upd}_g\left([\bar n_t^+,\, c_t],\, g_t^-\right).
 \]
-\noindent 若当前时刻所有节点都没有可用本地观测，则退回到简单平均池化。
+历史期 posterior 重建则由
+\[
+\hat o^+_{i,t}=\mathrm{Dec}^{post}_{obs}\left([z^+_{i,t},\, h^+_{i,t},\, g_t^+,\, s_i]\right)
+\]
+给出。
 
-在历史窗 prior propagation 和未来 rollout 阶段，全局转移共用同一接口。记
+\subsubsection{历史窗口控制流}
+历史窗口中的状态闭环按 ``\textbf{先 Transition 得到 prior，再用真实观测做 Update}'' 执行。
+第一个历史步 $t=t_0$ 没有上一时刻的历史后验，因此直接从初始化状态
 \[
-\bar n^{tr}_{t+\tau}=\frac{1}{N}\sum_{i=1}^{N}[z_{i,t+\tau|t},\, h_{i,t+\tau|t}],
+\left\{z^+_{i,t_0-1},\, h^+_{i,t_0-1}\right\}_{i=1}^N,\qquad g^+_{t_0-1}
 \]
-则
+作为第一个 history step 的 prior，即
 \[
-g_{t+\tau|t}=\mathrm{GRU}^{tr}_g\left([\bar n^{tr}_{t+\tau},\, \hat c^{met}_{t+\tau},\, \mathrm{cal}_{t+\tau}],\, g_{t+\tau-1|t}\right).
+z^-_{i,t_0}=z^+_{i,t_0-1},\qquad h^-_{i,t_0}=h^+_{i,t_0-1},\qquad g^-_{t_0}=g^+_{t_0-1},
 \]
-\noindent 因而历史窗 prior propagation 与未来窗 rollout 在 local/global transition 上使用的是同一套状态机。
+再进入上文定义的 posterior correction kernel。对每个后续历史步 $t>t_0$，先以上一时刻后验
+\[
+\left\{z^+_{i,t-1},\, h^+_{i,t-1}\right\}_{i=1}^N,\qquad g^+_{t-1}
+\]
+调用共享的 pred-transition kernel，并取
+\[
+z^-_{i,t}=z'_i,\qquad h^-_{i,t}=h'_i,\qquad g_t^-=g',
+\]
+再结合当前真实观测 $\{o_{i,t}\}_{i=1}^N$ 与共享上下文 $c_t$ 调用上文的 posterior correction kernel，得到
+\[
+\left\{z^+_{i,t},\, h^+_{i,t}\right\}_{i=1}^N,\qquad g_t^+.
+\]
+
+\subsubsection{未来 rollout 控制流}
+未来窗不再接入真实观测，只保留 open-loop transition。以历史窗口末端后验
+\[
+\left\{z^+_{i,t},\, h^+_{i,t}\right\}_{i=1}^N,\qquad g_t^+
+\]
+为起点，对每个 horizon 步 $\tau=1,\ldots,H$ 反复调用共享的 pred-transition kernel，并取
+\[
+z_{i,t+\tau|t}=z'_i,\qquad h_{i,t+\tau|t}=h'_i,\qquad g_{t+\tau|t}=g'.
+\]
+每一步 transition 同时给出内部预测的站点级摘要 $\hat c^{met}_{t+\tau}$。训练阶段从真实未来观测构造站点级统计量，并记为
+\[
+c^{met,*}_{t+\tau}=\left[\widetilde{\bar{ws}}_{t+\tau},\, C_{t+\tau},\, S_{t+\tau},\, R_{t+\tau},\, \rho^{ws}_{t+\tau},\, \rho^{wd}_{t+\tau}\right]
+\]
+并将其作为 $\hat c^{met}_{t+\tau}$ 的弱监督目标；pred-transition kernel 中的
+source summary $\hat\eta^{src}_{j,next}$ 仅作为 latent source summary，通过 forecast / graph losses 间接训练。
+
+\subsubsection{缺测与池化规则}
+时间缺口特征 $\Delta t^{obs}_{i,t}$ 由最近一次可用观测距离按时间步累计得到，并在
+\[
+\Delta t_{max}=72\Delta=720\,\mathrm{min}
+\]
+处截断。若某节点在时刻 $t$ 的全部本地观测通道都不可用，则由 $\rho^{node}_{i,t}=0$ 触发
+\[
+z^+_{i,t}=z^-_{i,t},\qquad h^+_{i,t}=h^-_{i,t},
+\]
+即跳过该节点的 posterior correction。若当前时刻所有节点都没有可用本地观测，则
+$\bar n_t^+$ 不再使用掩码平均，而退回到所有节点 posterior state 的简单平均。
 
 \subsubsection{Decode 与输出约束}
 \[
