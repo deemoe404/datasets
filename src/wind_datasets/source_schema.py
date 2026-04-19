@@ -182,12 +182,19 @@ def build_source_schema_inventory_exclusions(spec: DatasetSpec) -> tuple[list[di
     if not exclusions:
         return exclusions, []
 
-    csv_paths = sorted(spec.source_root.glob("*_dataSignalMapping.csv"))
+    csv_names = {path.name for path in spec.source_root.glob("*_dataSignalMapping.csv")}
+    unmatched_xlsx_names = [
+        path.name
+        for path in xlsx_paths
+        if path.with_suffix(".csv").name not in csv_names
+    ]
     warnings: list[str] = []
-    if not csv_paths:
+    if unmatched_xlsx_names:
         warnings.append(
-            "Source schema inventory skips supported Greenbyte signal-mapping workbooks because no "
-            "corresponding *_dataSignalMapping.csv files are present."
+            "Source schema inventory skips supported Greenbyte signal-mapping workbooks with no "
+            "corresponding CSV export: "
+            + ", ".join(unmatched_xlsx_names)
+            + "."
         )
     return exclusions, warnings
 

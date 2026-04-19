@@ -253,7 +253,7 @@ def test_manifest_records_signal_mapping_xlsx_exclusion_and_warning_when_csv_mis
             "reason": "supported_runtime_asset_not_schema_inventoried",
         }
     ]
-    assert any("no corresponding *_dataSignalMapping.csv files are present" in warning for warning in manifest["warnings"])
+    assert any(xlsx_path.name in warning for warning in manifest["warnings"])
 
 
 def test_manifest_records_signal_mapping_xlsx_exclusion_without_warning_when_csv_present(tmp_path) -> None:
@@ -271,7 +271,31 @@ def test_manifest_records_signal_mapping_xlsx_exclusion_without_warning_when_csv
     assert any(row["relative_path"] == xlsx_path.name for row in manifest["source_schema_inventory_exclusions"])
     assert any(row["source_asset"] == "signal_mapping" for row in manifest["source_schema_inventory"])
     assert not any(
-        "no corresponding *_dataSignalMapping.csv files are present" in warning
+        xlsx_path.name in warning
+        for warning in manifest["warnings"]
+    )
+
+
+def test_manifest_warns_only_for_signal_mapping_workbooks_missing_matching_csv(tmp_path) -> None:
+    spec = build_greenbyte_fixture(tmp_path / "raw" / "kelmarsh_partial_signal_mapping", "Kelmarsh", "Kelmarsh 1")
+    matched_xlsx_path = spec.source_root / "Kelmarsh_dataSignalMapping.xlsx"
+    matched_csv_path = spec.source_root / "Kelmarsh_dataSignalMapping.csv"
+    unmatched_xlsx_path = spec.source_root / "Kelmarsh_Archive_dataSignalMapping.xlsx"
+    matched_xlsx_path.write_bytes(b"fake-xlsx")
+    matched_csv_path.write_text(
+        "Greenbyte Signal ID,Greenbyte Title,Manufacturer Title,Unit\n1,Power,Power,kW\n",
+        encoding="utf-8",
+    )
+    unmatched_xlsx_path.write_bytes(b"fake-xlsx")
+
+    manifest = read_json(build_manifest_for_spec(spec, tmp_path / "cache"))
+
+    assert sorted(row["relative_path"] for row in manifest["source_schema_inventory_exclusions"]) == sorted(
+        [matched_xlsx_path.name, unmatched_xlsx_path.name]
+    )
+    assert any(unmatched_xlsx_path.name in warning for warning in manifest["warnings"])
+    assert not any(
+        matched_xlsx_path.name in warning and unmatched_xlsx_path.name not in warning
         for warning in manifest["warnings"]
     )
 
