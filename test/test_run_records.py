@@ -1,29 +1,14 @@
 from __future__ import annotations
 
-from importlib.util import module_from_spec, spec_from_file_location
+from importlib import import_module
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
 def _load_module():
-    module_path = (
-        Path(__file__).resolve().parents[1]
-        / "experiment"
-        / "infra"
-        / "common"
-        / "run_records.py"
-    )
-    common_dir = str(module_path.parent)
-    if common_dir not in sys.path:
-        sys.path.insert(0, common_dir)
-    spec = spec_from_file_location("run_records", module_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return import_module("experiment.infra.common.run_records")
 
 
 def test_resolve_family_feature_protocol_ids_maps_active_labels_to_registry_ids() -> None:
@@ -203,3 +188,19 @@ def test_record_cli_run_rejects_protocols_not_supported_by_family(tmp_path) -> N
         assert "unsupported feature protocols" in str(exc)
     else:
         raise AssertionError("Expected record_cli_run to reject unsupported feature protocols.")
+
+
+def test_family_runner_help_uses_package_common_imports() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    family_dir = repo_root / "experiment" / "families" / "agcrn"
+
+    completed = subprocess.run(
+        [sys.executable, "run_agcrn.py", "--help"],
+        cwd=family_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout.lower()
