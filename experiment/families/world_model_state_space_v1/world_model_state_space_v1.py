@@ -94,6 +94,9 @@ NO_MET_AUX_MODEL_VARIANT = "world_model_state_space_v1_no_met_aux_farm_sync"
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id
+CARRY_OVER_EVAL_PROTOCOL = "rolling_origin_carry_over"
+SELECTION_METRIC_CHOICES = ("val_rmse_pu", "val_mae_pu")
+DEFAULT_SELECTION_METRIC = "val_rmse_pu"
 DEFAULT_DATASETS = ("kelmarsh",)
 HISTORY_STEPS = 144
 FORECAST_STEPS = 36
@@ -162,9 +165,14 @@ _OUTPUT_TEMPLATE = default_family_output_template(repo_root=_REPO_ROOT, family_i
 _RUN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_world_model_state_space_v1"
 _RUN_STATE_SCHEMA_VERSION = "world_model_state_space_v1.run.resume.v1"
 _TRAINING_CHECKPOINT_SCHEMA_VERSION = "world_model_state_space_v1.training_checkpoint.v1"
+_BEST_CHECKPOINT_SCHEMA_VERSION = "world_model_state_space_v1.best_checkpoint.v1"
 _DATASET_ORDER = {"kelmarsh": 0}
 _SPLIT_ORDER = {"val": 0, "test": 1}
-_EVAL_PROTOCOL_ORDER = {ROLLING_EVAL_PROTOCOL: 0, NON_OVERLAP_EVAL_PROTOCOL: 1}
+_EVAL_PROTOCOL_ORDER = {
+    ROLLING_EVAL_PROTOCOL: 0,
+    CARRY_OVER_EVAL_PROTOCOL: 1,
+    NON_OVERLAP_EVAL_PROTOCOL: 2,
+}
 _METRIC_SCOPE_ORDER = {OVERALL_METRIC_SCOPE: 0, HORIZON_METRIC_SCOPE: 1}
 
 _LOCAL_VALUE_START = 0
@@ -240,6 +248,7 @@ _TRAINING_HISTORY_COLUMNS = [
     "model_id",
     "model_variant",
     "feature_protocol_id",
+    "selection_metric",
     "task_id",
     "window_protocol",
     "epoch",
@@ -274,6 +283,7 @@ _TRAINING_HISTORY_COLUMNS = [
 ]
 _TRAINING_HISTORY_BACKFILLABLE_COLUMNS = frozenset(
     {
+        "selection_metric",
         "val_rmse_pu_leads_13_24_mean",
         "val_rmse_pu_leads_25_36_mean",
     }
@@ -282,6 +292,38 @@ _VAL_RMSE_GROUP_SPECS = (
     ("val_rmse_pu_leads_13_24_mean", "leads_13_24_mean", 13, 24),
     ("val_rmse_pu_leads_25_36_mean", "leads_25_36_mean", 25, 36),
 )
+_LEAD_BUCKET_SPECS = (
+    ("leads_1_12", 1, 12),
+    ("leads_13_24", 13, 24),
+    ("leads_25_36", 25, 36),
+)
+_EVAL_DIAGNOSTIC_COLUMNS = [
+    "dataset_id",
+    "model_variant",
+    "selection_metric",
+    "split_name",
+    "eval_protocol",
+    "metric_scope",
+    "lead_step",
+    "window_count",
+    "prediction_count",
+    "clamp_hit_rate",
+    "anchor_only_mae_pu",
+    "anchor_only_rmse_pu",
+    "final_mae_pu",
+    "final_rmse_pu",
+    "mean_abs_residual",
+]
+_SCRATCH_SUMMARY_COLUMNS = [
+    "dataset_id",
+    "model_variant",
+    "selection_metric",
+    "split_name",
+    "eval_protocol",
+    "bucket_name",
+    "mae_pu",
+    "rmse_pu",
+]
 
 
 @dataclass(frozen=True)
@@ -393,6 +435,7 @@ class TrainingOutcome:
     epochs_ran: int
     best_val_rmse_pu: float
     best_val_mae_pu: float
+    selection_metric: str
     device: str
     amp_enabled: bool
     model: Any
@@ -415,6 +458,24 @@ class EvaluationMetrics:
 
 
 @dataclass(frozen=True)
+class FilterState:
+    z: Any
+    h: Any
+    g: Any
+
+
+@dataclass(frozen=True)
+class DecoderObservationCache:
+    persistence_anchor: Any | None
+
+
+@dataclass(frozen=True)
+class RollingEvalState:
+    filter_state: FilterState
+    observation_cache: DecoderObservationCache
+
+
+@dataclass(frozen=True)
 class ModelOutputs:
     future_predictions: Any
     hist_prior_observations: Any
@@ -422,6 +483,22 @@ class ModelOutputs:
     future_farm_predictions: Any
     future_met_predictions: Any
     innovation_regularization: Any
+
+
+@dataclass(frozen=True)
+class LoadedBestCheckpoint:
+    model: Any
+    profile: HyperparameterProfile
+    job_identity: dict[str, str]
+    best_epoch: int
+    epochs_ran: int
+    best_val_rmse_pu: float
+    best_val_mae_pu: float
+    selection_metric: str
+    seed: int
+    runtime_seconds: float
+    device: str
+    amp_enabled: bool
 
 
 VARIANT_SPECS = (
@@ -633,6 +710,27 @@ def resolve_hyperparameter_profile(
     return profile
 
 
+def normalize_selection_metric(selection_metric: str | None) -> str:
+    resolved = DEFAULT_SELECTION_METRIC if selection_metric is None else str(selection_metric)
+    if resolved not in SELECTION_METRIC_CHOICES:
+        raise ValueError(
+            f"Unsupported selection_metric {resolved!r}. Expected one of {SELECTION_METRIC_CHOICES!r}."
+        )
+    return resolved
+
+
+def _selection_metric_value(*, selection_metric: str, val_rmse_pu: float, val_mae_pu: float) -> float:
+    resolved_metric = normalize_selection_metric(selection_metric)
+    if resolved_metric == "val_rmse_pu":
+        return float(val_rmse_pu)
+    return float(val_mae_pu)
+
+
+def selection_metric_config_name(selection_metric: str) -> str:
+    resolved_metric = normalize_selection_metric(selection_metric)
+    return resolved_metric.replace("val_", "")
+
+
 def progress_is_enabled() -> bool:
     return HAS_TQDM and sys.stderr.isatty()
 
@@ -680,8 +778,9 @@ def _tensorboard_job_log_dir(
     *,
     dataset_id: str,
     model_variant: str,
+    selection_metric: str,
 ) -> Path:
-    return Path(tensorboard_root) / dataset_id / model_variant
+    return Path(tensorboard_root) / dataset_id / model_variant / selection_metric_config_name(selection_metric)
 
 
 def _open_tensorboard_writer(
@@ -787,6 +886,7 @@ def _tensorboard_log_run_config(
     *,
     prepared_dataset: PreparedDataset,
     profile: HyperparameterProfile,
+    selection_metric: str,
     seed: int,
     device: str,
     eval_batch_size: int | None,
@@ -798,6 +898,7 @@ def _tensorboard_log_run_config(
         "dataset_id": prepared_dataset.dataset_id,
         "model_variant": prepared_dataset.model_variant,
         "feature_protocol_id": prepared_dataset.feature_protocol_id,
+        "selection_metric": normalize_selection_metric(selection_metric),
         "task_id": TASK_ID,
         "history_steps": prepared_dataset.history_steps,
         "forecast_steps": prepared_dataset.forecast_steps,
@@ -1424,7 +1525,7 @@ if nn is not None and F is not None:
                 )
             )
 
-        def _persistence_anchor(self, local_history):
+        def _build_persistence_anchor(self, local_history):
             target_values = local_history[:, :, :, _LOCAL_VALUE_START]
             unavailable = local_history[:, :, :, _LOCAL_MASK_START]
             available = unavailable < 0.5
@@ -1442,6 +1543,26 @@ if nn is not None and F is not None:
             )
             return torch.where(has_valid, gathered, fallback)
 
+        def _persistence_anchor(self, local_history):
+            return self._build_persistence_anchor(local_history)
+
+        def build_observation_cache(self, local_history) -> DecoderObservationCache:
+            return DecoderObservationCache(
+                persistence_anchor=self._build_persistence_anchor(local_history),
+            )
+
+        def _update_observation_cache(self, observation_cache: DecoderObservationCache, local_observations) -> DecoderObservationCache:
+            target_values = local_observations[:, :, _LOCAL_VALUE_START]
+            target_available = local_observations[:, :, _LOCAL_MASK_START] < 0.5
+            current_anchor = observation_cache.persistence_anchor
+            if current_anchor is None:
+                current_anchor = self.persistence_fallback_pu.to(
+                    device=target_values.device,
+                    dtype=target_values.dtype,
+                )[None, :].expand(target_values.shape[0], -1)
+            updated_anchor = torch.where(target_available, target_values, current_anchor)
+            return DecoderObservationCache(persistence_anchor=updated_anchor)
+
         def _decode_forecast(self, raw, *, persistence_anchor):
             if not self.uses_persistence_residual_head:
                 return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(raw)
@@ -1456,10 +1577,9 @@ if nn is not None and F is not None:
         def _farm_prediction(self, forecast):
             return self.farm_bias + self.farm_scale * (forecast.squeeze(-1) * self.farm_weights[None]).sum(dim=1, keepdim=True)
 
-        def forward(self, local_history, context_history, context_future):
+        def _filter_history_with_traces(self, local_history, context_history):
             batch_size = local_history.shape[0]
             static = self._static(batch_size)
-            persistence_anchor = self._persistence_anchor(local_history) if self.uses_persistence_residual_head else None
             z, h, g = self._initial_states(
                 batch_size,
                 dtype=local_history.dtype,
@@ -1489,23 +1609,114 @@ if nn is not None and F is not None:
                 hist_prior.append(prior_obs)
                 hist_post.append(post_obs)
                 innovation_terms.append(innovation)
+            rolling_state = RollingEvalState(
+                filter_state=FilterState(z=z, h=h, g=g),
+                observation_cache=self.build_observation_cache(local_history),
+            )
+            return (
+                rolling_state,
+                torch.stack(hist_prior, dim=1),
+                torch.stack(hist_post, dim=1),
+                torch.stack([term.reshape(()) for term in innovation_terms]).mean(),
+            )
+
+        def filter_history(self, local_history, context_history) -> FilterState:
+            rolling_state, _hist_prior, _hist_post, _innovation = self._filter_history_with_traces(
+                local_history,
+                context_history,
+            )
+            return rolling_state.filter_state
+
+        def advance_with_observations(
+            self,
+            filter_state: FilterState,
+            observation_cache: DecoderObservationCache,
+            local_observations,
+            context_observations,
+        ) -> RollingEvalState:
+            if local_observations.ndim == 3:
+                local_observations = local_observations[:, None, :, :]
+            if context_observations.ndim == 2:
+                context_observations = context_observations[:, None, :]
+            if local_observations.shape[1] != context_observations.shape[1]:
+                raise ValueError(
+                    "advance_with_observations requires the same number of local and context steps."
+                )
+            batch_size = local_observations.shape[0]
+            static = self._static(batch_size)
+            z = filter_state.z
+            h = filter_state.h
+            g = filter_state.g
+            cache = observation_cache
+            for step_index in range(local_observations.shape[1]):
+                z, h, g, _met = self._transition(
+                    z,
+                    h,
+                    g,
+                    context_observations[:, step_index, _CONTEXT_CALENDAR_START:],
+                    static=static,
+                )
+                z, h, g, _prior_obs, _post_obs, _innovation = self._correct(
+                    z,
+                    h,
+                    g,
+                    local_observations[:, step_index],
+                    context_observations[:, step_index],
+                    static=static,
+                )
+                cache = self._update_observation_cache(cache, local_observations[:, step_index])
+            return RollingEvalState(
+                filter_state=FilterState(z=z, h=h, g=g),
+                observation_cache=cache,
+            )
+
+        def forecast_from_state(
+            self,
+            filter_state: FilterState,
+            observation_cache: DecoderObservationCache,
+            context_future,
+        ):
+            batch_size = context_future.shape[0]
+            static = self._static(batch_size)
+            z = filter_state.z
+            h = filter_state.h
+            g = filter_state.g
             forecasts = []
             farms = []
             mets = []
             for horizon_index in range(context_future.shape[1]):
                 z, h, g, met = self._transition(z, h, g, context_future[:, horizon_index], static=static)
                 raw_forecast = self._forecast(z, h, g, horizon_index, static=static)
-                forecast = self._decode_forecast(raw_forecast, persistence_anchor=persistence_anchor)
+                forecast = self._decode_forecast(
+                    raw_forecast,
+                    persistence_anchor=observation_cache.persistence_anchor,
+                )
                 forecasts.append(forecast)
                 farms.append(self._farm_prediction(forecast))
                 mets.append(met)
+            return (
+                torch.stack(forecasts, dim=1),
+                torch.stack(farms, dim=1),
+                torch.stack(mets, dim=1),
+            )
+
+        def forward(self, local_history, context_history, context_future):
+            rolling_state, hist_prior, hist_post, innovation_regularization = self._filter_history_with_traces(
+                local_history,
+                context_history,
+            )
+            forecasts, farms, mets = self.forecast_from_state(
+                rolling_state.filter_state,
+                rolling_state.observation_cache,
+                context_future,
+            )
             return ModelOutputs(
-                future_predictions=torch.stack(forecasts, dim=1),
-                hist_prior_observations=torch.stack(hist_prior, dim=1),
-                hist_post_observations=torch.stack(hist_post, dim=1),
-                future_farm_predictions=torch.stack(farms, dim=1),
-                future_met_predictions=torch.stack(mets, dim=1),
-                innovation_regularization=torch.stack([term.reshape(()) for term in innovation_terms]).mean(),
+                future_predictions=forecasts,
+                hist_prior_observations=hist_prior,
+                hist_post_observations=hist_post,
+                future_farm_predictions=farms,
+                future_met_predictions=mets,
+                innovation_regularization=innovation_regularization,
             )
 
 else:
@@ -1805,28 +2016,48 @@ def training_history_output_path(output_path: str | Path) -> Path:
     return output.with_name(f"{stem}.training_history{suffix}")
 
 
-def _job_key(dataset_id: str, model_variant: str) -> tuple[str, str]:
-    return dataset_id, model_variant
+def _job_key(dataset_id: str, model_variant: str, selection_metric: str) -> tuple[str, str, str]:
+    return dataset_id, model_variant, normalize_selection_metric(selection_metric)
 
 
-def _job_identity(*, dataset_id: str, model_variant: str, feature_protocol_id: str) -> dict[str, str]:
+def _job_identity(
+    *,
+    dataset_id: str,
+    model_variant: str,
+    feature_protocol_id: str,
+    selection_metric: str,
+) -> dict[str, str]:
     return {
         "dataset_id": dataset_id,
         "model_variant": model_variant,
         "feature_protocol_id": feature_protocol_id,
+        "selection_metric": normalize_selection_metric(selection_metric),
     }
 
 
-def _job_identity_for_prepared_dataset(prepared_dataset: PreparedDataset) -> dict[str, str]:
+def _job_identity_for_prepared_dataset(
+    prepared_dataset: PreparedDataset,
+    *,
+    selection_metric: str,
+) -> dict[str, str]:
     return _job_identity(
         dataset_id=prepared_dataset.dataset_id,
         model_variant=prepared_dataset.model_variant,
         feature_protocol_id=prepared_dataset.feature_protocol_id,
+        selection_metric=selection_metric,
     )
 
 
-def _job_checkpoint_path(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> Path:
-    return paths.checkpoints_dir / f"{dataset_id}__{model_variant}.pt"
+def _job_checkpoint_path(
+    paths: ResumePaths,
+    *,
+    dataset_id: str,
+    model_variant: str,
+    selection_metric: str,
+) -> Path:
+    return paths.checkpoints_dir / (
+        f"{dataset_id}__{model_variant}__{selection_metric_config_name(selection_metric)}.pt"
+    )
 
 
 def sort_result_frame(frame: pl.DataFrame) -> pl.DataFrame:
@@ -1888,7 +2119,7 @@ def sort_training_history_frame(frame: pl.DataFrame) -> pl.DataFrame:
             .replace_strict(_MODEL_VARIANT_ORDER, default=len(_MODEL_VARIANT_ORDER))
             .alias("__model_variant_order"),
         )
-        .sort(["__dataset_order", "__model_variant_order", "epoch"])
+        .sort(["__dataset_order", "__model_variant_order", "selection_metric", "epoch"])
         .drop(["__dataset_order", "__model_variant_order"])
     )
 
@@ -1964,7 +2195,16 @@ def _read_training_history(path: str | Path) -> pl.DataFrame:
             f"Training history at {history_path} is missing expected columns: {unsupported_columns!r}."
         )
     if missing_columns:
-        frame = frame.with_columns(*[pl.lit(None).alias(column) for column in missing_columns])
+        frame = frame.with_columns(
+            *[
+                (
+                    pl.lit(DEFAULT_SELECTION_METRIC)
+                    if column == "selection_metric"
+                    else pl.lit(None)
+                ).alias(column)
+                for column in missing_columns
+            ]
+        )
     return sort_training_history_frame(frame.select(_TRAINING_HISTORY_COLUMNS))
 
 
@@ -1977,6 +2217,7 @@ def _training_history_job_expr(job_identity: dict[str, str]) -> pl.Expr:
         (pl.col("dataset_id") == job_identity["dataset_id"])
         & (pl.col("model_variant") == job_identity["model_variant"])
         & (pl.col("feature_protocol_id") == job_identity["feature_protocol_id"])
+        & (pl.col("selection_metric") == job_identity["selection_metric"])
     )
 
 
@@ -2004,6 +2245,7 @@ def _append_training_history_row(path: str | Path, row: dict[str, object]) -> No
         "dataset_id": str(row["dataset_id"]),
         "model_variant": str(row["model_variant"]),
         "feature_protocol_id": str(row["feature_protocol_id"]),
+        "selection_metric": normalize_selection_metric(str(row["selection_metric"])),
     }
     if frame.is_empty():
         combined = row_frame
@@ -2031,8 +2273,19 @@ def _reset_resume_slot(paths: ResumePaths, *, effective_config: dict[str, object
     _write_resume_state(paths, status="running", effective_config=effective_config, active_job=None)
 
 
-def _delete_job_checkpoint(paths: ResumePaths, *, dataset_id: str, model_variant: str) -> None:
-    _job_checkpoint_path(paths, dataset_id=dataset_id, model_variant=model_variant).unlink(missing_ok=True)
+def _delete_job_checkpoint(
+    paths: ResumePaths,
+    *,
+    dataset_id: str,
+    model_variant: str,
+    selection_metric: str,
+) -> None:
+    _job_checkpoint_path(
+        paths,
+        dataset_id=dataset_id,
+        model_variant=model_variant,
+        selection_metric=selection_metric,
+    ).unlink(missing_ok=True)
 
 
 def _clear_checkpoint_dir(paths: ResumePaths) -> None:
@@ -2041,11 +2294,15 @@ def _clear_checkpoint_dir(paths: ResumePaths) -> None:
     paths.checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
 
-def _completed_job_keys(frame: pl.DataFrame) -> set[tuple[str, str]]:
+def _completed_job_keys(
+    frame: pl.DataFrame,
+    *,
+    selection_metric: str,
+) -> set[tuple[str, str, str]]:
     if frame.is_empty():
         return set()
     return {
-        _job_key(dataset_id, model_variant)
+        _job_key(dataset_id, model_variant, selection_metric)
         for dataset_id, model_variant in frame.select(["dataset_id", "model_variant"]).unique().iter_rows()
     }
 
@@ -2091,16 +2348,19 @@ def _build_effective_config(
     wake_lambda_y: float | None,
     wake_kappa: float | None,
     bounded_output_epsilon: float | None,
+    selection_metric: str,
     num_workers: int | None,
     tensorboard_root: str | Path | None,
     disable_tensorboard: bool,
 ) -> dict[str, object]:
     resolved_device = resolve_device(device)
+    resolved_selection_metric = normalize_selection_metric(selection_metric)
     return {
         "dataset_ids": list(dataset_ids),
         "variant_names": [spec.model_variant for spec in variant_specs],
         "device": resolved_device,
         "seed": seed,
+        "selection_metric": resolved_selection_metric,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
         "eval_batch_size": eval_batch_size,
@@ -2179,6 +2439,7 @@ def train_model(
     *,
     device: str,
     seed: int = DEFAULT_SEED,
+    selection_metric: str = DEFAULT_SELECTION_METRIC,
     batch_size: int = DEFAULT_BATCH_SIZE,
     eval_batch_size: int | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
@@ -2216,6 +2477,7 @@ def train_model(
     resolved_torch, _, _, _, _ = _require_torch()
     _set_random_seed(seed)
     resolved_device = resolve_device(device)
+    resolved_selection_metric = normalize_selection_metric(selection_metric)
     variant_spec = _resolve_variant_spec(prepared_dataset.model_variant)
     world_model_base._configure_torch_runtime(device=resolved_device, torch_module=resolved_torch)
     amp_enabled = resolved_device == "cuda"
@@ -2269,11 +2531,15 @@ def train_model(
     )
     resolved_checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
     resolved_training_history_path = Path(training_history_path) if training_history_path is not None else None
-    checkpoint_job_identity = _job_identity_for_prepared_dataset(prepared_dataset)
+    checkpoint_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=resolved_selection_metric,
+    )
     best_state: dict[str, Any] | None = None
     best_epoch = 0
     best_val_rmse_pu = float("inf")
     best_val_mae_pu = float("inf")
+    best_selection_value = float("inf")
     epochs_without_improvement = 0
     epochs_ran = 0
     start_epoch = 1
@@ -2303,6 +2569,19 @@ def train_model(
             best_epoch = int(checkpoint_payload["best_epoch"])
             best_val_rmse_pu = float(checkpoint_payload["best_val_rmse_pu"])
             best_val_mae_pu = float(checkpoint_payload.get("best_val_mae_pu", float("inf")))
+            checkpoint_selection_metric = normalize_selection_metric(
+                str(checkpoint_payload.get("selection_metric", DEFAULT_SELECTION_METRIC))
+            )
+            if checkpoint_selection_metric != resolved_selection_metric:
+                raise RuntimeError(
+                    f"Checkpoint at {resolved_checkpoint_path} does not match selection_metric="
+                    f"{resolved_selection_metric!r}."
+                )
+            best_selection_value = _selection_metric_value(
+                selection_metric=resolved_selection_metric,
+                val_rmse_pu=best_val_rmse_pu,
+                val_mae_pu=best_val_mae_pu,
+            )
             epochs_without_improvement = int(checkpoint_payload["epochs_without_improvement"])
             epochs_ran = int(checkpoint_payload["epochs_ran"])
             start_epoch = int(checkpoint_payload["next_epoch"])
@@ -2317,6 +2596,7 @@ def train_model(
                     epochs_ran=epochs_ran,
                     best_val_rmse_pu=best_val_rmse_pu,
                     best_val_mae_pu=best_val_mae_pu,
+                    selection_metric=resolved_selection_metric,
                     device=resolved_device,
                     amp_enabled=amp_enabled,
                     model=model,
@@ -2429,9 +2709,15 @@ def train_model(
             )
             val_rmse_pu = float(val_metrics.rmse_pu)
             val_mae_pu = float(val_metrics.mae_pu)
+            selection_value = _selection_metric_value(
+                selection_metric=resolved_selection_metric,
+                val_rmse_pu=val_rmse_pu,
+                val_mae_pu=val_mae_pu,
+            )
             val_horizon_rmse_group_means = _horizon_rmse_pu_group_means(val_metrics)
             is_best_epoch = False
-            if val_rmse_pu < best_val_rmse_pu - 1e-12:
+            if selection_value < best_selection_value - 1e-12:
+                best_selection_value = selection_value
                 best_val_rmse_pu = val_rmse_pu
                 best_val_mae_pu = val_mae_pu
                 best_epoch = epoch_index
@@ -2456,7 +2742,10 @@ def train_model(
                 node_count=prepared_dataset.node_count,
             )
             epoch_progress.update(1)
-            postfix_parts = [f"val_rmse={val_rmse_pu:.4f}", f"best={best_val_rmse_pu:.4f}"]
+            postfix_parts = [
+                f"{resolved_selection_metric}={selection_value:.4f}",
+                f"best={best_selection_value:.4f}",
+            ]
             if latest_losses:
                 postfix_parts.insert(0, f"loss={latest_losses['total']:.4f}")
             epoch_progress.set_postfix_str(" ".join(postfix_parts))
@@ -2469,6 +2758,7 @@ def train_model(
                         "model_id": MODEL_ID,
                         "model_variant": prepared_dataset.model_variant,
                         "feature_protocol_id": prepared_dataset.feature_protocol_id,
+                        "selection_metric": resolved_selection_metric,
                         "task_id": TASK_ID,
                         "window_protocol": WINDOW_PROTOCOL,
                         "epoch": epoch_index,
@@ -2539,6 +2829,7 @@ def train_model(
                     {
                         "schema_version": _TRAINING_CHECKPOINT_SCHEMA_VERSION,
                         "job": checkpoint_job_identity,
+                        "selection_metric": resolved_selection_metric,
                         "seed": seed,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
@@ -2565,6 +2856,7 @@ def train_model(
         epochs_ran=epochs_ran,
         best_val_rmse_pu=best_val_rmse_pu,
         best_val_mae_pu=best_val_mae_pu,
+        selection_metric=resolved_selection_metric,
         device=resolved_device,
         amp_enabled=amp_enabled,
         model=model,
@@ -2688,11 +2980,650 @@ def build_result_rows(
     return rows
 
 
+def _empty_eval_diagnostic_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_EVAL_DIAGNOSTIC_COLUMNS)
+
+
+def _empty_scratch_summary_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_SCRATCH_SUMMARY_COLUMNS)
+
+
+def _window_slices_for_target_index(
+    prepared_dataset: PreparedDataset,
+    *,
+    target_index: int,
+) -> tuple[slice, slice]:
+    return (
+        slice(target_index - prepared_dataset.history_steps, target_index),
+        slice(target_index, target_index + prepared_dataset.forecast_steps),
+    )
+
+
+def _window_batch_tensors(
+    prepared_dataset: PreparedDataset,
+    *,
+    target_index: int,
+    torch_module,
+    device: str,
+) -> tuple[Any, Any, Any, Any, Any]:
+    history_slice, future_slice = _window_slices_for_target_index(prepared_dataset, target_index=target_index)
+    return (
+        torch_module.from_numpy(
+            prepared_dataset.local_history_tensor[history_slice].astype(np.float32, copy=False)[None]
+        ).to(device=device, dtype=torch_module.float32, non_blocking=device == "cuda"),
+        torch_module.from_numpy(
+            prepared_dataset.context_history_tensor[history_slice].astype(np.float32, copy=False)[None]
+        ).to(device=device, dtype=torch_module.float32, non_blocking=device == "cuda"),
+        torch_module.from_numpy(
+            prepared_dataset.context_future_tensor[future_slice].astype(np.float32, copy=False)[None]
+        ).to(device=device, dtype=torch_module.float32, non_blocking=device == "cuda"),
+        torch_module.from_numpy(
+            prepared_dataset.target_pu_filled[future_slice, :, None].astype(np.float32, copy=False)[None]
+        ).to(device=device, dtype=torch_module.float32, non_blocking=device == "cuda"),
+        torch_module.from_numpy(
+            prepared_dataset.target_valid_mask[future_slice, :, None].astype(np.float32, copy=False)[None]
+        ).to(device=device, dtype=torch_module.float32, non_blocking=device == "cuda"),
+    )
+
+
+def _revealed_observation_tensors(
+    prepared_dataset: PreparedDataset,
+    *,
+    start_target_index: int,
+    end_target_index: int,
+    torch_module,
+    device: str,
+) -> tuple[Any, Any]:
+    if end_target_index < start_target_index:
+        raise ValueError(
+            f"revealed observation span must be non-negative, found {start_target_index}>{end_target_index}."
+        )
+    local_observations = prepared_dataset.local_history_tensor[start_target_index:end_target_index].astype(
+        np.float32,
+        copy=False,
+    )
+    context_observations = prepared_dataset.context_history_tensor[start_target_index:end_target_index].astype(
+        np.float32,
+        copy=False,
+    )
+    return (
+        torch_module.from_numpy(local_observations[None]).to(
+            device=device,
+            dtype=torch_module.float32,
+            non_blocking=device == "cuda",
+        ),
+        torch_module.from_numpy(context_observations[None]).to(
+            device=device,
+            dtype=torch_module.float32,
+            non_blocking=device == "cuda",
+        ),
+    )
+
+
+def _finalize_metric_arrays(
+    *,
+    window_count: int,
+    prediction_count: int,
+    abs_error_sum_kw: float,
+    squared_error_sum_kw: float,
+    abs_error_sum_pu: float,
+    squared_error_sum_pu: float,
+    horizon_window_count: np.ndarray,
+    horizon_prediction_count: np.ndarray,
+    horizon_abs_error_sum_kw: np.ndarray,
+    horizon_squared_error_sum_kw: np.ndarray,
+    horizon_abs_error_sum_pu: np.ndarray,
+    horizon_squared_error_sum_pu: np.ndarray,
+) -> EvaluationMetrics:
+    forecast_steps = int(horizon_prediction_count.shape[0])
+    return EvaluationMetrics(
+        window_count=window_count,
+        prediction_count=prediction_count,
+        mae_kw=_safe_divide(abs_error_sum_kw, prediction_count),
+        rmse_kw=_safe_rmse(squared_error_sum_kw, prediction_count),
+        mae_pu=_safe_divide(abs_error_sum_pu, prediction_count),
+        rmse_pu=_safe_rmse(squared_error_sum_pu, prediction_count),
+        horizon_window_count=horizon_window_count,
+        horizon_prediction_count=horizon_prediction_count,
+        horizon_mae_kw=np.asarray(
+            [_safe_divide(horizon_abs_error_sum_kw[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]
+        ),
+        horizon_rmse_kw=np.asarray(
+            [_safe_rmse(horizon_squared_error_sum_kw[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]
+        ),
+        horizon_mae_pu=np.asarray(
+            [_safe_divide(horizon_abs_error_sum_pu[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]
+        ),
+        horizon_rmse_pu=np.asarray(
+            [_safe_rmse(horizon_squared_error_sum_pu[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]
+        ),
+    )
+
+
+def _diagnostic_rows_from_sums(
+    *,
+    prepared_dataset: PreparedDataset,
+    selection_metric: str,
+    split_name: str,
+    eval_protocol: str,
+    window_count: int,
+    prediction_count: int,
+    clamp_hits: float,
+    anchor_abs_error_sum: float,
+    anchor_squared_error_sum: float,
+    final_abs_error_sum: float,
+    final_squared_error_sum: float,
+    residual_abs_sum: float,
+    horizon_window_count: np.ndarray,
+    horizon_prediction_count: np.ndarray,
+    horizon_clamp_hits: np.ndarray,
+    horizon_anchor_abs_error_sum: np.ndarray,
+    horizon_anchor_squared_error_sum: np.ndarray,
+    horizon_final_abs_error_sum: np.ndarray,
+    horizon_final_squared_error_sum: np.ndarray,
+    horizon_residual_abs_sum: np.ndarray,
+    has_residual_head: bool,
+) -> pl.DataFrame:
+    rows: list[dict[str, object]] = [
+        {
+            "dataset_id": prepared_dataset.dataset_id,
+            "model_variant": prepared_dataset.model_variant,
+            "selection_metric": selection_metric,
+            "split_name": split_name,
+            "eval_protocol": eval_protocol,
+            "metric_scope": OVERALL_METRIC_SCOPE,
+            "lead_step": None,
+            "window_count": window_count,
+            "prediction_count": prediction_count,
+            "clamp_hit_rate": _safe_divide(clamp_hits, prediction_count),
+            "anchor_only_mae_pu": _safe_divide(anchor_abs_error_sum, prediction_count),
+            "anchor_only_rmse_pu": _safe_rmse(anchor_squared_error_sum, prediction_count),
+            "final_mae_pu": _safe_divide(final_abs_error_sum, prediction_count),
+            "final_rmse_pu": _safe_rmse(final_squared_error_sum, prediction_count),
+            "mean_abs_residual": (
+                _safe_divide(residual_abs_sum, prediction_count) if has_residual_head else math.nan
+            ),
+        }
+    ]
+    for lead_index in range(prepared_dataset.forecast_steps):
+        lead_prediction_count = int(horizon_prediction_count[lead_index])
+        rows.append(
+            {
+                "dataset_id": prepared_dataset.dataset_id,
+                "model_variant": prepared_dataset.model_variant,
+                "selection_metric": selection_metric,
+                "split_name": split_name,
+                "eval_protocol": eval_protocol,
+                "metric_scope": HORIZON_METRIC_SCOPE,
+                "lead_step": lead_index + 1,
+                "window_count": int(horizon_window_count[lead_index]),
+                "prediction_count": lead_prediction_count,
+                "clamp_hit_rate": _safe_divide(float(horizon_clamp_hits[lead_index]), lead_prediction_count),
+                "anchor_only_mae_pu": _safe_divide(
+                    float(horizon_anchor_abs_error_sum[lead_index]),
+                    lead_prediction_count,
+                ),
+                "anchor_only_rmse_pu": _safe_rmse(
+                    float(horizon_anchor_squared_error_sum[lead_index]),
+                    lead_prediction_count,
+                ),
+                "final_mae_pu": _safe_divide(float(horizon_final_abs_error_sum[lead_index]), lead_prediction_count),
+                "final_rmse_pu": _safe_rmse(
+                    float(horizon_final_squared_error_sum[lead_index]),
+                    lead_prediction_count,
+                ),
+                "mean_abs_residual": (
+                    _safe_divide(float(horizon_residual_abs_sum[lead_index]), lead_prediction_count)
+                    if has_residual_head
+                    else math.nan
+                ),
+            }
+        )
+    return pl.DataFrame(rows, infer_schema_length=None).select(_EVAL_DIAGNOSTIC_COLUMNS)
+
+
+def _scratch_summary_rows(
+    *,
+    prepared_dataset: PreparedDataset,
+    selection_metric: str,
+    split_name: str,
+    eval_protocol: str,
+    metrics: EvaluationMetrics,
+) -> pl.DataFrame:
+    rows = [
+        {
+            "dataset_id": prepared_dataset.dataset_id,
+            "model_variant": prepared_dataset.model_variant,
+            "selection_metric": selection_metric,
+            "split_name": split_name,
+            "eval_protocol": eval_protocol,
+            "bucket_name": bucket_name,
+            "mae_pu": _mean_horizon_values(metrics.horizon_mae_pu, start_lead=start_lead, end_lead=end_lead),
+            "rmse_pu": _mean_horizon_values(metrics.horizon_rmse_pu, start_lead=start_lead, end_lead=end_lead),
+        }
+        for bucket_name, start_lead, end_lead in _LEAD_BUCKET_SPECS
+    ]
+    rows.insert(
+        0,
+        {
+            "dataset_id": prepared_dataset.dataset_id,
+            "model_variant": prepared_dataset.model_variant,
+            "selection_metric": selection_metric,
+            "split_name": split_name,
+            "eval_protocol": eval_protocol,
+            "bucket_name": "overall",
+            "mae_pu": float(metrics.mae_pu),
+            "rmse_pu": float(metrics.rmse_pu),
+        },
+    )
+    return pl.DataFrame(rows, infer_schema_length=None).select(_SCRATCH_SUMMARY_COLUMNS)
+
+
+def evaluate_saved_checkpoint_windows(
+    loaded_checkpoint: LoadedBestCheckpoint,
+    prepared_dataset: PreparedDataset,
+    *,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    split_name: str,
+    eval_protocol: str,
+    progress_label: str | None = None,
+) -> tuple[EvaluationMetrics, pl.DataFrame, pl.DataFrame]:
+    resolved_torch, _, _, _, _ = _require_torch()
+    resolved_eval_protocol = eval_protocol
+    if resolved_eval_protocol not in {ROLLING_EVAL_PROTOCOL, CARRY_OVER_EVAL_PROTOCOL}:
+        raise ValueError(
+            f"evaluate_saved_checkpoint_windows only supports {ROLLING_EVAL_PROTOCOL!r} and "
+            f"{CARRY_OVER_EVAL_PROTOCOL!r}, found {resolved_eval_protocol!r}."
+        )
+    model = loaded_checkpoint.model
+    model.eval()
+    forecast_steps = prepared_dataset.forecast_steps
+    window_count = 0
+    prediction_count = 0
+    abs_error_sum_kw = squared_error_sum_kw = abs_error_sum_pu = squared_error_sum_pu = 0.0
+    horizon_window_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_prediction_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_abs_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_squared_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    clamp_hits = 0.0
+    anchor_abs_error_sum = 0.0
+    anchor_squared_error_sum = 0.0
+    final_abs_error_sum = 0.0
+    final_squared_error_sum = 0.0
+    residual_abs_sum = 0.0
+    horizon_clamp_hits = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_anchor_abs_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_anchor_squared_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_final_abs_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_final_squared_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_residual_abs_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    previous_target_index: int | None = None
+    rolling_state: RollingEvalState | None = None
+    progress = _create_progress_bar(total=len(windows), desc=progress_label or resolved_eval_protocol)
+    try:
+        with resolved_torch.no_grad():
+            for target_index in windows.target_indices.tolist():
+                target_index = int(target_index)
+                if resolved_eval_protocol == CARRY_OVER_EVAL_PROTOCOL and previous_target_index is not None:
+                    revealed_local, revealed_context = _revealed_observation_tensors(
+                        prepared_dataset,
+                        start_target_index=previous_target_index,
+                        end_target_index=target_index,
+                        torch_module=resolved_torch,
+                        device=loaded_checkpoint.device,
+                    )
+                    if rolling_state is None:
+                        raise RuntimeError("carry-over evaluation requires an initialized rolling state.")
+                    rolling_state = model.advance_with_observations(
+                        rolling_state.filter_state,
+                        rolling_state.observation_cache,
+                        revealed_local,
+                        revealed_context,
+                    )
+                    _local_history, _context_history, context_future, targets, valid_mask = _window_batch_tensors(
+                        prepared_dataset,
+                        target_index=target_index,
+                        torch_module=resolved_torch,
+                        device=loaded_checkpoint.device,
+                    )
+                else:
+                    local_history, context_history, context_future, targets, valid_mask = _window_batch_tensors(
+                        prepared_dataset,
+                        target_index=target_index,
+                        torch_module=resolved_torch,
+                        device=loaded_checkpoint.device,
+                    )
+                    rolling_state = RollingEvalState(
+                        filter_state=model.filter_history(local_history, context_history),
+                        observation_cache=model.build_observation_cache(local_history),
+                    )
+                predictions, _farm_predictions, _met_predictions = model.forecast_from_state(
+                    rolling_state.filter_state,
+                    rolling_state.observation_cache,
+                    context_future,
+                )
+                predictions = predictions.float()
+                anchor_predictions = rolling_state.observation_cache.persistence_anchor[:, None, :, None].expand_as(
+                    predictions
+                )
+                errors_pu = predictions - targets
+                errors_kw = errors_pu * prepared_dataset.rated_power_kw
+                anchor_errors_pu = anchor_predictions - targets
+                valid = valid_mask
+                valid_np = valid.detach().cpu().numpy().astype(np.float64, copy=False)
+                batch_window_count = 1
+                batch_prediction_count = int(valid.sum().item())
+                window_count += batch_window_count
+                prediction_count += batch_prediction_count
+                abs_kw = resolved_torch.abs(errors_kw) * valid
+                sq_kw = resolved_torch.square(errors_kw) * valid
+                abs_pu = resolved_torch.abs(errors_pu) * valid
+                sq_pu = resolved_torch.square(errors_pu) * valid
+                anchor_abs = resolved_torch.abs(anchor_errors_pu) * valid
+                anchor_sq = resolved_torch.square(anchor_errors_pu) * valid
+                clamp_lower = predictions <= 1e-8
+                clamp_upper = predictions >= (1.0 + model.bounded_output_epsilon - 1e-8)
+                clamp_mask = (clamp_lower | clamp_upper).to(dtype=valid.dtype) * valid
+                residual_abs = resolved_torch.abs(predictions - anchor_predictions) * valid
+                abs_error_sum_kw += float(abs_kw.sum().item())
+                squared_error_sum_kw += float(sq_kw.sum().item())
+                abs_error_sum_pu += float(abs_pu.sum().item())
+                squared_error_sum_pu += float(sq_pu.sum().item())
+                clamp_hits += float(clamp_mask.sum().item())
+                anchor_abs_error_sum += float(anchor_abs.sum().item())
+                anchor_squared_error_sum += float(anchor_sq.sum().item())
+                final_abs_error_sum += float(abs_pu.sum().item())
+                final_squared_error_sum += float(sq_pu.sum().item())
+                residual_abs_sum += float(residual_abs.sum().item())
+                horizon_window_count += batch_window_count
+                horizon_prediction_count += valid_np.sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
+                horizon_abs_error_sum_kw += abs_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_squared_error_sum_kw += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_abs_error_sum_pu += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_squared_error_sum_pu += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_clamp_hits += clamp_mask.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_anchor_abs_error_sum += anchor_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_anchor_squared_error_sum += anchor_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_final_abs_error_sum += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_final_squared_error_sum += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_residual_abs_sum += residual_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                previous_target_index = target_index
+                progress.update(1)
+    finally:
+        progress.close()
+    metrics = _finalize_metric_arrays(
+        window_count=window_count,
+        prediction_count=prediction_count,
+        abs_error_sum_kw=abs_error_sum_kw,
+        squared_error_sum_kw=squared_error_sum_kw,
+        abs_error_sum_pu=abs_error_sum_pu,
+        squared_error_sum_pu=squared_error_sum_pu,
+        horizon_window_count=horizon_window_count,
+        horizon_prediction_count=horizon_prediction_count,
+        horizon_abs_error_sum_kw=horizon_abs_error_sum_kw,
+        horizon_squared_error_sum_kw=horizon_squared_error_sum_kw,
+        horizon_abs_error_sum_pu=horizon_abs_error_sum_pu,
+        horizon_squared_error_sum_pu=horizon_squared_error_sum_pu,
+    )
+    diagnostics = _diagnostic_rows_from_sums(
+        prepared_dataset=prepared_dataset,
+        selection_metric=loaded_checkpoint.selection_metric,
+        split_name=split_name,
+        eval_protocol=resolved_eval_protocol,
+        window_count=window_count,
+        prediction_count=prediction_count,
+        clamp_hits=clamp_hits,
+        anchor_abs_error_sum=anchor_abs_error_sum,
+        anchor_squared_error_sum=anchor_squared_error_sum,
+        final_abs_error_sum=final_abs_error_sum,
+        final_squared_error_sum=final_squared_error_sum,
+        residual_abs_sum=residual_abs_sum,
+        horizon_window_count=horizon_window_count,
+        horizon_prediction_count=horizon_prediction_count,
+        horizon_clamp_hits=horizon_clamp_hits,
+        horizon_anchor_abs_error_sum=horizon_anchor_abs_error_sum,
+        horizon_anchor_squared_error_sum=horizon_anchor_squared_error_sum,
+        horizon_final_abs_error_sum=horizon_final_abs_error_sum,
+        horizon_final_squared_error_sum=horizon_final_squared_error_sum,
+        horizon_residual_abs_sum=horizon_residual_abs_sum,
+        has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
+    )
+    summary = _scratch_summary_rows(
+        prepared_dataset=prepared_dataset,
+        selection_metric=loaded_checkpoint.selection_metric,
+        split_name=split_name,
+        eval_protocol=resolved_eval_protocol,
+        metrics=metrics,
+    )
+    return metrics, diagnostics, summary
+
+
+def _best_checkpoint_config_name(
+    *,
+    dataset_id: str,
+    model_variant: str,
+    selection_metric: str,
+    seed: int,
+) -> str:
+    return (
+        f"{dataset_id}__{model_variant}__{selection_metric_config_name(selection_metric)}__seed{seed}"
+    )
+
+
+def best_checkpoint_output_path(
+    checkpoint_root: str | Path,
+    *,
+    dataset_id: str,
+    model_variant: str,
+    selection_metric: str,
+    seed: int,
+) -> Path:
+    return (
+        Path(checkpoint_root).expanduser().resolve()
+        / f"{_best_checkpoint_config_name(dataset_id=dataset_id, model_variant=model_variant, selection_metric=selection_metric, seed=seed)}.pt"
+    )
+
+
+def save_best_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    prepared_dataset: PreparedDataset,
+    training_outcome: TrainingOutcome,
+    profile: HyperparameterProfile,
+    seed: int,
+    runtime_seconds: float,
+) -> Path:
+    resolved_path = Path(checkpoint_path).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    world_model_base._save_training_checkpoint(
+        resolved_path,
+        {
+            "schema_version": _BEST_CHECKPOINT_SCHEMA_VERSION,
+            "job": _job_identity_for_prepared_dataset(
+                prepared_dataset,
+                selection_metric=training_outcome.selection_metric,
+            ),
+            "profile": asdict(profile),
+            "seed": seed,
+            "model_state_dict": training_outcome.model.state_dict(),
+            "best_epoch": training_outcome.best_epoch,
+            "epochs_ran": training_outcome.epochs_ran,
+            "best_val_rmse_pu": training_outcome.best_val_rmse_pu,
+            "best_val_mae_pu": training_outcome.best_val_mae_pu,
+            "selection_metric": training_outcome.selection_metric,
+            "runtime_seconds": round(runtime_seconds, 6),
+        },
+    )
+    return resolved_path
+
+
+def load_best_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    prepared_dataset: PreparedDataset,
+    device: str | None = None,
+) -> LoadedBestCheckpoint:
+    resolved_device = resolve_device(device)
+    resolved_torch, _, _, _, _ = _require_torch()
+    payload = world_model_base._torch_load_checkpoint(
+        Path(checkpoint_path).expanduser().resolve(),
+        map_location=resolved_device,
+    )
+    if payload.get("schema_version") != _BEST_CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Unsupported best checkpoint schema at {checkpoint_path}: {payload.get('schema_version')!r}."
+        )
+    selection_metric = normalize_selection_metric(str(payload.get("selection_metric", DEFAULT_SELECTION_METRIC)))
+    expected_job_identity = _job_identity_for_prepared_dataset(
+        prepared_dataset,
+        selection_metric=selection_metric,
+    )
+    if payload.get("job") != expected_job_identity:
+        raise RuntimeError(
+            f"Best checkpoint at {checkpoint_path} does not match "
+            f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}/{selection_metric}."
+        )
+    profile_payload = dict(payload["profile"])
+    profile = HyperparameterProfile(**profile_payload)
+    variant_spec = _resolve_variant_spec(prepared_dataset.model_variant)
+    model = build_model(
+        node_count=prepared_dataset.node_count,
+        local_input_channels=prepared_dataset.local_input_channels,
+        context_history_channels=prepared_dataset.context_history_channels,
+        context_future_channels=prepared_dataset.context_future_channels,
+        static_tensor=prepared_dataset.static_tensor,
+        turbine_indices=prepared_dataset.turbine_indices,
+        pairwise_tensor=prepared_dataset.pairwise_tensor,
+        wake_geometry_tensor=prepared_dataset.wake_geometry_tensor,
+        persistence_fallback_pu=prepared_dataset.persistence_train_fallback_pu,
+        z_dim=profile.z_dim,
+        h_dim=profile.h_dim,
+        global_state_dim=profile.global_state_dim,
+        obs_encoding_dim=profile.obs_encoding_dim,
+        innovation_dim=profile.innovation_dim,
+        source_summary_dim=profile.source_summary_dim,
+        edge_message_dim=profile.edge_message_dim,
+        edge_hidden_dim=profile.edge_hidden_dim,
+        tau_embed_dim=profile.tau_embed_dim,
+        met_summary_dim=profile.met_summary_dim,
+        turbine_embed_dim=profile.turbine_embed_dim,
+        forecast_steps=prepared_dataset.forecast_steps,
+        dropout=profile.dropout,
+        uses_graph=variant_spec.uses_graph,
+        uses_wake_dynamic=variant_spec.uses_wake_dynamic,
+        uses_persistence_residual_head=variant_spec.uses_persistence_residual_head,
+        wake_lambda_x=profile.wake_lambda_x,
+        wake_lambda_y=profile.wake_lambda_y,
+        wake_kappa=profile.wake_kappa,
+        bounded_output_epsilon=profile.bounded_output_epsilon,
+    ).to(device=resolved_device)
+    model.load_state_dict(payload["model_state_dict"])
+    model.eval()
+    return LoadedBestCheckpoint(
+        model=model,
+        profile=profile,
+        job_identity=expected_job_identity,
+        best_epoch=int(payload["best_epoch"]),
+        epochs_ran=int(payload["epochs_ran"]),
+        best_val_rmse_pu=float(payload["best_val_rmse_pu"]),
+        best_val_mae_pu=float(payload["best_val_mae_pu"]),
+        selection_metric=selection_metric,
+        seed=int(payload["seed"]),
+        runtime_seconds=float(payload["runtime_seconds"]),
+        device=resolved_device,
+        amp_enabled=resolved_device == "cuda",
+    )
+
+
+def run_saved_checkpoint_scratch_evaluation(
+    *,
+    checkpoint_path: str | Path,
+    prepared_dataset: PreparedDataset,
+    output_dir: str | Path,
+    device: str | None = None,
+    include_carry_over: bool = True,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    loaded_checkpoint = load_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared_dataset,
+        device=device,
+    )
+    evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
+    diagnostics_frames: list[pl.DataFrame] = []
+    summary_frames: list[pl.DataFrame] = []
+    eval_specs = [
+        ("val", ROLLING_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows),
+        ("test", ROLLING_EVAL_PROTOCOL, prepared_dataset.test_rolling_windows),
+    ]
+    if include_carry_over:
+        eval_specs.extend(
+            [
+                ("val", CARRY_OVER_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows),
+                ("test", CARRY_OVER_EVAL_PROTOCOL, prepared_dataset.test_rolling_windows),
+            ]
+        )
+    for split_name, eval_protocol, windows in eval_specs:
+        metrics, diagnostics, summary = evaluate_saved_checkpoint_windows(
+            loaded_checkpoint,
+            prepared_dataset,
+            windows=windows,
+            split_name=split_name,
+            eval_protocol=eval_protocol,
+            progress_label=f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}/{split_name}/{eval_protocol}",
+        )
+        evaluation_results.append((split_name, eval_protocol, windows, metrics))
+        diagnostics_frames.append(diagnostics)
+        summary_frames.append(summary)
+    result_rows = build_result_rows(
+        prepared_dataset,
+        training_outcome=TrainingOutcome(
+            best_epoch=loaded_checkpoint.best_epoch,
+            epochs_ran=loaded_checkpoint.epochs_ran,
+            best_val_rmse_pu=loaded_checkpoint.best_val_rmse_pu,
+            best_val_mae_pu=loaded_checkpoint.best_val_mae_pu,
+            selection_metric=loaded_checkpoint.selection_metric,
+            device=loaded_checkpoint.device,
+            amp_enabled=loaded_checkpoint.amp_enabled,
+            model=loaded_checkpoint.model,
+        ),
+        runtime_seconds=loaded_checkpoint.runtime_seconds,
+        seed=loaded_checkpoint.seed,
+        profile=loaded_checkpoint.profile,
+        evaluation_results=evaluation_results,
+    )
+    results = _result_frame_from_rows(result_rows)
+    diagnostics = (
+        pl.concat(diagnostics_frames, how="diagonal_relaxed")
+        if diagnostics_frames
+        else _empty_eval_diagnostic_frame()
+    )
+    summaries = (
+        pl.concat(summary_frames, how="diagonal_relaxed")
+        if summary_frames
+        else _empty_scratch_summary_frame()
+    )
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    config_name = _best_checkpoint_config_name(
+        dataset_id=prepared_dataset.dataset_id,
+        model_variant=prepared_dataset.model_variant,
+        selection_metric=loaded_checkpoint.selection_metric,
+        seed=loaded_checkpoint.seed,
+    )
+    _atomic_write_csv(output_root / f"{config_name}.csv", results)
+    _atomic_write_csv(output_root / f"{config_name}.diagnostics.csv", diagnostics)
+    _atomic_write_csv(output_root / f"{config_name}.summary.csv", summaries)
+    return results, diagnostics, summaries
+
+
 def execute_training_job(
     prepared_dataset: PreparedDataset,
     *,
     device: str | None = None,
     seed: int = DEFAULT_SEED,
+    selection_metric: str = DEFAULT_SELECTION_METRIC,
     batch_size: int = DEFAULT_BATCH_SIZE,
     eval_batch_size: int | None = None,
     learning_rate: float = DEFAULT_LEARNING_RATE,
@@ -2722,12 +3653,18 @@ def execute_training_job(
     bounded_output_epsilon: float = DEFAULT_BOUNDED_OUTPUT_EPSILON,
     num_workers: int | None = None,
     checkpoint_path: str | Path | None = None,
+    save_best_checkpoint_path: str | Path | None = None,
     training_history_path: str | Path | None = None,
     resume_from_checkpoint: bool = False,
     tensorboard_log_dir: str | Path | None = None,
 ) -> list[dict[str, object]]:
     dataset_start = time.monotonic()
-    progress_label = f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}"
+    resolved_selection_metric = normalize_selection_metric(selection_metric)
+    progress_label = (
+        f"{prepared_dataset.dataset_id}/"
+        f"{prepared_dataset.model_variant}/"
+        f"{selection_metric_config_name(resolved_selection_metric)}"
+    )
     resolved_profile = resolve_hyperparameter_profile(
         prepared_dataset.model_variant,
         dataset_id=prepared_dataset.dataset_id,
@@ -2773,6 +3710,7 @@ def execute_training_job(
         writer,
         prepared_dataset=prepared_dataset,
         profile=resolved_profile,
+        selection_metric=resolved_selection_metric,
         seed=seed,
         device=resolved_device,
         eval_batch_size=resolved_eval_batch_size,
@@ -2783,6 +3721,7 @@ def execute_training_job(
             prepared_dataset,
             device=resolved_device,
             seed=seed,
+            selection_metric=resolved_selection_metric,
             batch_size=resolved_profile.batch_size,
             eval_batch_size=resolved_eval_batch_size,
             learning_rate=resolved_profile.learning_rate,
@@ -2849,6 +3788,15 @@ def execute_training_job(
     finally:
         _close_tensorboard_writer(writer)
     runtime_seconds = time.monotonic() - dataset_start
+    if save_best_checkpoint_path is not None:
+        save_best_checkpoint(
+            save_best_checkpoint_path,
+            prepared_dataset=prepared_dataset,
+            training_outcome=training_outcome,
+            profile=resolved_profile,
+            seed=seed,
+            runtime_seconds=runtime_seconds,
+        )
     test_rolling_metrics = next(
         metrics
         for split_name, eval_protocol, _windows, metrics in evaluation_results
@@ -2887,6 +3835,7 @@ def run_experiment(
     max_train_origins: int | None = None,
     max_eval_origins: int | None = None,
     seed: int = DEFAULT_SEED,
+    selection_metric: str = DEFAULT_SELECTION_METRIC,
     batch_size: int | None = None,
     eval_batch_size: int | None = None,
     learning_rate: float | None = None,
@@ -2916,6 +3865,7 @@ def run_experiment(
     num_workers: int | None = None,
     tensorboard_log_dir: str | Path | None = None,
     disable_tensorboard: bool = False,
+    save_best_checkpoint_root: str | Path | None = None,
     resume: bool = False,
     force_rerun: bool = False,
     work_root: str | Path = _RUN_WORK_ROOT,
@@ -2924,6 +3874,7 @@ def run_experiment(
 ) -> pl.DataFrame:
     resolved_dataset_ids = _validate_dataset_ids(dataset_ids)
     variant_specs = resolve_variant_specs(variant_names)
+    resolved_selection_metric = normalize_selection_metric(selection_metric)
     runner = job_runner or execute_training_job
     output = _resolve_output_path(output_path, resume=resume, force_rerun=force_rerun)
     resume_paths = _resume_paths_for_output(output_path=output, work_root=work_root)
@@ -2967,6 +3918,7 @@ def run_experiment(
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
         bounded_output_epsilon=bounded_output_epsilon,
+        selection_metric=resolved_selection_metric,
         num_workers=num_workers,
         tensorboard_root=resolved_tensorboard_root,
         disable_tensorboard=disable_tensorboard,
@@ -2997,7 +3949,10 @@ def run_experiment(
             )
     partial_results = _read_partial_results(resume_paths)
     rows: list[dict[str, object]] = partial_results.to_dicts()
-    completed_job_keys = _completed_job_keys(partial_results)
+    completed_job_keys = _completed_job_keys(
+        partial_results,
+        selection_metric=resolved_selection_metric,
+    )
     total_jobs = len(resolved_dataset_ids) * len(variant_specs)
     if len(completed_job_keys) == total_jobs:
         results = _result_frame_from_rows(rows)
@@ -3011,11 +3966,16 @@ def run_experiment(
     try:
         for dataset_id in resolved_dataset_ids:
             for variant_spec in variant_specs:
-                current_job_key = _job_key(dataset_id, variant_spec.model_variant)
+                current_job_key = _job_key(
+                    dataset_id,
+                    variant_spec.model_variant,
+                    resolved_selection_metric,
+                )
                 current_job_identity = _job_identity(
                     dataset_id=dataset_id,
                     model_variant=variant_spec.model_variant,
                     feature_protocol_id=variant_spec.feature_protocol_id,
+                    selection_metric=resolved_selection_metric,
                 )
                 if current_job_key in completed_job_keys:
                     job_progress.set_postfix_str(f"{dataset_id}/{variant_spec.model_variant}")
@@ -3072,6 +4032,18 @@ def run_experiment(
                     resume_paths,
                     dataset_id=dataset_id,
                     model_variant=variant_spec.model_variant,
+                    selection_metric=resolved_selection_metric,
+                )
+                best_checkpoint_path = (
+                    None
+                    if save_best_checkpoint_root is None
+                    else best_checkpoint_output_path(
+                        save_best_checkpoint_root,
+                        dataset_id=dataset_id,
+                        model_variant=variant_spec.model_variant,
+                        selection_metric=resolved_selection_metric,
+                        seed=seed,
+                    )
                 )
                 resume_from_checkpoint = resume_active_job == current_job_identity and checkpoint_path.exists()
                 _write_resume_state(
@@ -3085,6 +4057,7 @@ def run_experiment(
                         prepared,
                         device=device,
                         seed=seed,
+                        selection_metric=resolved_selection_metric,
                         batch_size=resolved_profile.batch_size,
                         eval_batch_size=eval_batch_size,
                         learning_rate=resolved_profile.learning_rate,
@@ -3114,6 +4087,7 @@ def run_experiment(
                         bounded_output_epsilon=resolved_profile.bounded_output_epsilon,
                         num_workers=num_workers,
                         checkpoint_path=checkpoint_path,
+                        save_best_checkpoint_path=best_checkpoint_path,
                         training_history_path=resume_paths.training_history_path,
                         resume_from_checkpoint=resume_from_checkpoint,
                         tensorboard_log_dir=(
@@ -3123,6 +4097,7 @@ def run_experiment(
                                 resolved_tensorboard_root,
                                 dataset_id=dataset_id,
                                 model_variant=variant_spec.model_variant,
+                                selection_metric=resolved_selection_metric,
                             )
                         ),
                     )
@@ -3134,6 +4109,7 @@ def run_experiment(
                     resume_paths,
                     dataset_id=dataset_id,
                     model_variant=variant_spec.model_variant,
+                    selection_metric=resolved_selection_metric,
                 )
                 _write_resume_state(resume_paths, status="running", effective_config=effective_config, active_job=None)
                 resume_active_job = None
@@ -3186,6 +4162,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Evaluation batch size.")
     parser.add_argument("--learning-rate", type=float, default=None, help="AdamW learning rate.")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed.")
+    parser.add_argument(
+        "--selection-metric",
+        choices=list(SELECTION_METRIC_CHOICES),
+        default=DEFAULT_SELECTION_METRIC,
+        help="Validation metric used for best-epoch selection and job identity.",
+    )
     parser.add_argument("--patience", type=int, default=None, help="Early stopping patience in epochs.")
     parser.add_argument("--z-dim", type=int, default=None, help="Node latent z dimension.")
     parser.add_argument("--h-dim", type=int, default=None, help="Node recurrent h dimension.")
@@ -3212,6 +4194,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker count.")
     parser.add_argument("--tensorboard-log-dir", type=Path, default=None, help="Optional TensorBoard log root.")
     parser.add_argument("--disable-tensorboard", action="store_true", help="Disable TensorBoard logging.")
+    parser.add_argument(
+        "--save-best-checkpoint-root",
+        type=Path,
+        default=None,
+        help="Optional root directory for durable best-checkpoint exports.",
+    )
+    parser.add_argument(
+        "--load-best-checkpoint",
+        type=Path,
+        default=None,
+        help="Run scratch evaluation from a previously exported best checkpoint instead of training.",
+    )
+    parser.add_argument(
+        "--scratch-output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for eval-only scratch metrics and diagnostics.",
+    )
+    parser.add_argument(
+        "--no-carry-over",
+        action="store_true",
+        help="When running eval-only from a saved checkpoint, skip rolling_origin_carry_over.",
+    )
     parser.add_argument(
         "--run-label",
         type=str,
@@ -3241,10 +4246,12 @@ def _resolved_record_hyperparameters(
     variant_specs: Sequence[ExperimentVariant],
     args: argparse.Namespace,
 ) -> dict[str, object]:
+    resolved_selection_metric = normalize_selection_metric(args.selection_metric)
     return {
         dataset_id: {
             spec.model_variant: {
                 "feature_protocol_id": spec.feature_protocol_id,
+                "selection_metric": resolved_selection_metric,
                 **asdict(
                     resolve_hyperparameter_profile(
                         spec.model_variant,
@@ -3309,6 +4316,73 @@ def resolve_tensorboard_root(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    resolved_dataset_ids = _validate_dataset_ids(tuple(args.datasets) if args.datasets else DEFAULT_DATASETS)
+    variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
+    resolved_selection_metric = normalize_selection_metric(args.selection_metric)
+    if args.load_best_checkpoint is not None:
+        if args.resume or args.force_rerun:
+            parser.error("--load-best-checkpoint cannot be combined with --resume or --force-rerun.")
+        if len(resolved_dataset_ids) != 1:
+            parser.error("--load-best-checkpoint requires exactly one dataset.")
+        if len(variant_specs) != 1:
+            parser.error("--load-best-checkpoint requires exactly one variant.")
+        prepared_dataset = prepare_dataset(
+            resolved_dataset_ids[0],
+            variant_spec=variant_specs[0],
+            max_train_origins=args.max_train_origins,
+            max_eval_origins=args.max_eval_origins,
+        )
+        loaded_checkpoint = load_best_checkpoint(
+            args.load_best_checkpoint,
+            prepared_dataset=prepared_dataset,
+            device=args.device,
+        )
+        scratch_output_dir = (
+            (_REPO_ROOT / "experiment" / "artifacts" / "scratch" / FAMILY_ID)
+            if args.scratch_output_dir is None
+            else args.scratch_output_dir.expanduser().resolve()
+        )
+        config_name = _best_checkpoint_config_name(
+            dataset_id=prepared_dataset.dataset_id,
+            model_variant=prepared_dataset.model_variant,
+            selection_metric=loaded_checkpoint.selection_metric,
+            seed=loaded_checkpoint.seed,
+        )
+        primary_output_path = scratch_output_dir / f"{config_name}.csv"
+        diagnostics_output_path = scratch_output_dir / f"{config_name}.diagnostics.csv"
+        summary_output_path = scratch_output_dir / f"{config_name}.summary.csv"
+        print(f"[{FAMILY_ID}] scratch_output={primary_output_path}")
+        results, _diagnostics, _summaries = run_saved_checkpoint_scratch_evaluation(
+            checkpoint_path=args.load_best_checkpoint,
+            prepared_dataset=prepared_dataset,
+            output_dir=scratch_output_dir,
+            device=args.device,
+            include_carry_over=not args.no_carry_over,
+        )
+        if not args.no_record_run:
+            recorded_args = vars(args).copy()
+            recorded_args["selection_metric"] = resolved_selection_metric
+            record_cli_run(
+                family_id=FAMILY_ID,
+                repo_root=_REPO_ROOT,
+                invocation_kind="family_checkpoint_eval",
+                entrypoint=f"experiment/families/{FAMILY_ID}/run_world_model_state_space_v1.py",
+                args=recorded_args,
+                output_path=primary_output_path,
+                result_row_count=results.height,
+                dataset_ids=(prepared_dataset.dataset_id,),
+                feature_protocol_ids=(prepared_dataset.feature_protocol_id,),
+                model_variants=(prepared_dataset.model_variant,),
+                eval_protocols=tuple(results["eval_protocol"].unique().to_list()),
+                result_splits=tuple(results["split_name"].unique().to_list()),
+                artifacts={
+                    "diagnostics_output": diagnostics_output_path,
+                    "summary_output": summary_output_path,
+                    "checkpoint_input": args.load_best_checkpoint,
+                },
+                run_label=args.run_label,
+            )
+        return 0
     run_stem = generate_run_stem()
     try:
         resolved_output_path = _resolve_output_path(
@@ -3319,8 +4393,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    resolved_dataset_ids = _validate_dataset_ids(tuple(args.datasets) if args.datasets else DEFAULT_DATASETS)
-    variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
     resolved_tensorboard_root = resolve_tensorboard_root(
         output_path=resolved_output_path,
         work_root=_RUN_WORK_ROOT,
@@ -3342,6 +4414,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_train_origins=args.max_train_origins,
         max_eval_origins=args.max_eval_origins,
         seed=args.seed,
+        selection_metric=resolved_selection_metric,
         batch_size=args.batch_size,
         eval_batch_size=args.eval_batch_size,
         learning_rate=args.learning_rate,
@@ -3371,11 +4444,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
         tensorboard_log_dir=args.tensorboard_log_dir,
         disable_tensorboard=args.disable_tensorboard,
+        save_best_checkpoint_root=args.save_best_checkpoint_root,
         resume=args.resume,
         force_rerun=args.force_rerun,
     )
     if not args.no_record_run:
         recorded_args = vars(args).copy()
+        recorded_args["selection_metric"] = resolved_selection_metric
         recorded_args["output_path"] = resolved_output_path
         recorded_args["resolved_dataset_variant_hyperparameters"] = resolved_dataset_variant_hyperparameters
         record_cli_run(
@@ -3393,7 +4468,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             result_splits=("val", "test"),
             artifacts={
                 "training_history": training_history_output_path(resolved_output_path),
-                **({} if resolved_tensorboard_root is None else {"tensorboard_root": resolved_tensorboard_root}),
+                **(
+                    {}
+                    if resolved_tensorboard_root is None
+                    else {"tensorboard_root": resolved_tensorboard_root}
+                ),
+                **(
+                    {}
+                    if args.save_best_checkpoint_root is None
+                    else {"best_checkpoint_root": args.save_best_checkpoint_root}
+                ),
             },
             run_label=args.run_label,
             run_stem=run_stem if args.output_path is None else None,

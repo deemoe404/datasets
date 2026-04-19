@@ -176,6 +176,38 @@ def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> 
     }
 
 
+def _tiny_profile(module, prepared, *, variant_name: str | None = None, selection_metric: str | None = None):
+    resolved_variant_name = prepared.model_variant if variant_name is None else variant_name
+    return module.resolve_hyperparameter_profile(
+        resolved_variant_name,
+        dataset_id=prepared.dataset_id,
+        batch_size=2,
+        learning_rate=1e-3,
+        max_epochs=1,
+        early_stopping_patience=1,
+        z_dim=4,
+        h_dim=6,
+        global_state_dim=8,
+        obs_encoding_dim=8,
+        innovation_dim=4,
+        source_summary_dim=4,
+        edge_message_dim=4,
+        edge_hidden_dim=8,
+        tau_embed_dim=4,
+        met_summary_dim=module.DEFAULT_MET_SUMMARY_DIM,
+        turbine_embed_dim=3,
+        dropout=0.0,
+    )
+
+
+def _take_first_windows(module, windows, count: int):
+    return module.world_model_base.FarmWindowDescriptorIndex(
+        target_indices=windows.target_indices[:count].copy(),
+        output_start_us=windows.output_start_us[:count].copy(),
+        output_end_us=windows.output_end_us[:count].copy(),
+    )
+
+
 def test_registry_declares_kelmarsh_only() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
@@ -544,6 +576,105 @@ def test_all_missing_node_keeps_prior_in_update(tmp_path, monkeypatch) -> None:
     assert any(not torch_module.allclose(z_post[:, index, :], z[:, index, :]) for index in observed_nodes)
 
 
+def test_selection_metric_identity_isolation(tmp_path) -> None:
+    module = _load_module()
+    paths = module._resume_paths_for_output(output_path=tmp_path / "latest.csv", work_root=tmp_path / ".work")
+
+    rmse_identity = module._job_identity(
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        feature_protocol_id=module.FEATURE_PROTOCOL_ID,
+        selection_metric="val_rmse_pu",
+    )
+    mae_identity = module._job_identity(
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        feature_protocol_id=module.FEATURE_PROTOCOL_ID,
+        selection_metric="val_mae_pu",
+    )
+
+    assert rmse_identity != mae_identity
+    assert module._job_checkpoint_path(
+        paths,
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        selection_metric="val_rmse_pu",
+    ).name == f"kelmarsh__{module.MODEL_VARIANT}__rmse_pu.pt"
+    assert module._job_checkpoint_path(
+        paths,
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        selection_metric="val_mae_pu",
+    ).name == f"kelmarsh__{module.MODEL_VARIANT}__mae_pu.pt"
+    assert module._tensorboard_job_log_dir(
+        tmp_path / "tb",
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        selection_metric="val_rmse_pu",
+    ) != module._tensorboard_job_log_dir(
+        tmp_path / "tb",
+        dataset_id="kelmarsh",
+        model_variant=module.MODEL_VARIANT,
+        selection_metric="val_mae_pu",
+    )
+
+
+def test_filter_state_prefix_equivalence_with_multi_step_reveal(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_eval_origins=4)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    module.initialize_model_parameters(model)
+    model.eval()
+    start_target_index = int(prepared.val_rolling_windows.target_indices[0])
+    end_target_index = start_target_index + 3
+    assert end_target_index - start_target_index > 1
+
+    start_local_history, start_context_history, _start_future, _start_targets, _start_valid = module._window_batch_tensors(
+        prepared,
+        target_index=start_target_index,
+        torch_module=torch_module,
+        device="cpu",
+    )
+    end_local_history, end_context_history, _end_future, _end_targets, _end_valid = module._window_batch_tensors(
+        prepared,
+        target_index=end_target_index,
+        torch_module=torch_module,
+        device="cpu",
+    )
+    revealed_local, revealed_context = module._revealed_observation_tensors(
+        prepared,
+        start_target_index=start_target_index,
+        end_target_index=end_target_index,
+        torch_module=torch_module,
+        device="cpu",
+    )
+    assert revealed_local.shape[1] == end_target_index - start_target_index
+    assert revealed_local.shape[1] > 1
+
+    with torch_module.no_grad():
+        cold_filter_state = model.filter_history(end_local_history, end_context_history)
+        cold_cache = model.build_observation_cache(end_local_history)
+        warm_filter_state = model.filter_history(start_local_history, start_context_history)
+        warm_cache = model.build_observation_cache(start_local_history)
+        advanced_state = model.advance_with_observations(
+            warm_filter_state,
+            warm_cache,
+            revealed_local,
+            revealed_context,
+        )
+
+    assert torch_module.allclose(advanced_state.filter_state.z, cold_filter_state.z, rtol=1e-5, atol=1e-6)
+    assert torch_module.allclose(advanced_state.filter_state.h, cold_filter_state.h, rtol=1e-5, atol=1e-6)
+    assert torch_module.allclose(advanced_state.filter_state.g, cold_filter_state.g, rtol=1e-5, atol=1e-6)
+    assert torch_module.allclose(
+        advanced_state.observation_cache.persistence_anchor,
+        cold_cache.persistence_anchor,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
 @pytest.mark.parametrize(
     "variant_name",
     (
@@ -600,6 +731,7 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch, varian
     assert history["train_farm_loss_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 0
+    assert history["selection_metric"].to_list() == [module.DEFAULT_SELECTION_METRIC]
     assert len(rows) == 148
     assert {row["split_name"] for row in rows} == {"val", "test"}
     assert rows[0]["model_variant"] == variant_name
@@ -669,15 +801,16 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     assert "final/test/rolling_origin_no_refit/horizon_group/rmse_pu/leads_25_36_mean" in scalar_tags
     assert "run/config_json" in text_tags
     assert "final/summary_json" in text_tags
+    assert any('"selection_metric": "val_rmse_pu"' in text for _tag, text, _step in writer.texts)
 
 
-def test_read_training_history_backfills_new_horizon_columns(tmp_path) -> None:
+def test_read_training_history_backfills_selection_metric_and_horizon_columns(tmp_path) -> None:
     module = _load_module()
     history_path = tmp_path / "legacy.training_history.csv"
     legacy_columns = [
         column
         for column in module._TRAINING_HISTORY_COLUMNS
-        if column not in {"val_rmse_pu_leads_13_24_mean", "val_rmse_pu_leads_25_36_mean"}
+        if column not in {"selection_metric", "val_rmse_pu_leads_13_24_mean", "val_rmse_pu_leads_25_36_mean"}
     ]
     pl.DataFrame(
         {
@@ -689,6 +822,7 @@ def test_read_training_history_backfills_new_horizon_columns(tmp_path) -> None:
     history = module._read_training_history(history_path)
 
     assert history.columns == module._TRAINING_HISTORY_COLUMNS
+    assert history["selection_metric"].to_list() == [module.DEFAULT_SELECTION_METRIC]
     assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 1
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 1
 
@@ -760,6 +894,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             epochs_ran=1,
             best_val_rmse_pu=0.2,
             best_val_mae_pu=0.1,
+            selection_metric=kwargs["selection_metric"],
             device="cpu",
             amp_enabled=False,
             model=None,
@@ -779,6 +914,7 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         device="cpu",
         max_epochs=1,
         seed=7,
+        selection_metric="val_mae_pu",
         batch_size=2,
         learning_rate=1e-3,
         z_dim=4,
@@ -811,9 +947,207 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
         paths,
         dataset_id=prepared.dataset_id,
         model_variant=prepared.model_variant,
-    ).name == f"{prepared.dataset_id}__{prepared.model_variant}.pt"
+        selection_metric="val_mae_pu",
+    ).name == f"{prepared.dataset_id}__{prepared.model_variant}__mae_pu.pt"
     state_payload = json.loads(paths.state_path.read_text(encoding="utf-8"))
     assert state_payload["status"] == "complete"
+    assert state_payload["effective_config"]["selection_metric"] == "val_mae_pu"
+
+
+def test_saved_checkpoint_single_origin_carry_over_matches_cold_start(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, max_eval_origins=1)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    module.initialize_model_parameters(model)
+    profile = _tiny_profile(module, prepared)
+    checkpoint_path = tmp_path / "best.pt"
+    module.save_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        training_outcome=module.TrainingOutcome(
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            device="cpu",
+            amp_enabled=False,
+            model=model,
+        ),
+        profile=profile,
+        seed=123,
+        runtime_seconds=0.5,
+    )
+    loaded_checkpoint = module.load_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        device="cpu",
+    )
+    single_window = _take_first_windows(module, prepared.val_rolling_windows, 1)
+
+    rolling_metrics, rolling_diagnostics, rolling_summary = module.evaluate_saved_checkpoint_windows(
+        loaded_checkpoint,
+        prepared,
+        windows=single_window,
+        split_name="val",
+        eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+    )
+    carry_metrics, carry_diagnostics, carry_summary = module.evaluate_saved_checkpoint_windows(
+        loaded_checkpoint,
+        prepared,
+        windows=single_window,
+        split_name="val",
+        eval_protocol=module.CARRY_OVER_EVAL_PROTOCOL,
+    )
+
+    assert carry_metrics.mae_pu == pytest.approx(rolling_metrics.mae_pu)
+    assert carry_metrics.rmse_pu == pytest.approx(rolling_metrics.rmse_pu)
+    assert carry_metrics.horizon_mae_pu.tolist() == pytest.approx(rolling_metrics.horizon_mae_pu.tolist())
+    assert carry_metrics.horizon_rmse_pu.tolist() == pytest.approx(rolling_metrics.horizon_rmse_pu.tolist())
+    assert rolling_diagnostics.drop("eval_protocol").to_dicts() == carry_diagnostics.drop("eval_protocol").to_dicts()
+    assert rolling_summary.drop("eval_protocol").to_dicts() == carry_summary.drop("eval_protocol").to_dicts()
+
+
+@pytest.mark.parametrize(
+    ("variant_name", "expect_residual_metric"),
+    (
+        ("world_model_state_space_v1_farm_sync", False),
+        ("world_model_state_space_v1_residual_persistence_farm_sync", True),
+    ),
+)
+def test_run_saved_checkpoint_scratch_evaluation_writes_diagnostics(
+    tmp_path,
+    monkeypatch,
+    variant_name: str,
+    expect_residual_metric: bool,
+) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=variant_name,
+        max_eval_origins=2,
+    )
+    model = module.build_model(**_tiny_model_kwargs(module, prepared, variant_name=variant_name))
+    module.initialize_model_parameters(model)
+    profile = _tiny_profile(module, prepared, variant_name=variant_name)
+    checkpoint_path = tmp_path / f"{variant_name}.pt"
+    module.save_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        training_outcome=module.TrainingOutcome(
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            device="cpu",
+            amp_enabled=False,
+            model=model,
+        ),
+        profile=profile,
+        seed=123,
+        runtime_seconds=0.5,
+    )
+    output_dir = tmp_path / "scratch"
+
+    results, diagnostics, summaries = module.run_saved_checkpoint_scratch_evaluation(
+        checkpoint_path=checkpoint_path,
+        prepared_dataset=prepared,
+        output_dir=output_dir,
+        device="cpu",
+        include_carry_over=True,
+    )
+
+    config_name = module._best_checkpoint_config_name(
+        dataset_id=prepared.dataset_id,
+        model_variant=prepared.model_variant,
+        selection_metric="val_rmse_pu",
+        seed=123,
+    )
+    assert (output_dir / f"{config_name}.csv").exists()
+    assert (output_dir / f"{config_name}.diagnostics.csv").exists()
+    assert (output_dir / f"{config_name}.summary.csv").exists()
+    assert results.height == 148
+    assert set(results["eval_protocol"].unique().to_list()) == {
+        module.ROLLING_EVAL_PROTOCOL,
+        module.CARRY_OVER_EVAL_PROTOCOL,
+    }
+    assert set(summaries["bucket_name"].unique().to_list()) == {"overall", "leads_1_12", "leads_13_24", "leads_25_36"}
+    clamp_values = diagnostics["clamp_hit_rate"].to_numpy()
+    assert np.all((clamp_values >= 0.0) & (clamp_values <= 1.0))
+    residual_values = diagnostics["mean_abs_residual"].to_numpy()
+    if expect_residual_metric:
+        assert np.isfinite(residual_values).any()
+    else:
+        assert not np.isfinite(residual_values).any()
+
+
+def test_main_eval_only_writes_scratch_outputs(tmp_path, monkeypatch, capsys) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
+    expected_results = pl.DataFrame({"dataset_id": [prepared.dataset_id], "split_name": ["val"], "eval_protocol": [module.ROLLING_EVAL_PROTOCOL]})
+    captured: dict[str, object] = {}
+
+    def _fake_prepare_dataset(*args, **kwargs):
+        del args, kwargs
+        return prepared
+
+    def _fake_load_best_checkpoint(checkpoint_path, *, prepared_dataset, device):
+        captured["load_best_checkpoint"] = {
+            "checkpoint_path": Path(checkpoint_path),
+            "prepared_dataset": prepared_dataset,
+            "device": device,
+        }
+        return module.LoadedBestCheckpoint(
+            model=None,
+            profile=_tiny_profile(module, prepared),
+            job_identity=module._job_identity_for_prepared_dataset(prepared, selection_metric="val_rmse_pu"),
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            seed=123,
+            runtime_seconds=0.5,
+            device="cpu",
+            amp_enabled=False,
+        )
+
+    def _fake_run_saved_checkpoint_scratch_evaluation(**kwargs):
+        captured["scratch_eval"] = kwargs
+        return expected_results, pl.DataFrame({"x": [1]}), pl.DataFrame({"y": [1]})
+
+    monkeypatch.setattr(module, "prepare_dataset", _fake_prepare_dataset)
+    monkeypatch.setattr(module, "load_best_checkpoint", _fake_load_best_checkpoint)
+    monkeypatch.setattr(module, "run_saved_checkpoint_scratch_evaluation", _fake_run_saved_checkpoint_scratch_evaluation)
+
+    scratch_output_dir = tmp_path / "scratch"
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    assert module.main(
+        [
+            "--dataset",
+            prepared.dataset_id,
+            "--variant",
+            prepared.model_variant,
+            "--load-best-checkpoint",
+            str(checkpoint_path),
+            "--scratch-output-dir",
+            str(scratch_output_dir),
+            "--no-record-run",
+        ]
+    ) == 0
+
+    assert captured["load_best_checkpoint"]["checkpoint_path"] == checkpoint_path
+    assert captured["scratch_eval"]["checkpoint_path"] == checkpoint_path
+    assert captured["scratch_eval"]["prepared_dataset"] is prepared
+    assert captured["scratch_eval"]["output_dir"] == scratch_output_dir
+    assert captured["scratch_eval"]["include_carry_over"] is True
+    assert str(scratch_output_dir / f"{prepared.dataset_id}__{prepared.model_variant}__rmse_pu__seed123.csv") in capsys.readouterr().out
+
 
 
 def test_search_screen_one_uses_training_device_for_eval_loaders(monkeypatch, tmp_path) -> None:
