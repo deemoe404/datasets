@@ -1,0 +1,23 @@
+2026-04-16 
+- 当天先有一次 formal rerun（`20260416-070708` manifest，结果文件已被后续 rerun 覆盖），随后在 `raw_wake_geometry_fix` 之后保留了当前 canonical publish（`20260416-144026-raw_wake_geometry_fix`）。
+- 当前保留的 canonical `world_model_state_space_v1_farm_sync`（`batch_size=432`, `seed=3407`）指标：val rolling RMSE/MAE = `0.164508 / 0.106924`，val non_overlap RMSE/MAE = `0.162985 / 0.105974`，test rolling RMSE/MAE = `0.172678 / 0.112051`，test non_overlap RMSE/MAE = `0.172004 / 0.111609`，best epoch = `6 / 16`。
+- 当天还做了 `kelmarsh_ablation_smoke.csv` 的 1 epoch CPU smoke，覆盖 canonical / `wake_off` / `graph_off` / `no_farm_aux` / `no_met_aux`。这个 smoke 只说明链路和 variant 选择逻辑是通的，不适合用于 ablation 排名；例如 smoke 下 `wake_off` 一度优于 canonical，但后续正式预算并不成立。
+- 结论：raw wake geometry 修复后的 canonical 已经能稳定完整跑通；正式预算下 non-overlap 指标略优于 rolling。
+
+2026-04-17
+- 跑了 `kelmarsh_ablation_batch.csv`，正式预算比较 canonical、`wake_off`、`graph_off`、`no_farm_aux`、`no_met_aux`。
+- 相对 canonical 的 test non_overlap RMSE `0.172004`：`no_farm_aux -> 0.169290`（提升 `0.002714`，当前保留 batch ablation 最强），`no_met_aux -> 0.171696`（提升 `0.000309`，但 val rolling 从 `0.164508` 变成 `0.164977`，收益不稳定），`wake_off -> 0.173176`（退化 `0.001172`），`graph_off -> 0.177885`（退化 `0.005881`）。
+- 这批结果说明：图聚合比当前 wake 分支更关键，去掉图结构会明显伤害泛化；动态 wake 特征有帮助，但贡献幅度小于图聚合；`farm_aux` 在默认 `0.1` 权重下更像副作用而不是收益项。
+- 同日跑了 `search_20260417` 的 `farm_loss_weight` sweep。final val rolling RMSE：`0.05 -> 0.162381`，`0.00 -> 0.162394`，`0.10 -> 0.164508`；final test non_overlap RMSE：`0.00 -> 0.169290`，`0.05 -> 0.169803`。`selected_defaults.json` 依验证集规则选了 `0.05`，但测试集实际是 `0.00` 更好。
+- 结论：`farm_loss_weight=0.1` 偏大，farm auxiliary loss 至少应降到 `0.05`，甚至可以直接关掉；当前 `no_farm_aux` 比默认 canonical 更像下一轮默认候选。
+
+2026-04-18
+- 代码层新增 `residual_persistence` head（commit `5bf97f4`），意图验证“预测 residual over last-value persistence anchor”是否比直接预测更稳。
+- 横向对照截至本地 2026-04-18 published artifacts：`world_model_rollout_v1` test non_overlap RMSE = `0.169162`，`world_model_agcrn_v1` test non_overlap RMSE = `0.170313`，best baseline test non_overlap RMSE = `0.171152`（`world_model_dgcrn_v1_farm_sync`）。
+- 结论：state-space 主线即便只看 `no_farm_aux` batch ablation（test non_overlap RMSE `0.169290`）也已经优于现有 baseline family 和 AGCRN world-model；与 rollout baseline 基本同一量级。
+
+2026-04-19
+- 跑了 `residual_vs_canonical_cuda4090.csv`，在同一设置（`batch_size=256`）下对比 canonical 与 `world_model_state_space_v1_residual_persistence_farm_sync`。
+- canonical：val/test non_overlap RMSE = `0.162490 / 0.169531`，best epoch = `5`；residual_persistence：val/test non_overlap RMSE = `0.162138 / 0.168685`，best epoch = `3`。
+- 相对 canonical，residual head 在 test non_overlap 上再提升 `0.000846`，在 test rolling 上提升 `0.000659`，MAE 也同步下降；但 val rolling RMSE 略差（`0.164162` vs `0.163861`）。
+- 结论：residual head 看起来对测试泛化有正收益，而且收敛更早，但验证集收益不够一致，暂时还不适合直接替换默认头；需要做额外复现实验。当前 `residual_head_plan_20260419/queue_status.txt` 仍显示有一条复现实验在跑，先不把它记成已确认结论。
