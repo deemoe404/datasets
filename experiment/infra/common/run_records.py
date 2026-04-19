@@ -8,8 +8,8 @@ from pathlib import Path
 import subprocess
 from typing import Any, Mapping, Sequence
 
-from experiment_registry import load_registry_snapshot
-from published_outputs import generate_run_stem, validate_run_stem
+from .experiment_registry import load_registry_snapshot
+from .published_outputs import generate_run_stem, validate_run_stem
 
 
 @dataclass(frozen=True)

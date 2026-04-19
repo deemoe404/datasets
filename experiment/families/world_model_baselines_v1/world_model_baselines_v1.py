@@ -44,13 +44,17 @@ except ImportError:
 
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 EXPERIMENT_ROOT = EXPERIMENT_DIR.parents[1]
-COMMON_DIR = EXPERIMENT_ROOT / "infra" / "common"
-if str(COMMON_DIR) not in sys.path:
-    sys.path.insert(0, str(COMMON_DIR))
+REPO_ROOT = EXPERIMENT_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from published_outputs import default_family_output_path, default_family_output_template, generate_run_stem  # noqa: E402
-from run_records import record_cli_run  # noqa: E402
-from window_protocols import (  # noqa: E402
+from experiment.infra.common.published_outputs import (  # noqa: E402
+    default_family_output_path,
+    default_family_output_template,
+    generate_run_stem,
+)
+from experiment.infra.common.run_records import record_cli_run  # noqa: E402
+from experiment.infra.common.window_protocols import (  # noqa: E402
     DEFAULT_WINDOW_PROTOCOL,
     HORIZON_METRIC_SCOPE,
     NON_OVERLAP_EVAL_PROTOCOL,

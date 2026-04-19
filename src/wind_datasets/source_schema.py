@@ -62,18 +62,24 @@ def _read_greenbyte_header(path: Path) -> list[str]:
 
 
 def _read_plain_csv_header(path: Path) -> list[str]:
-    for encoding in ("utf-8-sig", "windows-1252", "utf8-lossy"):
+    for encoding in ("utf-8-sig", "windows-1252"):
         try:
             with path.open("r", encoding=encoding, newline="") as handle:
-                reader = csv.reader(handle)
-                for row in reader:
-                    if not row:
-                        continue
-                    if row[0].startswith("#"):
-                        continue
-                    return normalize_source_header(row, drop_empty=True)
-        except UnicodeDecodeError:
+                return _read_first_plain_csv_row(handle)
+        except (LookupError, UnicodeDecodeError):
             continue
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        return _read_first_plain_csv_row(handle)
+
+
+def _read_first_plain_csv_row(handle) -> list[str]:
+    reader = csv.reader(handle)
+    for row in reader:
+        if not row:
+            continue
+        if row[0].startswith("#"):
+            continue
+        return normalize_source_header(row, drop_empty=True)
     return []
 
 
@@ -159,8 +165,43 @@ def build_source_schema_inventory(spec: DatasetSpec) -> list[dict[str, object]]:
     return list(inventory.values())
 
 
+def build_source_schema_inventory_exclusions(spec: DatasetSpec) -> tuple[list[dict[str, object]], list[str]]:
+    if spec.handler != "greenbyte":
+        return [], []
+
+    xlsx_paths = sorted(spec.source_root.glob("*_dataSignalMapping.xlsx"))
+    exclusions = [
+        {
+            "relative_path": str(path.relative_to(spec.source_root)),
+            "source_asset": "signal_mapping",
+            "source_table_or_file": "dataSignalMapping",
+            "reason": "supported_runtime_asset_not_schema_inventoried",
+        }
+        for path in xlsx_paths
+    ]
+    if not exclusions:
+        return exclusions, []
+
+    csv_names = {path.name for path in spec.source_root.glob("*_dataSignalMapping.csv")}
+    unmatched_xlsx_names = [
+        path.name
+        for path in xlsx_paths
+        if path.with_suffix(".csv").name not in csv_names
+    ]
+    warnings: list[str] = []
+    if unmatched_xlsx_names:
+        warnings.append(
+            "Source schema inventory skips supported Greenbyte signal-mapping workbooks with no "
+            "corresponding CSV export: "
+            + ", ".join(unmatched_xlsx_names)
+            + "."
+        )
+    return exclusions, warnings
+
+
 __all__ = [
     "build_source_schema_inventory",
+    "build_source_schema_inventory_exclusions",
     "normalize_source_column_name",
     "normalize_source_frame",
     "normalize_source_header",

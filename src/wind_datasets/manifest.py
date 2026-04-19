@@ -10,7 +10,7 @@ import polars as pl
 from .cache_state import manifest_meta_from_payload, source_file_record_for, write_build_meta
 from .models import DatasetSpec
 from .paths import dataset_cache_paths
-from .source_schema import build_source_schema_inventory
+from .source_schema import build_source_schema_inventory, build_source_schema_inventory_exclusions
 from .utils import ensure_directory, write_json
 
 _IGNORED_FILE_NAMES = {".DS_Store"}
@@ -24,6 +24,7 @@ _GREENBYTE_TURBINE_RANGE_PATTERN = re.compile(
 )
 _TEN_MINUTE_MINUTES = {0, 10, 20, 30, 40, 50}
 _KDDCUP_CALENDAR_ANCHOR_DATE = "2020-05-01"
+_RUNTIME_DEPENDENCY_NAMES = ("polars", "pyarrow", "duckdb")
 
 
 def _iter_source_files(root: Path) -> list[Path]:
@@ -393,6 +394,8 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
     release_check, release_warnings = _build_source_release_check(spec, relative_paths, source_layout)
     time_semantics_check: dict[str, object] | None = None
     time_semantics_warnings: list[str] = []
+    source_schema_inventory = build_source_schema_inventory(spec)
+    source_schema_inventory_exclusions, source_schema_warnings = build_source_schema_inventory_exclusions(spec)
     if spec.handler == "sdwpf_kddcup":
         time_semantics_check, time_semantics_warnings = _build_sdwpf_time_semantics_check(spec)
     payload = {
@@ -409,11 +412,12 @@ def build_manifest(spec: DatasetSpec, cache_root: Path) -> Path:
         "default_excluded_assets": list(spec.default_excluded_assets),
         "source_layout": source_layout,
         "source_release_check": release_check,
-        "warnings": [*layout_warnings, *release_warnings, *time_semantics_warnings],
-        "source_schema_inventory": build_source_schema_inventory(spec),
+        "warnings": [*layout_warnings, *release_warnings, *time_semantics_warnings, *source_schema_warnings],
+        "source_schema_inventory": source_schema_inventory,
+        "source_schema_inventory_exclusions": source_schema_inventory_exclusions,
         "dependencies": {
             name: metadata.version(name)
-            for name in ("polars", "pyarrow", "duckdb", "pytest")
+            for name in _RUNTIME_DEPENDENCY_NAMES
         },
         "files": [
             source_file_record_for(path, spec.source_root)
