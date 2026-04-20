@@ -5,6 +5,7 @@
 主线实验是experiment/families/world_model_state_space_v1，其他都是辅助实验（例如测试、baseline等）。
 如果对主线实验有新增模块（例如新增了一个版本的输出head），请如实记录在plan/wind_farm_design_revised_v3_input_reorg.tex里面
 每次做完主线实验之后都把发现、收获给记录在experiment/families/world_model_state_space_v1/work_log.txt里面，每次新增的时候都带上日期。如果太长可以记录在别的文件里面，在experiment/families/world_model_state_space_v1/work_log.txt里添加一个文件地址指向过去，experiment/families/world_model_state_space_v1/work_log.txt里只保留摘要也可以。
+开始新的任务之前也应该查看experiment/families/world_model_state_space_v1/work_log.txt，看看之前做到哪里了。
 
 ## 目录定义
 
