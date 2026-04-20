@@ -21,3 +21,10 @@
 - canonical：val/test non_overlap RMSE = `0.162490 / 0.169531`，best epoch = `5`；residual_persistence：val/test non_overlap RMSE = `0.162138 / 0.168685`，best epoch = `3`。
 - 相对 canonical，residual head 在 test non_overlap 上再提升 `0.000846`，在 test rolling 上提升 `0.000659`，MAE 也同步下降；但 val rolling RMSE 略差（`0.164162` vs `0.163861`）。
 - 结论：residual head 看起来对测试泛化有正收益，而且收敛更早，但验证集收益不够一致，暂时还不适合直接替换默认头；需要做额外复现实验。当前 `residual_head_plan_20260419/queue_status.txt` 仍显示有一条复现实验在跑，先不把它记成已确认结论。
+
+2026-04-21
+- `residual_head_plan_20260419_farm0p05` 队列已于 `2026-04-21T06:27:48+08:00` 完成；scratch root: `experiment/artifacts/scratch/world_model_state_space_v1/residual_head_plan_20260419_farm0p05`。
+- `farm_loss_weight=0.05`、`val_rmse_pu` 复现：canonical val/test rolling RMSE = `0.165483 / 0.173988`，MAE = `0.109451 / 0.114931`，best epoch = `5 / 15`；`residual_persistence` val/test rolling RMSE = `0.162973 / 0.169035`，MAE = `0.106281 / 0.109889`，best epoch = `3 / 13`。这次 residual 不只是测试集占优，验证集 overall rolling RMSE/MAE 也更好。
+- carry-over scratch eval 没有支持“在线状态延续有额外收益”的故事：canonical val/test overall RMSE 从 `0.165480 / 0.173977` 变成 `0.166228 / 0.175148`，residual 从 `0.163004 / 0.169064` 变成 `0.163559 / 0.169569`，两边都是 `rolling_origin_carry_over` 略差于 `rolling_origin_no_refit`。
+- `farm_loss_weight=0.0` 的双 contract 最小复跑中，absolute 在 `val_rmse_pu` / `val_mae_pu` 选择下的 val RMSE 分别为 `0.162922 / 0.164449`，test rolling RMSE 为 `0.169621 / 0.175486`；residual 对应 val RMSE 为 `0.162248 / 0.162402`，test rolling RMSE 为 `0.168571 / 0.168628`。也就是说 residual 在两种 selection metric 下都压过 absolute。
+- 当前结论：`residual_persistence` 已经足够升格为主线 family 的 experimental working head，但还不该直接翻成 official default；更合理的故事是“decoder-side 参数化改进已经被确认”，而不是“carry-over / online state persistence 已经成立”。
