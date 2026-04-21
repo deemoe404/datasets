@@ -14,7 +14,7 @@ import random
 import shutil
 import sys
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -127,6 +127,8 @@ DEFAULT_DROPOUT = 0.05
 DEFAULT_GRAD_CLIP_NORM = 1.0
 DEFAULT_HIST_RECON_LOSS_WEIGHT = 0.2
 DEFAULT_FARM_LOSS_WEIGHT = 0.1
+DEFAULT_RAMP_LOSS_WEIGHT = 0.0
+DEFAULT_RAMP_HUBER_DELTA = 0.015
 DEFAULT_MET_LOSS_WEIGHT = 0.05
 DEFAULT_INNOVATION_LOSS_WEIGHT = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
@@ -230,6 +232,8 @@ _RESULT_COLUMNS = [
     "bounded_output_epsilon",
     "hist_recon_loss_weight",
     "farm_loss_weight",
+    "ramp_loss_weight",
+    "ramp_huber_delta",
     "met_loss_weight",
     "innovation_loss_weight",
     "weight_decay",
@@ -264,6 +268,8 @@ _TRAINING_HISTORY_COLUMNS = [
     "train_hist_recon_loss_last",
     "train_farm_loss_mean",
     "train_farm_loss_last",
+    "train_ramp_loss_mean",
+    "train_ramp_loss_last",
     "train_met_loss_mean",
     "train_met_loss_last",
     "train_innovation_loss_mean",
@@ -290,6 +296,8 @@ _TRAINING_HISTORY_BACKFILLABLE_COLUMNS = frozenset(
         "selection_metric",
         "val_rmse_pu_leads_13_24_mean",
         "val_rmse_pu_leads_25_36_mean",
+        "train_ramp_loss_mean",
+        "train_ramp_loss_last",
     }
 )
 _VAL_RMSE_GROUP_SPECS = (
@@ -317,6 +325,9 @@ _EVAL_DIAGNOSTIC_COLUMNS = [
     "final_mae_pu",
     "final_rmse_pu",
     "mean_abs_residual",
+    "ramp_mae_pu",
+    "ramp_rmse_pu",
+    "sign_agreement_rate",
 ]
 _SCRATCH_SUMMARY_COLUMNS = [
     "dataset_id",
@@ -327,6 +338,9 @@ _SCRATCH_SUMMARY_COLUMNS = [
     "bucket_name",
     "mae_pu",
     "rmse_pu",
+    "ramp_mae_pu",
+    "ramp_rmse_pu",
+    "sign_agreement_rate",
 ]
 
 
@@ -362,6 +376,8 @@ class HyperparameterProfile:
     grad_clip_norm: float
     hist_recon_loss_weight: float
     farm_loss_weight: float
+    ramp_loss_weight: float
+    ramp_huber_delta: float
     met_loss_weight: float
     innovation_loss_weight: float
     weight_decay: float
@@ -459,6 +475,12 @@ class EvaluationMetrics:
     horizon_rmse_kw: np.ndarray
     horizon_mae_pu: np.ndarray
     horizon_rmse_pu: np.ndarray
+    ramp_mae_pu: float
+    ramp_rmse_pu: float
+    sign_agreement_rate: float
+    horizon_ramp_mae_pu: np.ndarray
+    horizon_ramp_rmse_pu: np.ndarray
+    horizon_sign_agreement_rate: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -558,6 +580,8 @@ _DEFAULT_PROFILE = HyperparameterProfile(
     grad_clip_norm=DEFAULT_GRAD_CLIP_NORM,
     hist_recon_loss_weight=DEFAULT_HIST_RECON_LOSS_WEIGHT,
     farm_loss_weight=DEFAULT_FARM_LOSS_WEIGHT,
+    ramp_loss_weight=DEFAULT_RAMP_LOSS_WEIGHT,
+    ramp_huber_delta=DEFAULT_RAMP_HUBER_DELTA,
     met_loss_weight=DEFAULT_MET_LOSS_WEIGHT,
     innovation_loss_weight=DEFAULT_INNOVATION_LOSS_WEIGHT,
     weight_decay=DEFAULT_WEIGHT_DECAY,
@@ -630,6 +654,8 @@ def resolve_hyperparameter_profile(
     grad_clip_norm: float | None = None,
     hist_recon_loss_weight: float | None = None,
     farm_loss_weight: float | None = None,
+    ramp_loss_weight: float | None = None,
+    ramp_huber_delta: float | None = None,
     met_loss_weight: float | None = None,
     innovation_loss_weight: float | None = None,
     weight_decay: float | None = None,
@@ -667,6 +693,8 @@ def resolve_hyperparameter_profile(
             defaults.hist_recon_loss_weight if hist_recon_loss_weight is None else hist_recon_loss_weight
         ),
         farm_loss_weight=defaults.farm_loss_weight if farm_loss_weight is None else farm_loss_weight,
+        ramp_loss_weight=defaults.ramp_loss_weight if ramp_loss_weight is None else ramp_loss_weight,
+        ramp_huber_delta=defaults.ramp_huber_delta if ramp_huber_delta is None else ramp_huber_delta,
         met_loss_weight=defaults.met_loss_weight if met_loss_weight is None else met_loss_weight,
         innovation_loss_weight=(
             defaults.innovation_loss_weight if innovation_loss_weight is None else innovation_loss_weight
@@ -681,6 +709,10 @@ def resolve_hyperparameter_profile(
     )
     if profile.dropout < 0.0 or profile.dropout >= 1.0:
         raise ValueError(f"dropout must be in [0, 1), found {profile.dropout!r}.")
+    if profile.ramp_loss_weight < 0.0:
+        raise ValueError(f"ramp_loss_weight must be >= 0, found {profile.ramp_loss_weight!r}.")
+    if profile.ramp_huber_delta <= 0.0:
+        raise ValueError(f"ramp_huber_delta must be > 0, found {profile.ramp_huber_delta!r}.")
     if not variant_spec.uses_farm_aux:
         if farm_loss_weight is not None and not math.isclose(float(farm_loss_weight), 0.0, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(
@@ -1843,7 +1875,43 @@ def masked_huber_loss(predictions, targets, valid_mask, *, torch_module, delta: 
     return (huber * mask).sum() / count
 
 
-def _compute_training_losses(outputs: ModelOutputs, batch_local_history, batch_targets, batch_target_valid_mask, batch_met_targets, batch_met_valid_mask, batch_farm_targets, batch_farm_valid_mask, *, hist_recon_loss_weight: float, farm_loss_weight: float, met_loss_weight: float, innovation_loss_weight: float, torch_module) -> tuple[Any, dict[str, float]]:
+def _build_derived_ramp_tensors(predictions, targets, valid_mask, batch_local_history, *, torch_module):
+    last_history_target = batch_local_history[:, -1:, :, _LOCAL_VALUE_START : _LOCAL_VALUE_START + 1]
+    last_history_valid = 1.0 - batch_local_history[:, -1:, :, _LOCAL_MASK_START : _LOCAL_MASK_START + 1]
+    ramp_predictions = [predictions[:, :1] - last_history_target]
+    ramp_targets = [targets[:, :1] - last_history_target]
+    ramp_valid_masks = [valid_mask[:, :1] * last_history_valid]
+    if predictions.shape[1] > 1:
+        ramp_predictions.append(predictions[:, 1:] - predictions[:, :-1])
+        ramp_targets.append(targets[:, 1:] - targets[:, :-1])
+        ramp_valid_masks.append(valid_mask[:, 1:] * valid_mask[:, :-1])
+    if len(ramp_predictions) == 1:
+        return ramp_predictions[0], ramp_targets[0], ramp_valid_masks[0]
+    return (
+        torch_module.cat(ramp_predictions, dim=1),
+        torch_module.cat(ramp_targets, dim=1),
+        torch_module.cat(ramp_valid_masks, dim=1),
+    )
+
+
+def _compute_training_losses(
+    outputs: ModelOutputs,
+    batch_local_history,
+    batch_targets,
+    batch_target_valid_mask,
+    batch_met_targets,
+    batch_met_valid_mask,
+    batch_farm_targets,
+    batch_farm_valid_mask,
+    *,
+    hist_recon_loss_weight: float,
+    farm_loss_weight: float,
+    ramp_loss_weight: float,
+    ramp_huber_delta: float,
+    met_loss_weight: float,
+    innovation_loss_weight: float,
+    torch_module,
+) -> tuple[Any, dict[str, float]]:
     forecast_loss = masked_huber_loss(outputs.future_predictions, batch_targets, batch_target_valid_mask, torch_module=torch_module, delta=0.03)
     history_targets = batch_local_history[:, DEFAULT_HISTORY_RECON_BURN_IN:, :, _LOCAL_VALUE_START : _LOCAL_VALUE_START + LOCAL_VALUE_COUNT]
     history_valid = 1.0 - batch_local_history[:, DEFAULT_HISTORY_RECON_BURN_IN:, :, _LOCAL_MASK_START : _LOCAL_MASK_START + LOCAL_MASK_COUNT]
@@ -1851,14 +1919,39 @@ def _compute_training_losses(outputs: ModelOutputs, batch_local_history, batch_t
     post_loss = masked_huber_loss(outputs.hist_post_observations[:, DEFAULT_HISTORY_RECON_BURN_IN:], history_targets, history_valid, torch_module=torch_module, delta=0.05, allow_zero=True)
     hist_loss = 0.25 * prior_loss + 0.75 * post_loss
     farm_loss = masked_huber_loss(outputs.future_farm_predictions, batch_farm_targets, batch_farm_valid_mask, torch_module=torch_module, delta=0.03, allow_zero=True)
+    ramp_loss = outputs.future_predictions.new_tensor(0.0)
+    if not math.isclose(ramp_loss_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
+        ramp_predictions, ramp_targets, ramp_valid_mask = _build_derived_ramp_tensors(
+            outputs.future_predictions,
+            batch_targets,
+            batch_target_valid_mask,
+            batch_local_history,
+            torch_module=torch_module,
+        )
+        ramp_loss = masked_huber_loss(
+            ramp_predictions,
+            ramp_targets,
+            ramp_valid_mask,
+            torch_module=torch_module,
+            delta=ramp_huber_delta,
+            allow_zero=True,
+        )
     met_loss = masked_huber_loss(outputs.future_met_predictions, batch_met_targets, batch_met_valid_mask, torch_module=torch_module, delta=0.05, allow_zero=True)
     innovation_loss = outputs.innovation_regularization
-    total_loss = forecast_loss + hist_recon_loss_weight * hist_loss + farm_loss_weight * farm_loss + met_loss_weight * met_loss + innovation_loss_weight * innovation_loss
+    total_loss = (
+        forecast_loss
+        + hist_recon_loss_weight * hist_loss
+        + farm_loss_weight * farm_loss
+        + ramp_loss_weight * ramp_loss
+        + met_loss_weight * met_loss
+        + innovation_loss_weight * innovation_loss
+    )
     return total_loss, {
         "total": float(total_loss.item()),
         "forecast": float(forecast_loss.item()),
         "hist_recon": float(hist_loss.item()),
         "farm": float(farm_loss.item()),
+        "ramp": float(ramp_loss.item()),
         "met": float(met_loss.item()),
         "innovation": float(innovation_loss.item()),
     }
@@ -1877,12 +1970,18 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float, forecas
     window_count = 0
     prediction_count = 0
     abs_error_sum_kw = squared_error_sum_kw = abs_error_sum_pu = squared_error_sum_pu = 0.0
+    ramp_pair_count = 0
+    ramp_abs_error_sum_pu = ramp_squared_error_sum_pu = ramp_sign_agreement_sum = 0.0
     horizon_window_count = np.zeros((forecast_steps,), dtype=np.int64)
     horizon_prediction_count = np.zeros((forecast_steps,), dtype=np.int64)
     horizon_abs_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_squared_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_pair_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_ramp_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_sign_agreement_sum = np.zeros((forecast_steps,), dtype=np.float64)
     model.eval()
     progress = _create_progress_bar(total=_loader_batch_total(loader), desc=progress_label or "evaluate")
     try:
@@ -1908,32 +2007,62 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float, forecas
                 sq_kw = resolved_torch.square(errors_kw) * valid
                 abs_pu = resolved_torch.abs(errors_pu) * valid
                 sq_pu = resolved_torch.square(errors_pu) * valid
+                ramp_predictions, ramp_targets, ramp_valid = _build_derived_ramp_tensors(
+                    predictions,
+                    batch_targets,
+                    batch_target_valid_mask,
+                    batch_local_history,
+                    torch_module=resolved_torch,
+                )
+                ramp_errors = ramp_predictions - ramp_targets
+                ramp_abs = resolved_torch.abs(ramp_errors) * ramp_valid
+                ramp_sq = resolved_torch.square(ramp_errors) * ramp_valid
+                ramp_sign_agreement = (
+                    (resolved_torch.sign(ramp_predictions) == resolved_torch.sign(ramp_targets)).to(dtype=ramp_valid.dtype)
+                    * ramp_valid
+                )
                 abs_error_sum_kw += float(abs_kw.sum().item())
                 squared_error_sum_kw += float(sq_kw.sum().item())
                 abs_error_sum_pu += float(abs_pu.sum().item())
                 squared_error_sum_pu += float(sq_pu.sum().item())
+                ramp_pair_count += int(ramp_valid.sum().item())
+                ramp_abs_error_sum_pu += float(ramp_abs.sum().item())
+                ramp_squared_error_sum_pu += float(ramp_sq.sum().item())
+                ramp_sign_agreement_sum += float(ramp_sign_agreement.sum().item())
                 horizon_window_count += batch_window_count
                 horizon_prediction_count += valid_np.sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
                 horizon_abs_error_sum_kw += abs_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_squared_error_sum_kw += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_abs_error_sum_pu += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_squared_error_sum_pu += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_pair_count += ramp_valid.detach().cpu().numpy().sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
+                horizon_ramp_abs_error_sum_pu += ramp_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_squared_error_sum_pu += ramp_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_sign_agreement_sum += ramp_sign_agreement.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 progress.update(1)
     finally:
         progress.close()
-    return EvaluationMetrics(
+    return _finalize_metric_arrays(
         window_count=window_count,
         prediction_count=prediction_count,
-        mae_kw=_safe_divide(abs_error_sum_kw, prediction_count),
-        rmse_kw=_safe_rmse(squared_error_sum_kw, prediction_count),
-        mae_pu=_safe_divide(abs_error_sum_pu, prediction_count),
-        rmse_pu=_safe_rmse(squared_error_sum_pu, prediction_count),
+        abs_error_sum_kw=abs_error_sum_kw,
+        squared_error_sum_kw=squared_error_sum_kw,
+        abs_error_sum_pu=abs_error_sum_pu,
+        squared_error_sum_pu=squared_error_sum_pu,
+        ramp_pair_count=ramp_pair_count,
+        ramp_abs_error_sum_pu=ramp_abs_error_sum_pu,
+        ramp_squared_error_sum_pu=ramp_squared_error_sum_pu,
+        ramp_sign_agreement_sum=ramp_sign_agreement_sum,
         horizon_window_count=horizon_window_count,
         horizon_prediction_count=horizon_prediction_count,
-        horizon_mae_kw=np.asarray([_safe_divide(horizon_abs_error_sum_kw[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]),
-        horizon_rmse_kw=np.asarray([_safe_rmse(horizon_squared_error_sum_kw[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]),
-        horizon_mae_pu=np.asarray([_safe_divide(horizon_abs_error_sum_pu[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]),
-        horizon_rmse_pu=np.asarray([_safe_rmse(horizon_squared_error_sum_pu[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]),
+        horizon_abs_error_sum_kw=horizon_abs_error_sum_kw,
+        horizon_squared_error_sum_kw=horizon_squared_error_sum_kw,
+        horizon_abs_error_sum_pu=horizon_abs_error_sum_pu,
+        horizon_squared_error_sum_pu=horizon_squared_error_sum_pu,
+        horizon_ramp_pair_count=horizon_ramp_pair_count,
+        horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
+        horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
+        horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
     )
 
 
@@ -2317,6 +2446,10 @@ def _result_frame_from_rows(rows: Sequence[dict[str, object]]) -> pl.DataFrame:
     return sort_result_frame(pl.DataFrame(rows, infer_schema_length=None).select(_RESULT_COLUMNS))
 
 
+def _profile_from_payload(profile_payload: Mapping[str, object]) -> HyperparameterProfile:
+    return HyperparameterProfile(**{**asdict(_DEFAULT_PROFILE), **dict(profile_payload)})
+
+
 def _build_effective_config(
     *,
     dataset_ids: Sequence[str],
@@ -2345,6 +2478,8 @@ def _build_effective_config(
     grad_clip_norm: float | None,
     hist_recon_loss_weight: float | None,
     farm_loss_weight: float | None,
+    ramp_loss_weight: float | None,
+    ramp_huber_delta: float | None,
     met_loss_weight: float | None,
     innovation_loss_weight: float | None,
     weight_decay: float | None,
@@ -2398,6 +2533,8 @@ def _build_effective_config(
                             grad_clip_norm=grad_clip_norm,
                             hist_recon_loss_weight=hist_recon_loss_weight,
                             farm_loss_weight=farm_loss_weight,
+                            ramp_loss_weight=ramp_loss_weight,
+                            ramp_huber_delta=ramp_huber_delta,
                             met_loss_weight=met_loss_weight,
                             innovation_loss_weight=innovation_loss_weight,
                             weight_decay=weight_decay,
@@ -2464,6 +2601,8 @@ def train_model(
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     hist_recon_loss_weight: float = DEFAULT_HIST_RECON_LOSS_WEIGHT,
     farm_loss_weight: float = DEFAULT_FARM_LOSS_WEIGHT,
+    ramp_loss_weight: float = DEFAULT_RAMP_LOSS_WEIGHT,
+    ramp_huber_delta: float = DEFAULT_RAMP_HUBER_DELTA,
     met_loss_weight: float = DEFAULT_MET_LOSS_WEIGHT,
     innovation_loss_weight: float = DEFAULT_INNOVATION_LOSS_WEIGHT,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
@@ -2640,6 +2779,7 @@ def train_model(
                 "forecast": 0.0,
                 "hist_recon": 0.0,
                 "farm": 0.0,
+                "ramp": 0.0,
                 "met": 0.0,
                 "innovation": 0.0,
             }
@@ -2674,6 +2814,8 @@ def train_model(
                             batch_farm_valid_mask,
                             hist_recon_loss_weight=hist_recon_loss_weight,
                             farm_loss_weight=farm_loss_weight,
+                            ramp_loss_weight=ramp_loss_weight,
+                            ramp_huber_delta=ramp_huber_delta,
                             met_loss_weight=met_loss_weight,
                             innovation_loss_weight=innovation_loss_weight,
                             torch_module=resolved_torch,
@@ -2774,6 +2916,8 @@ def train_model(
                         "train_hist_recon_loss_last": latest_losses.get("hist_recon"),
                         "train_farm_loss_mean": loss_means["farm"],
                         "train_farm_loss_last": latest_losses.get("farm"),
+                        "train_ramp_loss_mean": loss_means["ramp"],
+                        "train_ramp_loss_last": latest_losses.get("ramp"),
                         "train_met_loss_mean": loss_means["met"],
                         "train_met_loss_last": latest_losses.get("met"),
                         "train_innovation_loss_mean": loss_means["innovation"],
@@ -2804,6 +2948,8 @@ def train_model(
             _tensorboard_add_scalar(tensorboard_writer, "train/hist_recon_loss_last", latest_losses.get("hist_recon"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/farm_loss_mean", loss_means["farm"], epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/farm_loss_last", latest_losses.get("farm"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_mean", loss_means["ramp"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_last", latest_losses.get("ramp"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_mean", loss_means["met"], epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_last", latest_losses.get("met"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/innovation_loss_mean", loss_means["innovation"], epoch_index)
@@ -2924,6 +3070,8 @@ def build_result_rows(
         "bounded_output_epsilon": profile.bounded_output_epsilon,
         "hist_recon_loss_weight": profile.hist_recon_loss_weight,
         "farm_loss_weight": profile.farm_loss_weight,
+        "ramp_loss_weight": profile.ramp_loss_weight,
+        "ramp_huber_delta": profile.ramp_huber_delta,
         "met_loss_weight": profile.met_loss_weight,
         "innovation_loss_weight": profile.innovation_loss_weight,
         "weight_decay": profile.weight_decay,
@@ -3072,12 +3220,20 @@ def _finalize_metric_arrays(
     squared_error_sum_kw: float,
     abs_error_sum_pu: float,
     squared_error_sum_pu: float,
+    ramp_pair_count: int,
+    ramp_abs_error_sum_pu: float,
+    ramp_squared_error_sum_pu: float,
+    ramp_sign_agreement_sum: float,
     horizon_window_count: np.ndarray,
     horizon_prediction_count: np.ndarray,
     horizon_abs_error_sum_kw: np.ndarray,
     horizon_squared_error_sum_kw: np.ndarray,
     horizon_abs_error_sum_pu: np.ndarray,
     horizon_squared_error_sum_pu: np.ndarray,
+    horizon_ramp_pair_count: np.ndarray,
+    horizon_ramp_abs_error_sum_pu: np.ndarray,
+    horizon_ramp_squared_error_sum_pu: np.ndarray,
+    horizon_ramp_sign_agreement_sum: np.ndarray,
 ) -> EvaluationMetrics:
     forecast_steps = int(horizon_prediction_count.shape[0])
     return EvaluationMetrics(
@@ -3101,6 +3257,18 @@ def _finalize_metric_arrays(
         horizon_rmse_pu=np.asarray(
             [_safe_rmse(horizon_squared_error_sum_pu[i], int(horizon_prediction_count[i])) for i in range(forecast_steps)]
         ),
+        ramp_mae_pu=_safe_divide(ramp_abs_error_sum_pu, ramp_pair_count),
+        ramp_rmse_pu=_safe_rmse(ramp_squared_error_sum_pu, ramp_pair_count),
+        sign_agreement_rate=_safe_divide(ramp_sign_agreement_sum, ramp_pair_count),
+        horizon_ramp_mae_pu=np.asarray(
+            [_safe_divide(horizon_ramp_abs_error_sum_pu[i], int(horizon_ramp_pair_count[i])) for i in range(forecast_steps)]
+        ),
+        horizon_ramp_rmse_pu=np.asarray(
+            [_safe_rmse(horizon_ramp_squared_error_sum_pu[i], int(horizon_ramp_pair_count[i])) for i in range(forecast_steps)]
+        ),
+        horizon_sign_agreement_rate=np.asarray(
+            [_safe_divide(horizon_ramp_sign_agreement_sum[i], int(horizon_ramp_pair_count[i])) for i in range(forecast_steps)]
+        ),
     )
 
 
@@ -3118,6 +3286,10 @@ def _diagnostic_rows_from_sums(
     final_abs_error_sum: float,
     final_squared_error_sum: float,
     residual_abs_sum: float,
+    ramp_pair_count: int,
+    ramp_abs_error_sum_pu: float,
+    ramp_squared_error_sum_pu: float,
+    ramp_sign_agreement_sum: float,
     horizon_window_count: np.ndarray,
     horizon_prediction_count: np.ndarray,
     horizon_clamp_hits: np.ndarray,
@@ -3126,6 +3298,10 @@ def _diagnostic_rows_from_sums(
     horizon_final_abs_error_sum: np.ndarray,
     horizon_final_squared_error_sum: np.ndarray,
     horizon_residual_abs_sum: np.ndarray,
+    horizon_ramp_pair_count: np.ndarray,
+    horizon_ramp_abs_error_sum_pu: np.ndarray,
+    horizon_ramp_squared_error_sum_pu: np.ndarray,
+    horizon_ramp_sign_agreement_sum: np.ndarray,
     has_residual_head: bool,
 ) -> pl.DataFrame:
     rows: list[dict[str, object]] = [
@@ -3147,10 +3323,14 @@ def _diagnostic_rows_from_sums(
             "mean_abs_residual": (
                 _safe_divide(residual_abs_sum, prediction_count) if has_residual_head else math.nan
             ),
+            "ramp_mae_pu": _safe_divide(ramp_abs_error_sum_pu, ramp_pair_count),
+            "ramp_rmse_pu": _safe_rmse(ramp_squared_error_sum_pu, ramp_pair_count),
+            "sign_agreement_rate": _safe_divide(ramp_sign_agreement_sum, ramp_pair_count),
         }
     ]
     for lead_index in range(prepared_dataset.forecast_steps):
         lead_prediction_count = int(horizon_prediction_count[lead_index])
+        lead_ramp_pair_count = int(horizon_ramp_pair_count[lead_index])
         rows.append(
             {
                 "dataset_id": prepared_dataset.dataset_id,
@@ -3181,6 +3361,18 @@ def _diagnostic_rows_from_sums(
                     if has_residual_head
                     else math.nan
                 ),
+                "ramp_mae_pu": _safe_divide(
+                    float(horizon_ramp_abs_error_sum_pu[lead_index]),
+                    lead_ramp_pair_count,
+                ),
+                "ramp_rmse_pu": _safe_rmse(
+                    float(horizon_ramp_squared_error_sum_pu[lead_index]),
+                    lead_ramp_pair_count,
+                ),
+                "sign_agreement_rate": _safe_divide(
+                    float(horizon_ramp_sign_agreement_sum[lead_index]),
+                    lead_ramp_pair_count,
+                ),
             }
         )
     return pl.DataFrame(rows, infer_schema_length=None).select(_EVAL_DIAGNOSTIC_COLUMNS)
@@ -3204,6 +3396,13 @@ def _scratch_summary_rows(
             "bucket_name": bucket_name,
             "mae_pu": _mean_horizon_values(metrics.horizon_mae_pu, start_lead=start_lead, end_lead=end_lead),
             "rmse_pu": _mean_horizon_values(metrics.horizon_rmse_pu, start_lead=start_lead, end_lead=end_lead),
+            "ramp_mae_pu": _mean_horizon_values(metrics.horizon_ramp_mae_pu, start_lead=start_lead, end_lead=end_lead),
+            "ramp_rmse_pu": _mean_horizon_values(metrics.horizon_ramp_rmse_pu, start_lead=start_lead, end_lead=end_lead),
+            "sign_agreement_rate": _mean_horizon_values(
+                metrics.horizon_sign_agreement_rate,
+                start_lead=start_lead,
+                end_lead=end_lead,
+            ),
         }
         for bucket_name, start_lead, end_lead in _LEAD_BUCKET_SPECS
     ]
@@ -3218,6 +3417,9 @@ def _scratch_summary_rows(
             "bucket_name": "overall",
             "mae_pu": float(metrics.mae_pu),
             "rmse_pu": float(metrics.rmse_pu),
+            "ramp_mae_pu": float(metrics.ramp_mae_pu),
+            "ramp_rmse_pu": float(metrics.ramp_rmse_pu),
+            "sign_agreement_rate": float(metrics.sign_agreement_rate),
         },
     )
     return pl.DataFrame(rows, infer_schema_length=None).select(_SCRATCH_SUMMARY_COLUMNS)
@@ -3245,12 +3447,18 @@ def evaluate_saved_checkpoint_windows(
     window_count = 0
     prediction_count = 0
     abs_error_sum_kw = squared_error_sum_kw = abs_error_sum_pu = squared_error_sum_pu = 0.0
+    ramp_pair_count = 0
+    ramp_abs_error_sum_pu = ramp_squared_error_sum_pu = ramp_sign_agreement_sum = 0.0
     horizon_window_count = np.zeros((forecast_steps,), dtype=np.int64)
     horizon_prediction_count = np.zeros((forecast_steps,), dtype=np.int64)
     horizon_abs_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_squared_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_pair_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_ramp_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_ramp_sign_agreement_sum = np.zeros((forecast_steps,), dtype=np.float64)
     clamp_hits = 0.0
     anchor_abs_error_sum = 0.0
     anchor_squared_error_sum = 0.0
@@ -3286,7 +3494,7 @@ def evaluate_saved_checkpoint_windows(
                         revealed_local,
                         revealed_context,
                     )
-                    _local_history, _context_history, context_future, targets, valid_mask = _window_batch_tensors(
+                    local_history, _context_history, context_future, targets, valid_mask = _window_batch_tensors(
                         prepared_dataset,
                         target_index=target_index,
                         torch_module=resolved_torch,
@@ -3327,6 +3535,20 @@ def evaluate_saved_checkpoint_windows(
                 sq_pu = resolved_torch.square(errors_pu) * valid
                 anchor_abs = resolved_torch.abs(anchor_errors_pu) * valid
                 anchor_sq = resolved_torch.square(anchor_errors_pu) * valid
+                ramp_predictions, ramp_targets, ramp_valid = _build_derived_ramp_tensors(
+                    predictions,
+                    targets,
+                    valid_mask,
+                    local_history,
+                    torch_module=resolved_torch,
+                )
+                ramp_errors = ramp_predictions - ramp_targets
+                ramp_abs = resolved_torch.abs(ramp_errors) * ramp_valid
+                ramp_sq = resolved_torch.square(ramp_errors) * ramp_valid
+                ramp_sign_agreement = (
+                    (resolved_torch.sign(ramp_predictions) == resolved_torch.sign(ramp_targets)).to(dtype=ramp_valid.dtype)
+                    * ramp_valid
+                )
                 clamp_lower = predictions <= 1e-8
                 clamp_upper = predictions >= (1.0 + model.bounded_output_epsilon - 1e-8)
                 clamp_mask = (clamp_lower | clamp_upper).to(dtype=valid.dtype) * valid
@@ -3335,6 +3557,10 @@ def evaluate_saved_checkpoint_windows(
                 squared_error_sum_kw += float(sq_kw.sum().item())
                 abs_error_sum_pu += float(abs_pu.sum().item())
                 squared_error_sum_pu += float(sq_pu.sum().item())
+                ramp_pair_count += int(ramp_valid.sum().item())
+                ramp_abs_error_sum_pu += float(ramp_abs.sum().item())
+                ramp_squared_error_sum_pu += float(ramp_sq.sum().item())
+                ramp_sign_agreement_sum += float(ramp_sign_agreement.sum().item())
                 clamp_hits += float(clamp_mask.sum().item())
                 anchor_abs_error_sum += float(anchor_abs.sum().item())
                 anchor_squared_error_sum += float(anchor_sq.sum().item())
@@ -3347,6 +3573,10 @@ def evaluate_saved_checkpoint_windows(
                 horizon_squared_error_sum_kw += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_abs_error_sum_pu += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_squared_error_sum_pu += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_pair_count += ramp_valid.detach().cpu().numpy().sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
+                horizon_ramp_abs_error_sum_pu += ramp_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_squared_error_sum_pu += ramp_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_sign_agreement_sum += ramp_sign_agreement.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_clamp_hits += clamp_mask.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_anchor_abs_error_sum += anchor_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_anchor_squared_error_sum += anchor_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
@@ -3364,12 +3594,20 @@ def evaluate_saved_checkpoint_windows(
         squared_error_sum_kw=squared_error_sum_kw,
         abs_error_sum_pu=abs_error_sum_pu,
         squared_error_sum_pu=squared_error_sum_pu,
+        ramp_pair_count=ramp_pair_count,
+        ramp_abs_error_sum_pu=ramp_abs_error_sum_pu,
+        ramp_squared_error_sum_pu=ramp_squared_error_sum_pu,
+        ramp_sign_agreement_sum=ramp_sign_agreement_sum,
         horizon_window_count=horizon_window_count,
         horizon_prediction_count=horizon_prediction_count,
         horizon_abs_error_sum_kw=horizon_abs_error_sum_kw,
         horizon_squared_error_sum_kw=horizon_squared_error_sum_kw,
         horizon_abs_error_sum_pu=horizon_abs_error_sum_pu,
         horizon_squared_error_sum_pu=horizon_squared_error_sum_pu,
+        horizon_ramp_pair_count=horizon_ramp_pair_count,
+        horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
+        horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
+        horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
     )
     diagnostics = _diagnostic_rows_from_sums(
         prepared_dataset=prepared_dataset,
@@ -3384,6 +3622,10 @@ def evaluate_saved_checkpoint_windows(
         final_abs_error_sum=final_abs_error_sum,
         final_squared_error_sum=final_squared_error_sum,
         residual_abs_sum=residual_abs_sum,
+        ramp_pair_count=ramp_pair_count,
+        ramp_abs_error_sum_pu=ramp_abs_error_sum_pu,
+        ramp_squared_error_sum_pu=ramp_squared_error_sum_pu,
+        ramp_sign_agreement_sum=ramp_sign_agreement_sum,
         horizon_window_count=horizon_window_count,
         horizon_prediction_count=horizon_prediction_count,
         horizon_clamp_hits=horizon_clamp_hits,
@@ -3392,6 +3634,10 @@ def evaluate_saved_checkpoint_windows(
         horizon_final_abs_error_sum=horizon_final_abs_error_sum,
         horizon_final_squared_error_sum=horizon_final_squared_error_sum,
         horizon_residual_abs_sum=horizon_residual_abs_sum,
+        horizon_ramp_pair_count=horizon_ramp_pair_count,
+        horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
+        horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
+        horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
         has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
     )
     summary = _scratch_summary_rows(
@@ -3489,8 +3735,7 @@ def load_best_checkpoint(
             f"Best checkpoint at {checkpoint_path} does not match "
             f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}/{selection_metric}."
         )
-    profile_payload = dict(payload["profile"])
-    profile = HyperparameterProfile(**profile_payload)
+    profile = _profile_from_payload(payload["profile"])
     variant_spec = _resolve_variant_spec(prepared_dataset.model_variant)
     model = build_model(
         node_count=prepared_dataset.node_count,
@@ -3648,6 +3893,8 @@ def execute_training_job(
     grad_clip_norm: float = DEFAULT_GRAD_CLIP_NORM,
     hist_recon_loss_weight: float = DEFAULT_HIST_RECON_LOSS_WEIGHT,
     farm_loss_weight: float | None = None,
+    ramp_loss_weight: float | None = None,
+    ramp_huber_delta: float | None = None,
     met_loss_weight: float | None = None,
     innovation_loss_weight: float = DEFAULT_INNOVATION_LOSS_WEIGHT,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
@@ -3691,6 +3938,8 @@ def execute_training_job(
         grad_clip_norm=grad_clip_norm,
         hist_recon_loss_weight=hist_recon_loss_weight,
         farm_loss_weight=farm_loss_weight,
+        ramp_loss_weight=ramp_loss_weight,
+        ramp_huber_delta=ramp_huber_delta,
         met_loss_weight=met_loss_weight,
         innovation_loss_weight=innovation_loss_weight,
         weight_decay=weight_decay,
@@ -3746,6 +3995,8 @@ def execute_training_job(
             grad_clip_norm=resolved_profile.grad_clip_norm,
             hist_recon_loss_weight=resolved_profile.hist_recon_loss_weight,
             farm_loss_weight=resolved_profile.farm_loss_weight,
+            ramp_loss_weight=resolved_profile.ramp_loss_weight,
+            ramp_huber_delta=resolved_profile.ramp_huber_delta,
             met_loss_weight=resolved_profile.met_loss_weight,
             innovation_loss_weight=resolved_profile.innovation_loss_weight,
             weight_decay=resolved_profile.weight_decay,
@@ -3859,6 +4110,8 @@ def run_experiment(
     grad_clip_norm: float | None = None,
     hist_recon_loss_weight: float | None = None,
     farm_loss_weight: float | None = None,
+    ramp_loss_weight: float | None = None,
+    ramp_huber_delta: float | None = None,
     met_loss_weight: float | None = None,
     innovation_loss_weight: float | None = None,
     weight_decay: float | None = None,
@@ -3915,6 +4168,8 @@ def run_experiment(
         grad_clip_norm=grad_clip_norm,
         hist_recon_loss_weight=hist_recon_loss_weight,
         farm_loss_weight=farm_loss_weight,
+        ramp_loss_weight=ramp_loss_weight,
+        ramp_huber_delta=ramp_huber_delta,
         met_loss_weight=met_loss_weight,
         innovation_loss_weight=innovation_loss_weight,
         weight_decay=weight_decay,
@@ -4024,6 +4279,8 @@ def run_experiment(
                     grad_clip_norm=grad_clip_norm,
                     hist_recon_loss_weight=hist_recon_loss_weight,
                     farm_loss_weight=farm_loss_weight,
+                    ramp_loss_weight=ramp_loss_weight,
+                    ramp_huber_delta=ramp_huber_delta,
                     met_loss_weight=met_loss_weight,
                     innovation_loss_weight=innovation_loss_weight,
                     weight_decay=weight_decay,
@@ -4082,6 +4339,8 @@ def run_experiment(
                         grad_clip_norm=resolved_profile.grad_clip_norm,
                         hist_recon_loss_weight=resolved_profile.hist_recon_loss_weight,
                         farm_loss_weight=resolved_profile.farm_loss_weight,
+                        ramp_loss_weight=resolved_profile.ramp_loss_weight,
+                        ramp_huber_delta=resolved_profile.ramp_huber_delta,
                         met_loss_weight=resolved_profile.met_loss_weight,
                         innovation_loss_weight=resolved_profile.innovation_loss_weight,
                         weight_decay=resolved_profile.weight_decay,
@@ -4188,6 +4447,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grad-clip-norm", type=float, default=None, help="Gradient clipping max norm; 0 disables.")
     parser.add_argument("--hist-recon-loss-weight", type=float, default=None, help="History reconstruction loss weight.")
     parser.add_argument("--farm-loss-weight", type=float, default=None, help="Farm consistency loss weight.")
+    parser.add_argument("--ramp-loss-weight", type=float, default=None, help="Derived-ramp auxiliary loss weight.")
+    parser.add_argument("--ramp-huber-delta", type=float, default=None, help="Huber delta for derived-ramp supervision.")
     parser.add_argument("--met-loss-weight", type=float, default=None, help="Site-summary auxiliary loss weight.")
     parser.add_argument("--innovation-loss-weight", type=float, default=None, help="Innovation regularization weight.")
     parser.add_argument("--weight-decay", type=float, default=None, help="AdamW weight decay.")
@@ -4279,6 +4540,8 @@ def _resolved_record_hyperparameters(
                         grad_clip_norm=args.grad_clip_norm,
                         hist_recon_loss_weight=args.hist_recon_loss_weight,
                         farm_loss_weight=args.farm_loss_weight,
+                        ramp_loss_weight=args.ramp_loss_weight,
+                        ramp_huber_delta=args.ramp_huber_delta,
                         met_loss_weight=args.met_loss_weight,
                         innovation_loss_weight=args.innovation_loss_weight,
                         weight_decay=args.weight_decay,
@@ -4438,6 +4701,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         grad_clip_norm=args.grad_clip_norm,
         hist_recon_loss_weight=args.hist_recon_loss_weight,
         farm_loss_weight=args.farm_loss_weight,
+        ramp_loss_weight=args.ramp_loss_weight,
+        ramp_huber_delta=args.ramp_huber_delta,
         met_loss_weight=args.met_loss_weight,
         innovation_loss_weight=args.innovation_loss_weight,
         weight_decay=args.weight_decay,

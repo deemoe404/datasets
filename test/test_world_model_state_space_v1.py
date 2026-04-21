@@ -288,6 +288,12 @@ def test_horizon_rmse_group_means_cover_expected_ranges() -> None:
         horizon_rmse_kw=np.zeros((36,), dtype=np.float64),
         horizon_mae_pu=np.zeros((36,), dtype=np.float64),
         horizon_rmse_pu=np.arange(1.0, 37.0, dtype=np.float64),
+        ramp_mae_pu=0.0,
+        ramp_rmse_pu=0.0,
+        sign_agreement_rate=1.0,
+        horizon_ramp_mae_pu=np.zeros((36,), dtype=np.float64),
+        horizon_ramp_rmse_pu=np.zeros((36,), dtype=np.float64),
+        horizon_sign_agreement_rate=np.ones((36,), dtype=np.float64),
     )
 
     summary = module._horizon_rmse_pu_group_means(metrics)
@@ -311,6 +317,8 @@ def test_resolve_hyperparameter_profile_applies_ablation_guardrails() -> None:
     assert graph_profile.wake_lambda_y == 0.0
     assert graph_profile.wake_kappa == 0.0
     assert no_farm_profile.farm_loss_weight == 0.0
+    assert no_farm_profile.ramp_loss_weight == module.DEFAULT_RAMP_LOSS_WEIGHT
+    assert no_farm_profile.ramp_huber_delta == module.DEFAULT_RAMP_HUBER_DELTA
     assert no_met_profile.met_loss_weight == 0.0
 
     with pytest.raises(ValueError, match="farm_loss_weight=0.0"):
@@ -330,6 +338,18 @@ def test_resolve_hyperparameter_profile_applies_ablation_guardrails() -> None:
             module.WAKE_OFF_MODEL_VARIANT,
             dataset_id="kelmarsh",
             wake_lambda_x=99.0,
+        )
+    with pytest.raises(ValueError, match="ramp_loss_weight"):
+        module.resolve_hyperparameter_profile(
+            module.MODEL_VARIANT,
+            dataset_id="kelmarsh",
+            ramp_loss_weight=-0.01,
+        )
+    with pytest.raises(ValueError, match="ramp_huber_delta"):
+        module.resolve_hyperparameter_profile(
+            module.MODEL_VARIANT,
+            dataset_id="kelmarsh",
+            ramp_huber_delta=0.0,
         )
 
 
@@ -498,6 +518,53 @@ def test_persistence_anchor_uses_train_fallback_when_history_missing(tmp_path, m
     anchor = model._persistence_anchor(local_history)
 
     assert float(anchor[0, 0].item()) == pytest.approx(float(prepared.persistence_train_fallback_pu[0]))
+
+
+def test_derived_ramp_masks_first_step_when_last_history_target_missing() -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    local_history = torch_module.zeros((1, 2, 1, module._LOCAL_MASK_START + 1), dtype=torch_module.float32)
+    local_history[:, -1, 0, module._LOCAL_VALUE_START] = 0.9
+    local_history[:, -1, 0, module._LOCAL_MASK_START] = 1.0
+    local_history[:, -2, 0, module._LOCAL_VALUE_START] = 0.25
+    local_history[:, -2, 0, module._LOCAL_MASK_START] = 0.0
+    predictions = torch_module.tensor([[[[0.5]], [[0.7]], [[0.8]]]], dtype=torch_module.float32)
+    targets = torch_module.tensor([[[[0.4]], [[0.6]], [[0.9]]]], dtype=torch_module.float32)
+    valid_mask = torch_module.ones_like(targets)
+
+    _ramp_predictions, _ramp_targets, ramp_valid_mask = module._build_derived_ramp_tensors(
+        predictions,
+        targets,
+        valid_mask,
+        local_history,
+        torch_module=torch_module,
+    )
+
+    assert float(ramp_valid_mask[0, 0, 0, 0].item()) == 0.0
+    assert float(ramp_valid_mask[0, 1, 0, 0].item()) == 1.0
+
+
+def test_derived_ramp_uses_last_history_value_and_double_valid_future_mask() -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    local_history = torch_module.zeros((1, 2, 1, module._LOCAL_MASK_START + 1), dtype=torch_module.float32)
+    local_history[:, -1, 0, module._LOCAL_VALUE_START] = 0.2
+    local_history[:, -1, 0, module._LOCAL_MASK_START] = 0.0
+    predictions = torch_module.tensor([[[[0.4]], [[0.8]], [[1.0]]]], dtype=torch_module.float32)
+    targets = torch_module.tensor([[[[0.5]], [[0.7]], [[1.1]]]], dtype=torch_module.float32)
+    valid_mask = torch_module.tensor([[[[1.0]], [[1.0]], [[0.0]]]], dtype=torch_module.float32)
+
+    ramp_predictions, ramp_targets, ramp_valid_mask = module._build_derived_ramp_tensors(
+        predictions,
+        targets,
+        valid_mask,
+        local_history,
+        torch_module=torch_module,
+    )
+
+    assert float(ramp_predictions[0, 0, 0, 0].item()) == pytest.approx(0.2)
+    assert float(ramp_targets[0, 0, 0, 0].item()) == pytest.approx(0.3)
+    assert ramp_valid_mask.squeeze().tolist() == [1.0, 1.0, 0.0]
 
 
 def test_canonical_zero_decoder_keeps_absolute_head_behavior(tmp_path, monkeypatch) -> None:
@@ -729,15 +796,19 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch, varian
     assert history["train_forecast_loss_mean"].null_count() == 0
     assert history["train_hist_recon_loss_mean"].null_count() == 0
     assert history["train_farm_loss_mean"].null_count() == 0
+    assert history["train_ramp_loss_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 0
     assert history["selection_metric"].to_list() == [module.DEFAULT_SELECTION_METRIC]
+    assert history["train_ramp_loss_mean"].to_list() == [0.0]
     assert len(rows) == 148
     assert {row["split_name"] for row in rows} == {"val", "test"}
     assert rows[0]["model_variant"] == variant_name
     assert rows[0]["z_dim"] == 4
     assert rows[0]["h_dim"] == 6
     assert rows[0]["amp_enabled"] is False
+    assert rows[0]["ramp_loss_weight"] == module.DEFAULT_RAMP_LOSS_WEIGHT
+    assert rows[0]["ramp_huber_delta"] == module.DEFAULT_RAMP_HUBER_DELTA
     if variant_name == module.GRAPH_OFF_MODEL_VARIANT:
         assert rows[0]["wake_lambda_x"] == 0.0
         assert rows[0]["wake_lambda_y"] == 0.0
@@ -795,6 +866,7 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     text_tags = {tag for tag, _text, _step in writer.texts}
     assert "train/loss_mean" in scalar_tags
     assert "train/forecast_loss_mean" in scalar_tags
+    assert "train/ramp_loss_mean" in scalar_tags
     assert "val/overall/rmse_pu" in scalar_tags
     assert "val/horizon_group/rmse_pu/leads_13_24_mean" in scalar_tags
     assert "final/test/rolling_origin_no_refit/overall/rmse_pu" in scalar_tags
@@ -802,6 +874,7 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     assert "run/config_json" in text_tags
     assert "final/summary_json" in text_tags
     assert any('"selection_metric": "val_rmse_pu"' in text for _tag, text, _step in writer.texts)
+    assert any('"ramp_loss_weight": 0.0' in text for _tag, text, _step in writer.texts)
 
 
 def test_read_training_history_backfills_selection_metric_and_horizon_columns(tmp_path) -> None:
@@ -810,7 +883,14 @@ def test_read_training_history_backfills_selection_metric_and_horizon_columns(tm
     legacy_columns = [
         column
         for column in module._TRAINING_HISTORY_COLUMNS
-        if column not in {"selection_metric", "val_rmse_pu_leads_13_24_mean", "val_rmse_pu_leads_25_36_mean"}
+        if column
+        not in {
+            "selection_metric",
+            "val_rmse_pu_leads_13_24_mean",
+            "val_rmse_pu_leads_25_36_mean",
+            "train_ramp_loss_mean",
+            "train_ramp_loss_last",
+        }
     ]
     pl.DataFrame(
         {
@@ -825,6 +905,8 @@ def test_read_training_history_backfills_selection_metric_and_horizon_columns(tm
     assert history["selection_metric"].to_list() == [module.DEFAULT_SELECTION_METRIC]
     assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 1
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 1
+    assert history["train_ramp_loss_mean"].null_count() == 1
+    assert history["train_ramp_loss_last"].null_count() == 1
 
 
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:
@@ -859,6 +941,8 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             grad_clip_norm=kwargs["grad_clip_norm"],
             hist_recon_loss_weight=kwargs["hist_recon_loss_weight"],
             farm_loss_weight=kwargs["farm_loss_weight"],
+            ramp_loss_weight=kwargs["ramp_loss_weight"],
+            ramp_huber_delta=kwargs["ramp_huber_delta"],
             met_loss_weight=kwargs["met_loss_weight"],
             innovation_loss_weight=kwargs["innovation_loss_weight"],
             weight_decay=kwargs["weight_decay"],
@@ -884,6 +968,12 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             horizon_rmse_kw=np.full((prepared_dataset.forecast_steps,), 2.0, dtype=np.float64),
             horizon_mae_pu=np.full((prepared_dataset.forecast_steps,), 0.1, dtype=np.float64),
             horizon_rmse_pu=np.full((prepared_dataset.forecast_steps,), 0.2, dtype=np.float64),
+            ramp_mae_pu=0.03,
+            ramp_rmse_pu=0.04,
+            sign_agreement_rate=0.8,
+            horizon_ramp_mae_pu=np.full((prepared_dataset.forecast_steps,), 0.03, dtype=np.float64),
+            horizon_ramp_rmse_pu=np.full((prepared_dataset.forecast_steps,), 0.04, dtype=np.float64),
+            horizon_sign_agreement_rate=np.full((prepared_dataset.forecast_steps,), 0.8, dtype=np.float64),
         )
         evaluation_results = [
             (split_name, eval_protocol, windows, metrics)
@@ -952,6 +1042,11 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
     state_payload = json.loads(paths.state_path.read_text(encoding="utf-8"))
     assert state_payload["status"] == "complete"
     assert state_payload["effective_config"]["selection_metric"] == "val_mae_pu"
+    resolved_profile = state_payload["effective_config"]["resolved_dataset_variant_hyperparameters"][prepared.dataset_id][
+        prepared.model_variant
+    ]
+    assert resolved_profile["ramp_loss_weight"] == module.DEFAULT_RAMP_LOSS_WEIGHT
+    assert resolved_profile["ramp_huber_delta"] == module.DEFAULT_RAMP_HUBER_DELTA
 
 
 def test_saved_checkpoint_single_origin_carry_over_matches_cold_start(tmp_path, monkeypatch) -> None:
@@ -1077,8 +1172,15 @@ def test_run_saved_checkpoint_scratch_evaluation_writes_diagnostics(
         module.CARRY_OVER_EVAL_PROTOCOL,
     }
     assert set(summaries["bucket_name"].unique().to_list()) == {"overall", "leads_1_12", "leads_13_24", "leads_25_36"}
+    overall_summary = summaries.filter(pl.col("bucket_name") == "overall")
+    assert overall_summary["ramp_mae_pu"].null_count() == 0
+    assert overall_summary["ramp_rmse_pu"].null_count() == 0
+    sign_values = summaries["sign_agreement_rate"].drop_nulls().to_numpy()
+    assert np.all((sign_values >= 0.0) & (sign_values <= 1.0))
     clamp_values = diagnostics["clamp_hit_rate"].to_numpy()
     assert np.all((clamp_values >= 0.0) & (clamp_values <= 1.0))
+    ramp_rmse_values = diagnostics["ramp_rmse_pu"].drop_nulls().to_numpy()
+    assert ramp_rmse_values.size > 0
     residual_values = diagnostics["mean_abs_residual"].to_numpy()
     if expect_residual_metric:
         assert np.isfinite(residual_values).any()
@@ -1196,6 +1298,12 @@ def test_search_screen_one_uses_training_device_for_eval_loaders(monkeypatch, tm
             horizon_rmse_kw=np.ones((prepared.forecast_steps,), dtype=np.float64),
             horizon_mae_pu=np.ones((prepared.forecast_steps,), dtype=np.float64) * 0.1,
             horizon_rmse_pu=np.linspace(0.1, 0.36, prepared.forecast_steps, dtype=np.float64),
+            ramp_mae_pu=0.02,
+            ramp_rmse_pu=0.03,
+            sign_agreement_rate=0.75,
+            horizon_ramp_mae_pu=np.full((prepared.forecast_steps,), 0.02, dtype=np.float64),
+            horizon_ramp_rmse_pu=np.full((prepared.forecast_steps,), 0.03, dtype=np.float64),
+            horizon_sign_agreement_rate=np.full((prepared.forecast_steps,), 0.75, dtype=np.float64),
         )
 
     monkeypatch.setattr(search_module.state_space, "train_model", _fake_train_model)

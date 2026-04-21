@@ -24,6 +24,11 @@ The default runner behavior remains canonical-only; ablations must be selected
 explicitly with repeated `--variant` flags.
 The search harness also remains canonical-only in this revision.
 
+The family also exposes an optional derived-ramp auxiliary loss via
+`--ramp-loss-weight` and `--ramp-huber-delta`. Both knobs default to disabled
+behavior (`ramp_loss_weight=0.0`) and apply uniformly to every variant without
+changing the published result schema or checkpoint-selection metric.
+
 ## Run
 
 ```shell
@@ -42,6 +47,17 @@ Smoke run:
   --max-train-origins 64 \
   --max-eval-origins 32 \
   --output-path ../../artifacts/scratch/world_model_state_space_v1/kelmarsh_smoke.csv
+```
+
+Residual-head ramp ablation example:
+
+```shell
+./.conda/bin/python run_world_model_state_space_v1.py \
+  --variant world_model_state_space_v1_residual_persistence_farm_sync \
+  --farm-loss-weight 0.0 \
+  --ramp-loss-weight 0.02 \
+  --ramp-huber-delta 0.015 \
+  --selection-metric val_rmse_pu
 ```
 
 Farm-loss sweep:
@@ -65,6 +81,11 @@ Default formal output:
 
 Default `--resume` and `--force-rerun` flows must pass the exact historical
 `--output-path` because the formal publish path is timestamped per run.
+
+Scratch checkpoint evaluation (`--load-best-checkpoint`) continues to write
+`*.diagnostics.csv` and `*.summary.csv`, and now includes ramp-side diagnostics
+such as `ramp_mae_pu`, `ramp_rmse_pu`, and `sign_agreement_rate` for both
+`rolling_origin_no_refit` and optional `rolling_origin_carry_over`.
 
 Default TensorBoard output:
 
