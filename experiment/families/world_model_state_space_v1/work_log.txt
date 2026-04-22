@@ -35,6 +35,8 @@
 - 训练侧把 ramp loss 改成多尺度等权平均：`L_ramp = mean(L_k)` for `K in {3,6}`，同时把 `train_ramp_loss_k3_*` / `train_ramp_loss_k6_*` 接进 training history 和 TensorBoard；formal result rows 增加 `ramp_scale_steps="3,6"` 追踪字段。
 - scratch eval 侧新增 `ramp_mae_pu_k3` / `ramp_rmse_pu_k3` / `sign_agreement_rate_k3` 以及对应 `k6` 列；原有 aggregate ramp 指标现在表示 active scales 的聚合结果。
 - 性能修复先落在 checkpoint scratch eval：`rolling_origin_no_refit` 改成 batched path，不再逐 window 调 `filter_history`；`rolling_origin_carry_over` 仍保持顺序 state persistence 语义，但和 no-refit 共用同一套 metrics accumulator，减少重复逻辑和 host/device 往返。
+- 代码层新增两个 decoder-side 结构变体：`global_local_residual` 与 `global_local_increment`。两者都把 `global` 固定为 whole-farm shared component，并对 local branch 做 weighted zero-mean 约束；第一版不引入 cluster state，也不学习额外的 `alpha_i` mixing。
+- `global_local_residual` 直接在 persistence anchor 上加“全场共享 residual + 去均值 local correction”；`global_local_increment` 则把“全场共享 increment + 去均值 local increment correction”从同一个 persistence anchor 逐步累积回 level。当前这一轮只完成代码、测试和文档同步，实验仍待后续统一排期。
 - 当前这轮改动没有触碰训练主干 `_aggregate()` / `144+36` 的结构性热点，也没有把 ramp 接到 `persistent_chunk6`；`chunk6 v1` 仍应保持 `ramp_loss_weight=0.0`。
 - 旧版单尺度 ramp 队列 `ramp_ablation_20260421_residual_farm0p00_val_rmse` 到此为止正式封存：`ramp0p00` train + scratch eval 已完成，`ramp0p02` train 已完成但 carry-over scratch eval 在 CPU-bound 顺序路径上运行超过 8 小时仍未产出 summary/diagnostics，因此按主线判断价值不足而主动放弃；`ramp0p05` 在启动前取消。
 - 这次旧队列留下的主线结论是：单尺度 `K=1` ramp 在当前 residual/no-farm trunk 上没有给出足够干净的收益信号，而且旧 checkpoint eval 路径的 wall-clock 成本过高；后续 ramp 实验应直接基于 `ramp v2` 和 batched no-refit eval 重开，不再继续追加这条旧队列。

@@ -15,6 +15,8 @@ Active variants:
 
 - `world_model_state_space_v1_farm_sync`: canonical model.
 - `world_model_state_space_v1_residual_persistence_farm_sync`: predicts an additive residual over the per-turbine last-value persistence anchor.
+- `world_model_state_space_v1_global_local_residual_farm_sync`: decomposes the anchor-relative forecast into one farm-shared residual plus a hard zero-mean local correction.
+- `world_model_state_space_v1_global_local_increment_farm_sync`: predicts one farm-shared increment plus a hard zero-mean local increment correction, then accumulates them from the persistence anchor back into level space.
 - `world_model_state_space_v1_wake_off_farm_sync`: disables only dynamic wake features.
 - `world_model_state_space_v1_graph_off_farm_sync`: bypasses graph aggregation.
 - `world_model_state_space_v1_no_farm_aux_farm_sync`: sets farm auxiliary loss weight to `0.0`.
@@ -23,6 +25,9 @@ Active variants:
 The default runner behavior remains canonical-only; ablations must be selected
 explicitly with repeated `--variant` flags.
 The search harness also remains canonical-only in this revision.
+The two global/local variants use `global = whole farm`, fix `alpha = 1`, and
+enforce a hard weighted zero-mean constraint on the local branch; they do not
+introduce cluster state or extra CLI knobs in this first pass.
 
 The family also exposes an optional derived-ramp auxiliary loss via
 `--ramp-loss-weight` and `--ramp-huber-delta`. Both knobs default to disabled

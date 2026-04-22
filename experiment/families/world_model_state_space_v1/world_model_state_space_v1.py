@@ -91,6 +91,8 @@ MODEL_ID = "WORLD_MODEL"
 FAMILY_ID = "world_model_state_space_v1"
 MODEL_VARIANT = "world_model_state_space_v1_farm_sync"
 RESIDUAL_PERSISTENCE_MODEL_VARIANT = "world_model_state_space_v1_residual_persistence_farm_sync"
+GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT = "world_model_state_space_v1_global_local_residual_farm_sync"
+GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT = "world_model_state_space_v1_global_local_increment_farm_sync"
 WAKE_OFF_MODEL_VARIANT = "world_model_state_space_v1_wake_off_farm_sync"
 GRAPH_OFF_MODEL_VARIANT = "world_model_state_space_v1_graph_off_farm_sync"
 NO_FARM_AUX_MODEL_VARIANT = "world_model_state_space_v1_no_farm_aux_farm_sync"
@@ -192,6 +194,21 @@ _CONTEXT_GLOBAL_MASK_START = 9
 _CONTEXT_GLOBAL_DELTA_START = 18
 _CONTEXT_SITE_SUMMARY_START = 27
 _CONTEXT_CALENDAR_START = 33
+
+HEAD_KIND_ABSOLUTE = "absolute"
+HEAD_KIND_RESIDUAL_PERSISTENCE = "residual_persistence"
+HEAD_KIND_GLOBAL_LOCAL_RESIDUAL = "global_local_residual"
+HEAD_KIND_GLOBAL_LOCAL_INCREMENT = "global_local_increment"
+HEAD_KIND_CHOICES = (
+    HEAD_KIND_ABSOLUTE,
+    HEAD_KIND_RESIDUAL_PERSISTENCE,
+    HEAD_KIND_GLOBAL_LOCAL_RESIDUAL,
+    HEAD_KIND_GLOBAL_LOCAL_INCREMENT,
+)
+
+
+def _head_kind_uses_anchor_metric(head_kind: str) -> bool:
+    return head_kind != HEAD_KIND_ABSOLUTE
 
 
 def _ramp_scale_suffix(scale_steps: int) -> str:
@@ -380,7 +397,13 @@ class ExperimentVariant:
     uses_wake_dynamic: bool = True
     uses_farm_aux: bool = True
     uses_met_aux: bool = True
-    uses_persistence_residual_head: bool = False
+    head_kind: str = HEAD_KIND_ABSOLUTE
+
+    def __post_init__(self) -> None:
+        if self.head_kind not in HEAD_KIND_CHOICES:
+            raise ValueError(
+                f"Unsupported head_kind {self.head_kind!r}. Expected one of {HEAD_KIND_CHOICES!r}."
+            )
 
 
 @dataclass(frozen=True)
@@ -566,7 +589,17 @@ VARIANT_SPECS = (
     ExperimentVariant(
         model_variant=RESIDUAL_PERSISTENCE_MODEL_VARIANT,
         feature_protocol_id=FEATURE_PROTOCOL_ID,
-        uses_persistence_residual_head=True,
+        head_kind=HEAD_KIND_RESIDUAL_PERSISTENCE,
+    ),
+    ExperimentVariant(
+        model_variant=GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        head_kind=HEAD_KIND_GLOBAL_LOCAL_RESIDUAL,
+    ),
+    ExperimentVariant(
+        model_variant=GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        head_kind=HEAD_KIND_GLOBAL_LOCAL_INCREMENT,
     ),
     ExperimentVariant(
         model_variant=WAKE_OFF_MODEL_VARIANT,
@@ -1402,7 +1435,7 @@ if nn is not None and F is not None:
             dropout: float,
             uses_graph: bool,
             uses_wake_dynamic: bool,
-            uses_persistence_residual_head: bool,
+            head_kind: str,
             wake_lambda_x: float,
             wake_lambda_y: float,
             wake_kappa: float,
@@ -1419,7 +1452,9 @@ if nn is not None and F is not None:
             self.edge_message_dim = edge_message_dim
             self.uses_graph = bool(uses_graph)
             self.uses_wake_dynamic = bool(uses_wake_dynamic)
-            self.uses_persistence_residual_head = bool(uses_persistence_residual_head)
+            if head_kind not in HEAD_KIND_CHOICES:
+                raise ValueError(f"Unsupported head_kind {head_kind!r}. Expected one of {HEAD_KIND_CHOICES!r}.")
+            self.head_kind = str(head_kind)
             self.wake_lambda_x = wake_lambda_x
             self.wake_lambda_y = wake_lambda_y
             self.wake_kappa = wake_kappa
@@ -1468,7 +1503,44 @@ if nn is not None and F is not None:
             self.global_transition = nn.GRUCell(self.node_state_dim + met_summary_dim + context_future_channels, global_state_dim)
             self.met_head = FeedForward(global_state_dim + context_future_channels, max(global_state_dim, met_summary_dim), met_summary_dim, dropout=dropout)
             self.tau_embedding = nn.Embedding(forecast_steps, tau_embed_dim)
-            self.forecast_decoder = FeedForward(self.node_state_dim + global_state_dim + static_dim + tau_embed_dim, self.node_state_dim, 1, dropout=dropout)
+            self.forecast_decoder = None
+            if self.head_kind in {HEAD_KIND_ABSOLUTE, HEAD_KIND_RESIDUAL_PERSISTENCE}:
+                self.forecast_decoder = FeedForward(
+                    self.node_state_dim + global_state_dim + static_dim + tau_embed_dim,
+                    self.node_state_dim,
+                    1,
+                    dropout=dropout,
+                )
+            self.global_residual_head = None
+            self.local_residual_head = None
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_RESIDUAL:
+                self.global_residual_head = FeedForward(
+                    global_state_dim + tau_embed_dim,
+                    max(global_state_dim, tau_embed_dim),
+                    1,
+                    dropout=dropout,
+                )
+                self.local_residual_head = FeedForward(
+                    self.node_state_dim + static_dim + tau_embed_dim,
+                    self.node_state_dim,
+                    1,
+                    dropout=dropout,
+                )
+            self.global_increment_head = None
+            self.local_increment_head = None
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_INCREMENT:
+                self.global_increment_head = FeedForward(
+                    global_state_dim + tau_embed_dim,
+                    max(global_state_dim, tau_embed_dim),
+                    1,
+                    dropout=dropout,
+                )
+                self.local_increment_head = FeedForward(
+                    self.node_state_dim + static_dim + tau_embed_dim,
+                    self.node_state_dim,
+                    1,
+                    dropout=dropout,
+                )
             self.farm_bias = nn.Parameter(torch.zeros((), dtype=torch.float32))
             self.farm_scale = nn.Parameter(torch.ones((), dtype=torch.float32))
 
@@ -1584,17 +1656,53 @@ if nn is not None and F is not None:
             batch_size = z.shape[0]
             static_nodes = self._static(batch_size) if static is None else static
             tau = self.tau_embedding(torch.full((batch_size,), tau_index, dtype=torch.long, device=z.device))
-            return self.forecast_decoder(
-                torch.cat(
-                    (
-                        self._node_state(z, h),
-                        g[:, None, :].expand(-1, self.node_count, -1),
-                        static_nodes,
-                        tau[:, None, :].expand(-1, self.node_count, -1),
-                    ),
-                    dim=-1,
+            tau_nodes = tau[:, None, :].expand(-1, self.node_count, -1)
+            if self.head_kind in {HEAD_KIND_ABSOLUTE, HEAD_KIND_RESIDUAL_PERSISTENCE}:
+                if self.forecast_decoder is None:
+                    raise ValueError(f"{self.head_kind!r} requires forecast_decoder.")
+                return self.forecast_decoder(
+                    torch.cat(
+                        (
+                            self._node_state(z, h),
+                            g[:, None, :].expand(-1, self.node_count, -1),
+                            static_nodes,
+                            tau_nodes,
+                        ),
+                        dim=-1,
+                    )
                 )
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_RESIDUAL:
+                if self.global_residual_head is None or self.local_residual_head is None:
+                    raise ValueError("global_local_residual head requires both residual sub-heads.")
+                global_component = self.global_residual_head(torch.cat((g, tau), dim=-1))[:, None, :].expand(
+                    -1,
+                    self.node_count,
+                    -1,
+                )
+                local_component = self.local_residual_head(
+                    torch.cat((self._node_state(z, h), static_nodes, tau_nodes), dim=-1)
+                )
+                return global_component + self._center_local_component(local_component)
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_INCREMENT:
+                if self.global_increment_head is None or self.local_increment_head is None:
+                    raise ValueError("global_local_increment head requires both increment sub-heads.")
+                global_component = self.global_increment_head(torch.cat((g, tau), dim=-1))[:, None, :].expand(
+                    -1,
+                    self.node_count,
+                    -1,
+                )
+                local_component = self.local_increment_head(
+                    torch.cat((self._node_state(z, h), static_nodes, tau_nodes), dim=-1)
+                )
+                return global_component + self._center_local_component(local_component)
+            raise ValueError(f"Unsupported head_kind {self.head_kind!r}.")
+
+        def _center_local_component(self, local_component):
+            weighted_mean = (local_component.squeeze(-1) * self.farm_weights[None].to(local_component)).sum(
+                dim=1,
+                keepdim=True,
             )
+            return local_component - weighted_mean.unsqueeze(-1)
 
         def _build_persistence_anchor(self, local_history):
             target_values = local_history[:, :, :, _LOCAL_VALUE_START]
@@ -1634,16 +1742,26 @@ if nn is not None and F is not None:
             updated_anchor = torch.where(target_available, target_values, current_anchor)
             return DecoderObservationCache(persistence_anchor=updated_anchor)
 
-        def _decode_forecast(self, raw, *, persistence_anchor):
-            if not self.uses_persistence_residual_head:
+        def _decode_forecast(self, raw, *, persistence_anchor, running_level=None):
+            if self.head_kind == HEAD_KIND_ABSOLUTE:
                 return (1.0 + self.bounded_output_epsilon) * torch.sigmoid(raw)
-            if persistence_anchor is None:
-                raise ValueError("Residual-over-persistence head requires a persistence anchor.")
-            return torch.clamp(
-                persistence_anchor[:, :, None] + raw,
-                min=0.0,
-                max=1.0 + self.bounded_output_epsilon,
-            )
+            if self.head_kind in {HEAD_KIND_RESIDUAL_PERSISTENCE, HEAD_KIND_GLOBAL_LOCAL_RESIDUAL}:
+                if persistence_anchor is None:
+                    raise ValueError(f"{self.head_kind!r} requires a persistence anchor.")
+                return torch.clamp(
+                    persistence_anchor[:, :, None] + raw,
+                    min=0.0,
+                    max=1.0 + self.bounded_output_epsilon,
+                )
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_INCREMENT:
+                if running_level is None:
+                    raise ValueError("global_local_increment head requires a running_level.")
+                return torch.clamp(
+                    running_level + raw,
+                    min=0.0,
+                    max=1.0 + self.bounded_output_epsilon,
+                )
+            raise ValueError(f"Unsupported head_kind {self.head_kind!r}.")
 
         def _farm_prediction(self, forecast):
             return self.farm_bias + self.farm_scale * (forecast.squeeze(-1) * self.farm_weights[None]).sum(dim=1, keepdim=True)
@@ -1755,13 +1873,21 @@ if nn is not None and F is not None:
             forecasts = []
             farms = []
             mets = []
+            running_level = None
+            if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_INCREMENT:
+                if observation_cache.persistence_anchor is None:
+                    raise ValueError("global_local_increment head requires a persistence anchor.")
+                running_level = observation_cache.persistence_anchor[:, :, None]
             for horizon_index in range(context_future.shape[1]):
                 z, h, g, met = self._transition(z, h, g, context_future[:, horizon_index], static=static)
                 raw_forecast = self._forecast(z, h, g, horizon_index, static=static)
                 forecast = self._decode_forecast(
                     raw_forecast,
                     persistence_anchor=observation_cache.persistence_anchor,
+                    running_level=running_level,
                 )
+                if self.head_kind == HEAD_KIND_GLOBAL_LOCAL_INCREMENT:
+                    running_level = forecast
                 forecasts.append(forecast)
                 farms.append(self._farm_prediction(forecast))
                 mets.append(met)
@@ -1831,7 +1957,7 @@ def build_model(
     bounded_output_epsilon: float,
     uses_graph: bool = True,
     uses_wake_dynamic: bool = True,
-    uses_persistence_residual_head: bool = False,
+    head_kind: str = HEAD_KIND_ABSOLUTE,
 ):
     _require_torch()
     return WorldModelStateSpace(
@@ -1859,7 +1985,7 @@ def build_model(
         dropout=dropout,
         uses_graph=uses_graph,
         uses_wake_dynamic=uses_wake_dynamic,
-        uses_persistence_residual_head=uses_persistence_residual_head,
+        head_kind=head_kind,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -2859,7 +2985,7 @@ def train_model(
         dropout=dropout,
         uses_graph=variant_spec.uses_graph,
         uses_wake_dynamic=variant_spec.uses_wake_dynamic,
-        uses_persistence_residual_head=variant_spec.uses_persistence_residual_head,
+        head_kind=variant_spec.head_kind,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -3572,7 +3698,7 @@ def _diagnostic_rows_from_sums(
     horizon_ramp_abs_error_sum_pu_by_scale: dict[int, np.ndarray],
     horizon_ramp_squared_error_sum_pu_by_scale: dict[int, np.ndarray],
     horizon_ramp_sign_agreement_sum_by_scale: dict[int, np.ndarray],
-    has_residual_head: bool,
+    has_anchor_delta_metric: bool,
 ) -> pl.DataFrame:
     rows: list[dict[str, object]] = [
         {
@@ -3591,7 +3717,7 @@ def _diagnostic_rows_from_sums(
             "final_mae_pu": _safe_divide(final_abs_error_sum, prediction_count),
             "final_rmse_pu": _safe_rmse(final_squared_error_sum, prediction_count),
             "mean_abs_residual": (
-                _safe_divide(residual_abs_sum, prediction_count) if has_residual_head else math.nan
+                _safe_divide(residual_abs_sum, prediction_count) if has_anchor_delta_metric else math.nan
             ),
             "ramp_mae_pu": _safe_divide(ramp_abs_error_sum_pu, ramp_pair_count),
             "ramp_rmse_pu": _safe_rmse(ramp_squared_error_sum_pu, ramp_pair_count),
@@ -3649,7 +3775,7 @@ def _diagnostic_rows_from_sums(
                 ),
                 "mean_abs_residual": (
                     _safe_divide(float(horizon_residual_abs_sum[lead_index]), lead_prediction_count)
-                    if has_residual_head
+                    if has_anchor_delta_metric
                     else math.nan
                 ),
                 "ramp_mae_pu": _safe_divide(
@@ -3928,7 +4054,7 @@ def _finalize_scratch_eval_outputs(
     selection_metric: str,
     split_name: str,
     eval_protocol: str,
-    has_residual_head: bool,
+    has_anchor_delta_metric: bool,
 ) -> tuple[EvaluationMetrics, pl.DataFrame, pl.DataFrame]:
     metrics = _finalize_metric_arrays(
         window_count=int(accumulator["window_count"]),
@@ -3997,7 +4123,7 @@ def _finalize_scratch_eval_outputs(
         horizon_ramp_abs_error_sum_pu_by_scale=accumulator["horizon_ramp_abs_error_sum_pu_by_scale"],
         horizon_ramp_squared_error_sum_pu_by_scale=accumulator["horizon_ramp_squared_error_sum_pu_by_scale"],
         horizon_ramp_sign_agreement_sum_by_scale=accumulator["horizon_ramp_sign_agreement_sum_by_scale"],
-        has_residual_head=has_residual_head,
+        has_anchor_delta_metric=has_anchor_delta_metric,
     )
     summary = _scratch_summary_rows(
         prepared_dataset=prepared_dataset,
@@ -4099,7 +4225,9 @@ def _evaluate_saved_checkpoint_windows_no_refit(
         selection_metric=loaded_checkpoint.selection_metric,
         split_name=split_name,
         eval_protocol=ROLLING_EVAL_PROTOCOL,
-        has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
+        has_anchor_delta_metric=_head_kind_uses_anchor_metric(
+            _resolve_variant_spec(prepared_dataset.model_variant).head_kind
+        ),
     )
 
 
@@ -4200,7 +4328,9 @@ def evaluate_saved_checkpoint_windows(
         selection_metric=loaded_checkpoint.selection_metric,
         split_name=split_name,
         eval_protocol=resolved_eval_protocol,
-        has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
+        has_anchor_delta_metric=_head_kind_uses_anchor_metric(
+            _resolve_variant_spec(prepared_dataset.model_variant).head_kind
+        ),
     )
 
 
@@ -4316,7 +4446,7 @@ def load_best_checkpoint(
         dropout=profile.dropout,
         uses_graph=variant_spec.uses_graph,
         uses_wake_dynamic=variant_spec.uses_wake_dynamic,
-        uses_persistence_residual_head=variant_spec.uses_persistence_residual_head,
+        head_kind=variant_spec.head_kind,
         wake_lambda_x=profile.wake_lambda_x,
         wake_lambda_y=profile.wake_lambda_y,
         wake_kappa=profile.wake_kappa,

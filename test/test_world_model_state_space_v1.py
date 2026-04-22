@@ -168,7 +168,7 @@ def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> 
         "dropout": 0.0,
         "uses_graph": variant_spec.uses_graph,
         "uses_wake_dynamic": variant_spec.uses_wake_dynamic,
-        "uses_persistence_residual_head": variant_spec.uses_persistence_residual_head,
+        "head_kind": variant_spec.head_kind,
         "wake_lambda_x": module.DEFAULT_WAKE_LAMBDA_X,
         "wake_lambda_y": module.DEFAULT_WAKE_LAMBDA_Y,
         "wake_kappa": module.DEFAULT_WAKE_KAPPA,
@@ -208,6 +208,11 @@ def _take_first_windows(module, windows, count: int):
     )
 
 
+def _zero_module_parameters(module_obj) -> None:
+    for parameter in module_obj.parameters():
+        parameter.data.zero_()
+
+
 def test_registry_declares_kelmarsh_only() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
@@ -224,6 +229,8 @@ def test_registry_declares_kelmarsh_only() -> None:
     assert 'supported_feature_protocols = ["world_model_v1"]' in text
     assert 'world_model_state_space_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_residual_persistence_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_global_local_residual_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_global_local_increment_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_wake_off_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_graph_off_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_no_farm_aux_farm_sync = "world_model_v1"' in text
@@ -263,6 +270,8 @@ def test_default_variants_remain_canonical_only() -> None:
     assert set(module.ALL_VARIANTS) == {
         module.MODEL_VARIANT,
         module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+        module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT,
+        module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT,
         module.WAKE_OFF_MODEL_VARIANT,
         module.GRAPH_OFF_MODEL_VARIANT,
         module.NO_FARM_AUX_MODEL_VARIANT,
@@ -271,6 +280,16 @@ def test_default_variants_remain_canonical_only() -> None:
     parser = module.build_arg_parser()
     variant_action = next(action for action in parser._actions if action.dest == "variants")
     assert set(variant_action.choices) == set(module.ALL_VARIANTS)
+
+
+def test_variant_head_kinds_are_explicit() -> None:
+    module = _load_module()
+    variants_by_name = {spec.model_variant: spec for spec in module.VARIANT_SPECS}
+
+    assert variants_by_name[module.MODEL_VARIANT].head_kind == "absolute"
+    assert variants_by_name[module.RESIDUAL_PERSISTENCE_MODEL_VARIANT].head_kind == "residual_persistence"
+    assert variants_by_name[module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT].head_kind == "global_local_residual"
+    assert variants_by_name[module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT].head_kind == "global_local_increment"
 
 
 def test_horizon_rmse_group_means_cover_expected_ranges() -> None:
@@ -489,6 +508,115 @@ def test_residual_persistence_zero_decoder_matches_persistence_anchor(tmp_path, 
 
     expected = persistence_anchor[:, None, :, None].expand(-1, prepared.forecast_steps, -1, -1)
     assert torch_module.allclose(outputs.future_predictions, expected)
+
+
+def test_global_local_residual_zero_decoder_matches_persistence_anchor(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(module, prepared, variant_name=module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT)
+    )
+    _zero_module_parameters(model.global_residual_head)
+    _zero_module_parameters(model.local_residual_head)
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    context_history = torch_module.from_numpy(sample[1][None])
+    context_future = torch_module.from_numpy(sample[2][None])
+
+    with torch_module.no_grad():
+        persistence_anchor = model._persistence_anchor(local_history)
+        outputs = model(local_history, context_history, context_future)
+
+    expected = persistence_anchor[:, None, :, None].expand(-1, prepared.forecast_steps, -1, -1)
+    assert torch_module.allclose(outputs.future_predictions, expected)
+
+
+def test_global_local_increment_zero_decoder_matches_persistence_anchor(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(module, prepared, variant_name=module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT)
+    )
+    _zero_module_parameters(model.global_increment_head)
+    _zero_module_parameters(model.local_increment_head)
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    context_history = torch_module.from_numpy(sample[1][None])
+    context_future = torch_module.from_numpy(sample[2][None])
+
+    with torch_module.no_grad():
+        persistence_anchor = model._persistence_anchor(local_history)
+        outputs = model(local_history, context_history, context_future)
+
+    expected = persistence_anchor[:, None, :, None].expand(-1, prepared.forecast_steps, -1, -1)
+    assert torch_module.allclose(outputs.future_predictions, expected)
+
+
+@pytest.mark.parametrize(
+    "variant_name",
+    (
+        "world_model_state_space_v1_global_local_residual_farm_sync",
+        "world_model_state_space_v1_global_local_increment_farm_sync",
+    ),
+)
+def test_global_local_variants_center_local_component(tmp_path, monkeypatch, variant_name: str) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=variant_name,
+    )
+    model = module.build_model(**_tiny_model_kwargs(module, prepared, variant_name=variant_name))
+    raw_local = torch_module.arange(prepared.node_count, dtype=torch_module.float32)[None, :, None]
+
+    centered = model._center_local_component(raw_local)
+    weighted_mean = (centered.squeeze(-1) * model.farm_weights[None].to(centered)).sum(dim=1)
+
+    assert torch_module.allclose(weighted_mean, torch_module.zeros_like(weighted_mean), atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "variant_name",
+    (
+        "world_model_state_space_v1_global_local_residual_farm_sync",
+        "world_model_state_space_v1_global_local_increment_farm_sync",
+    ),
+)
+def test_forward_outputs_shapes_and_bounded_forecast_for_global_local_variants(
+    tmp_path,
+    monkeypatch,
+    variant_name: str,
+) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch, variant_name=variant_name)
+    model = module.build_model(**_tiny_model_kwargs(module, prepared, variant_name=variant_name))
+    sample = module.PanelWindowDataset(prepared, prepared.val_rolling_windows)[0]
+    local_history = torch_module.from_numpy(sample[0][None])
+    context_history = torch_module.from_numpy(sample[1][None])
+    context_future = torch_module.from_numpy(sample[2][None])
+
+    with torch_module.no_grad():
+        outputs = model(local_history, context_history, context_future)
+
+    assert outputs.future_predictions.shape == (1, prepared.forecast_steps, prepared.node_count, 1)
+    assert torch_module.isfinite(outputs.future_predictions).all()
+    assert float(outputs.future_predictions.min().item()) >= 0.0
+    assert float(outputs.future_predictions.max().item()) <= 1.05
 
 
 def test_persistence_anchor_backtracks_to_last_available_history_value(tmp_path, monkeypatch) -> None:
@@ -1377,6 +1505,8 @@ def test_saved_checkpoint_no_refit_matches_sequential_reference(tmp_path, monkey
     (
         ("world_model_state_space_v1_farm_sync", False),
         ("world_model_state_space_v1_residual_persistence_farm_sync", True),
+        ("world_model_state_space_v1_global_local_residual_farm_sync", True),
+        ("world_model_state_space_v1_global_local_increment_farm_sync", True),
     ),
 )
 def test_run_saved_checkpoint_scratch_evaluation_writes_diagnostics(

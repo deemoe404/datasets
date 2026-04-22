@@ -18,6 +18,8 @@ implementation_label_kind = "model_variant"
 implementation_labels = [
   "world_model_state_space_v1_farm_sync",
   "world_model_state_space_v1_residual_persistence_farm_sync",
+  "world_model_state_space_v1_global_local_residual_farm_sync",
+  "world_model_state_space_v1_global_local_increment_farm_sync",
   "world_model_state_space_v1_wake_off_farm_sync",
   "world_model_state_space_v1_graph_off_farm_sync",
   "world_model_state_space_v1_no_farm_aux_farm_sync",
@@ -26,6 +28,8 @@ implementation_labels = [
 model_variants = [
   "world_model_state_space_v1_farm_sync",
   "world_model_state_space_v1_residual_persistence_farm_sync",
+  "world_model_state_space_v1_global_local_residual_farm_sync",
+  "world_model_state_space_v1_global_local_increment_farm_sync",
   "world_model_state_space_v1_wake_off_farm_sync",
   "world_model_state_space_v1_graph_off_farm_sync",
   "world_model_state_space_v1_no_farm_aux_farm_sync",
@@ -35,7 +39,7 @@ notes = [
   "This family keeps world_model_rollout_v1 as a simplified baseline and carries the state-space world-model MVP.",
   "It is intentionally Kelmarsh-only in v1 and does not introduce a new dataset-side feature protocol.",
   "The default runner still targets the canonical farm-sync variant; ablations are additional explicit model variants within the same family.",
-  "The residual-over-persistence head is an explicit comparison variant and does not change the canonical search harness defaults.",
+  "Residual-over-persistence and global-local decoder heads are explicit comparison variants and do not change the canonical search harness defaults.",
 ]
 
 [task_contract]
@@ -49,6 +53,8 @@ granularity = "farm"
 [implementation_bindings]
 world_model_state_space_v1_farm_sync = "world_model_v1"
 world_model_state_space_v1_residual_persistence_farm_sync = "world_model_v1"
+world_model_state_space_v1_global_local_residual_farm_sync = "world_model_v1"
+world_model_state_space_v1_global_local_increment_farm_sync = "world_model_v1"
 world_model_state_space_v1_wake_off_farm_sync = "world_model_v1"
 world_model_state_space_v1_graph_off_farm_sync = "world_model_v1"
 world_model_state_space_v1_no_farm_aux_farm_sync = "world_model_v1"
