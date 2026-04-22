@@ -861,6 +861,9 @@ y^{anchor}_{i,t}+\hat y^{raw}_{i,t+\tau|t},
 \paragraph{当前实验状态（2026-04-21）}
 基于 scratch 队列 \texttt{residual\_head\_plan\_20260419\_farm0p05} 的完成结果，\texttt{residual\_persistence} 现在更适合作为主线 family 的 experimental working head，而不是立即替换 canonical 默认头。在 \texttt{farm\_loss\_weight=0.05}、按 \texttt{val\_rmse\_pu} 选 best epoch 的 repro 中，residual 相对 bounded absolute 在 val/test rolling overall 上都更好（val RMSE 0.16297 vs 0.16548，test RMSE 0.16903 vs 0.17399，MAE 也同步下降），说明这次收益不只是 test-side 偶然波动。进一步地，在 \texttt{farm\_loss\_weight=0.0} 的双 contract 最小复跑里，residual 在 \texttt{val\_rmse\_pu} 与 \texttt{val\_mae\_pu} 两种 selection metric 下都优于 absolute；但 carry-over scratch eval 并没有带来增益，canonical 与 residual 在 \texttt{rolling\_origin\_carry\_over} 下都比 \texttt{rolling\_origin\_no\_refit} 略差。因此当前更稳的研究定位是：把 residual 视为 decoder-side 的稳定改进并带入后续原型线，而不要把这轮结果解读成“online state persistence 已经被证实有效”。
 
+\paragraph{loss-side 更新（2026-04-22）}
+derived-ramp auxiliary 的第一轮最小 ablation 只在当前 \texttt{residual\_persistence + farm\_loss\_weight=0.0} trunk 上验证；这条旧线现在已经收口，不再继续追加单尺度 \(K=1\) ramp。原因有两点：第一，已完成的训练结果只给出极小且不够干净的 level-side 变化，尚不足以支持把单尺度 ramp 当成主杠杆；第二，旧的 saved-checkpoint scratch eval 路径在 \texttt{rolling\_origin\_carry\_over} 上 wall-clock 成本过高，\texttt{ramp0p02} 的 eval 运行超过 8 小时仍未产出 summary/diagnostics，因此被主动放弃，\texttt{ramp0p05} 也在启动前取消。主线因此切到 \texttt{ramp v2}：固定多尺度一阶差分 \(K\in\{3,6\}\)，同时把 \texttt{rolling\_origin\_no\_refit} 的 checkpoint scratch eval 改成 batched path；而 \texttt{persistent\_chunk6} 继续保持独立结构线，第一版仍固定 \texttt{ramp\_loss\_weight=0.0}，只有当新的 ramp 设计先在当前 residual trunk 上证明自己，才考虑接到 chunk6 上。
+
 \section{可直接启动的超参数与训练策略}
 
 基于当前网络结构，一个可直接启动且实现风险较低的配置如下。整体上，模型容量应优先控制在“足以表达局部时空交互，但不过早引入过强自由度”的范围内，以便先验证动态图建模与全局状态建模是否能够稳定带来收益。在固定单风场设定下，可保留 turbine id embedding；若目标是跨风场泛化，则更建议直接移除该项，以避免模型对风机身份索引产生过强依赖。局部状态采用 \(z/h\) 双变量形式，其中 \(z\) 用于刻画相对快速变化的局部隐变量，\(h\) 用于承载相对平滑的记忆状态；全场摘要状态 \(g\) 则用于建模跨机组的全局背景与场级约束。推荐的启动超参数见表~\ref{tab:hyperparams_startup}。
