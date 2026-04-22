@@ -27,7 +27,9 @@ The search harness also remains canonical-only in this revision.
 The family also exposes an optional derived-ramp auxiliary loss via
 `--ramp-loss-weight` and `--ramp-huber-delta`. Both knobs default to disabled
 behavior (`ramp_loss_weight=0.0`) and apply uniformly to every variant without
-changing the published result schema or checkpoint-selection metric.
+changing the published result schema or checkpoint-selection metric. The current
+`ramp v2` implementation fixes the auxiliary to multiscale first-order
+differences with `K={3,6}`; those scales are not exposed as CLI knobs in v2.
 
 ## Run
 
@@ -85,7 +87,16 @@ Default `--resume` and `--force-rerun` flows must pass the exact historical
 Scratch checkpoint evaluation (`--load-best-checkpoint`) continues to write
 `*.diagnostics.csv` and `*.summary.csv`, and now includes ramp-side diagnostics
 such as `ramp_mae_pu`, `ramp_rmse_pu`, and `sign_agreement_rate` for both
-`rolling_origin_no_refit` and optional `rolling_origin_carry_over`.
+`rolling_origin_no_refit` and optional `rolling_origin_carry_over`. The
+aggregate ramp metrics now summarize the active `K={3,6}` scales, and the
+scratch outputs also expose per-scale columns:
+
+- `ramp_mae_pu_k3`, `ramp_rmse_pu_k3`, `sign_agreement_rate_k3`
+- `ramp_mae_pu_k6`, `ramp_rmse_pu_k6`, `sign_agreement_rate_k6`
+
+`rolling_origin_no_refit` scratch evaluation now runs through a batched path
+instead of the old per-window sequential loop; `rolling_origin_carry_over`
+keeps its sequential state-persistence semantics.
 
 Default TensorBoard output:
 

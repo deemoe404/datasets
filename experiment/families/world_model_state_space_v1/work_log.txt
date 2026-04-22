@@ -28,3 +28,11 @@
 - carry-over scratch eval 没有支持“在线状态延续有额外收益”的故事：canonical val/test overall RMSE 从 `0.165480 / 0.173977` 变成 `0.166228 / 0.175148`，residual 从 `0.163004 / 0.169064` 变成 `0.163559 / 0.169569`，两边都是 `rolling_origin_carry_over` 略差于 `rolling_origin_no_refit`。
 - `farm_loss_weight=0.0` 的双 contract 最小复跑中，absolute 在 `val_rmse_pu` / `val_mae_pu` 选择下的 val RMSE 分别为 `0.162922 / 0.164449`，test rolling RMSE 为 `0.169621 / 0.175486`；residual 对应 val RMSE 为 `0.162248 / 0.162402`，test rolling RMSE 为 `0.168571 / 0.168628`。也就是说 residual 在两种 selection metric 下都压过 absolute。
 - 当前结论：`residual_persistence` 已经足够升格为主线 family 的 experimental working head，但还不该直接翻成 official default；更合理的故事是“decoder-side 参数化改进已经被确认”，而不是“carry-over / online state persistence 已经成立”。
+
+2026-04-22
+- derived-ramp auxiliary 从单尺度 `K=1` 升级成 `ramp v2`：固定多尺度一阶差分 `K={3,6}`。当前 family 仍只暴露 `ramp_loss_weight` / `ramp_huber_delta` 两个公共 knob；scale 不对外开放成 CLI。
+- 新的 ramp 监督统一按“prepend 最后 `K` 个真实 history target，再做 `K-step diff`”实现：`h<=K` 时回看 history 尾部真实值，`h>K` 时回看 `forecast[t-K]`。mask 仍坚持双端真实有效，禁止把 persistence fallback anchor 当作 ramp supervision 目标。
+- 训练侧把 ramp loss 改成多尺度等权平均：`L_ramp = mean(L_k)` for `K in {3,6}`，同时把 `train_ramp_loss_k3_*` / `train_ramp_loss_k6_*` 接进 training history 和 TensorBoard；formal result rows 增加 `ramp_scale_steps="3,6"` 追踪字段。
+- scratch eval 侧新增 `ramp_mae_pu_k3` / `ramp_rmse_pu_k3` / `sign_agreement_rate_k3` 以及对应 `k6` 列；原有 aggregate ramp 指标现在表示 active scales 的聚合结果。
+- 性能修复先落在 checkpoint scratch eval：`rolling_origin_no_refit` 改成 batched path，不再逐 window 调 `filter_history`；`rolling_origin_carry_over` 仍保持顺序 state persistence 语义，但和 no-refit 共用同一套 metrics accumulator，减少重复逻辑和 host/device 往返。
+- 当前这轮改动没有触碰训练主干 `_aggregate()` / `144+36` 的结构性热点，也没有把 ramp 接到 `persistent_chunk6`；`chunk6 v1` 仍应保持 `ramp_loss_weight=0.0`。

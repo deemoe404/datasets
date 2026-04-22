@@ -294,6 +294,21 @@ def test_horizon_rmse_group_means_cover_expected_ranges() -> None:
         horizon_ramp_mae_pu=np.zeros((36,), dtype=np.float64),
         horizon_ramp_rmse_pu=np.zeros((36,), dtype=np.float64),
         horizon_sign_agreement_rate=np.ones((36,), dtype=np.float64),
+        ramp_mae_pu_by_scale={3: 0.0, 6: 0.0},
+        ramp_rmse_pu_by_scale={3: 0.0, 6: 0.0},
+        sign_agreement_rate_by_scale={3: 1.0, 6: 1.0},
+        horizon_ramp_mae_pu_by_scale={
+            3: np.zeros((36,), dtype=np.float64),
+            6: np.zeros((36,), dtype=np.float64),
+        },
+        horizon_ramp_rmse_pu_by_scale={
+            3: np.zeros((36,), dtype=np.float64),
+            6: np.zeros((36,), dtype=np.float64),
+        },
+        horizon_sign_agreement_rate_by_scale={
+            3: np.ones((36,), dtype=np.float64),
+            6: np.ones((36,), dtype=np.float64),
+        },
     )
 
     summary = module._horizon_rmse_pu_group_means(metrics)
@@ -567,6 +582,75 @@ def test_derived_ramp_uses_last_history_value_and_double_valid_future_mask() -> 
     assert ramp_valid_mask.squeeze().tolist() == [1.0, 1.0, 0.0]
 
 
+def test_derived_ramp_k3_uses_history_tail_and_future_lag() -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    local_history = torch_module.zeros((1, 6, 1, module._LOCAL_MASK_START + 1), dtype=torch_module.float32)
+    local_history[:, :, 0, module._LOCAL_VALUE_START] = torch_module.tensor(
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        dtype=torch_module.float32,
+    )
+    local_history[:, :, 0, module._LOCAL_MASK_START] = torch_module.tensor(
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+        dtype=torch_module.float32,
+    )
+    predictions = torch_module.tensor(
+        [[[[0.7]], [[0.8]], [[0.9]], [[1.0]], [[1.1]], [[1.2]]]],
+        dtype=torch_module.float32,
+    )
+    targets = torch_module.tensor(
+        [[[[0.65]], [[0.75]], [[0.85]], [[0.95]], [[1.05]], [[1.15]]]],
+        dtype=torch_module.float32,
+    )
+    valid_mask = torch_module.tensor(
+        [[[[1.0]], [[1.0]], [[1.0]], [[0.0]], [[1.0]], [[1.0]]]],
+        dtype=torch_module.float32,
+    )
+
+    ramp_predictions, ramp_targets, ramp_valid_mask = module._build_derived_ramp_tensors(
+        predictions,
+        targets,
+        valid_mask,
+        local_history,
+        torch_module=torch_module,
+        scale_steps=3,
+    )
+
+    assert ramp_predictions.squeeze().tolist() == pytest.approx([0.3, 0.3, 0.3, 0.3, 0.3, 0.3])
+    assert ramp_targets.squeeze().tolist() == pytest.approx([0.25, 0.25, 0.25, 0.3, 0.3, 0.3])
+    assert ramp_valid_mask.squeeze().tolist() == [1.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+
+
+def test_derived_ramp_k6_masks_missing_history_anchor_without_fallback() -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    local_history = torch_module.zeros((1, 6, 1, module._LOCAL_MASK_START + 1), dtype=torch_module.float32)
+    local_history[:, :, 0, module._LOCAL_VALUE_START] = torch_module.tensor(
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        dtype=torch_module.float32,
+    )
+    local_history[:, :, 0, module._LOCAL_MASK_START] = torch_module.tensor(
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        dtype=torch_module.float32,
+    )
+    predictions = torch_module.tensor([[[[0.7]], [[0.8]], [[0.9]]]], dtype=torch_module.float32)
+    targets = torch_module.tensor([[[[0.65]], [[0.75]], [[0.85]]]], dtype=torch_module.float32)
+    valid_mask = torch_module.ones_like(targets)
+
+    ramp_predictions, ramp_targets, ramp_valid_mask = module._build_derived_ramp_tensors(
+        predictions,
+        targets,
+        valid_mask,
+        local_history,
+        torch_module=torch_module,
+        scale_steps=6,
+    )
+
+    assert ramp_predictions.squeeze().tolist() == pytest.approx([0.6, 0.6, 0.6])
+    assert ramp_targets.squeeze().tolist() == pytest.approx([0.55, 0.55, 0.55])
+    assert ramp_valid_mask.squeeze().tolist() == [1.0, 1.0, 0.0]
+
+
 def test_canonical_zero_decoder_keeps_absolute_head_behavior(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
@@ -797,16 +881,21 @@ def test_execute_training_job_smoke_writes_history(tmp_path, monkeypatch, varian
     assert history["train_hist_recon_loss_mean"].null_count() == 0
     assert history["train_farm_loss_mean"].null_count() == 0
     assert history["train_ramp_loss_mean"].null_count() == 0
+    assert history["train_ramp_loss_k3_mean"].null_count() == 0
+    assert history["train_ramp_loss_k6_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_13_24_mean"].null_count() == 0
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 0
     assert history["selection_metric"].to_list() == [module.DEFAULT_SELECTION_METRIC]
     assert history["train_ramp_loss_mean"].to_list() == [0.0]
+    assert history["train_ramp_loss_k3_mean"].to_list() == [0.0]
+    assert history["train_ramp_loss_k6_mean"].to_list() == [0.0]
     assert len(rows) == 148
     assert {row["split_name"] for row in rows} == {"val", "test"}
     assert rows[0]["model_variant"] == variant_name
     assert rows[0]["z_dim"] == 4
     assert rows[0]["h_dim"] == 6
     assert rows[0]["amp_enabled"] is False
+    assert rows[0]["ramp_scale_steps"] == "3,6"
     assert rows[0]["ramp_loss_weight"] == module.DEFAULT_RAMP_LOSS_WEIGHT
     assert rows[0]["ramp_huber_delta"] == module.DEFAULT_RAMP_HUBER_DELTA
     if variant_name == module.GRAPH_OFF_MODEL_VARIANT:
@@ -867,6 +956,8 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     assert "train/loss_mean" in scalar_tags
     assert "train/forecast_loss_mean" in scalar_tags
     assert "train/ramp_loss_mean" in scalar_tags
+    assert "train/ramp_loss_k3_mean" in scalar_tags
+    assert "train/ramp_loss_k6_mean" in scalar_tags
     assert "val/overall/rmse_pu" in scalar_tags
     assert "val/horizon_group/rmse_pu/leads_13_24_mean" in scalar_tags
     assert "final/test/rolling_origin_no_refit/overall/rmse_pu" in scalar_tags
@@ -874,6 +965,7 @@ def test_execute_training_job_logs_tensorboard_with_fake_writer(tmp_path, monkey
     assert "run/config_json" in text_tags
     assert "final/summary_json" in text_tags
     assert any('"selection_metric": "val_rmse_pu"' in text for _tag, text, _step in writer.texts)
+    assert any('"ramp_scale_steps": "3,6"' in text for _tag, text, _step in writer.texts)
     assert any('"ramp_loss_weight": 0.0' in text for _tag, text, _step in writer.texts)
 
 
@@ -890,6 +982,10 @@ def test_read_training_history_backfills_selection_metric_and_horizon_columns(tm
             "val_rmse_pu_leads_25_36_mean",
             "train_ramp_loss_mean",
             "train_ramp_loss_last",
+            "train_ramp_loss_k3_mean",
+            "train_ramp_loss_k3_last",
+            "train_ramp_loss_k6_mean",
+            "train_ramp_loss_k6_last",
         }
     ]
     pl.DataFrame(
@@ -907,6 +1003,10 @@ def test_read_training_history_backfills_selection_metric_and_horizon_columns(tm
     assert history["val_rmse_pu_leads_25_36_mean"].null_count() == 1
     assert history["train_ramp_loss_mean"].null_count() == 1
     assert history["train_ramp_loss_last"].null_count() == 1
+    assert history["train_ramp_loss_k3_mean"].null_count() == 1
+    assert history["train_ramp_loss_k3_last"].null_count() == 1
+    assert history["train_ramp_loss_k6_mean"].null_count() == 1
+    assert history["train_ramp_loss_k6_last"].null_count() == 1
 
 
 def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeypatch) -> None:
@@ -974,6 +1074,21 @@ def test_run_experiment_writes_results_and_hashed_resume_state(tmp_path, monkeyp
             horizon_ramp_mae_pu=np.full((prepared_dataset.forecast_steps,), 0.03, dtype=np.float64),
             horizon_ramp_rmse_pu=np.full((prepared_dataset.forecast_steps,), 0.04, dtype=np.float64),
             horizon_sign_agreement_rate=np.full((prepared_dataset.forecast_steps,), 0.8, dtype=np.float64),
+            ramp_mae_pu_by_scale={3: 0.03, 6: 0.03},
+            ramp_rmse_pu_by_scale={3: 0.04, 6: 0.04},
+            sign_agreement_rate_by_scale={3: 0.8, 6: 0.8},
+            horizon_ramp_mae_pu_by_scale={
+                3: np.full((prepared_dataset.forecast_steps,), 0.03, dtype=np.float64),
+                6: np.full((prepared_dataset.forecast_steps,), 0.03, dtype=np.float64),
+            },
+            horizon_ramp_rmse_pu_by_scale={
+                3: np.full((prepared_dataset.forecast_steps,), 0.04, dtype=np.float64),
+                6: np.full((prepared_dataset.forecast_steps,), 0.04, dtype=np.float64),
+            },
+            horizon_sign_agreement_rate_by_scale={
+                3: np.full((prepared_dataset.forecast_steps,), 0.8, dtype=np.float64),
+                6: np.full((prepared_dataset.forecast_steps,), 0.8, dtype=np.float64),
+            },
         )
         evaluation_results = [
             (split_name, eval_protocol, windows, metrics)
@@ -1104,6 +1219,159 @@ def test_saved_checkpoint_single_origin_carry_over_matches_cold_start(tmp_path, 
     assert rolling_summary.drop("eval_protocol").to_dicts() == carry_summary.drop("eval_protocol").to_dicts()
 
 
+def test_saved_checkpoint_no_refit_avoids_sequential_filter_history(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_eval_origins=2,
+    )
+    model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    module.initialize_model_parameters(model)
+    profile = _tiny_profile(module, prepared)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    module.save_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        training_outcome=module.TrainingOutcome(
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            device="cpu",
+            amp_enabled=False,
+            model=model,
+        ),
+        profile=profile,
+        seed=123,
+        runtime_seconds=0.5,
+    )
+    loaded_checkpoint = module.load_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        device="cpu",
+    )
+
+    def _boom(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("rolling_origin_no_refit should not call sequential filter_history")
+
+    monkeypatch.setattr(loaded_checkpoint.model, "filter_history", _boom)
+
+    metrics, diagnostics, summary = module.evaluate_saved_checkpoint_windows(
+        loaded_checkpoint,
+        prepared,
+        windows=prepared.val_rolling_windows,
+        split_name="val",
+        eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+    )
+
+    assert metrics.window_count == len(prepared.val_rolling_windows)
+    assert diagnostics.height > 0
+    assert summary.height == 4
+
+
+def test_saved_checkpoint_no_refit_matches_sequential_reference(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_eval_origins=2,
+    )
+    model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    module.initialize_model_parameters(model)
+    profile = _tiny_profile(module, prepared)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    module.save_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        training_outcome=module.TrainingOutcome(
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            device="cpu",
+            amp_enabled=False,
+            model=model,
+        ),
+        profile=profile,
+        seed=123,
+        runtime_seconds=0.5,
+    )
+    loaded_checkpoint = module.load_best_checkpoint(
+        checkpoint_path,
+        prepared_dataset=prepared,
+        device="cpu",
+    )
+    windows = _take_first_windows(module, prepared.val_rolling_windows, 2)
+
+    batched_metrics, batched_diagnostics, batched_summary = module.evaluate_saved_checkpoint_windows(
+        loaded_checkpoint,
+        prepared,
+        windows=windows,
+        split_name="val",
+        eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+    )
+
+    accumulator = module._init_scratch_eval_accumulator(forecast_steps=prepared.forecast_steps)
+    with torch_module.no_grad():
+        for target_index in windows.target_indices.tolist():
+            local_history, context_history, context_future, targets, valid_mask = module._window_batch_tensors(
+                prepared,
+                target_index=int(target_index),
+                torch_module=torch_module,
+                device="cpu",
+            )
+            rolling_state = module.RollingEvalState(
+                filter_state=loaded_checkpoint.model.filter_history(local_history, context_history),
+                observation_cache=loaded_checkpoint.model.build_observation_cache(local_history),
+            )
+            predictions, _farm_predictions, _met_predictions = loaded_checkpoint.model.forecast_from_state(
+                rolling_state.filter_state,
+                rolling_state.observation_cache,
+                context_future,
+            )
+            predictions = predictions.float()
+            anchor_predictions = rolling_state.observation_cache.persistence_anchor[:, None, :, None].expand_as(
+                predictions
+            )
+            module._accumulate_scratch_eval_batch(
+                accumulator,
+                predictions=predictions,
+                targets=targets,
+                valid_mask=valid_mask,
+                local_history=local_history,
+                anchor_predictions=anchor_predictions,
+                rated_power_kw=prepared.rated_power_kw,
+                bounded_output_epsilon=loaded_checkpoint.model.bounded_output_epsilon,
+                torch_module=torch_module,
+            )
+    sequential_metrics, sequential_diagnostics, sequential_summary = module._finalize_scratch_eval_outputs(
+        accumulator,
+        prepared_dataset=prepared,
+        selection_metric=loaded_checkpoint.selection_metric,
+        split_name="val",
+        eval_protocol=module.ROLLING_EVAL_PROTOCOL,
+        has_residual_head=False,
+    )
+
+    assert batched_metrics.mae_pu == pytest.approx(sequential_metrics.mae_pu)
+    assert batched_metrics.rmse_pu == pytest.approx(sequential_metrics.rmse_pu)
+    assert batched_metrics.ramp_rmse_pu == pytest.approx(sequential_metrics.ramp_rmse_pu)
+    assert batched_metrics.horizon_rmse_pu.tolist() == pytest.approx(sequential_metrics.horizon_rmse_pu.tolist())
+    assert batched_metrics.horizon_ramp_rmse_pu.tolist() == pytest.approx(
+        sequential_metrics.horizon_ramp_rmse_pu.tolist()
+    )
+    assert batched_summary.drop("eval_protocol").to_dicts() == sequential_summary.drop("eval_protocol").to_dicts()
+    assert batched_diagnostics.drop("eval_protocol").to_dicts() == sequential_diagnostics.drop("eval_protocol").to_dicts()
+
+
 @pytest.mark.parametrize(
     ("variant_name", "expect_residual_metric"),
     (
@@ -1175,6 +1443,16 @@ def test_run_saved_checkpoint_scratch_evaluation_writes_diagnostics(
     overall_summary = summaries.filter(pl.col("bucket_name") == "overall")
     assert overall_summary["ramp_mae_pu"].null_count() == 0
     assert overall_summary["ramp_rmse_pu"].null_count() == 0
+    for column in (
+        "ramp_mae_pu_k3",
+        "ramp_rmse_pu_k3",
+        "sign_agreement_rate_k3",
+        "ramp_mae_pu_k6",
+        "ramp_rmse_pu_k6",
+        "sign_agreement_rate_k6",
+    ):
+        assert column in summaries.columns
+        assert column in diagnostics.columns
     sign_values = summaries["sign_agreement_rate"].drop_nulls().to_numpy()
     assert np.all((sign_values >= 0.0) & (sign_values <= 1.0))
     clamp_values = diagnostics["clamp_hit_rate"].to_numpy()
@@ -1304,6 +1582,21 @@ def test_search_screen_one_uses_training_device_for_eval_loaders(monkeypatch, tm
             horizon_ramp_mae_pu=np.full((prepared.forecast_steps,), 0.02, dtype=np.float64),
             horizon_ramp_rmse_pu=np.full((prepared.forecast_steps,), 0.03, dtype=np.float64),
             horizon_sign_agreement_rate=np.full((prepared.forecast_steps,), 0.75, dtype=np.float64),
+            ramp_mae_pu_by_scale={3: 0.02, 6: 0.02},
+            ramp_rmse_pu_by_scale={3: 0.03, 6: 0.03},
+            sign_agreement_rate_by_scale={3: 0.75, 6: 0.75},
+            horizon_ramp_mae_pu_by_scale={
+                3: np.full((prepared.forecast_steps,), 0.02, dtype=np.float64),
+                6: np.full((prepared.forecast_steps,), 0.02, dtype=np.float64),
+            },
+            horizon_ramp_rmse_pu_by_scale={
+                3: np.full((prepared.forecast_steps,), 0.03, dtype=np.float64),
+                6: np.full((prepared.forecast_steps,), 0.03, dtype=np.float64),
+            },
+            horizon_sign_agreement_rate_by_scale={
+                3: np.full((prepared.forecast_steps,), 0.75, dtype=np.float64),
+                6: np.full((prepared.forecast_steps,), 0.75, dtype=np.float64),
+            },
         )
 
     monkeypatch.setattr(search_module.state_space, "train_model", _fake_train_model)

@@ -129,6 +129,8 @@ DEFAULT_HIST_RECON_LOSS_WEIGHT = 0.2
 DEFAULT_FARM_LOSS_WEIGHT = 0.1
 DEFAULT_RAMP_LOSS_WEIGHT = 0.0
 DEFAULT_RAMP_HUBER_DELTA = 0.015
+DEFAULT_RAMP_SCALE_STEPS = (3, 6)
+DEFAULT_RAMP_SCALE_STEPS_TEXT = ",".join(str(step) for step in DEFAULT_RAMP_SCALE_STEPS)
 DEFAULT_MET_LOSS_WEIGHT = 0.05
 DEFAULT_INNOVATION_LOSS_WEIGHT = 1e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
@@ -191,6 +193,21 @@ _CONTEXT_GLOBAL_DELTA_START = 18
 _CONTEXT_SITE_SUMMARY_START = 27
 _CONTEXT_CALENDAR_START = 33
 
+
+def _ramp_scale_suffix(scale_steps: int) -> str:
+    return f"k{int(scale_steps)}"
+
+
+_RAMP_SCALE_SUMMARY_COLUMNS = [
+    column
+    for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+    for column in (
+        f"ramp_mae_pu_{_ramp_scale_suffix(scale_steps)}",
+        f"ramp_rmse_pu_{_ramp_scale_suffix(scale_steps)}",
+        f"sign_agreement_rate_{_ramp_scale_suffix(scale_steps)}",
+    )
+]
+
 _RESULT_COLUMNS = [
     "dataset_id",
     "model_id",
@@ -234,6 +251,7 @@ _RESULT_COLUMNS = [
     "farm_loss_weight",
     "ramp_loss_weight",
     "ramp_huber_delta",
+    "ramp_scale_steps",
     "met_loss_weight",
     "innovation_loss_weight",
     "weight_decay",
@@ -270,6 +288,10 @@ _TRAINING_HISTORY_COLUMNS = [
     "train_farm_loss_last",
     "train_ramp_loss_mean",
     "train_ramp_loss_last",
+    "train_ramp_loss_k3_mean",
+    "train_ramp_loss_k3_last",
+    "train_ramp_loss_k6_mean",
+    "train_ramp_loss_k6_last",
     "train_met_loss_mean",
     "train_met_loss_last",
     "train_innovation_loss_mean",
@@ -298,6 +320,10 @@ _TRAINING_HISTORY_BACKFILLABLE_COLUMNS = frozenset(
         "val_rmse_pu_leads_25_36_mean",
         "train_ramp_loss_mean",
         "train_ramp_loss_last",
+        "train_ramp_loss_k3_mean",
+        "train_ramp_loss_k3_last",
+        "train_ramp_loss_k6_mean",
+        "train_ramp_loss_k6_last",
     }
 )
 _VAL_RMSE_GROUP_SPECS = (
@@ -328,6 +354,7 @@ _EVAL_DIAGNOSTIC_COLUMNS = [
     "ramp_mae_pu",
     "ramp_rmse_pu",
     "sign_agreement_rate",
+    *_RAMP_SCALE_SUMMARY_COLUMNS,
 ]
 _SCRATCH_SUMMARY_COLUMNS = [
     "dataset_id",
@@ -341,6 +368,7 @@ _SCRATCH_SUMMARY_COLUMNS = [
     "ramp_mae_pu",
     "ramp_rmse_pu",
     "sign_agreement_rate",
+    *_RAMP_SCALE_SUMMARY_COLUMNS,
 ]
 
 
@@ -481,6 +509,12 @@ class EvaluationMetrics:
     horizon_ramp_mae_pu: np.ndarray
     horizon_ramp_rmse_pu: np.ndarray
     horizon_sign_agreement_rate: np.ndarray
+    ramp_mae_pu_by_scale: dict[int, float]
+    ramp_rmse_pu_by_scale: dict[int, float]
+    sign_agreement_rate_by_scale: dict[int, float]
+    horizon_ramp_mae_pu_by_scale: dict[int, np.ndarray]
+    horizon_ramp_rmse_pu_by_scale: dict[int, np.ndarray]
+    horizon_sign_agreement_rate_by_scale: dict[int, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -953,6 +987,7 @@ def _tensorboard_log_run_config(
         "seed": seed,
         "eval_batch_size": eval_batch_size,
         "num_workers": num_workers,
+        "ramp_scale_steps": DEFAULT_RAMP_SCALE_STEPS_TEXT,
         **asdict(profile),
     }
     _tensorboard_add_text(writer, "run/config_json", f"```json\n{json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True)}\n```")
@@ -1875,23 +1910,164 @@ def masked_huber_loss(predictions, targets, valid_mask, *, torch_module, delta: 
     return (huber * mask).sum() / count
 
 
-def _build_derived_ramp_tensors(predictions, targets, valid_mask, batch_local_history, *, torch_module):
-    last_history_target = batch_local_history[:, -1:, :, _LOCAL_VALUE_START : _LOCAL_VALUE_START + 1]
-    last_history_valid = 1.0 - batch_local_history[:, -1:, :, _LOCAL_MASK_START : _LOCAL_MASK_START + 1]
-    ramp_predictions = [predictions[:, :1] - last_history_target]
-    ramp_targets = [targets[:, :1] - last_history_target]
-    ramp_valid_masks = [valid_mask[:, :1] * last_history_valid]
-    if predictions.shape[1] > 1:
-        ramp_predictions.append(predictions[:, 1:] - predictions[:, :-1])
-        ramp_targets.append(targets[:, 1:] - targets[:, :-1])
-        ramp_valid_masks.append(valid_mask[:, 1:] * valid_mask[:, :-1])
-    if len(ramp_predictions) == 1:
-        return ramp_predictions[0], ramp_targets[0], ramp_valid_masks[0]
+def _build_derived_ramp_tensors(
+    predictions,
+    targets,
+    valid_mask,
+    batch_local_history,
+    *,
+    torch_module,
+    scale_steps: int = 1,
+):
+    resolved_scale_steps = int(scale_steps)
+    if resolved_scale_steps <= 0:
+        raise ValueError(f"scale_steps must be positive, found {scale_steps!r}.")
+    if batch_local_history.shape[1] < resolved_scale_steps:
+        raise ValueError(
+            f"derived ramp requires at least {resolved_scale_steps} history steps, "
+            f"found {batch_local_history.shape[1]!r}."
+        )
+    history_targets = batch_local_history[
+        :,
+        -resolved_scale_steps:,
+        :,
+        _LOCAL_VALUE_START : _LOCAL_VALUE_START + 1,
+    ]
+    history_valid = 1.0 - batch_local_history[
+        :,
+        -resolved_scale_steps:,
+        :,
+        _LOCAL_MASK_START : _LOCAL_MASK_START + 1,
+    ]
+    extended_predictions = torch_module.cat([history_targets, predictions], dim=1)
+    extended_targets = torch_module.cat([history_targets, targets], dim=1)
+    extended_valid = torch_module.cat([history_valid, valid_mask], dim=1)
     return (
-        torch_module.cat(ramp_predictions, dim=1),
-        torch_module.cat(ramp_targets, dim=1),
-        torch_module.cat(ramp_valid_masks, dim=1),
+        extended_predictions[:, resolved_scale_steps:] - extended_predictions[:, :-resolved_scale_steps],
+        extended_targets[:, resolved_scale_steps:] - extended_targets[:, :-resolved_scale_steps],
+        extended_valid[:, resolved_scale_steps:] * extended_valid[:, :-resolved_scale_steps],
     )
+
+
+def _compute_multiscale_ramp_losses(
+    predictions,
+    targets,
+    valid_mask,
+    batch_local_history,
+    *,
+    torch_module,
+    delta: float,
+):
+    per_scale_losses: dict[int, Any] = {}
+    for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+        ramp_predictions, ramp_targets, ramp_valid_mask = _build_derived_ramp_tensors(
+            predictions,
+            targets,
+            valid_mask,
+            batch_local_history,
+            torch_module=torch_module,
+            scale_steps=scale_steps,
+        )
+        per_scale_losses[scale_steps] = masked_huber_loss(
+            ramp_predictions,
+            ramp_targets,
+            ramp_valid_mask,
+            torch_module=torch_module,
+            delta=delta,
+            allow_zero=True,
+        )
+    if not per_scale_losses:
+        zero = predictions.new_tensor(0.0)
+        return zero, {}
+    aggregate_loss = torch_module.stack([loss.reshape(()) for loss in per_scale_losses.values()]).mean()
+    return aggregate_loss, per_scale_losses
+
+
+def _compute_multiscale_ramp_metrics(
+    predictions,
+    targets,
+    valid_mask,
+    batch_local_history,
+    *,
+    torch_module,
+) -> dict[str, object]:
+    forecast_steps = int(predictions.shape[1])
+    pair_count = 0
+    abs_error_sum_pu = 0.0
+    squared_error_sum_pu = 0.0
+    sign_agreement_sum = 0.0
+    horizon_pair_count = np.zeros((forecast_steps,), dtype=np.int64)
+    horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
+    horizon_sign_agreement_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    pair_count_by_scale: dict[int, int] = {}
+    abs_error_sum_pu_by_scale: dict[int, float] = {}
+    squared_error_sum_pu_by_scale: dict[int, float] = {}
+    sign_agreement_sum_by_scale: dict[int, float] = {}
+    horizon_pair_count_by_scale: dict[int, np.ndarray] = {}
+    horizon_abs_error_sum_pu_by_scale: dict[int, np.ndarray] = {}
+    horizon_squared_error_sum_pu_by_scale: dict[int, np.ndarray] = {}
+    horizon_sign_agreement_sum_by_scale: dict[int, np.ndarray] = {}
+    for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+        ramp_predictions, ramp_targets, ramp_valid = _build_derived_ramp_tensors(
+            predictions,
+            targets,
+            valid_mask,
+            batch_local_history,
+            torch_module=torch_module,
+            scale_steps=scale_steps,
+        )
+        ramp_errors = ramp_predictions - ramp_targets
+        ramp_abs = torch_module.abs(ramp_errors) * ramp_valid
+        ramp_sq = torch_module.square(ramp_errors) * ramp_valid
+        ramp_sign_agreement = (
+            (torch_module.sign(ramp_predictions) == torch_module.sign(ramp_targets)).to(dtype=ramp_valid.dtype)
+            * ramp_valid
+        )
+        scale_pair_count = int(ramp_valid.sum().item())
+        scale_abs_sum = float(ramp_abs.sum().item())
+        scale_sq_sum = float(ramp_sq.sum().item())
+        scale_sign_sum = float(ramp_sign_agreement.sum().item())
+        scale_horizon_pair_count = ramp_valid.detach().cpu().numpy().sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
+        scale_horizon_abs_sum = ramp_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+        scale_horizon_sq_sum = ramp_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+        scale_horizon_sign_sum = (
+            ramp_sign_agreement.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+        )
+        pair_count += scale_pair_count
+        abs_error_sum_pu += scale_abs_sum
+        squared_error_sum_pu += scale_sq_sum
+        sign_agreement_sum += scale_sign_sum
+        horizon_pair_count += scale_horizon_pair_count
+        horizon_abs_error_sum_pu += scale_horizon_abs_sum
+        horizon_squared_error_sum_pu += scale_horizon_sq_sum
+        horizon_sign_agreement_sum += scale_horizon_sign_sum
+        pair_count_by_scale[scale_steps] = scale_pair_count
+        abs_error_sum_pu_by_scale[scale_steps] = scale_abs_sum
+        squared_error_sum_pu_by_scale[scale_steps] = scale_sq_sum
+        sign_agreement_sum_by_scale[scale_steps] = scale_sign_sum
+        horizon_pair_count_by_scale[scale_steps] = scale_horizon_pair_count
+        horizon_abs_error_sum_pu_by_scale[scale_steps] = scale_horizon_abs_sum
+        horizon_squared_error_sum_pu_by_scale[scale_steps] = scale_horizon_sq_sum
+        horizon_sign_agreement_sum_by_scale[scale_steps] = scale_horizon_sign_sum
+    return {
+        "pair_count": pair_count,
+        "abs_error_sum_pu": abs_error_sum_pu,
+        "squared_error_sum_pu": squared_error_sum_pu,
+        "sign_agreement_sum": sign_agreement_sum,
+        "horizon_pair_count": horizon_pair_count,
+        "horizon_abs_error_sum_pu": horizon_abs_error_sum_pu,
+        "horizon_squared_error_sum_pu": horizon_squared_error_sum_pu,
+        "horizon_sign_agreement_sum": horizon_sign_agreement_sum,
+        "pair_count_by_scale": pair_count_by_scale,
+        "abs_error_sum_pu_by_scale": abs_error_sum_pu_by_scale,
+        "squared_error_sum_pu_by_scale": squared_error_sum_pu_by_scale,
+        "sign_agreement_sum_by_scale": sign_agreement_sum_by_scale,
+        "horizon_pair_count_by_scale": horizon_pair_count_by_scale,
+        "horizon_abs_error_sum_pu_by_scale": horizon_abs_error_sum_pu_by_scale,
+        "horizon_squared_error_sum_pu_by_scale": horizon_squared_error_sum_pu_by_scale,
+        "horizon_sign_agreement_sum_by_scale": horizon_sign_agreement_sum_by_scale,
+    }
 
 
 def _compute_training_losses(
@@ -1920,21 +2096,15 @@ def _compute_training_losses(
     hist_loss = 0.25 * prior_loss + 0.75 * post_loss
     farm_loss = masked_huber_loss(outputs.future_farm_predictions, batch_farm_targets, batch_farm_valid_mask, torch_module=torch_module, delta=0.03, allow_zero=True)
     ramp_loss = outputs.future_predictions.new_tensor(0.0)
+    ramp_loss_by_scale = {scale_steps: outputs.future_predictions.new_tensor(0.0) for scale_steps in DEFAULT_RAMP_SCALE_STEPS}
     if not math.isclose(ramp_loss_weight, 0.0, rel_tol=0.0, abs_tol=1e-12):
-        ramp_predictions, ramp_targets, ramp_valid_mask = _build_derived_ramp_tensors(
+        ramp_loss, ramp_loss_by_scale = _compute_multiscale_ramp_losses(
             outputs.future_predictions,
             batch_targets,
             batch_target_valid_mask,
             batch_local_history,
             torch_module=torch_module,
-        )
-        ramp_loss = masked_huber_loss(
-            ramp_predictions,
-            ramp_targets,
-            ramp_valid_mask,
-            torch_module=torch_module,
             delta=ramp_huber_delta,
-            allow_zero=True,
         )
     met_loss = masked_huber_loss(outputs.future_met_predictions, batch_met_targets, batch_met_valid_mask, torch_module=torch_module, delta=0.05, allow_zero=True)
     innovation_loss = outputs.innovation_regularization
@@ -1952,6 +2122,8 @@ def _compute_training_losses(
         "hist_recon": float(hist_loss.item()),
         "farm": float(farm_loss.item()),
         "ramp": float(ramp_loss.item()),
+        "ramp_k3": float(ramp_loss_by_scale[3].item()),
+        "ramp_k6": float(ramp_loss_by_scale[6].item()),
         "met": float(met_loss.item()),
         "innovation": float(innovation_loss.item()),
     }
@@ -1982,6 +2154,22 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float, forecas
     horizon_ramp_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_ramp_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
     horizon_ramp_sign_agreement_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    ramp_pair_count_by_scale = {scale_steps: 0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS}
+    ramp_abs_error_sum_pu_by_scale = {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS}
+    ramp_squared_error_sum_pu_by_scale = {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS}
+    ramp_sign_agreement_sum_by_scale = {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS}
+    horizon_ramp_pair_count_by_scale = {
+        scale_steps: np.zeros((forecast_steps,), dtype=np.int64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+    }
+    horizon_ramp_abs_error_sum_pu_by_scale = {
+        scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+    }
+    horizon_ramp_squared_error_sum_pu_by_scale = {
+        scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+    }
+    horizon_ramp_sign_agreement_sum_by_scale = {
+        scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+    }
     model.eval()
     progress = _create_progress_bar(total=_loader_batch_total(loader), desc=progress_label or "evaluate")
     try:
@@ -2007,38 +2195,47 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float, forecas
                 sq_kw = resolved_torch.square(errors_kw) * valid
                 abs_pu = resolved_torch.abs(errors_pu) * valid
                 sq_pu = resolved_torch.square(errors_pu) * valid
-                ramp_predictions, ramp_targets, ramp_valid = _build_derived_ramp_tensors(
+                ramp_metrics = _compute_multiscale_ramp_metrics(
                     predictions,
                     batch_targets,
                     batch_target_valid_mask,
                     batch_local_history,
                     torch_module=resolved_torch,
                 )
-                ramp_errors = ramp_predictions - ramp_targets
-                ramp_abs = resolved_torch.abs(ramp_errors) * ramp_valid
-                ramp_sq = resolved_torch.square(ramp_errors) * ramp_valid
-                ramp_sign_agreement = (
-                    (resolved_torch.sign(ramp_predictions) == resolved_torch.sign(ramp_targets)).to(dtype=ramp_valid.dtype)
-                    * ramp_valid
-                )
                 abs_error_sum_kw += float(abs_kw.sum().item())
                 squared_error_sum_kw += float(sq_kw.sum().item())
                 abs_error_sum_pu += float(abs_pu.sum().item())
                 squared_error_sum_pu += float(sq_pu.sum().item())
-                ramp_pair_count += int(ramp_valid.sum().item())
-                ramp_abs_error_sum_pu += float(ramp_abs.sum().item())
-                ramp_squared_error_sum_pu += float(ramp_sq.sum().item())
-                ramp_sign_agreement_sum += float(ramp_sign_agreement.sum().item())
+                ramp_pair_count += int(ramp_metrics["pair_count"])
+                ramp_abs_error_sum_pu += float(ramp_metrics["abs_error_sum_pu"])
+                ramp_squared_error_sum_pu += float(ramp_metrics["squared_error_sum_pu"])
+                ramp_sign_agreement_sum += float(ramp_metrics["sign_agreement_sum"])
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+                    ramp_pair_count_by_scale[scale_steps] += int(ramp_metrics["pair_count_by_scale"][scale_steps])
+                    ramp_abs_error_sum_pu_by_scale[scale_steps] += float(
+                        ramp_metrics["abs_error_sum_pu_by_scale"][scale_steps]
+                    )
+                    ramp_squared_error_sum_pu_by_scale[scale_steps] += float(
+                        ramp_metrics["squared_error_sum_pu_by_scale"][scale_steps]
+                    )
+                    ramp_sign_agreement_sum_by_scale[scale_steps] += float(
+                        ramp_metrics["sign_agreement_sum_by_scale"][scale_steps]
+                    )
                 horizon_window_count += batch_window_count
                 horizon_prediction_count += valid_np.sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
                 horizon_abs_error_sum_kw += abs_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_squared_error_sum_kw += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_abs_error_sum_pu += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 horizon_squared_error_sum_pu += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_pair_count += ramp_valid.detach().cpu().numpy().sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
-                horizon_ramp_abs_error_sum_pu += ramp_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_squared_error_sum_pu += ramp_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_sign_agreement_sum += ramp_sign_agreement.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+                horizon_ramp_pair_count += ramp_metrics["horizon_pair_count"]
+                horizon_ramp_abs_error_sum_pu += ramp_metrics["horizon_abs_error_sum_pu"]
+                horizon_ramp_squared_error_sum_pu += ramp_metrics["horizon_squared_error_sum_pu"]
+                horizon_ramp_sign_agreement_sum += ramp_metrics["horizon_sign_agreement_sum"]
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+                    horizon_ramp_pair_count_by_scale[scale_steps] += ramp_metrics["horizon_pair_count_by_scale"][scale_steps]
+                    horizon_ramp_abs_error_sum_pu_by_scale[scale_steps] += ramp_metrics["horizon_abs_error_sum_pu_by_scale"][scale_steps]
+                    horizon_ramp_squared_error_sum_pu_by_scale[scale_steps] += ramp_metrics["horizon_squared_error_sum_pu_by_scale"][scale_steps]
+                    horizon_ramp_sign_agreement_sum_by_scale[scale_steps] += ramp_metrics["horizon_sign_agreement_sum_by_scale"][scale_steps]
                 progress.update(1)
     finally:
         progress.close()
@@ -2063,6 +2260,14 @@ def evaluate_model(model, loader, *, device: str, rated_power_kw: float, forecas
         horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
         horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
         horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
+        ramp_pair_count_by_scale=ramp_pair_count_by_scale,
+        ramp_abs_error_sum_pu_by_scale=ramp_abs_error_sum_pu_by_scale,
+        ramp_squared_error_sum_pu_by_scale=ramp_squared_error_sum_pu_by_scale,
+        ramp_sign_agreement_sum_by_scale=ramp_sign_agreement_sum_by_scale,
+        horizon_ramp_pair_count_by_scale=horizon_ramp_pair_count_by_scale,
+        horizon_ramp_abs_error_sum_pu_by_scale=horizon_ramp_abs_error_sum_pu_by_scale,
+        horizon_ramp_squared_error_sum_pu_by_scale=horizon_ramp_squared_error_sum_pu_by_scale,
+        horizon_ramp_sign_agreement_sum_by_scale=horizon_ramp_sign_agreement_sum_by_scale,
     )
 
 
@@ -2780,6 +2985,8 @@ def train_model(
                 "hist_recon": 0.0,
                 "farm": 0.0,
                 "ramp": 0.0,
+                "ramp_k3": 0.0,
+                "ramp_k6": 0.0,
                 "met": 0.0,
                 "innovation": 0.0,
             }
@@ -2918,6 +3125,10 @@ def train_model(
                         "train_farm_loss_last": latest_losses.get("farm"),
                         "train_ramp_loss_mean": loss_means["ramp"],
                         "train_ramp_loss_last": latest_losses.get("ramp"),
+                        "train_ramp_loss_k3_mean": loss_means["ramp_k3"],
+                        "train_ramp_loss_k3_last": latest_losses.get("ramp_k3"),
+                        "train_ramp_loss_k6_mean": loss_means["ramp_k6"],
+                        "train_ramp_loss_k6_last": latest_losses.get("ramp_k6"),
                         "train_met_loss_mean": loss_means["met"],
                         "train_met_loss_last": latest_losses.get("met"),
                         "train_innovation_loss_mean": loss_means["innovation"],
@@ -2950,6 +3161,10 @@ def train_model(
             _tensorboard_add_scalar(tensorboard_writer, "train/farm_loss_last", latest_losses.get("farm"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_mean", loss_means["ramp"], epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_last", latest_losses.get("ramp"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_k3_mean", loss_means["ramp_k3"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_k3_last", latest_losses.get("ramp_k3"), epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_k6_mean", loss_means["ramp_k6"], epoch_index)
+            _tensorboard_add_scalar(tensorboard_writer, "train/ramp_loss_k6_last", latest_losses.get("ramp_k6"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_mean", loss_means["met"], epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/met_loss_last", latest_losses.get("met"), epoch_index)
             _tensorboard_add_scalar(tensorboard_writer, "train/innovation_loss_mean", loss_means["innovation"], epoch_index)
@@ -3072,6 +3287,7 @@ def build_result_rows(
         "farm_loss_weight": profile.farm_loss_weight,
         "ramp_loss_weight": profile.ramp_loss_weight,
         "ramp_huber_delta": profile.ramp_huber_delta,
+        "ramp_scale_steps": DEFAULT_RAMP_SCALE_STEPS_TEXT,
         "met_loss_weight": profile.met_loss_weight,
         "innovation_loss_weight": profile.innovation_loss_weight,
         "weight_decay": profile.weight_decay,
@@ -3234,8 +3450,48 @@ def _finalize_metric_arrays(
     horizon_ramp_abs_error_sum_pu: np.ndarray,
     horizon_ramp_squared_error_sum_pu: np.ndarray,
     horizon_ramp_sign_agreement_sum: np.ndarray,
+    ramp_pair_count_by_scale: dict[int, int],
+    ramp_abs_error_sum_pu_by_scale: dict[int, float],
+    ramp_squared_error_sum_pu_by_scale: dict[int, float],
+    ramp_sign_agreement_sum_by_scale: dict[int, float],
+    horizon_ramp_pair_count_by_scale: dict[int, np.ndarray],
+    horizon_ramp_abs_error_sum_pu_by_scale: dict[int, np.ndarray],
+    horizon_ramp_squared_error_sum_pu_by_scale: dict[int, np.ndarray],
+    horizon_ramp_sign_agreement_sum_by_scale: dict[int, np.ndarray],
 ) -> EvaluationMetrics:
     forecast_steps = int(horizon_prediction_count.shape[0])
+    ramp_mae_pu_by_scale: dict[int, float] = {}
+    ramp_rmse_pu_by_scale: dict[int, float] = {}
+    sign_agreement_rate_by_scale: dict[int, float] = {}
+    horizon_ramp_mae_pu_by_scale: dict[int, np.ndarray] = {}
+    horizon_ramp_rmse_pu_by_scale: dict[int, np.ndarray] = {}
+    horizon_sign_agreement_rate_by_scale: dict[int, np.ndarray] = {}
+    for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+        scale_pair_count = horizon_ramp_pair_count_by_scale[scale_steps]
+        scale_abs_error_sum = horizon_ramp_abs_error_sum_pu_by_scale[scale_steps]
+        scale_squared_error_sum = horizon_ramp_squared_error_sum_pu_by_scale[scale_steps]
+        scale_sign_agreement_sum = horizon_ramp_sign_agreement_sum_by_scale[scale_steps]
+        ramp_mae_pu_by_scale[scale_steps] = _safe_divide(
+            ramp_abs_error_sum_pu_by_scale[scale_steps],
+            ramp_pair_count_by_scale[scale_steps],
+        )
+        ramp_rmse_pu_by_scale[scale_steps] = _safe_rmse(
+            ramp_squared_error_sum_pu_by_scale[scale_steps],
+            ramp_pair_count_by_scale[scale_steps],
+        )
+        sign_agreement_rate_by_scale[scale_steps] = _safe_divide(
+            ramp_sign_agreement_sum_by_scale[scale_steps],
+            ramp_pair_count_by_scale[scale_steps],
+        )
+        horizon_ramp_mae_pu_by_scale[scale_steps] = np.asarray(
+            [_safe_divide(scale_abs_error_sum[i], int(scale_pair_count[i])) for i in range(forecast_steps)]
+        )
+        horizon_ramp_rmse_pu_by_scale[scale_steps] = np.asarray(
+            [_safe_rmse(scale_squared_error_sum[i], int(scale_pair_count[i])) for i in range(forecast_steps)]
+        )
+        horizon_sign_agreement_rate_by_scale[scale_steps] = np.asarray(
+            [_safe_divide(scale_sign_agreement_sum[i], int(scale_pair_count[i])) for i in range(forecast_steps)]
+        )
     return EvaluationMetrics(
         window_count=window_count,
         prediction_count=prediction_count,
@@ -3269,6 +3525,12 @@ def _finalize_metric_arrays(
         horizon_sign_agreement_rate=np.asarray(
             [_safe_divide(horizon_ramp_sign_agreement_sum[i], int(horizon_ramp_pair_count[i])) for i in range(forecast_steps)]
         ),
+        ramp_mae_pu_by_scale=ramp_mae_pu_by_scale,
+        ramp_rmse_pu_by_scale=ramp_rmse_pu_by_scale,
+        sign_agreement_rate_by_scale=sign_agreement_rate_by_scale,
+        horizon_ramp_mae_pu_by_scale=horizon_ramp_mae_pu_by_scale,
+        horizon_ramp_rmse_pu_by_scale=horizon_ramp_rmse_pu_by_scale,
+        horizon_sign_agreement_rate_by_scale=horizon_sign_agreement_rate_by_scale,
     )
 
 
@@ -3302,6 +3564,14 @@ def _diagnostic_rows_from_sums(
     horizon_ramp_abs_error_sum_pu: np.ndarray,
     horizon_ramp_squared_error_sum_pu: np.ndarray,
     horizon_ramp_sign_agreement_sum: np.ndarray,
+    ramp_pair_count_by_scale: dict[int, int],
+    ramp_abs_error_sum_pu_by_scale: dict[int, float],
+    ramp_squared_error_sum_pu_by_scale: dict[int, float],
+    ramp_sign_agreement_sum_by_scale: dict[int, float],
+    horizon_ramp_pair_count_by_scale: dict[int, np.ndarray],
+    horizon_ramp_abs_error_sum_pu_by_scale: dict[int, np.ndarray],
+    horizon_ramp_squared_error_sum_pu_by_scale: dict[int, np.ndarray],
+    horizon_ramp_sign_agreement_sum_by_scale: dict[int, np.ndarray],
     has_residual_head: bool,
 ) -> pl.DataFrame:
     rows: list[dict[str, object]] = [
@@ -3326,6 +3596,27 @@ def _diagnostic_rows_from_sums(
             "ramp_mae_pu": _safe_divide(ramp_abs_error_sum_pu, ramp_pair_count),
             "ramp_rmse_pu": _safe_rmse(ramp_squared_error_sum_pu, ramp_pair_count),
             "sign_agreement_rate": _safe_divide(ramp_sign_agreement_sum, ramp_pair_count),
+            **{
+                f"ramp_mae_pu_{_ramp_scale_suffix(scale_steps)}": _safe_divide(
+                    ramp_abs_error_sum_pu_by_scale[scale_steps],
+                    ramp_pair_count_by_scale[scale_steps],
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"ramp_rmse_pu_{_ramp_scale_suffix(scale_steps)}": _safe_rmse(
+                    ramp_squared_error_sum_pu_by_scale[scale_steps],
+                    ramp_pair_count_by_scale[scale_steps],
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"sign_agreement_rate_{_ramp_scale_suffix(scale_steps)}": _safe_divide(
+                    ramp_sign_agreement_sum_by_scale[scale_steps],
+                    ramp_pair_count_by_scale[scale_steps],
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
         }
     ]
     for lead_index in range(prepared_dataset.forecast_steps):
@@ -3373,6 +3664,27 @@ def _diagnostic_rows_from_sums(
                     float(horizon_ramp_sign_agreement_sum[lead_index]),
                     lead_ramp_pair_count,
                 ),
+                **{
+                    f"ramp_mae_pu_{_ramp_scale_suffix(scale_steps)}": _safe_divide(
+                        float(horizon_ramp_abs_error_sum_pu_by_scale[scale_steps][lead_index]),
+                        int(horizon_ramp_pair_count_by_scale[scale_steps][lead_index]),
+                    )
+                    for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+                },
+                **{
+                    f"ramp_rmse_pu_{_ramp_scale_suffix(scale_steps)}": _safe_rmse(
+                        float(horizon_ramp_squared_error_sum_pu_by_scale[scale_steps][lead_index]),
+                        int(horizon_ramp_pair_count_by_scale[scale_steps][lead_index]),
+                    )
+                    for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+                },
+                **{
+                    f"sign_agreement_rate_{_ramp_scale_suffix(scale_steps)}": _safe_divide(
+                        float(horizon_ramp_sign_agreement_sum_by_scale[scale_steps][lead_index]),
+                        int(horizon_ramp_pair_count_by_scale[scale_steps][lead_index]),
+                    )
+                    for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+                },
             }
         )
     return pl.DataFrame(rows, infer_schema_length=None).select(_EVAL_DIAGNOSTIC_COLUMNS)
@@ -3403,6 +3715,30 @@ def _scratch_summary_rows(
                 start_lead=start_lead,
                 end_lead=end_lead,
             ),
+            **{
+                f"ramp_mae_pu_{_ramp_scale_suffix(scale_steps)}": _mean_horizon_values(
+                    metrics.horizon_ramp_mae_pu_by_scale[scale_steps],
+                    start_lead=start_lead,
+                    end_lead=end_lead,
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"ramp_rmse_pu_{_ramp_scale_suffix(scale_steps)}": _mean_horizon_values(
+                    metrics.horizon_ramp_rmse_pu_by_scale[scale_steps],
+                    start_lead=start_lead,
+                    end_lead=end_lead,
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"sign_agreement_rate_{_ramp_scale_suffix(scale_steps)}": _mean_horizon_values(
+                    metrics.horizon_sign_agreement_rate_by_scale[scale_steps],
+                    start_lead=start_lead,
+                    end_lead=end_lead,
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
         }
         for bucket_name, start_lead, end_lead in _LEAD_BUCKET_SPECS
     ]
@@ -3420,9 +3756,351 @@ def _scratch_summary_rows(
             "ramp_mae_pu": float(metrics.ramp_mae_pu),
             "ramp_rmse_pu": float(metrics.ramp_rmse_pu),
             "sign_agreement_rate": float(metrics.sign_agreement_rate),
+            **{
+                f"ramp_mae_pu_{_ramp_scale_suffix(scale_steps)}": float(metrics.ramp_mae_pu_by_scale[scale_steps])
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"ramp_rmse_pu_{_ramp_scale_suffix(scale_steps)}": float(metrics.ramp_rmse_pu_by_scale[scale_steps])
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
+            **{
+                f"sign_agreement_rate_{_ramp_scale_suffix(scale_steps)}": float(
+                    metrics.sign_agreement_rate_by_scale[scale_steps]
+                )
+                for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+            },
         },
     )
     return pl.DataFrame(rows, infer_schema_length=None).select(_SCRATCH_SUMMARY_COLUMNS)
+
+
+def _init_scratch_eval_accumulator(*, forecast_steps: int) -> dict[str, object]:
+    return {
+        "window_count": 0,
+        "prediction_count": 0,
+        "abs_error_sum_kw": 0.0,
+        "squared_error_sum_kw": 0.0,
+        "abs_error_sum_pu": 0.0,
+        "squared_error_sum_pu": 0.0,
+        "ramp_pair_count": 0,
+        "ramp_abs_error_sum_pu": 0.0,
+        "ramp_squared_error_sum_pu": 0.0,
+        "ramp_sign_agreement_sum": 0.0,
+        "horizon_window_count": np.zeros((forecast_steps,), dtype=np.int64),
+        "horizon_prediction_count": np.zeros((forecast_steps,), dtype=np.int64),
+        "horizon_abs_error_sum_kw": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_squared_error_sum_kw": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_abs_error_sum_pu": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_squared_error_sum_pu": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_ramp_pair_count": np.zeros((forecast_steps,), dtype=np.int64),
+        "horizon_ramp_abs_error_sum_pu": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_ramp_squared_error_sum_pu": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_ramp_sign_agreement_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "clamp_hits": 0.0,
+        "anchor_abs_error_sum": 0.0,
+        "anchor_squared_error_sum": 0.0,
+        "final_abs_error_sum": 0.0,
+        "final_squared_error_sum": 0.0,
+        "residual_abs_sum": 0.0,
+        "horizon_clamp_hits": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_anchor_abs_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_anchor_squared_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_final_abs_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_final_squared_error_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "horizon_residual_abs_sum": np.zeros((forecast_steps,), dtype=np.float64),
+        "ramp_pair_count_by_scale": {scale_steps: 0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS},
+        "ramp_abs_error_sum_pu_by_scale": {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS},
+        "ramp_squared_error_sum_pu_by_scale": {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS},
+        "ramp_sign_agreement_sum_by_scale": {scale_steps: 0.0 for scale_steps in DEFAULT_RAMP_SCALE_STEPS},
+        "horizon_ramp_pair_count_by_scale": {
+            scale_steps: np.zeros((forecast_steps,), dtype=np.int64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+        },
+        "horizon_ramp_abs_error_sum_pu_by_scale": {
+            scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+        },
+        "horizon_ramp_squared_error_sum_pu_by_scale": {
+            scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+        },
+        "horizon_ramp_sign_agreement_sum_by_scale": {
+            scale_steps: np.zeros((forecast_steps,), dtype=np.float64) for scale_steps in DEFAULT_RAMP_SCALE_STEPS
+        },
+    }
+
+
+def _accumulate_scratch_eval_batch(
+    accumulator: dict[str, object],
+    *,
+    predictions,
+    targets,
+    valid_mask,
+    local_history,
+    anchor_predictions,
+    rated_power_kw: float,
+    bounded_output_epsilon: float,
+    torch_module,
+) -> None:
+    errors_pu = predictions - targets
+    errors_kw = errors_pu * rated_power_kw
+    anchor_errors_pu = anchor_predictions - targets
+    valid = valid_mask
+    valid_np = valid.detach().cpu().numpy().astype(np.float64, copy=False)
+    batch_window_count = int(predictions.shape[0])
+    batch_prediction_count = int(valid.sum().item())
+    abs_kw = torch_module.abs(errors_kw) * valid
+    sq_kw = torch_module.square(errors_kw) * valid
+    abs_pu = torch_module.abs(errors_pu) * valid
+    sq_pu = torch_module.square(errors_pu) * valid
+    anchor_abs = torch_module.abs(anchor_errors_pu) * valid
+    anchor_sq = torch_module.square(anchor_errors_pu) * valid
+    clamp_lower = predictions <= 1e-8
+    clamp_upper = predictions >= (1.0 + bounded_output_epsilon - 1e-8)
+    clamp_mask = (clamp_lower | clamp_upper).to(dtype=valid.dtype) * valid
+    residual_abs = torch_module.abs(predictions - anchor_predictions) * valid
+    ramp_metrics = _compute_multiscale_ramp_metrics(
+        predictions,
+        targets,
+        valid_mask,
+        local_history,
+        torch_module=torch_module,
+    )
+    accumulator["window_count"] += batch_window_count
+    accumulator["prediction_count"] += batch_prediction_count
+    accumulator["abs_error_sum_kw"] += float(abs_kw.sum().item())
+    accumulator["squared_error_sum_kw"] += float(sq_kw.sum().item())
+    accumulator["abs_error_sum_pu"] += float(abs_pu.sum().item())
+    accumulator["squared_error_sum_pu"] += float(sq_pu.sum().item())
+    accumulator["ramp_pair_count"] += int(ramp_metrics["pair_count"])
+    accumulator["ramp_abs_error_sum_pu"] += float(ramp_metrics["abs_error_sum_pu"])
+    accumulator["ramp_squared_error_sum_pu"] += float(ramp_metrics["squared_error_sum_pu"])
+    accumulator["ramp_sign_agreement_sum"] += float(ramp_metrics["sign_agreement_sum"])
+    accumulator["clamp_hits"] += float(clamp_mask.sum().item())
+    accumulator["anchor_abs_error_sum"] += float(anchor_abs.sum().item())
+    accumulator["anchor_squared_error_sum"] += float(anchor_sq.sum().item())
+    accumulator["final_abs_error_sum"] += float(abs_pu.sum().item())
+    accumulator["final_squared_error_sum"] += float(sq_pu.sum().item())
+    accumulator["residual_abs_sum"] += float(residual_abs.sum().item())
+    accumulator["horizon_window_count"] += batch_window_count
+    accumulator["horizon_prediction_count"] += valid_np.sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
+    accumulator["horizon_abs_error_sum_kw"] += abs_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_squared_error_sum_kw"] += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_abs_error_sum_pu"] += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_squared_error_sum_pu"] += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_ramp_pair_count"] += ramp_metrics["horizon_pair_count"]
+    accumulator["horizon_ramp_abs_error_sum_pu"] += ramp_metrics["horizon_abs_error_sum_pu"]
+    accumulator["horizon_ramp_squared_error_sum_pu"] += ramp_metrics["horizon_squared_error_sum_pu"]
+    accumulator["horizon_ramp_sign_agreement_sum"] += ramp_metrics["horizon_sign_agreement_sum"]
+    accumulator["horizon_clamp_hits"] += clamp_mask.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_anchor_abs_error_sum"] += anchor_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_anchor_squared_error_sum"] += anchor_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_final_abs_error_sum"] += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_final_squared_error_sum"] += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    accumulator["horizon_residual_abs_sum"] += residual_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
+    for scale_steps in DEFAULT_RAMP_SCALE_STEPS:
+        accumulator["ramp_pair_count_by_scale"][scale_steps] += int(ramp_metrics["pair_count_by_scale"][scale_steps])
+        accumulator["ramp_abs_error_sum_pu_by_scale"][scale_steps] += float(
+            ramp_metrics["abs_error_sum_pu_by_scale"][scale_steps]
+        )
+        accumulator["ramp_squared_error_sum_pu_by_scale"][scale_steps] += float(
+            ramp_metrics["squared_error_sum_pu_by_scale"][scale_steps]
+        )
+        accumulator["ramp_sign_agreement_sum_by_scale"][scale_steps] += float(
+            ramp_metrics["sign_agreement_sum_by_scale"][scale_steps]
+        )
+        accumulator["horizon_ramp_pair_count_by_scale"][scale_steps] += ramp_metrics["horizon_pair_count_by_scale"][
+            scale_steps
+        ]
+        accumulator["horizon_ramp_abs_error_sum_pu_by_scale"][scale_steps] += ramp_metrics[
+            "horizon_abs_error_sum_pu_by_scale"
+        ][scale_steps]
+        accumulator["horizon_ramp_squared_error_sum_pu_by_scale"][scale_steps] += ramp_metrics[
+            "horizon_squared_error_sum_pu_by_scale"
+        ][scale_steps]
+        accumulator["horizon_ramp_sign_agreement_sum_by_scale"][scale_steps] += ramp_metrics[
+            "horizon_sign_agreement_sum_by_scale"
+        ][scale_steps]
+
+
+def _finalize_scratch_eval_outputs(
+    accumulator: dict[str, object],
+    *,
+    prepared_dataset: PreparedDataset,
+    selection_metric: str,
+    split_name: str,
+    eval_protocol: str,
+    has_residual_head: bool,
+) -> tuple[EvaluationMetrics, pl.DataFrame, pl.DataFrame]:
+    metrics = _finalize_metric_arrays(
+        window_count=int(accumulator["window_count"]),
+        prediction_count=int(accumulator["prediction_count"]),
+        abs_error_sum_kw=float(accumulator["abs_error_sum_kw"]),
+        squared_error_sum_kw=float(accumulator["squared_error_sum_kw"]),
+        abs_error_sum_pu=float(accumulator["abs_error_sum_pu"]),
+        squared_error_sum_pu=float(accumulator["squared_error_sum_pu"]),
+        ramp_pair_count=int(accumulator["ramp_pair_count"]),
+        ramp_abs_error_sum_pu=float(accumulator["ramp_abs_error_sum_pu"]),
+        ramp_squared_error_sum_pu=float(accumulator["ramp_squared_error_sum_pu"]),
+        ramp_sign_agreement_sum=float(accumulator["ramp_sign_agreement_sum"]),
+        horizon_window_count=accumulator["horizon_window_count"],
+        horizon_prediction_count=accumulator["horizon_prediction_count"],
+        horizon_abs_error_sum_kw=accumulator["horizon_abs_error_sum_kw"],
+        horizon_squared_error_sum_kw=accumulator["horizon_squared_error_sum_kw"],
+        horizon_abs_error_sum_pu=accumulator["horizon_abs_error_sum_pu"],
+        horizon_squared_error_sum_pu=accumulator["horizon_squared_error_sum_pu"],
+        horizon_ramp_pair_count=accumulator["horizon_ramp_pair_count"],
+        horizon_ramp_abs_error_sum_pu=accumulator["horizon_ramp_abs_error_sum_pu"],
+        horizon_ramp_squared_error_sum_pu=accumulator["horizon_ramp_squared_error_sum_pu"],
+        horizon_ramp_sign_agreement_sum=accumulator["horizon_ramp_sign_agreement_sum"],
+        ramp_pair_count_by_scale=accumulator["ramp_pair_count_by_scale"],
+        ramp_abs_error_sum_pu_by_scale=accumulator["ramp_abs_error_sum_pu_by_scale"],
+        ramp_squared_error_sum_pu_by_scale=accumulator["ramp_squared_error_sum_pu_by_scale"],
+        ramp_sign_agreement_sum_by_scale=accumulator["ramp_sign_agreement_sum_by_scale"],
+        horizon_ramp_pair_count_by_scale=accumulator["horizon_ramp_pair_count_by_scale"],
+        horizon_ramp_abs_error_sum_pu_by_scale=accumulator["horizon_ramp_abs_error_sum_pu_by_scale"],
+        horizon_ramp_squared_error_sum_pu_by_scale=accumulator["horizon_ramp_squared_error_sum_pu_by_scale"],
+        horizon_ramp_sign_agreement_sum_by_scale=accumulator["horizon_ramp_sign_agreement_sum_by_scale"],
+    )
+    diagnostics = _diagnostic_rows_from_sums(
+        prepared_dataset=prepared_dataset,
+        selection_metric=selection_metric,
+        split_name=split_name,
+        eval_protocol=eval_protocol,
+        window_count=int(accumulator["window_count"]),
+        prediction_count=int(accumulator["prediction_count"]),
+        clamp_hits=float(accumulator["clamp_hits"]),
+        anchor_abs_error_sum=float(accumulator["anchor_abs_error_sum"]),
+        anchor_squared_error_sum=float(accumulator["anchor_squared_error_sum"]),
+        final_abs_error_sum=float(accumulator["final_abs_error_sum"]),
+        final_squared_error_sum=float(accumulator["final_squared_error_sum"]),
+        residual_abs_sum=float(accumulator["residual_abs_sum"]),
+        ramp_pair_count=int(accumulator["ramp_pair_count"]),
+        ramp_abs_error_sum_pu=float(accumulator["ramp_abs_error_sum_pu"]),
+        ramp_squared_error_sum_pu=float(accumulator["ramp_squared_error_sum_pu"]),
+        ramp_sign_agreement_sum=float(accumulator["ramp_sign_agreement_sum"]),
+        horizon_window_count=accumulator["horizon_window_count"],
+        horizon_prediction_count=accumulator["horizon_prediction_count"],
+        horizon_clamp_hits=accumulator["horizon_clamp_hits"],
+        horizon_anchor_abs_error_sum=accumulator["horizon_anchor_abs_error_sum"],
+        horizon_anchor_squared_error_sum=accumulator["horizon_anchor_squared_error_sum"],
+        horizon_final_abs_error_sum=accumulator["horizon_final_abs_error_sum"],
+        horizon_final_squared_error_sum=accumulator["horizon_final_squared_error_sum"],
+        horizon_residual_abs_sum=accumulator["horizon_residual_abs_sum"],
+        horizon_ramp_pair_count=accumulator["horizon_ramp_pair_count"],
+        horizon_ramp_abs_error_sum_pu=accumulator["horizon_ramp_abs_error_sum_pu"],
+        horizon_ramp_squared_error_sum_pu=accumulator["horizon_ramp_squared_error_sum_pu"],
+        horizon_ramp_sign_agreement_sum=accumulator["horizon_ramp_sign_agreement_sum"],
+        ramp_pair_count_by_scale=accumulator["ramp_pair_count_by_scale"],
+        ramp_abs_error_sum_pu_by_scale=accumulator["ramp_abs_error_sum_pu_by_scale"],
+        ramp_squared_error_sum_pu_by_scale=accumulator["ramp_squared_error_sum_pu_by_scale"],
+        ramp_sign_agreement_sum_by_scale=accumulator["ramp_sign_agreement_sum_by_scale"],
+        horizon_ramp_pair_count_by_scale=accumulator["horizon_ramp_pair_count_by_scale"],
+        horizon_ramp_abs_error_sum_pu_by_scale=accumulator["horizon_ramp_abs_error_sum_pu_by_scale"],
+        horizon_ramp_squared_error_sum_pu_by_scale=accumulator["horizon_ramp_squared_error_sum_pu_by_scale"],
+        horizon_ramp_sign_agreement_sum_by_scale=accumulator["horizon_ramp_sign_agreement_sum_by_scale"],
+        has_residual_head=has_residual_head,
+    )
+    summary = _scratch_summary_rows(
+        prepared_dataset=prepared_dataset,
+        selection_metric=selection_metric,
+        split_name=split_name,
+        eval_protocol=eval_protocol,
+        metrics=metrics,
+    )
+    return metrics, diagnostics, summary
+
+
+def _evaluate_saved_checkpoint_windows_no_refit(
+    loaded_checkpoint: LoadedBestCheckpoint,
+    prepared_dataset: PreparedDataset,
+    *,
+    windows: world_model_base.FarmWindowDescriptorIndex,
+    split_name: str,
+    progress_label: str | None = None,
+) -> tuple[EvaluationMetrics, pl.DataFrame, pl.DataFrame]:
+    resolved_torch, _, _, _, _ = _require_torch()
+    model = loaded_checkpoint.model
+    model.eval()
+    accumulator = _init_scratch_eval_accumulator(forecast_steps=prepared_dataset.forecast_steps)
+    eval_batch_size = resolve_eval_batch_size(
+        loaded_checkpoint.profile.batch_size,
+        device=loaded_checkpoint.device,
+    )
+    loader = _build_dataloader(
+        prepared_dataset,
+        windows=windows,
+        batch_size=eval_batch_size,
+        device=loaded_checkpoint.device,
+        shuffle=False,
+        seed=loaded_checkpoint.seed,
+    )
+    progress = _create_progress_bar(total=_loader_batch_total(loader), desc=progress_label or ROLLING_EVAL_PROTOCOL)
+    try:
+        with resolved_torch.no_grad():
+            for batch in loader:
+                batch_local_history, batch_context_history, batch_context_future, batch_targets, batch_target_valid_mask = batch[:5]
+                batch_local_history = batch_local_history.to(
+                    device=loaded_checkpoint.device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=loaded_checkpoint.device == "cuda",
+                )
+                batch_context_history = batch_context_history.to(
+                    device=loaded_checkpoint.device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=loaded_checkpoint.device == "cuda",
+                )
+                batch_context_future = batch_context_future.to(
+                    device=loaded_checkpoint.device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=loaded_checkpoint.device == "cuda",
+                )
+                batch_targets = batch_targets.to(
+                    device=loaded_checkpoint.device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=loaded_checkpoint.device == "cuda",
+                )
+                batch_target_valid_mask = batch_target_valid_mask.to(
+                    device=loaded_checkpoint.device,
+                    dtype=resolved_torch.float32,
+                    non_blocking=loaded_checkpoint.device == "cuda",
+                )
+                with _amp_context(
+                    torch_module=resolved_torch,
+                    device=loaded_checkpoint.device,
+                    enabled=loaded_checkpoint.amp_enabled,
+                ):
+                    predictions = model(
+                        batch_local_history,
+                        batch_context_history,
+                        batch_context_future,
+                    ).future_predictions.float()
+                anchor_predictions = model.build_observation_cache(batch_local_history).persistence_anchor[
+                    :,
+                    None,
+                    :,
+                    None,
+                ].expand_as(predictions)
+                _accumulate_scratch_eval_batch(
+                    accumulator,
+                    predictions=predictions,
+                    targets=batch_targets,
+                    valid_mask=batch_target_valid_mask,
+                    local_history=batch_local_history,
+                    anchor_predictions=anchor_predictions,
+                    rated_power_kw=prepared_dataset.rated_power_kw,
+                    bounded_output_epsilon=model.bounded_output_epsilon,
+                    torch_module=resolved_torch,
+                )
+                progress.update(1)
+    finally:
+        progress.close()
+    return _finalize_scratch_eval_outputs(
+        accumulator,
+        prepared_dataset=prepared_dataset,
+        selection_metric=loaded_checkpoint.selection_metric,
+        split_name=split_name,
+        eval_protocol=ROLLING_EVAL_PROTOCOL,
+        has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
+    )
 
 
 def evaluate_saved_checkpoint_windows(
@@ -3441,36 +4119,17 @@ def evaluate_saved_checkpoint_windows(
             f"evaluate_saved_checkpoint_windows only supports {ROLLING_EVAL_PROTOCOL!r} and "
             f"{CARRY_OVER_EVAL_PROTOCOL!r}, found {resolved_eval_protocol!r}."
         )
+    if resolved_eval_protocol == ROLLING_EVAL_PROTOCOL:
+        return _evaluate_saved_checkpoint_windows_no_refit(
+            loaded_checkpoint,
+            prepared_dataset,
+            windows=windows,
+            split_name=split_name,
+            progress_label=progress_label,
+        )
     model = loaded_checkpoint.model
     model.eval()
-    forecast_steps = prepared_dataset.forecast_steps
-    window_count = 0
-    prediction_count = 0
-    abs_error_sum_kw = squared_error_sum_kw = abs_error_sum_pu = squared_error_sum_pu = 0.0
-    ramp_pair_count = 0
-    ramp_abs_error_sum_pu = ramp_squared_error_sum_pu = ramp_sign_agreement_sum = 0.0
-    horizon_window_count = np.zeros((forecast_steps,), dtype=np.int64)
-    horizon_prediction_count = np.zeros((forecast_steps,), dtype=np.int64)
-    horizon_abs_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_squared_error_sum_kw = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_ramp_pair_count = np.zeros((forecast_steps,), dtype=np.int64)
-    horizon_ramp_abs_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_ramp_squared_error_sum_pu = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_ramp_sign_agreement_sum = np.zeros((forecast_steps,), dtype=np.float64)
-    clamp_hits = 0.0
-    anchor_abs_error_sum = 0.0
-    anchor_squared_error_sum = 0.0
-    final_abs_error_sum = 0.0
-    final_squared_error_sum = 0.0
-    residual_abs_sum = 0.0
-    horizon_clamp_hits = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_anchor_abs_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_anchor_squared_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_final_abs_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_final_squared_error_sum = np.zeros((forecast_steps,), dtype=np.float64)
-    horizon_residual_abs_sum = np.zeros((forecast_steps,), dtype=np.float64)
+    accumulator = _init_scratch_eval_accumulator(forecast_steps=prepared_dataset.forecast_steps)
     previous_target_index: int | None = None
     rolling_state: RollingEvalState | None = None
     progress = _create_progress_bar(total=len(windows), desc=progress_label or resolved_eval_protocol)
@@ -3520,134 +4179,29 @@ def evaluate_saved_checkpoint_windows(
                 anchor_predictions = rolling_state.observation_cache.persistence_anchor[:, None, :, None].expand_as(
                     predictions
                 )
-                errors_pu = predictions - targets
-                errors_kw = errors_pu * prepared_dataset.rated_power_kw
-                anchor_errors_pu = anchor_predictions - targets
-                valid = valid_mask
-                valid_np = valid.detach().cpu().numpy().astype(np.float64, copy=False)
-                batch_window_count = 1
-                batch_prediction_count = int(valid.sum().item())
-                window_count += batch_window_count
-                prediction_count += batch_prediction_count
-                abs_kw = resolved_torch.abs(errors_kw) * valid
-                sq_kw = resolved_torch.square(errors_kw) * valid
-                abs_pu = resolved_torch.abs(errors_pu) * valid
-                sq_pu = resolved_torch.square(errors_pu) * valid
-                anchor_abs = resolved_torch.abs(anchor_errors_pu) * valid
-                anchor_sq = resolved_torch.square(anchor_errors_pu) * valid
-                ramp_predictions, ramp_targets, ramp_valid = _build_derived_ramp_tensors(
-                    predictions,
-                    targets,
-                    valid_mask,
-                    local_history,
+                _accumulate_scratch_eval_batch(
+                    accumulator,
+                    predictions=predictions,
+                    targets=targets,
+                    valid_mask=valid_mask,
+                    local_history=local_history,
+                    anchor_predictions=anchor_predictions,
+                    rated_power_kw=prepared_dataset.rated_power_kw,
+                    bounded_output_epsilon=model.bounded_output_epsilon,
                     torch_module=resolved_torch,
                 )
-                ramp_errors = ramp_predictions - ramp_targets
-                ramp_abs = resolved_torch.abs(ramp_errors) * ramp_valid
-                ramp_sq = resolved_torch.square(ramp_errors) * ramp_valid
-                ramp_sign_agreement = (
-                    (resolved_torch.sign(ramp_predictions) == resolved_torch.sign(ramp_targets)).to(dtype=ramp_valid.dtype)
-                    * ramp_valid
-                )
-                clamp_lower = predictions <= 1e-8
-                clamp_upper = predictions >= (1.0 + model.bounded_output_epsilon - 1e-8)
-                clamp_mask = (clamp_lower | clamp_upper).to(dtype=valid.dtype) * valid
-                residual_abs = resolved_torch.abs(predictions - anchor_predictions) * valid
-                abs_error_sum_kw += float(abs_kw.sum().item())
-                squared_error_sum_kw += float(sq_kw.sum().item())
-                abs_error_sum_pu += float(abs_pu.sum().item())
-                squared_error_sum_pu += float(sq_pu.sum().item())
-                ramp_pair_count += int(ramp_valid.sum().item())
-                ramp_abs_error_sum_pu += float(ramp_abs.sum().item())
-                ramp_squared_error_sum_pu += float(ramp_sq.sum().item())
-                ramp_sign_agreement_sum += float(ramp_sign_agreement.sum().item())
-                clamp_hits += float(clamp_mask.sum().item())
-                anchor_abs_error_sum += float(anchor_abs.sum().item())
-                anchor_squared_error_sum += float(anchor_sq.sum().item())
-                final_abs_error_sum += float(abs_pu.sum().item())
-                final_squared_error_sum += float(sq_pu.sum().item())
-                residual_abs_sum += float(residual_abs.sum().item())
-                horizon_window_count += batch_window_count
-                horizon_prediction_count += valid_np.sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
-                horizon_abs_error_sum_kw += abs_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_squared_error_sum_kw += sq_kw.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_abs_error_sum_pu += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_squared_error_sum_pu += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_pair_count += ramp_valid.detach().cpu().numpy().sum(axis=(0, 2, 3)).astype(np.int64, copy=False)
-                horizon_ramp_abs_error_sum_pu += ramp_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_squared_error_sum_pu += ramp_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_ramp_sign_agreement_sum += ramp_sign_agreement.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_clamp_hits += clamp_mask.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_anchor_abs_error_sum += anchor_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_anchor_squared_error_sum += anchor_sq.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_final_abs_error_sum += abs_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_final_squared_error_sum += sq_pu.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
-                horizon_residual_abs_sum += residual_abs.sum(dim=(0, 2, 3)).detach().cpu().numpy().astype(np.float64, copy=False)
                 previous_target_index = target_index
                 progress.update(1)
     finally:
         progress.close()
-    metrics = _finalize_metric_arrays(
-        window_count=window_count,
-        prediction_count=prediction_count,
-        abs_error_sum_kw=abs_error_sum_kw,
-        squared_error_sum_kw=squared_error_sum_kw,
-        abs_error_sum_pu=abs_error_sum_pu,
-        squared_error_sum_pu=squared_error_sum_pu,
-        ramp_pair_count=ramp_pair_count,
-        ramp_abs_error_sum_pu=ramp_abs_error_sum_pu,
-        ramp_squared_error_sum_pu=ramp_squared_error_sum_pu,
-        ramp_sign_agreement_sum=ramp_sign_agreement_sum,
-        horizon_window_count=horizon_window_count,
-        horizon_prediction_count=horizon_prediction_count,
-        horizon_abs_error_sum_kw=horizon_abs_error_sum_kw,
-        horizon_squared_error_sum_kw=horizon_squared_error_sum_kw,
-        horizon_abs_error_sum_pu=horizon_abs_error_sum_pu,
-        horizon_squared_error_sum_pu=horizon_squared_error_sum_pu,
-        horizon_ramp_pair_count=horizon_ramp_pair_count,
-        horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
-        horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
-        horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
-    )
-    diagnostics = _diagnostic_rows_from_sums(
+    return _finalize_scratch_eval_outputs(
+        accumulator,
         prepared_dataset=prepared_dataset,
         selection_metric=loaded_checkpoint.selection_metric,
         split_name=split_name,
         eval_protocol=resolved_eval_protocol,
-        window_count=window_count,
-        prediction_count=prediction_count,
-        clamp_hits=clamp_hits,
-        anchor_abs_error_sum=anchor_abs_error_sum,
-        anchor_squared_error_sum=anchor_squared_error_sum,
-        final_abs_error_sum=final_abs_error_sum,
-        final_squared_error_sum=final_squared_error_sum,
-        residual_abs_sum=residual_abs_sum,
-        ramp_pair_count=ramp_pair_count,
-        ramp_abs_error_sum_pu=ramp_abs_error_sum_pu,
-        ramp_squared_error_sum_pu=ramp_squared_error_sum_pu,
-        ramp_sign_agreement_sum=ramp_sign_agreement_sum,
-        horizon_window_count=horizon_window_count,
-        horizon_prediction_count=horizon_prediction_count,
-        horizon_clamp_hits=horizon_clamp_hits,
-        horizon_anchor_abs_error_sum=horizon_anchor_abs_error_sum,
-        horizon_anchor_squared_error_sum=horizon_anchor_squared_error_sum,
-        horizon_final_abs_error_sum=horizon_final_abs_error_sum,
-        horizon_final_squared_error_sum=horizon_final_squared_error_sum,
-        horizon_residual_abs_sum=horizon_residual_abs_sum,
-        horizon_ramp_pair_count=horizon_ramp_pair_count,
-        horizon_ramp_abs_error_sum_pu=horizon_ramp_abs_error_sum_pu,
-        horizon_ramp_squared_error_sum_pu=horizon_ramp_squared_error_sum_pu,
-        horizon_ramp_sign_agreement_sum=horizon_ramp_sign_agreement_sum,
         has_residual_head=_resolve_variant_spec(prepared_dataset.model_variant).uses_persistence_residual_head,
     )
-    summary = _scratch_summary_rows(
-        prepared_dataset=prepared_dataset,
-        selection_metric=loaded_checkpoint.selection_metric,
-        split_name=split_name,
-        eval_protocol=resolved_eval_protocol,
-        metrics=metrics,
-    )
-    return metrics, diagnostics, summary
 
 
 def _best_checkpoint_config_name(
