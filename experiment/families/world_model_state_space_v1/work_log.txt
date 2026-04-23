@@ -50,3 +50,10 @@
 - `global_local_increment`：val/test rolling RMSE = `0.162425 / 0.178203`，MAE = `0.107249 / 0.116558`，test non_overlap RMSE = `0.176716`；no-refit test overall `ramp_rmse_pu = 0.122373`，`sign_agreement_rate = 0.523707`，`k3 = 0.111559`，`k6 = 0.132311`。
 - 相对当前 residual trunk 最优的 `ramp0p05`（test rolling/non_overlap RMSE = `0.168230 / 0.166406`），两条 global/local decoder 变体都没有给出正收益；其中 `global_local_increment` 明显更差，说明“从 persistence anchor 逐步累积 global/local increment”这条参数化在现有 trunk 上不稳。
 - 当前结论：`global_local_residual` 仍可保留为一个 clean decoder decomposition 备选，但不应升格为新的 working head；主线 working head 仍是 `residual_persistence`，而 `global_local_increment` 暂不值得继续追加预算。
+
+- Ubuntu residual edge-gating `2x2` 队列已完成；scratch root: `experiment/artifacts/scratch/world_model_state_space_v1/edge_gating_2x2_20260423_residual_farm0p00_val_rmse`。固定设置为 `farm_loss_weight=0.0`、`ramp_loss_weight=0.0`、`selection_metric=val_rmse_pu`、`batch_size=432`，4 个单元都完成 train + no-refit eval + edge diagnostics。
+- `residual_baseline`：val/test rolling RMSE = `0.162090 / 0.169124`，test non_overlap RMSE = `0.167406`，test ramp RMSE = `0.121198`，sign agreement = `0.537017`。
+- `gated_sum`：val/test rolling RMSE = `0.161424 / 0.169829`，test non_overlap RMSE = `0.168675`，test ramp RMSE = `0.121238`，sign agreement = `0.536705`。验证集更好但测试集退化；单独改 `gated_sum` 不支持继续升格。
+- `rotor_units_wake`：val/test rolling RMSE = `0.162393 / 0.170105`，test non_overlap RMSE = `0.169225`，test ramp RMSE = `0.121367`，sign agreement = `0.537090`。wake 单位修正后 edge diagnostics 变正常，test transition/update `wake_gate_mean` 从 baseline 的约 `0.0005 / 0.0009` 提到 `0.397 / 0.409`，但主指标退化。
+- `gated_sum_rotor_units_wake`：val/test rolling RMSE = `0.161994 / 0.168980`，test non_overlap RMSE = `0.167588`，test ramp RMSE = `0.121244`，sign agreement = `0.537432`。这是本组唯一 test rolling 略优于 baseline 的新增单元，但 non_overlap 和 ramp 仍略差于 baseline，幅度不足以推翻当前 working head。
+- 当前结论：这组 residual edge-gating `2x2` 没有产生稳定优于 `residual_persistence` baseline 的新结构。`rotor_diameter_units` 修复了 wake-gate 饱和的语义问题，但单独或与 `gated_sum` 组合都没有给出足够干净的泛化收益；主线 working head 仍保持 `residual_persistence`。
