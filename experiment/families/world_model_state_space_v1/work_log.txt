@@ -40,3 +40,10 @@
 - 当前这轮改动没有触碰训练主干 `_aggregate()` / `144+36` 的结构性热点，也没有把 ramp 接到 `persistent_chunk6`；`chunk6 v1` 仍应保持 `ramp_loss_weight=0.0`。
 - 旧版单尺度 ramp 队列 `ramp_ablation_20260421_residual_farm0p00_val_rmse` 到此为止正式封存：`ramp0p00` train + scratch eval 已完成，`ramp0p02` train 已完成但 carry-over scratch eval 在 CPU-bound 顺序路径上运行超过 8 小时仍未产出 summary/diagnostics，因此按主线判断价值不足而主动放弃；`ramp0p05` 在启动前取消。
 - 这次旧队列留下的主线结论是：单尺度 `K=1` ramp 在当前 residual/no-farm trunk 上没有给出足够干净的收益信号，而且旧 checkpoint eval 路径的 wall-clock 成本过高；后续 ramp 实验应直接基于 `ramp v2` 和 batched no-refit eval 重开，不再继续追加这条旧队列。
+
+2026-04-23
+- Ubuntu `global_local_ablation_20260422_farm0p00_val_rmse` 队列已完成；scratch root: `experiment/artifacts/scratch/world_model_state_space_v1/global_local_ablation_20260422_farm0p00_val_rmse`。固定设置为 `farm_loss_weight=0.0`、`ramp_loss_weight=0.0`、`selection_metric=val_rmse_pu`、`batch_size=432`，两条线都只做 train + no-refit eval。
+- `global_local_residual`：val/test rolling RMSE = `0.161666 / 0.169643`，MAE = `0.106090 / 0.111140`，test non_overlap RMSE = `0.168121`；no-refit test overall `ramp_rmse_pu = 0.121335`，`sign_agreement_rate = 0.537487`，`k3 = 0.110702`，`k6 = 0.131112`。
+- `global_local_increment`：val/test rolling RMSE = `0.162425 / 0.178203`，MAE = `0.107249 / 0.116558`，test non_overlap RMSE = `0.176716`；no-refit test overall `ramp_rmse_pu = 0.122373`，`sign_agreement_rate = 0.523707`，`k3 = 0.111559`，`k6 = 0.132311`。
+- 相对当前 residual trunk 最优的 `ramp0p05`（test rolling/non_overlap RMSE = `0.168230 / 0.166406`），两条 global/local decoder 变体都没有给出正收益；其中 `global_local_increment` 明显更差，说明“从 persistence anchor 逐步累积 global/local increment”这条参数化在现有 trunk 上不稳。
+- 当前结论：`global_local_residual` 仍可保留为一个 clean decoder decomposition 备选，但不应升格为新的 working head；主线 working head 仍是 `residual_persistence`，而 `global_local_increment` 暂不值得继续追加预算。
