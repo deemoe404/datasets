@@ -91,6 +91,13 @@ MODEL_ID = "WORLD_MODEL"
 FAMILY_ID = "world_model_state_space_v1"
 MODEL_VARIANT = "world_model_state_space_v1_farm_sync"
 RESIDUAL_PERSISTENCE_MODEL_VARIANT = "world_model_state_space_v1_residual_persistence_farm_sync"
+RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT = "world_model_state_space_v1_residual_persistence_gated_sum_farm_sync"
+RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT = (
+    "world_model_state_space_v1_residual_persistence_rotor_units_wake_farm_sync"
+)
+RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT = (
+    "world_model_state_space_v1_residual_persistence_gated_sum_rotor_units_wake_farm_sync"
+)
 GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT = "world_model_state_space_v1_global_local_residual_farm_sync"
 GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT = "world_model_state_space_v1_global_local_increment_farm_sync"
 WAKE_OFF_MODEL_VARIANT = "world_model_state_space_v1_wake_off_farm_sync"
@@ -205,6 +212,19 @@ HEAD_KIND_CHOICES = (
     HEAD_KIND_GLOBAL_LOCAL_RESIDUAL,
     HEAD_KIND_GLOBAL_LOCAL_INCREMENT,
 )
+AGGREGATION_KIND_NORMALIZED_GATED_AVERAGE = "normalized_gated_average"
+AGGREGATION_KIND_GATED_SUM = "gated_sum"
+AGGREGATION_KIND_CHOICES = (
+    AGGREGATION_KIND_NORMALIZED_GATED_AVERAGE,
+    AGGREGATION_KIND_GATED_SUM,
+)
+WAKE_UNITS_KIND_LEGACY_MIXED = "legacy_mixed_units"
+WAKE_UNITS_KIND_ROTOR_DIAMETER = "rotor_diameter_units"
+WAKE_UNITS_KIND_CHOICES = (
+    WAKE_UNITS_KIND_LEGACY_MIXED,
+    WAKE_UNITS_KIND_ROTOR_DIAMETER,
+)
+EDGE_DIAGNOSTIC_PHASES = ("transition", "update")
 
 
 def _head_kind_uses_anchor_metric(head_kind: str) -> bool:
@@ -387,6 +407,36 @@ _SCRATCH_SUMMARY_COLUMNS = [
     "sign_agreement_rate",
     *_RAMP_SCALE_SUMMARY_COLUMNS,
 ]
+_EDGE_DIAGNOSTIC_COLUMNS = [
+    "dataset_id",
+    "model_variant",
+    "selection_metric",
+    "split_name",
+    "eval_protocol",
+    "phase",
+    "d_parallel_q05",
+    "d_parallel_q50",
+    "d_parallel_q95",
+    "d_cross_q05",
+    "d_cross_q50",
+    "d_cross_q95",
+    "wake_gate_mean",
+    "wake_gate_q05",
+    "wake_gate_q50",
+    "wake_gate_q95",
+    "learned_gate_mean",
+    "learned_gate_q05",
+    "learned_gate_q50",
+    "learned_gate_q95",
+    "gate_sum_per_dst_mean",
+    "gate_sum_per_dst_q05",
+    "gate_sum_per_dst_q50",
+    "gate_sum_per_dst_q95",
+    "fraction_learned_gate_lt_1e_6",
+    "fraction_gate_sum_per_dst_lt_1e_6",
+    "gated_message_norm_mean",
+    "aggregated_message_norm_mean",
+]
 
 
 @dataclass(frozen=True)
@@ -398,11 +448,23 @@ class ExperimentVariant:
     uses_farm_aux: bool = True
     uses_met_aux: bool = True
     head_kind: str = HEAD_KIND_ABSOLUTE
+    aggregation_kind: str = AGGREGATION_KIND_NORMALIZED_GATED_AVERAGE
+    wake_units_kind: str = WAKE_UNITS_KIND_LEGACY_MIXED
 
     def __post_init__(self) -> None:
         if self.head_kind not in HEAD_KIND_CHOICES:
             raise ValueError(
                 f"Unsupported head_kind {self.head_kind!r}. Expected one of {HEAD_KIND_CHOICES!r}."
+            )
+        if self.aggregation_kind not in AGGREGATION_KIND_CHOICES:
+            raise ValueError(
+                "Unsupported aggregation_kind "
+                f"{self.aggregation_kind!r}. Expected one of {AGGREGATION_KIND_CHOICES!r}."
+            )
+        if self.wake_units_kind not in WAKE_UNITS_KIND_CHOICES:
+            raise ValueError(
+                f"Unsupported wake_units_kind {self.wake_units_kind!r}. "
+                f"Expected one of {WAKE_UNITS_KIND_CHOICES!r}."
             )
 
 
@@ -584,12 +646,149 @@ class LoadedBestCheckpoint:
     amp_enabled: bool
 
 
+class EdgeDiagnosticsCollector:
+    def __init__(self) -> None:
+        self._buffers = {
+            phase: {
+                "d_parallel": [],
+                "d_cross": [],
+                "wake_gate": [],
+                "learned_gate": [],
+                "gate_sum_per_dst": [],
+                "gated_message_norm": [],
+                "aggregated_message_norm": [],
+            }
+            for phase in EDGE_DIAGNOSTIC_PHASES
+        }
+
+    @staticmethod
+    def _to_numpy(values) -> np.ndarray:
+        if values is None:
+            return np.empty((0,), dtype=np.float64)
+        if isinstance(values, np.ndarray):
+            return values.astype(np.float64, copy=False).reshape(-1)
+        if hasattr(values, "detach"):
+            return values.detach().to(device="cpu", dtype=torch.float32).numpy().astype(np.float64, copy=False).reshape(-1)
+        return np.asarray(values, dtype=np.float64).reshape(-1)
+
+    def record_wake(self, *, phase: str | None, d_parallel, d_cross, wake_gate) -> None:
+        if phase not in self._buffers:
+            return
+        self._buffers[phase]["d_parallel"].append(self._to_numpy(d_parallel))
+        self._buffers[phase]["d_cross"].append(self._to_numpy(d_cross))
+        self._buffers[phase]["wake_gate"].append(self._to_numpy(wake_gate))
+
+    def record_aggregation(self, *, phase: str | None, learned_gate, gate_sum_per_dst, gated_message_norm, aggregated_message_norm) -> None:
+        if phase not in self._buffers:
+            return
+        self._buffers[phase]["learned_gate"].append(self._to_numpy(learned_gate))
+        self._buffers[phase]["gate_sum_per_dst"].append(self._to_numpy(gate_sum_per_dst))
+        self._buffers[phase]["gated_message_norm"].append(self._to_numpy(gated_message_norm))
+        self._buffers[phase]["aggregated_message_norm"].append(self._to_numpy(aggregated_message_norm))
+
+    @staticmethod
+    def _concat(buffers: list[np.ndarray]) -> np.ndarray:
+        non_empty = [buffer for buffer in buffers if buffer.size > 0]
+        if not non_empty:
+            return np.empty((0,), dtype=np.float64)
+        return np.concatenate(non_empty)
+
+    @staticmethod
+    def _quantile(values: np.ndarray, probability: float) -> float:
+        if values.size == 0:
+            return math.nan
+        return float(np.quantile(values, probability))
+
+    @staticmethod
+    def _mean(values: np.ndarray) -> float:
+        if values.size == 0:
+            return math.nan
+        return float(values.mean())
+
+    @staticmethod
+    def _fraction(values: np.ndarray, *, threshold: float) -> float:
+        if values.size == 0:
+            return math.nan
+        return float((values < threshold).mean())
+
+    def to_frame(
+        self,
+        *,
+        prepared_dataset: PreparedDataset,
+        selection_metric: str,
+        split_name: str,
+        eval_protocol: str,
+    ) -> pl.DataFrame:
+        rows: list[dict[str, object]] = []
+        for phase in EDGE_DIAGNOSTIC_PHASES:
+            phase_buffers = self._buffers[phase]
+            d_parallel = self._concat(phase_buffers["d_parallel"])
+            d_cross = self._concat(phase_buffers["d_cross"])
+            wake_gate = self._concat(phase_buffers["wake_gate"])
+            learned_gate = self._concat(phase_buffers["learned_gate"])
+            gate_sum_per_dst = self._concat(phase_buffers["gate_sum_per_dst"])
+            gated_message_norm = self._concat(phase_buffers["gated_message_norm"])
+            aggregated_message_norm = self._concat(phase_buffers["aggregated_message_norm"])
+            rows.append(
+                {
+                    "dataset_id": prepared_dataset.dataset_id,
+                    "model_variant": prepared_dataset.model_variant,
+                    "selection_metric": selection_metric,
+                    "split_name": split_name,
+                    "eval_protocol": eval_protocol,
+                    "phase": phase,
+                    "d_parallel_q05": self._quantile(d_parallel, 0.05),
+                    "d_parallel_q50": self._quantile(d_parallel, 0.50),
+                    "d_parallel_q95": self._quantile(d_parallel, 0.95),
+                    "d_cross_q05": self._quantile(d_cross, 0.05),
+                    "d_cross_q50": self._quantile(d_cross, 0.50),
+                    "d_cross_q95": self._quantile(d_cross, 0.95),
+                    "wake_gate_mean": self._mean(wake_gate),
+                    "wake_gate_q05": self._quantile(wake_gate, 0.05),
+                    "wake_gate_q50": self._quantile(wake_gate, 0.50),
+                    "wake_gate_q95": self._quantile(wake_gate, 0.95),
+                    "learned_gate_mean": self._mean(learned_gate),
+                    "learned_gate_q05": self._quantile(learned_gate, 0.05),
+                    "learned_gate_q50": self._quantile(learned_gate, 0.50),
+                    "learned_gate_q95": self._quantile(learned_gate, 0.95),
+                    "gate_sum_per_dst_mean": self._mean(gate_sum_per_dst),
+                    "gate_sum_per_dst_q05": self._quantile(gate_sum_per_dst, 0.05),
+                    "gate_sum_per_dst_q50": self._quantile(gate_sum_per_dst, 0.50),
+                    "gate_sum_per_dst_q95": self._quantile(gate_sum_per_dst, 0.95),
+                    "fraction_learned_gate_lt_1e_6": self._fraction(learned_gate, threshold=1e-6),
+                    "fraction_gate_sum_per_dst_lt_1e_6": self._fraction(gate_sum_per_dst, threshold=1e-6),
+                    "gated_message_norm_mean": self._mean(gated_message_norm),
+                    "aggregated_message_norm_mean": self._mean(aggregated_message_norm),
+                }
+            )
+        return pl.DataFrame(rows, schema=_EDGE_DIAGNOSTIC_COLUMNS)
+
+
 VARIANT_SPECS = (
     ExperimentVariant(model_variant=MODEL_VARIANT, feature_protocol_id=FEATURE_PROTOCOL_ID),
     ExperimentVariant(
         model_variant=RESIDUAL_PERSISTENCE_MODEL_VARIANT,
         feature_protocol_id=FEATURE_PROTOCOL_ID,
         head_kind=HEAD_KIND_RESIDUAL_PERSISTENCE,
+    ),
+    ExperimentVariant(
+        model_variant=RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        head_kind=HEAD_KIND_RESIDUAL_PERSISTENCE,
+        aggregation_kind=AGGREGATION_KIND_GATED_SUM,
+    ),
+    ExperimentVariant(
+        model_variant=RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        head_kind=HEAD_KIND_RESIDUAL_PERSISTENCE,
+        wake_units_kind=WAKE_UNITS_KIND_ROTOR_DIAMETER,
+    ),
+    ExperimentVariant(
+        model_variant=RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+        feature_protocol_id=FEATURE_PROTOCOL_ID,
+        head_kind=HEAD_KIND_RESIDUAL_PERSISTENCE,
+        aggregation_kind=AGGREGATION_KIND_GATED_SUM,
+        wake_units_kind=WAKE_UNITS_KIND_ROTOR_DIAMETER,
     ),
     ExperimentVariant(
         model_variant=GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT,
@@ -1436,6 +1635,8 @@ if nn is not None and F is not None:
             uses_graph: bool,
             uses_wake_dynamic: bool,
             head_kind: str,
+            aggregation_kind: str,
+            wake_units_kind: str,
             wake_lambda_x: float,
             wake_lambda_y: float,
             wake_kappa: float,
@@ -1455,10 +1656,22 @@ if nn is not None and F is not None:
             if head_kind not in HEAD_KIND_CHOICES:
                 raise ValueError(f"Unsupported head_kind {head_kind!r}. Expected one of {HEAD_KIND_CHOICES!r}.")
             self.head_kind = str(head_kind)
+            if aggregation_kind not in AGGREGATION_KIND_CHOICES:
+                raise ValueError(
+                    f"Unsupported aggregation_kind {aggregation_kind!r}. Expected one of {AGGREGATION_KIND_CHOICES!r}."
+                )
+            self.aggregation_kind = str(aggregation_kind)
+            if wake_units_kind not in WAKE_UNITS_KIND_CHOICES:
+                raise ValueError(
+                    f"Unsupported wake_units_kind {wake_units_kind!r}. Expected one of {WAKE_UNITS_KIND_CHOICES!r}."
+                )
+            self.wake_units_kind = str(wake_units_kind)
             self.wake_lambda_x = wake_lambda_x
             self.wake_lambda_y = wake_lambda_y
             self.wake_kappa = wake_kappa
             self.bounded_output_epsilon = bounded_output_epsilon
+            self.edge_diagnostics_collector: EdgeDiagnosticsCollector | None = None
+            self.edge_diagnostics_phase: str | None = None
             self.register_buffer("static_features", torch.from_numpy(np.asarray(static_tensor, dtype=np.float32)))
             self.register_buffer("turbine_indices", torch.from_numpy(np.asarray(turbine_indices, dtype=np.int64)))
             self.register_buffer("pairwise_features", torch.from_numpy(np.asarray(pairwise_tensor, dtype=np.float32)))
@@ -1571,6 +1784,18 @@ if nn is not None and F is not None:
             raw = self.met_head(torch.cat((g, calendar), dim=-1))
             return torch.cat((raw[:, 0:1], torch.tanh(raw[:, 1:3]), torch.sigmoid(raw[:, 3:6])), dim=-1)
 
+        def set_edge_diagnostics_context(self, collector: EdgeDiagnosticsCollector | None, *, phase: str | None = None) -> None:
+            self.edge_diagnostics_collector = collector
+            self.edge_diagnostics_phase = phase
+
+        def _with_edge_diagnostics_phase(self, phase: str, fn: Callable[[], Any]):
+            previous_phase = self.edge_diagnostics_phase
+            self.edge_diagnostics_phase = phase
+            try:
+                return fn()
+            finally:
+                self.edge_diagnostics_phase = previous_phase
+
         def _wake(self, met):
             if not self.uses_wake_dynamic:
                 return met.new_zeros((met.shape[0], self.node_count, self.node_count, 3))
@@ -1579,11 +1804,23 @@ if nn is not None and F is not None:
             dx = self.wake_geometry[:, :, 0][None, :, :].to(device=met.device, dtype=met.dtype)
             dy = self.wake_geometry[:, :, 1][None, :, :].to(device=met.device, dtype=met.dtype)
             distance = self.wake_geometry[:, :, 2][None, :, :].abs().clamp_min(1e-6).to(device=met.device, dtype=met.dtype)
+            if self.wake_units_kind == WAKE_UNITS_KIND_ROTOR_DIAMETER:
+                meters_per_rotor_diameter = torch.sqrt(torch.square(dx) + torch.square(dy)).clamp_min(1e-6) / distance
+                dx = dx / meters_per_rotor_diameter
+                dy = dy / meters_per_rotor_diameter
             d_parallel = (dx * cos_value[:, None, None] + dy * sin_value[:, None, None]) / distance
             d_cross = (-dx * sin_value[:, None, None] + dy * cos_value[:, None, None]) / distance
             gate = torch.sigmoid(self.wake_kappa * d_parallel) * torch.exp(-F.relu(d_parallel) / self.wake_lambda_x) * torch.exp(-torch.square(d_cross / self.wake_lambda_y))
             diagonal = self.edge_diagonal_mask[..., 0].to(device=met.device)
             gate = gate.masked_fill(diagonal, 0.0)
+            if self.edge_diagnostics_collector is not None and self.edge_diagnostics_phase is not None:
+                non_diagonal = (~diagonal).expand(met.shape[0], -1, -1)
+                self.edge_diagnostics_collector.record_wake(
+                    phase=self.edge_diagnostics_phase,
+                    d_parallel=d_parallel.masked_select(non_diagonal),
+                    d_cross=d_cross.masked_select(non_diagonal),
+                    wake_gate=gate.masked_select(non_diagonal),
+                )
             return torch.stack((d_parallel, d_cross, gate), dim=-1)
 
         def _aggregate(self, source_summary, g, met, calendar, edge_net, gate_net, *, static=None):
@@ -1605,7 +1842,22 @@ if nn is not None and F is not None:
             diagonal = self.edge_diagonal_mask.to(device=messages.device)
             messages = messages.masked_fill(diagonal, 0.0)
             gates = gates.masked_fill(diagonal, 0.0)
-            return (messages * gates).sum(dim=2) / gates.sum(dim=2).clamp_min(1e-6)
+            gated_messages = messages * gates
+            gate_sum_per_dst = gates.sum(dim=2).squeeze(-1)
+            if self.aggregation_kind == AGGREGATION_KIND_GATED_SUM:
+                aggregated = gated_messages.sum(dim=2)
+            else:
+                aggregated = gated_messages.sum(dim=2) / gates.sum(dim=2).clamp_min(1e-6)
+            if self.edge_diagnostics_collector is not None and self.edge_diagnostics_phase is not None:
+                non_diagonal = (~diagonal.squeeze(-1)).expand(batch_size, -1, -1)
+                self.edge_diagnostics_collector.record_aggregation(
+                    phase=self.edge_diagnostics_phase,
+                    learned_gate=gates.squeeze(-1).masked_select(non_diagonal),
+                    gate_sum_per_dst=gate_sum_per_dst,
+                    gated_message_norm=torch.linalg.vector_norm(gated_messages, dim=-1).masked_select(non_diagonal),
+                    aggregated_message_norm=torch.linalg.vector_norm(aggregated, dim=-1),
+                )
+            return aggregated
 
         def _correct(self, z, h, g, local_obs, context, *, static=None):
             batch_size = local_obs.shape[0]
@@ -1621,7 +1873,10 @@ if nn is not None and F is not None:
             source = self.update_source(torch.cat((local_obs, self._node_state(z, h), static_nodes), dim=-1))
             met = context[:, _CONTEXT_SITE_SUMMARY_START : _CONTEXT_SITE_SUMMARY_START + len(SITE_SUMMARY_FEATURE_NAMES)]
             calendar = context[:, _CONTEXT_CALENDAR_START:]
-            edge_message = self._aggregate(source, g, met, calendar, self.update_edge, self.update_gate, static=static_nodes)
+            edge_message = self._with_edge_diagnostics_phase(
+                "update",
+                lambda: self._aggregate(source, g, met, calendar, self.update_edge, self.update_gate, static=static_nodes),
+            )
             g_nodes = g[:, None, :].expand(-1, self.node_count, -1)
             context_nodes = context[:, None, :].expand(-1, self.node_count, -1)
             z_next = self.update_z(torch.cat((innovation, edge_message, g_nodes, context_nodes, static_nodes), dim=-1).reshape(batch_size * self.node_count, -1), z.reshape(batch_size * self.node_count, -1)).reshape(batch_size, self.node_count, self.z_dim)
@@ -1643,7 +1898,10 @@ if nn is not None and F is not None:
             met = self._met(g, calendar)
             g_nodes = g[:, None, :].expand(-1, self.node_count, -1)
             source = self.transition_source(torch.cat((self._node_state(z, h), static_nodes, g_nodes), dim=-1))
-            edge_message = self._aggregate(source, g, met, calendar, self.transition_edge, self.transition_gate, static=static_nodes)
+            edge_message = self._with_edge_diagnostics_phase(
+                "transition",
+                lambda: self._aggregate(source, g, met, calendar, self.transition_edge, self.transition_gate, static=static_nodes),
+            )
             met_nodes = met[:, None, :].expand(-1, self.node_count, -1)
             calendar_nodes = calendar[:, None, :].expand(-1, self.node_count, -1)
             z_next = self.transition_z(torch.cat((edge_message, g_nodes, met_nodes, calendar_nodes, static_nodes, h), dim=-1).reshape(batch_size * self.node_count, -1), z.reshape(batch_size * self.node_count, -1)).reshape(batch_size, self.node_count, self.z_dim)
@@ -1958,6 +2216,8 @@ def build_model(
     uses_graph: bool = True,
     uses_wake_dynamic: bool = True,
     head_kind: str = HEAD_KIND_ABSOLUTE,
+    aggregation_kind: str = AGGREGATION_KIND_NORMALIZED_GATED_AVERAGE,
+    wake_units_kind: str = WAKE_UNITS_KIND_LEGACY_MIXED,
 ):
     _require_torch()
     return WorldModelStateSpace(
@@ -1986,6 +2246,8 @@ def build_model(
         uses_graph=uses_graph,
         uses_wake_dynamic=uses_wake_dynamic,
         head_kind=head_kind,
+        aggregation_kind=aggregation_kind,
+        wake_units_kind=wake_units_kind,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -2986,6 +3248,8 @@ def train_model(
         uses_graph=variant_spec.uses_graph,
         uses_wake_dynamic=variant_spec.uses_wake_dynamic,
         head_kind=variant_spec.head_kind,
+        aggregation_kind=variant_spec.aggregation_kind,
+        wake_units_kind=variant_spec.wake_units_kind,
         wake_lambda_x=wake_lambda_x,
         wake_lambda_y=wake_lambda_y,
         wake_kappa=wake_kappa,
@@ -3476,6 +3740,10 @@ def build_result_rows(
 
 def _empty_eval_diagnostic_frame() -> pl.DataFrame:
     return pl.DataFrame(schema=_EVAL_DIAGNOSTIC_COLUMNS)
+
+
+def _empty_edge_diagnostic_frame() -> pl.DataFrame:
+    return pl.DataFrame(schema=_EDGE_DIAGNOSTIC_COLUMNS)
 
 
 def _empty_scratch_summary_frame() -> pl.DataFrame:
@@ -4447,6 +4715,8 @@ def load_best_checkpoint(
         uses_graph=variant_spec.uses_graph,
         uses_wake_dynamic=variant_spec.uses_wake_dynamic,
         head_kind=variant_spec.head_kind,
+        aggregation_kind=variant_spec.aggregation_kind,
+        wake_units_kind=variant_spec.wake_units_kind,
         wake_lambda_x=profile.wake_lambda_x,
         wake_lambda_y=profile.wake_lambda_y,
         wake_kappa=profile.wake_kappa,
@@ -4477,6 +4747,7 @@ def run_saved_checkpoint_scratch_evaluation(
     output_dir: str | Path,
     device: str | None = None,
     include_carry_over: bool = True,
+    include_edge_diagnostics: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     loaded_checkpoint = load_best_checkpoint(
         checkpoint_path,
@@ -4486,6 +4757,7 @@ def run_saved_checkpoint_scratch_evaluation(
     evaluation_results: list[tuple[str, str, world_model_base.FarmWindowDescriptorIndex, EvaluationMetrics]] = []
     diagnostics_frames: list[pl.DataFrame] = []
     summary_frames: list[pl.DataFrame] = []
+    edge_diagnostics_frames: list[pl.DataFrame] = []
     eval_specs = [
         ("val", ROLLING_EVAL_PROTOCOL, prepared_dataset.val_rolling_windows),
         ("test", ROLLING_EVAL_PROTOCOL, prepared_dataset.test_rolling_windows),
@@ -4498,17 +4770,31 @@ def run_saved_checkpoint_scratch_evaluation(
             ]
         )
     for split_name, eval_protocol, windows in eval_specs:
-        metrics, diagnostics, summary = evaluate_saved_checkpoint_windows(
-            loaded_checkpoint,
-            prepared_dataset,
-            windows=windows,
-            split_name=split_name,
-            eval_protocol=eval_protocol,
-            progress_label=f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}/{split_name}/{eval_protocol}",
-        )
+        edge_collector = EdgeDiagnosticsCollector() if include_edge_diagnostics else None
+        loaded_checkpoint.model.set_edge_diagnostics_context(edge_collector)
+        try:
+            metrics, diagnostics, summary = evaluate_saved_checkpoint_windows(
+                loaded_checkpoint,
+                prepared_dataset,
+                windows=windows,
+                split_name=split_name,
+                eval_protocol=eval_protocol,
+                progress_label=f"{prepared_dataset.dataset_id}/{prepared_dataset.model_variant}/{split_name}/{eval_protocol}",
+            )
+        finally:
+            loaded_checkpoint.model.set_edge_diagnostics_context(None)
         evaluation_results.append((split_name, eval_protocol, windows, metrics))
         diagnostics_frames.append(diagnostics)
         summary_frames.append(summary)
+        if edge_collector is not None:
+            edge_diagnostics_frames.append(
+                edge_collector.to_frame(
+                    prepared_dataset=prepared_dataset,
+                    selection_metric=loaded_checkpoint.selection_metric,
+                    split_name=split_name,
+                    eval_protocol=eval_protocol,
+                )
+            )
     result_rows = build_result_rows(
         prepared_dataset,
         training_outcome=TrainingOutcome(
@@ -4537,6 +4823,11 @@ def run_saved_checkpoint_scratch_evaluation(
         if summary_frames
         else _empty_scratch_summary_frame()
     )
+    edge_diagnostics = (
+        pl.concat(edge_diagnostics_frames, how="diagonal_relaxed")
+        if edge_diagnostics_frames
+        else _empty_edge_diagnostic_frame()
+    )
     output_root = Path(output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     config_name = _best_checkpoint_config_name(
@@ -4548,6 +4839,8 @@ def run_saved_checkpoint_scratch_evaluation(
     _atomic_write_csv(output_root / f"{config_name}.csv", results)
     _atomic_write_csv(output_root / f"{config_name}.diagnostics.csv", diagnostics)
     _atomic_write_csv(output_root / f"{config_name}.summary.csv", summaries)
+    if include_edge_diagnostics:
+        _atomic_write_csv(output_root / f"{config_name}.edge_diagnostics.csv", edge_diagnostics)
     return results, diagnostics, summaries
 
 
@@ -5167,6 +5460,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="When running eval-only from a saved checkpoint, skip rolling_origin_carry_over.",
     )
     parser.add_argument(
+        "--include-edge-diagnostics",
+        action="store_true",
+        help="When running eval-only from a saved checkpoint, also write phase-wise edge diagnostics.",
+    )
+    parser.add_argument(
         "--run-label",
         type=str,
         default=None,
@@ -5270,6 +5568,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     resolved_dataset_ids = _validate_dataset_ids(tuple(args.datasets) if args.datasets else DEFAULT_DATASETS)
     variant_specs = resolve_variant_specs(tuple(args.variants) if args.variants else None)
     resolved_selection_metric = normalize_selection_metric(args.selection_metric)
+    if args.include_edge_diagnostics and args.load_best_checkpoint is None:
+        parser.error("--include-edge-diagnostics only applies together with --load-best-checkpoint.")
     if args.load_best_checkpoint is not None:
         if args.resume or args.force_rerun:
             parser.error("--load-best-checkpoint cannot be combined with --resume or --force-rerun.")
@@ -5302,6 +5602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         primary_output_path = scratch_output_dir / f"{config_name}.csv"
         diagnostics_output_path = scratch_output_dir / f"{config_name}.diagnostics.csv"
         summary_output_path = scratch_output_dir / f"{config_name}.summary.csv"
+        edge_diagnostics_output_path = scratch_output_dir / f"{config_name}.edge_diagnostics.csv"
         print(f"[{FAMILY_ID}] scratch_output={primary_output_path}")
         results, _diagnostics, _summaries = run_saved_checkpoint_scratch_evaluation(
             checkpoint_path=args.load_best_checkpoint,
@@ -5309,10 +5610,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir=scratch_output_dir,
             device=args.device,
             include_carry_over=not args.no_carry_over,
+            include_edge_diagnostics=args.include_edge_diagnostics,
         )
         if not args.no_record_run:
             recorded_args = vars(args).copy()
             recorded_args["selection_metric"] = resolved_selection_metric
+            artifacts = {
+                "diagnostics_output": diagnostics_output_path,
+                "summary_output": summary_output_path,
+                "checkpoint_input": args.load_best_checkpoint,
+            }
+            if args.include_edge_diagnostics:
+                artifacts["edge_diagnostics_output"] = edge_diagnostics_output_path
             record_cli_run(
                 family_id=FAMILY_ID,
                 repo_root=_REPO_ROOT,
@@ -5326,11 +5635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model_variants=(prepared_dataset.model_variant,),
                 eval_protocols=tuple(results["eval_protocol"].unique().to_list()),
                 result_splits=tuple(results["split_name"].unique().to_list()),
-                artifacts={
-                    "diagnostics_output": diagnostics_output_path,
-                    "summary_output": summary_output_path,
-                    "checkpoint_input": args.load_best_checkpoint,
-                },
+                artifacts=artifacts,
                 run_label=args.run_label,
             )
         return 0

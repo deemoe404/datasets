@@ -15,6 +15,9 @@ Active variants:
 
 - `world_model_state_space_v1_farm_sync`: canonical model.
 - `world_model_state_space_v1_residual_persistence_farm_sync`: predicts an additive residual over the per-turbine last-value persistence anchor.
+- `world_model_state_space_v1_residual_persistence_gated_sum_farm_sync`: keeps the residual head but changes graph aggregation from normalized gated average to gated sum.
+- `world_model_state_space_v1_residual_persistence_rotor_units_wake_farm_sync`: keeps the residual head and normalized aggregation, but interprets wake `dx/dy` in rotor-diameter units before computing `d_parallel` and `d_cross`.
+- `world_model_state_space_v1_residual_persistence_gated_sum_rotor_units_wake_farm_sync`: combines the residual-head gated-sum aggregator with the rotor-diameter wake-unit interpretation.
 - `world_model_state_space_v1_global_local_residual_farm_sync`: decomposes the anchor-relative forecast into one farm-shared residual plus a hard zero-mean local correction.
 - `world_model_state_space_v1_global_local_increment_farm_sync`: predicts one farm-shared increment plus a hard zero-mean local increment correction, then accumulates them from the persistence anchor back into level space.
 - `world_model_state_space_v1_wake_off_farm_sync`: disables only dynamic wake features.
@@ -25,6 +28,10 @@ Active variants:
 The default runner behavior remains canonical-only; ablations must be selected
 explicitly with repeated `--variant` flags.
 The search harness also remains canonical-only in this revision.
+The residual edge-gating 2x2 stays residual-only on purpose: the base residual
+variant is the control, while the three extra residual variants isolate
+`gated_sum`, `rotor_diameter_units`, or both without turning these axes into
+family-wide CLI knobs.
 The two global/local variants use `global = whole farm`, fix `alpha = 1`, and
 enforce a hard weighted zero-mean constraint on the local branch; they do not
 introduce cluster state or extra CLI knobs in this first pass.
@@ -102,6 +109,14 @@ scratch outputs also expose per-scale columns:
 `rolling_origin_no_refit` scratch evaluation now runs through a batched path
 instead of the old per-window sequential loop; `rolling_origin_carry_over`
 keeps its sequential state-persistence semantics.
+
+When checkpoint scratch eval is run with `--include-edge-diagnostics`, the same
+scratch directory also gains a `*.edge_diagnostics.csv` file with one row per
+`(split_name, eval_protocol, phase)` where `phase ∈ {transition, update}`.
+Those rows summarize wake geometry and learned gate distributions
+(`d_parallel/d_cross`, `wake_gate`, `learned_gate`, `gate_sum_per_dst`,
+`gated_message_norm`, `aggregated_message_norm`) without changing the formal
+publish schema or the default training path.
 
 Default TensorBoard output:
 

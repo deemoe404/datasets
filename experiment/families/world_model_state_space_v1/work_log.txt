@@ -40,6 +40,9 @@
 - 当前这轮改动没有触碰训练主干 `_aggregate()` / `144+36` 的结构性热点，也没有把 ramp 接到 `persistent_chunk6`；`chunk6 v1` 仍应保持 `ramp_loss_weight=0.0`。
 - 旧版单尺度 ramp 队列 `ramp_ablation_20260421_residual_farm0p00_val_rmse` 到此为止正式封存：`ramp0p00` train + scratch eval 已完成，`ramp0p02` train 已完成但 carry-over scratch eval 在 CPU-bound 顺序路径上运行超过 8 小时仍未产出 summary/diagnostics，因此按主线判断价值不足而主动放弃；`ramp0p05` 在启动前取消。
 - 这次旧队列留下的主线结论是：单尺度 `K=1` ramp 在当前 residual/no-farm trunk 上没有给出足够干净的收益信号，而且旧 checkpoint eval 路径的 wall-clock 成本过高；后续 ramp 实验应直接基于 `ramp v2` 和 batched no-refit eval 重开，不再继续追加这条旧队列。
+- 本地代码层已补上 residual 路径的 edge-gating 2x2 实现面：以 `world_model_state_space_v1_residual_persistence_farm_sync` 为控制，再新增 `residual_persistence_gated_sum`、`residual_persistence_rotor_units_wake`、`residual_persistence_gated_sum_rotor_units_wake` 三个显式 variants。第一轮仍不把 `aggregation_kind` / `wake_units_kind` 暴露成 family-wide CLI 组合轴。
+- `_wake()` 现在支持两种内部解释：旧的 `legacy_mixed_units` 继续直接用 raw `dx_m/dy_m` 除以 `distance_in_rotor_diameters`，新的 `rotor_diameter_units` 先按 `meters_per_rotor_diameter = hypot(dx,dy) / distance_in_rotor_diameters` 把 `dx,dy` 转成叶轮直径单位，再算 `d_parallel` / `d_cross`。`_aggregate()` 也新增了 residual-only 的 `gated_sum` 分支，用来和当前 `normalized_gated_average` 做干净对照。
+- checkpoint scratch eval 现在可选 `--include-edge-diagnostics`，会在原有 `*.csv` / `*.diagnostics.csv` / `*.summary.csv` 旁边额外写 `*.edge_diagnostics.csv`。这份输出只做 phase-wise 聚合诊断，不改默认训练路径，也不改 formal publish schema。当前这轮只完成本地代码、测试和文档同步，实验继续等后续有空余算力再排。
 
 2026-04-23
 - Ubuntu `global_local_ablation_20260422_farm0p00_val_rmse` 队列已完成；scratch root: `experiment/artifacts/scratch/world_model_state_space_v1/global_local_ablation_20260422_farm0p00_val_rmse`。固定设置为 `farm_loss_weight=0.0`、`ramp_loss_weight=0.0`、`selection_metric=val_rmse_pu`、`batch_size=432`，两条线都只做 train + no-refit eval。

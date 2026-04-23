@@ -126,6 +126,9 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     assert world_model_state_space.implementation_bindings == {
         "world_model_state_space_v1_farm_sync": "world_model_v1",
         "world_model_state_space_v1_residual_persistence_farm_sync": "world_model_v1",
+        "world_model_state_space_v1_residual_persistence_gated_sum_farm_sync": "world_model_v1",
+        "world_model_state_space_v1_residual_persistence_rotor_units_wake_farm_sync": "world_model_v1",
+        "world_model_state_space_v1_residual_persistence_gated_sum_rotor_units_wake_farm_sync": "world_model_v1",
         "world_model_state_space_v1_global_local_residual_farm_sync": "world_model_v1",
         "world_model_state_space_v1_global_local_increment_farm_sync": "world_model_v1",
         "world_model_state_space_v1_wake_off_farm_sync": "world_model_v1",
@@ -197,6 +200,9 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "world_model_rollout_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_residual_persistence_farm_sync" in rendered
+    assert "world_model_state_space_v1_residual_persistence_gated_sum_farm_sync" in rendered
+    assert "world_model_state_space_v1_residual_persistence_rotor_units_wake_farm_sync" in rendered
+    assert "world_model_state_space_v1_residual_persistence_gated_sum_rotor_units_wake_farm_sync" in rendered
     assert "world_model_state_space_v1_global_local_residual_farm_sync" in rendered
     assert "world_model_state_space_v1_global_local_increment_farm_sync" in rendered
     assert "world_model_state_space_v1_wake_off_farm_sync" in rendered

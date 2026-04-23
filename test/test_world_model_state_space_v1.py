@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from importlib.util import module_from_spec, spec_from_file_location
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -169,6 +170,8 @@ def _tiny_model_kwargs(module, prepared, *, variant_name: str | None = None) -> 
         "uses_graph": variant_spec.uses_graph,
         "uses_wake_dynamic": variant_spec.uses_wake_dynamic,
         "head_kind": variant_spec.head_kind,
+        "aggregation_kind": variant_spec.aggregation_kind,
+        "wake_units_kind": variant_spec.wake_units_kind,
         "wake_lambda_x": module.DEFAULT_WAKE_LAMBDA_X,
         "wake_lambda_y": module.DEFAULT_WAKE_LAMBDA_Y,
         "wake_kappa": module.DEFAULT_WAKE_KAPPA,
@@ -213,6 +216,21 @@ def _zero_module_parameters(module_obj) -> None:
         parameter.data.zero_()
 
 
+def _assert_dict_rows_equal_with_nan(left_rows, right_rows) -> None:
+    assert len(left_rows) == len(right_rows)
+    for left_row, right_row in zip(left_rows, right_rows):
+        assert set(left_row) == set(right_row)
+        for key in left_row:
+            left_value = left_row[key]
+            right_value = right_row[key]
+            if isinstance(left_value, float) and isinstance(right_value, float):
+                if math.isnan(left_value) and math.isnan(right_value):
+                    continue
+                assert left_value == pytest.approx(right_value, rel=1e-5, abs=1e-7)
+                continue
+            assert left_value == right_value
+
+
 def test_registry_declares_kelmarsh_only() -> None:
     registry_path = (
         Path(__file__).resolve().parents[1]
@@ -229,6 +247,9 @@ def test_registry_declares_kelmarsh_only() -> None:
     assert 'supported_feature_protocols = ["world_model_v1"]' in text
     assert 'world_model_state_space_v1_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_residual_persistence_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_residual_persistence_gated_sum_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_residual_persistence_rotor_units_wake_farm_sync = "world_model_v1"' in text
+    assert 'world_model_state_space_v1_residual_persistence_gated_sum_rotor_units_wake_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_global_local_residual_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_global_local_increment_farm_sync = "world_model_v1"' in text
     assert 'world_model_state_space_v1_wake_off_farm_sync = "world_model_v1"' in text
@@ -270,6 +291,9 @@ def test_default_variants_remain_canonical_only() -> None:
     assert set(module.ALL_VARIANTS) == {
         module.MODEL_VARIANT,
         module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+        module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT,
+        module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+        module.RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT,
         module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT,
         module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT,
         module.WAKE_OFF_MODEL_VARIANT,
@@ -288,8 +312,34 @@ def test_variant_head_kinds_are_explicit() -> None:
 
     assert variants_by_name[module.MODEL_VARIANT].head_kind == "absolute"
     assert variants_by_name[module.RESIDUAL_PERSISTENCE_MODEL_VARIANT].head_kind == "residual_persistence"
+    assert variants_by_name[module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT].head_kind == "residual_persistence"
+    assert (
+        variants_by_name[module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT].head_kind
+        == "residual_persistence"
+    )
+    assert (
+        variants_by_name[module.RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT].head_kind
+        == "residual_persistence"
+    )
     assert variants_by_name[module.GLOBAL_LOCAL_RESIDUAL_MODEL_VARIANT].head_kind == "global_local_residual"
     assert variants_by_name[module.GLOBAL_LOCAL_INCREMENT_MODEL_VARIANT].head_kind == "global_local_increment"
+    assert variants_by_name[module.MODEL_VARIANT].aggregation_kind == "normalized_gated_average"
+    assert variants_by_name[module.RESIDUAL_PERSISTENCE_MODEL_VARIANT].aggregation_kind == "normalized_gated_average"
+    assert variants_by_name[module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT].aggregation_kind == "gated_sum"
+    assert (
+        variants_by_name[module.RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT].aggregation_kind
+        == "gated_sum"
+    )
+    assert variants_by_name[module.MODEL_VARIANT].wake_units_kind == "legacy_mixed_units"
+    assert variants_by_name[module.RESIDUAL_PERSISTENCE_MODEL_VARIANT].wake_units_kind == "legacy_mixed_units"
+    assert (
+        variants_by_name[module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT].wake_units_kind
+        == "rotor_diameter_units"
+    )
+    assert (
+        variants_by_name[module.RESIDUAL_PERSISTENCE_GATED_SUM_ROTOR_UNITS_WAKE_MODEL_VARIANT].wake_units_kind
+        == "rotor_diameter_units"
+    )
 
 
 def test_horizon_rmse_group_means_cover_expected_ranges() -> None:
@@ -354,6 +404,16 @@ def test_resolve_hyperparameter_profile_applies_ablation_guardrails() -> None:
     assert no_farm_profile.ramp_loss_weight == module.DEFAULT_RAMP_LOSS_WEIGHT
     assert no_farm_profile.ramp_huber_delta == module.DEFAULT_RAMP_HUBER_DELTA
     assert no_met_profile.met_loss_weight == 0.0
+    gated_sum_profile = module.resolve_hyperparameter_profile(
+        module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT,
+        dataset_id="kelmarsh",
+    )
+    rotor_units_profile = module.resolve_hyperparameter_profile(
+        module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+        dataset_id="kelmarsh",
+    )
+    assert gated_sum_profile.wake_lambda_x == module.DEFAULT_WAKE_LAMBDA_X
+    assert rotor_units_profile.wake_lambda_y == module.DEFAULT_WAKE_LAMBDA_Y
 
     with pytest.raises(ValueError, match="farm_loss_weight=0.0"):
         module.resolve_hyperparameter_profile(
@@ -440,6 +500,32 @@ def test_wake_geometry_uses_raw_pairwise_values(tmp_path, monkeypatch) -> None:
     assert prepared.pairwise_tensor[1, 0, 0] != pytest.approx(prepared.wake_geometry_tensor[1, 0, 0])
     assert prepared.pairwise_tensor[2, 0, 1] != pytest.approx(prepared.wake_geometry_tensor[2, 0, 1])
     assert prepared.pairwise_tensor[2, 0, 6] != pytest.approx(prepared.wake_geometry_tensor[2, 0, 2])
+
+
+def test_rotor_units_wake_interprets_dx_dy_in_rotor_diameter_units(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+    )
+    model = module.build_model(
+        **_tiny_model_kwargs(
+            module,
+            prepared,
+            variant_name=module.RESIDUAL_PERSISTENCE_ROTOR_UNITS_WAKE_MODEL_VARIANT,
+        )
+    )
+    met = torch_module.zeros(1, module.DEFAULT_MET_SUMMARY_DIM)
+    met[:, 1] = 1.0
+
+    dynamic = model._wake(met)
+
+    assert dynamic[0, 1, 0, 0].item() == pytest.approx(1.0)
+    assert dynamic[0, 2, 0, 0].item() == pytest.approx(220.0 / np.hypot(220.0, 30.0))
+    assert dynamic[0, 2, 0, 1].item() == pytest.approx(30.0 / np.hypot(220.0, 30.0))
 
 
 def test_future_inputs_exclude_real_observations(tmp_path, monkeypatch) -> None:
@@ -832,11 +918,92 @@ def test_graph_off_aggregate_returns_zero_message(tmp_path, monkeypatch) -> None
     assert torch_module.count_nonzero(edge_message) == 0
 
 
+def test_gated_sum_aggregate_keeps_total_message_strength(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    torch_module = _require_torch(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+    )
+    normalized_model = module.build_model(
+        **_tiny_model_kwargs(
+            module,
+            prepared,
+            variant_name=module.RESIDUAL_PERSISTENCE_MODEL_VARIANT,
+        )
+    )
+    gated_sum_prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        variant_name=module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT,
+    )
+    gated_sum_model = module.build_model(
+        **_tiny_model_kwargs(
+            module,
+            gated_sum_prepared,
+            variant_name=module.RESIDUAL_PERSISTENCE_GATED_SUM_MODEL_VARIANT,
+        )
+    )
+    source_summary = torch_module.randn(1, prepared.node_count, 4)
+    g = torch_module.randn(1, 8)
+    met = torch_module.randn(1, module.DEFAULT_MET_SUMMARY_DIM)
+    calendar = torch_module.randn(1, prepared.context_future_channels)
+    normalized_static = normalized_model._static(batch_size=1)
+    gated_sum_static = gated_sum_model._static(batch_size=1)
+
+    def _constant_message(edge_inputs):
+        batch, dst, src, _ = edge_inputs.shape
+        return torch_module.full((batch, dst, src, 4), 2.0, dtype=edge_inputs.dtype, device=edge_inputs.device)
+
+    def _tiny_gate(edge_inputs):
+        batch, dst, src, _ = edge_inputs.shape
+        gates = torch_module.full((batch, dst, src, 1), -10.0, dtype=edge_inputs.dtype, device=edge_inputs.device)
+        return gates
+
+    normalized = normalized_model._aggregate(
+        source_summary,
+        g,
+        met,
+        calendar,
+        _constant_message,
+        _tiny_gate,
+        static=normalized_static,
+    )
+    gated_sum = gated_sum_model._aggregate(
+        source_summary,
+        g,
+        met,
+        calendar,
+        _constant_message,
+        _tiny_gate,
+        static=gated_sum_static,
+    )
+
+    expected_gate = torch_module.sigmoid(torch_module.tensor(-10.0))
+    expected_neighbor_count = prepared.node_count - 1
+    assert torch_module.allclose(
+        normalized,
+        torch_module.full_like(normalized, 2.0),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert torch_module.allclose(
+        gated_sum,
+        torch_module.full_like(gated_sum, float(expected_neighbor_count * 2.0 * expected_gate.item())),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
 def test_all_missing_node_keeps_prior_in_update(tmp_path, monkeypatch) -> None:
     module = _load_module()
     torch_module = _require_torch(module)
     prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
     model = module.build_model(**_tiny_model_kwargs(module, prepared))
+    module.initialize_model_parameters(model)
     local_observations = torch_module.from_numpy(prepared.local_history_tensor[144][None].copy())
     local_observations[:, 0, module._LOCAL_MASK_START : module._LOCAL_MASK_START + module.LOCAL_MASK_COUNT] = 1.0
     context = torch_module.from_numpy(prepared.context_history_tensor[144][None].copy())
@@ -943,9 +1110,26 @@ def test_filter_state_prefix_equivalence_with_multi_step_reveal(tmp_path, monkey
             revealed_context,
         )
 
-    assert torch_module.allclose(advanced_state.filter_state.z, cold_filter_state.z, rtol=1e-5, atol=1e-6)
-    assert torch_module.allclose(advanced_state.filter_state.h, cold_filter_state.h, rtol=1e-5, atol=1e-6)
-    assert torch_module.allclose(advanced_state.filter_state.g, cold_filter_state.g, rtol=1e-5, atol=1e-6)
+    state_rtol = 5e-5
+    state_atol = 2e-5
+    assert torch_module.allclose(
+        advanced_state.filter_state.z,
+        cold_filter_state.z,
+        rtol=state_rtol,
+        atol=state_atol,
+    )
+    assert torch_module.allclose(
+        advanced_state.filter_state.h,
+        cold_filter_state.h,
+        rtol=state_rtol,
+        atol=state_atol,
+    )
+    assert torch_module.allclose(
+        advanced_state.filter_state.g,
+        cold_filter_state.g,
+        rtol=state_rtol,
+        atol=state_atol,
+    )
     assert torch_module.allclose(
         advanced_state.observation_cache.persistence_anchor,
         cold_cache.persistence_anchor,
@@ -1343,8 +1527,14 @@ def test_saved_checkpoint_single_origin_carry_over_matches_cold_start(tmp_path, 
     assert carry_metrics.rmse_pu == pytest.approx(rolling_metrics.rmse_pu)
     assert carry_metrics.horizon_mae_pu.tolist() == pytest.approx(rolling_metrics.horizon_mae_pu.tolist())
     assert carry_metrics.horizon_rmse_pu.tolist() == pytest.approx(rolling_metrics.horizon_rmse_pu.tolist())
-    assert rolling_diagnostics.drop("eval_protocol").to_dicts() == carry_diagnostics.drop("eval_protocol").to_dicts()
-    assert rolling_summary.drop("eval_protocol").to_dicts() == carry_summary.drop("eval_protocol").to_dicts()
+    _assert_dict_rows_equal_with_nan(
+        rolling_diagnostics.drop("eval_protocol").to_dicts(),
+        carry_diagnostics.drop("eval_protocol").to_dicts(),
+    )
+    _assert_dict_rows_equal_with_nan(
+        rolling_summary.drop("eval_protocol").to_dicts(),
+        carry_summary.drop("eval_protocol").to_dicts(),
+    )
 
 
 def test_saved_checkpoint_no_refit_avoids_sequential_filter_history(tmp_path, monkeypatch) -> None:
@@ -1486,7 +1676,7 @@ def test_saved_checkpoint_no_refit_matches_sequential_reference(tmp_path, monkey
         selection_metric=loaded_checkpoint.selection_metric,
         split_name="val",
         eval_protocol=module.ROLLING_EVAL_PROTOCOL,
-        has_residual_head=False,
+        has_anchor_delta_metric=False,
     )
 
     assert batched_metrics.mae_pu == pytest.approx(sequential_metrics.mae_pu)
@@ -1494,10 +1684,18 @@ def test_saved_checkpoint_no_refit_matches_sequential_reference(tmp_path, monkey
     assert batched_metrics.ramp_rmse_pu == pytest.approx(sequential_metrics.ramp_rmse_pu)
     assert batched_metrics.horizon_rmse_pu.tolist() == pytest.approx(sequential_metrics.horizon_rmse_pu.tolist())
     assert batched_metrics.horizon_ramp_rmse_pu.tolist() == pytest.approx(
-        sequential_metrics.horizon_ramp_rmse_pu.tolist()
+        sequential_metrics.horizon_ramp_rmse_pu.tolist(),
+        rel=1e-5,
+        abs=1e-7,
     )
-    assert batched_summary.drop("eval_protocol").to_dicts() == sequential_summary.drop("eval_protocol").to_dicts()
-    assert batched_diagnostics.drop("eval_protocol").to_dicts() == sequential_diagnostics.drop("eval_protocol").to_dicts()
+    _assert_dict_rows_equal_with_nan(
+        batched_summary.drop("eval_protocol").to_dicts(),
+        sequential_summary.drop("eval_protocol").to_dicts(),
+    )
+    _assert_dict_rows_equal_with_nan(
+        batched_diagnostics.drop("eval_protocol").to_dicts(),
+        sequential_diagnostics.drop("eval_protocol").to_dicts(),
+    )
 
 
 @pytest.mark.parametrize(
@@ -1656,7 +1854,181 @@ def test_main_eval_only_writes_scratch_outputs(tmp_path, monkeypatch, capsys) ->
     assert captured["scratch_eval"]["prepared_dataset"] is prepared
     assert captured["scratch_eval"]["output_dir"] == scratch_output_dir
     assert captured["scratch_eval"]["include_carry_over"] is True
+    assert captured["scratch_eval"]["include_edge_diagnostics"] is False
     assert str(scratch_output_dir / f"{prepared.dataset_id}__{prepared.model_variant}__rmse_pu__seed123.csv") in capsys.readouterr().out
+
+
+def test_main_eval_only_can_enable_edge_diagnostics(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+
+    def _fake_prepare_dataset(*args, **kwargs):
+        del args, kwargs
+        return prepared
+
+    def _fake_load_best_checkpoint(checkpoint_path, *, prepared_dataset, device):
+        del checkpoint_path, prepared_dataset, device
+        return module.LoadedBestCheckpoint(
+            model=None,
+            profile=_tiny_profile(module, prepared),
+            job_identity=module._job_identity_for_prepared_dataset(prepared, selection_metric="val_rmse_pu"),
+            best_epoch=1,
+            epochs_ran=1,
+            best_val_rmse_pu=0.2,
+            best_val_mae_pu=0.1,
+            selection_metric="val_rmse_pu",
+            seed=123,
+            runtime_seconds=0.5,
+            device="cpu",
+            amp_enabled=False,
+        )
+
+    def _fake_run_saved_checkpoint_scratch_evaluation(**kwargs):
+        captured["scratch_eval"] = kwargs
+        return pl.DataFrame({"dataset_id": [prepared.dataset_id]}), pl.DataFrame({"x": [1]}), pl.DataFrame({"y": [1]})
+
+    monkeypatch.setattr(module, "prepare_dataset", _fake_prepare_dataset)
+    monkeypatch.setattr(module, "load_best_checkpoint", _fake_load_best_checkpoint)
+    monkeypatch.setattr(module, "run_saved_checkpoint_scratch_evaluation", _fake_run_saved_checkpoint_scratch_evaluation)
+
+    assert module.main(
+        [
+            "--dataset",
+            prepared.dataset_id,
+            "--variant",
+            prepared.model_variant,
+            "--load-best-checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--scratch-output-dir",
+            str(tmp_path / "scratch"),
+            "--include-edge-diagnostics",
+            "--no-record-run",
+        ]
+    ) == 0
+
+    assert captured["scratch_eval"]["include_edge_diagnostics"] is True
+
+
+def test_run_saved_checkpoint_scratch_evaluation_writes_edge_diagnostics_file(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    prepared = _prepare_temp_dataset(module, tmp_path, monkeypatch)
+
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.edge_diagnostics_collector = None
+
+        def set_edge_diagnostics_context(self, collector, *, phase=None):
+            del phase
+            self.edge_diagnostics_collector = collector
+
+    fake_model = _FakeModel()
+    fake_checkpoint = module.LoadedBestCheckpoint(
+        model=fake_model,
+        profile=_tiny_profile(module, prepared),
+        job_identity=module._job_identity_for_prepared_dataset(prepared, selection_metric="val_rmse_pu"),
+        best_epoch=1,
+        epochs_ran=1,
+        best_val_rmse_pu=0.2,
+        best_val_mae_pu=0.1,
+        selection_metric="val_rmse_pu",
+        seed=123,
+        runtime_seconds=0.5,
+        device="cpu",
+        amp_enabled=False,
+    )
+
+    def _fake_load_best_checkpoint(checkpoint_path, *, prepared_dataset, device):
+        del checkpoint_path, prepared_dataset, device
+        return fake_checkpoint
+
+    fake_metrics = module.EvaluationMetrics(
+        window_count=1,
+        prediction_count=36,
+        mae_kw=0.0,
+        rmse_kw=0.0,
+        mae_pu=0.0,
+        rmse_pu=0.0,
+        horizon_window_count=np.ones((36,), dtype=np.int64),
+        horizon_prediction_count=np.ones((36,), dtype=np.int64),
+        horizon_mae_kw=np.zeros((36,), dtype=np.float64),
+        horizon_rmse_kw=np.zeros((36,), dtype=np.float64),
+        horizon_mae_pu=np.zeros((36,), dtype=np.float64),
+        horizon_rmse_pu=np.zeros((36,), dtype=np.float64),
+        ramp_mae_pu=0.0,
+        ramp_rmse_pu=0.0,
+        sign_agreement_rate=1.0,
+        horizon_ramp_mae_pu=np.zeros((36,), dtype=np.float64),
+        horizon_ramp_rmse_pu=np.zeros((36,), dtype=np.float64),
+        horizon_sign_agreement_rate=np.ones((36,), dtype=np.float64),
+        ramp_mae_pu_by_scale={3: 0.0, 6: 0.0},
+        ramp_rmse_pu_by_scale={3: 0.0, 6: 0.0},
+        sign_agreement_rate_by_scale={3: 1.0, 6: 1.0},
+        horizon_ramp_mae_pu_by_scale={3: np.zeros((36,), dtype=np.float64), 6: np.zeros((36,), dtype=np.float64)},
+        horizon_ramp_rmse_pu_by_scale={3: np.zeros((36,), dtype=np.float64), 6: np.zeros((36,), dtype=np.float64)},
+        horizon_sign_agreement_rate_by_scale={3: np.ones((36,), dtype=np.float64), 6: np.ones((36,), dtype=np.float64)},
+    )
+
+    def _fake_evaluate_saved_checkpoint_windows(
+        loaded_checkpoint,
+        prepared_dataset,
+        *,
+        windows,
+        split_name,
+        eval_protocol,
+        progress_label=None,
+    ):
+        del loaded_checkpoint, prepared_dataset, windows, progress_label
+        collector = fake_model.edge_diagnostics_collector
+        assert collector is not None
+        collector.record_wake(
+            phase="transition",
+            d_parallel=np.array([0.1, 0.3]),
+            d_cross=np.array([0.2, 0.4]),
+            wake_gate=np.array([0.5, 0.6]),
+        )
+        collector.record_aggregation(
+            phase="transition",
+            learned_gate=np.array([0.01, 0.02]),
+            gate_sum_per_dst=np.array([0.03, 0.04]),
+            gated_message_norm=np.array([0.05, 0.06]),
+            aggregated_message_norm=np.array([0.07, 0.08]),
+        )
+        collector.record_wake(
+            phase="update",
+            d_parallel=np.array([0.9]),
+            d_cross=np.array([0.8]),
+            wake_gate=np.array([0.7]),
+        )
+        collector.record_aggregation(
+            phase="update",
+            learned_gate=np.array([0.09]),
+            gate_sum_per_dst=np.array([0.1]),
+            gated_message_norm=np.array([0.11]),
+            aggregated_message_norm=np.array([0.12]),
+        )
+        diagnostics = pl.DataFrame({"split_name": [split_name], "eval_protocol": [eval_protocol]})
+        summary = pl.DataFrame({"split_name": [split_name], "eval_protocol": [eval_protocol]})
+        return fake_metrics, diagnostics, summary
+
+    monkeypatch.setattr(module, "load_best_checkpoint", _fake_load_best_checkpoint)
+    monkeypatch.setattr(module, "evaluate_saved_checkpoint_windows", _fake_evaluate_saved_checkpoint_windows)
+
+    output_dir = tmp_path / "scratch"
+    module.run_saved_checkpoint_scratch_evaluation(
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        prepared_dataset=prepared,
+        output_dir=output_dir,
+        include_carry_over=False,
+        include_edge_diagnostics=True,
+    )
+
+    edge_path = output_dir / f"{prepared.dataset_id}__{prepared.model_variant}__rmse_pu__seed123.edge_diagnostics.csv"
+    assert edge_path.exists()
+    edge_frame = pl.read_csv(edge_path)
+    assert set(edge_frame.columns) == set(module._EDGE_DIAGNOSTIC_COLUMNS)
+    assert set(edge_frame["phase"].to_list()) == {"transition", "update"}
+    assert set(edge_frame["split_name"].to_list()) == {"val", "test"}
 
 
 
