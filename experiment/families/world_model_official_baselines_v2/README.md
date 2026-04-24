@@ -78,6 +78,20 @@ official trainable adapters as blocked rows, not performance results:
   --run-label official_baselines_v2_formal_tuning_start_20260424
 ```
 
+For neural adapter bring-up, keep checkpoint selection validation-only but bound
+the validation surface while debugging:
+
+```shell
+./.conda/bin/python run_world_model_official_baselines_v2_formal_tuning.py \
+  --variant dgcrn_official_core_residual_b2_v2 \
+  --eval-protocol non_overlap \
+  --checkpoint-eval-protocol non_overlap \
+  --max-checkpoint-origins 1310 \
+  --gate-origin-count 64 \
+  --output-path ../../artifacts/scratch/world_model_official_baselines_v2/dgcrn_debug.csv \
+  --no-record-run
+```
+
 Current executable formal rows include analytic persistence, the closed-form
 Ridge residual control, Chronos-2 zero-shot, DGCRN official-core
 direct/residual, TimeXer official target-only direct/residual, and iTransformer

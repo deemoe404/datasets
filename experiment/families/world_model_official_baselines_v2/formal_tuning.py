@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
 import math
@@ -120,6 +120,33 @@ def _selected_window_specs(
         for split_name, eval_protocol, windows in _windows_by_split(prepared)
         if (not split_filter or split_name in split_filter) and (not eval_filter or eval_protocol in eval_filter)
     )
+
+
+def _limit_windows(windows: Any, max_origins: int | None) -> Any:
+    if max_origins is None or len(windows) <= max_origins:
+        return windows
+    keep = np.arange(int(max_origins), dtype=np.int64)
+    return replace(
+        windows,
+        target_indices=windows.target_indices[keep],
+        output_start_us=windows.output_start_us[keep],
+        output_end_us=windows.output_end_us[keep],
+    )
+
+
+def _validation_windows_for_checkpoint(
+    prepared: Any,
+    *,
+    eval_protocol: str,
+    max_origins: int | None,
+) -> Any:
+    if eval_protocol == ROLLING_EVAL_PROTOCOL:
+        windows = prepared.val_rolling_windows
+    elif eval_protocol == NON_OVERLAP_EVAL_PROTOCOL:
+        windows = prepared.val_non_overlap_windows
+    else:
+        raise ValueError(f"Unsupported checkpoint eval protocol {eval_protocol!r}.")
+    return _limit_windows(windows, max_origins)
 
 
 def _target_and_valid(prepared: Any, windows: Any) -> tuple[np.ndarray, np.ndarray]:
@@ -595,6 +622,7 @@ def _train_itransformer(
     prepared: Any,
     *,
     variant_name: str,
+    validation_windows: Any,
     seed: int,
     device: str,
     batch_size: int,
@@ -652,12 +680,12 @@ def _train_itransformer(
         val_predictions = _evaluate_itransformer(
             model,
             prepared,
-            prepared.val_rolling_windows,
+            validation_windows,
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
         )
-        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
         history.append(
             {
@@ -688,6 +716,7 @@ def _train_dgcrn(
     prepared: Any,
     *,
     variant_name: str,
+    validation_windows: Any,
     seed: int,
     device: str,
     batch_size: int,
@@ -749,12 +778,12 @@ def _train_dgcrn(
         val_predictions = _evaluate_dgcrn(
             model,
             prepared,
-            prepared.val_rolling_windows,
+            validation_windows,
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
         )
-        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
         history.append(
             {
@@ -785,6 +814,7 @@ def _train_timexer(
     prepared: Any,
     *,
     variant_name: str,
+    validation_windows: Any,
     seed: int,
     device: str,
     batch_size: int,
@@ -844,12 +874,12 @@ def _train_timexer(
         val_predictions = _evaluate_timexer(
             model,
             prepared,
-            prepared.val_rolling_windows,
+            validation_windows,
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
         )
-        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
         history.append(
             {
@@ -972,6 +1002,52 @@ def _evaluate_timexer(
             predictions[offset : offset + raw.shape[0]] = raw
             offset += raw.shape[0]
     return predictions
+
+
+def _gate_status_for_neural_model(
+    *,
+    evaluator: Any,
+    model: Any,
+    prepared: Any,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    train_gate_windows: Any,
+    gate_c_windows: Any,
+    persistence_train_rmse: float,
+    persistence_gate_c_lead1_rmse: float,
+    persistence_gate_c_lead1_mae: float,
+) -> tuple[bool, bool, dict[str, Any], dict[str, Any]]:
+    train_predictions = evaluator(
+        model,
+        prepared,
+        train_gate_windows,
+        variant_name=variant_name,
+        device=device,
+        batch_size=batch_size,
+    )
+    train_targets, train_valid = _target_and_valid(prepared, train_gate_windows)
+    train_metrics = _metrics(train_predictions, train_targets, train_valid, rated_power_kw=prepared.rated_power_kw)
+    gate_b_passed = bool(
+        train_metrics["rmse_pu"] <= 0.03
+        or train_metrics["rmse_pu"] <= 0.5 * persistence_train_rmse
+    )
+
+    gate_c_predictions = evaluator(
+        model,
+        prepared,
+        gate_c_windows,
+        variant_name=variant_name,
+        device=device,
+        batch_size=batch_size,
+    )
+    gate_c_targets, gate_c_valid = _target_and_valid(prepared, gate_c_windows)
+    gate_c_metrics = _metrics(gate_c_predictions, gate_c_targets, gate_c_valid, rated_power_kw=prepared.rated_power_kw)
+    gate_c_passed = bool(
+        gate_c_metrics["lead1_rmse_pu"] <= 1.05 * persistence_gate_c_lead1_rmse
+        and gate_c_metrics["lead1_mae_pu"] <= 1.05 * persistence_gate_c_lead1_mae
+    )
+    return gate_b_passed, gate_c_passed, train_metrics, gate_c_metrics
 
 
 def _base_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int) -> dict[str, Any]:
@@ -1100,6 +1176,9 @@ def run_formal_tuning(
     learning_rate: float = 1e-4,
     split_names: Sequence[str] | None = None,
     eval_protocols: Sequence[str] | None = None,
+    checkpoint_eval_protocol: str = ROLLING_EVAL_PROTOCOL,
+    max_checkpoint_origins: int | None = None,
+    gate_origin_count: int = 64,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -1110,16 +1189,41 @@ def run_formal_tuning(
         window_specs = _selected_window_specs(prepared, split_names=split_names, eval_protocols=eval_protocols)
         if not window_specs:
             raise ValueError("No evaluation windows selected by split_names/eval_protocols.")
-        persistence_train_predictions = _repeat_anchor(_last_value_anchor(prepared, prepared.train_windows), prepared.forecast_steps)
-        train_targets, train_valid = _target_and_valid(prepared, prepared.train_windows)
-        persistence_train_metrics = _metrics(
-            persistence_train_predictions,
-            train_targets,
-            train_valid,
+        checkpoint_windows = _validation_windows_for_checkpoint(
+            prepared,
+            eval_protocol=checkpoint_eval_protocol,
+            max_origins=max_checkpoint_origins,
+        )
+        train_gate_windows = _limit_windows(prepared.train_windows, gate_origin_count)
+        gate_c_windows = _validation_windows_for_checkpoint(
+            prepared,
+            eval_protocol=checkpoint_eval_protocol,
+            max_origins=gate_origin_count,
+        )
+        persistence_train_gate_predictions = _repeat_anchor(
+            _last_value_anchor(prepared, train_gate_windows),
+            prepared.forecast_steps,
+        )
+        train_gate_targets, train_gate_valid = _target_and_valid(prepared, train_gate_windows)
+        persistence_train_gate_metrics = _metrics(
+            persistence_train_gate_predictions,
+            train_gate_targets,
+            train_gate_valid,
             rated_power_kw=prepared.rated_power_kw,
         )
-        persistence_val_lead1_rmse: float | None = None
-        persistence_val_lead1_mae: float | None = None
+        persistence_gate_c_predictions = _repeat_anchor(
+            _last_value_anchor(prepared, gate_c_windows),
+            prepared.forecast_steps,
+        )
+        gate_c_targets, gate_c_valid = _target_and_valid(prepared, gate_c_windows)
+        persistence_gate_c_metrics = _metrics(
+            persistence_gate_c_predictions,
+            gate_c_targets,
+            gate_c_valid,
+            rated_power_kw=prepared.rated_power_kw,
+        )
+        persistence_val_lead1_rmse: float | None = persistence_gate_c_metrics["lead1_rmse_pu"]
+        persistence_val_lead1_mae: float | None = persistence_gate_c_metrics["lead1_mae_pu"]
         for spec in specs:
             status, blocker = formal_support_status(spec)
             if status != "supported":
@@ -1131,9 +1235,10 @@ def run_formal_tuning(
                     (split_name, eval_protocol): _repeat_anchor(_last_value_anchor(prepared, windows), prepared.forecast_steps)
                     for split_name, eval_protocol, windows in window_specs
                 }
-                val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+                val_predictions = _repeat_anchor(_last_value_anchor(prepared, gate_c_windows), prepared.forecast_steps)
+                val_targets, val_valid = _target_and_valid(prepared, gate_c_windows)
                 val_metrics = _metrics(
-                    predictions_by_split[("val", ROLLING_EVAL_PROTOCOL)],
+                    val_predictions,
                     val_targets,
                     val_valid,
                     rated_power_kw=prepared.rated_power_kw,
@@ -1187,22 +1292,29 @@ def run_formal_tuning(
                     val_predictions = _predict_ridge(prepared, prepared.val_rolling_windows, weights)
                     val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
                     val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
-                    gate_b_predictions = _predict_ridge(prepared, prepared.train_windows, weights)
+                    gate_b_predictions = _predict_ridge(prepared, train_gate_windows, weights)
                     gate_b_metrics = _metrics(
                         gate_b_predictions,
-                        train_targets,
-                        train_valid,
+                        train_gate_targets,
+                        train_gate_valid,
                         rated_power_kw=prepared.rated_power_kw,
                     )
                     gate_b_passed = bool(
                         gate_b_metrics["rmse_pu"] <= 0.03
-                        or gate_b_metrics["rmse_pu"] <= 0.5 * persistence_train_metrics["rmse_pu"]
+                        or gate_b_metrics["rmse_pu"] <= 0.5 * persistence_train_gate_metrics["rmse_pu"]
+                    )
+                    gate_c_predictions = _predict_ridge(prepared, gate_c_windows, weights)
+                    gate_c_metrics = _metrics(
+                        gate_c_predictions,
+                        gate_c_targets,
+                        gate_c_valid,
+                        rated_power_kw=prepared.rated_power_kw,
                     )
                     gate_c_passed = bool(
                         persistence_val_lead1_rmse is not None
                         and persistence_val_lead1_mae is not None
-                        and val_metrics["lead1_rmse_pu"] <= 1.05 * persistence_val_lead1_rmse
-                        and val_metrics["lead1_mae_pu"] <= 1.05 * persistence_val_lead1_mae
+                        and gate_c_metrics["lead1_rmse_pu"] <= 1.05 * persistence_val_lead1_rmse
+                        and gate_c_metrics["lead1_mae_pu"] <= 1.05 * persistence_val_lead1_mae
                     )
                     predictions_by_split = {
                         (split_name, eval_protocol): _predict_ridge(prepared, windows, weights)
@@ -1267,6 +1379,7 @@ def run_formal_tuning(
                 model, train_summary = _train_dgcrn(
                     prepared,
                     variant_name=spec.model_variant,
+                    validation_windows=checkpoint_windows,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1287,6 +1400,19 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
+                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                    evaluator=_evaluate_dgcrn,
+                    model=model,
+                    prepared=prepared,
+                    variant_name=spec.model_variant,
+                    device=train_summary["device"],
+                    batch_size=train_batch_size,
+                    train_gate_windows=train_gate_windows,
+                    gate_c_windows=gate_c_windows,
+                    persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
+                    persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
+                    persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
                 rows.extend(
                     _metric_rows(
                         spec,
@@ -1301,8 +1427,8 @@ def run_formal_tuning(
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=None,
-                        gate_c_passed=None,
+                        gate_b_passed=gate_b_passed,
+                        gate_c_passed=gate_c_passed,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1311,6 +1437,7 @@ def run_formal_tuning(
                 model, train_summary = _train_timexer(
                     prepared,
                     variant_name=spec.model_variant,
+                    validation_windows=checkpoint_windows,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1333,6 +1460,19 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
+                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                    evaluator=_evaluate_timexer,
+                    model=model,
+                    prepared=prepared,
+                    variant_name=spec.model_variant,
+                    device=train_summary["device"],
+                    batch_size=train_batch_size,
+                    train_gate_windows=train_gate_windows,
+                    gate_c_windows=gate_c_windows,
+                    persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
+                    persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
+                    persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
                 rows.extend(
                     _metric_rows(
                         spec,
@@ -1347,8 +1487,8 @@ def run_formal_tuning(
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=None,
-                        gate_c_passed=None,
+                        gate_b_passed=gate_b_passed,
+                        gate_c_passed=gate_c_passed,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1357,6 +1497,7 @@ def run_formal_tuning(
                 model, train_summary = _train_itransformer(
                     prepared,
                     variant_name=spec.model_variant,
+                    validation_windows=checkpoint_windows,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1378,6 +1519,19 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
+                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                    evaluator=_evaluate_itransformer,
+                    model=model,
+                    prepared=prepared,
+                    variant_name=spec.model_variant,
+                    device=train_summary["device"],
+                    batch_size=train_batch_size,
+                    train_gate_windows=train_gate_windows,
+                    gate_c_windows=gate_c_windows,
+                    persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
+                    persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
+                    persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
                 rows.extend(
                     _metric_rows(
                         spec,
@@ -1392,8 +1546,8 @@ def run_formal_tuning(
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=None,
-                        gate_c_passed=None,
+                        gate_b_passed=gate_b_passed,
+                        gate_c_passed=gate_c_passed,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1418,6 +1572,9 @@ def run_formal_tuning(
         "learning_rate": learning_rate,
         "split_names": list(split_names) if split_names else None,
         "eval_protocols": list(eval_protocols) if eval_protocols else None,
+        "checkpoint_eval_protocol": checkpoint_eval_protocol,
+        "max_checkpoint_origins": max_checkpoint_origins,
+        "gate_origin_count": gate_origin_count,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -1440,6 +1597,9 @@ def run_formal_tuning(
                 "learning_rate": learning_rate,
                 "split_names": list(split_names) if split_names else None,
                 "eval_protocols": list(eval_protocols) if eval_protocols else None,
+                "checkpoint_eval_protocol": checkpoint_eval_protocol,
+                "max_checkpoint_origins": max_checkpoint_origins,
+                "gate_origin_count": gate_origin_count,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -1475,8 +1635,8 @@ def _enrich_formal_manifest(manifest_path: str | Path, *, summary: dict[str, Any
     payload["quality_gates"].update(
         {
             "gate_a": {"status": "previous_debug_snapshots_written"},
-            "gate_b": {"status": "computed_for_ridge_residual_controls_only"},
-            "gate_c": {"status": "computed_for_ridge_residual_controls_only"},
+            "gate_b": {"status": "computed_for_ridge_and_supported_neural_trainable_paths"},
+            "gate_c": {"status": "computed_for_ridge_and_supported_neural_trainable_paths"},
             "gate_d": {"status": "validation_only_selection"},
             "gate_e": {"status": "test_once_for_selected_completed_trials"},
         }
@@ -1505,6 +1665,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=[ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL],
         dest="eval_protocols",
     )
+    parser.add_argument(
+        "--checkpoint-eval-protocol",
+        choices=[ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL],
+        default=ROLLING_EVAL_PROTOCOL,
+    )
+    parser.add_argument("--max-checkpoint-origins", type=int, default=None)
+    parser.add_argument("--gate-origin-count", type=int, default=64)
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -1527,6 +1694,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         learning_rate=args.learning_rate,
         split_names=tuple(args.split_names) if args.split_names else None,
         eval_protocols=tuple(args.eval_protocols) if args.eval_protocols else None,
+        checkpoint_eval_protocol=args.checkpoint_eval_protocol,
+        max_checkpoint_origins=args.max_checkpoint_origins,
+        gate_origin_count=args.gate_origin_count,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )
