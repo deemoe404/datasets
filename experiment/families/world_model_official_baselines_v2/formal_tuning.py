@@ -100,6 +100,21 @@ def _windows_by_split(prepared: Any) -> tuple[tuple[str, str, Any], ...]:
     )
 
 
+def _selected_window_specs(
+    prepared: Any,
+    *,
+    split_names: Sequence[str] | None = None,
+    eval_protocols: Sequence[str] | None = None,
+) -> tuple[tuple[str, str, Any], ...]:
+    split_filter = set(split_names or ())
+    eval_filter = set(eval_protocols or ())
+    return tuple(
+        (split_name, eval_protocol, windows)
+        for split_name, eval_protocol, windows in _windows_by_split(prepared)
+        if (not split_filter or split_name in split_filter) and (not eval_filter or eval_protocol in eval_filter)
+    )
+
+
 def _target_and_valid(prepared: Any, windows: Any) -> tuple[np.ndarray, np.ndarray]:
     targets = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
     valid = np.zeros_like(targets, dtype=np.float32)
@@ -597,9 +612,10 @@ def _metric_rows(
     gate_b_passed: bool | None,
     gate_c_passed: bool | None,
     best_trial: bool,
+    window_specs: Sequence[tuple[str, str, Any]],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for split_name, eval_protocol, windows in _windows_by_split(prepared):
+    for split_name, eval_protocol, windows in window_specs:
         predictions = predictions_by_split[(split_name, eval_protocol)]
         targets, valid = _target_and_valid(prepared, windows)
         metrics = _metrics(predictions, targets, valid, rated_power_kw=prepared.rated_power_kw)
@@ -674,6 +690,8 @@ def run_formal_tuning(
     train_batch_size: int = 128,
     max_epochs: int = 3,
     learning_rate: float = 1e-4,
+    split_names: Sequence[str] | None = None,
+    eval_protocols: Sequence[str] | None = None,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -681,6 +699,9 @@ def run_formal_tuning(
     rows: list[dict[str, Any]] = []
     for dataset_id in dataset_ids:
         prepared = _prepare_dataset(dataset_id, max_train_origins=max_train_origins, max_eval_origins=max_eval_origins)
+        window_specs = _selected_window_specs(prepared, split_names=split_names, eval_protocols=eval_protocols)
+        if not window_specs:
+            raise ValueError("No evaluation windows selected by split_names/eval_protocols.")
         persistence_train_predictions = _repeat_anchor(_last_value_anchor(prepared, prepared.train_windows), prepared.forecast_steps)
         train_targets, train_valid = _target_and_valid(prepared, prepared.train_windows)
         persistence_train_metrics = _metrics(
@@ -700,7 +721,7 @@ def run_formal_tuning(
             if spec.model_variant == PERSISTENCE_VARIANT:
                 predictions_by_split = {
                     (split_name, eval_protocol): _repeat_anchor(_last_value_anchor(prepared, windows), prepared.forecast_steps)
-                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                    for split_name, eval_protocol, windows in window_specs
                 }
                 val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
                 val_metrics = _metrics(
@@ -724,12 +745,13 @@ def run_formal_tuning(
                         gate_b_passed=None,
                         gate_c_passed=True,
                         best_trial=True,
+                        window_specs=window_specs,
                     )
                 )
             elif spec.model_variant == SEASONAL_PERSISTENCE_VARIANT:
                 predictions_by_split = {
                     (split_name, eval_protocol): _repeat_anchor(_seasonal_anchor(prepared, windows), prepared.forecast_steps)
-                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                    for split_name, eval_protocol, windows in window_specs
                 }
                 rows.extend(
                     _metric_rows(
@@ -744,6 +766,7 @@ def run_formal_tuning(
                         gate_b_passed=None,
                         gate_c_passed=None,
                         best_trial=True,
+                        window_specs=window_specs,
                     )
                 )
             elif spec.model_variant == RIDGE_RESIDUAL_VARIANT:
@@ -775,7 +798,7 @@ def run_formal_tuning(
                     )
                     predictions_by_split = {
                         (split_name, eval_protocol): _predict_ridge(prepared, windows, weights)
-                        for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                        for split_name, eval_protocol, windows in window_specs
                     }
                     trial_summaries.append(
                         (
@@ -802,6 +825,7 @@ def run_formal_tuning(
                             gate_b_passed=gate_b_passed,
                             gate_c_passed=gate_c_passed,
                             best_trial=index == best_index,
+                            window_specs=window_specs,
                         )
                     )
             elif spec.model_variant == CHRONOS2_VARIANT:
@@ -813,7 +837,7 @@ def run_formal_tuning(
                         windows,
                         batch_size=chronos_batch_size,
                     )
-                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                    for split_name, eval_protocol, windows in window_specs
                 }
                 rows.extend(
                     _metric_rows(
@@ -828,6 +852,7 @@ def run_formal_tuning(
                         gate_b_passed=None,
                         gate_c_passed=None,
                         best_trial=True,
+                        window_specs=window_specs,
                     )
                 )
             elif spec.model_variant in {ITRANSFORMER_TARGET_DIRECT_VARIANT, ITRANSFORMER_TARGET_RESIDUAL_VARIANT}:
@@ -853,7 +878,7 @@ def run_formal_tuning(
                         device=train_summary["device"],
                         batch_size=train_batch_size,
                     )
-                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                    for split_name, eval_protocol, windows in window_specs
                 }
                 rows.extend(
                     _metric_rows(
@@ -872,6 +897,7 @@ def run_formal_tuning(
                         gate_b_passed=None,
                         gate_c_passed=None,
                         best_trial=True,
+                        window_specs=window_specs,
                     )
                 )
     frame = pl.DataFrame(rows)
@@ -892,6 +918,8 @@ def run_formal_tuning(
         "train_batch_size": train_batch_size,
         "max_epochs": max_epochs,
         "learning_rate": learning_rate,
+        "split_names": list(split_names) if split_names else None,
+        "eval_protocols": list(eval_protocols) if eval_protocols else None,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -912,6 +940,8 @@ def run_formal_tuning(
                 "train_batch_size": train_batch_size,
                 "max_epochs": max_epochs,
                 "learning_rate": learning_rate,
+                "split_names": list(split_names) if split_names else None,
+                "eval_protocols": list(eval_protocols) if eval_protocols else None,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -920,8 +950,8 @@ def run_formal_tuning(
             dataset_ids=tuple(dataset_ids),
             feature_protocol_ids=(FEATURE_PROTOCOL_ID,),
             model_variants=tuple(spec.model_variant for spec in specs),
-            eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
-            result_splits=("val", "test", "formal_tuning_blocked"),
+            eval_protocols=tuple(eval_protocols or (ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL)),
+            result_splits=tuple(split_names or ("val", "test", "formal_tuning_blocked")),
             artifacts={"summary": summary_path},
             notes=(
                 "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, "
@@ -970,6 +1000,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-batch-size", type=int, default=128)
     parser.add_argument("--max-epochs", type=int, default=3)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--split-name", action="append", choices=["val", "test"], dest="split_names")
+    parser.add_argument(
+        "--eval-protocol",
+        action="append",
+        choices=[ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL],
+        dest="eval_protocols",
+    )
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -990,6 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_batch_size=args.train_batch_size,
         max_epochs=args.max_epochs,
         learning_rate=args.learning_rate,
+        split_names=tuple(args.split_names) if args.split_names else None,
+        eval_protocols=tuple(args.eval_protocols) if args.eval_protocols else None,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )
