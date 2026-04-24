@@ -36,6 +36,8 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
+    TIMEXER_TARGET_DIRECT_VARIANT,
+    TIMEXER_TARGET_RESIDUAL_VARIANT,
     TASK_ID,
     OfficialVariantSpec,
     resolve_variant_specs,
@@ -48,13 +50,15 @@ FORMAL_SUPPORTED_VARIANTS = {
     CHRONOS2_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+    TIMEXER_TARGET_DIRECT_VARIANT,
+    TIMEXER_TARGET_RESIDUAL_VARIANT,
 }
 FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
     "dgcrn_official_core": "official_core_training_adapter_not_implemented",
-    "timexer_official": "official_training_adapter_not_implemented",
+    "timexer_official_full_exog": "official_full_exog_adapter_not_implemented",
     "itransformer_official_target_plus_exog": "official_exog_adapter_not_implemented",
     "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
     "mtgnn_official_core": "official_core_training_adapter_not_implemented",
@@ -400,6 +404,33 @@ def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layer
     return Model(configs).to(device)
 
 
+def _load_timexer_model(*, device: str, d_model: int, n_heads: int, e_layers: int, dropout: float, patch_len: int):
+    source_root = REPO_ROOT / "experiment" / "official_baselines" / "timexer" / "source"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from models.TimeXer import Model  # type: ignore
+
+    configs = SimpleNamespace(
+        task_name="long_term_forecast",
+        features="M",
+        seq_len=HISTORY_STEPS,
+        pred_len=FORECAST_STEPS,
+        use_norm=True,
+        patch_len=patch_len,
+        enc_in=6,
+        d_model=d_model,
+        embed="timeF",
+        freq="h",
+        dropout=dropout,
+        factor=1,
+        n_heads=n_heads,
+        d_ff=d_model * 4,
+        e_layers=e_layers,
+        activation="gelu",
+    )
+    return Model(configs).to(device)
+
+
 def _iter_target_only_batches(
     prepared: Any,
     windows: Any,
@@ -534,6 +565,101 @@ def _train_itransformer(
     }
 
 
+def _train_timexer(
+    prepared: Any,
+    *,
+    variant_name: str,
+    seed: int,
+    device: str,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    d_model: int,
+    n_heads: int,
+    e_layers: int,
+    dropout: float,
+    patch_len: int,
+) -> tuple[Any, dict[str, Any]]:
+    import torch
+
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    model = _load_timexer_model(
+        device=resolved_device,
+        d_model=d_model,
+        n_heads=n_heads,
+        e_layers=e_layers,
+        dropout=dropout,
+        patch_len=patch_len,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    best_state = None
+    best_val_rmse = math.inf
+    best_val_mae = math.inf
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    residual_output = variant_name == TIMEXER_TARGET_RESIDUAL_VARIANT
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_batches = 0
+        for x_np, y_np, valid_np, anchor_np in _iter_target_only_batches(
+            prepared,
+            prepared.train_windows,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed + epoch,
+        ):
+            x = torch.as_tensor(x_np, device=resolved_device)
+            y = torch.as_tensor(y_np, device=resolved_device)
+            valid = torch.as_tensor(valid_np, device=resolved_device)
+            anchor = torch.as_tensor(anchor_np, device=resolved_device)
+            target = y - anchor[:, None, :] if residual_output else y
+            optimizer.zero_grad(set_to_none=True)
+            raw = model(x, None, None, None)
+            loss = _masked_mse_torch(raw, target, valid)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss_sum += float(loss.detach().cpu())
+            train_batches += 1
+        val_predictions = _evaluate_timexer(
+            model,
+            prepared,
+            prepared.val_rolling_windows,
+            variant_name=variant_name,
+            device=resolved_device,
+            batch_size=batch_size,
+        )
+        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss_mean": train_loss_sum / max(train_batches, 1),
+                "val_rmse_pu": val_metrics["rmse_pu"],
+                "val_mae_pu": val_metrics["mae_pu"],
+            }
+        )
+        if val_metrics["rmse_pu"] < best_val_rmse:
+            best_val_rmse = float(val_metrics["rmse_pu"])
+            best_val_mae = float(val_metrics["mae_pu"])
+            best_epoch = epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {
+        "best_epoch": best_epoch,
+        "epochs_ran": max_epochs,
+        "best_val_rmse_pu": best_val_rmse,
+        "best_val_mae_pu": best_val_mae,
+        "history": history,
+        "device": resolved_device,
+    }
+
+
 def _evaluate_itransformer(
     model: Any,
     prepared: Any,
@@ -546,6 +672,38 @@ def _evaluate_itransformer(
     import torch
 
     residual_output = variant_name == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    model.eval()
+    offset = 0
+    with torch.no_grad():
+        for x_np, _y_np, _valid_np, anchor_np in _iter_target_only_batches(
+            prepared,
+            windows,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=0,
+        ):
+            x = torch.as_tensor(x_np, device=device)
+            raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            if residual_output:
+                raw = raw + anchor_np[:, None, :]
+            predictions[offset : offset + raw.shape[0]] = raw
+            offset += raw.shape[0]
+    return predictions
+
+
+def _evaluate_timexer(
+    model: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+) -> np.ndarray:
+    import torch
+
+    residual_output = variant_name == TIMEXER_TARGET_RESIDUAL_VARIANT
     predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
     model.eval()
     offset = 0
@@ -846,6 +1004,52 @@ def run_formal_tuning(
                         seed=seed,
                         trial_id="chronos2_zero_shot_median",
                         search_config_id="chronos2_zero_shot_b2",
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=None,
+                        gate_c_passed=None,
+                        best_trial=True,
+                        window_specs=window_specs,
+                    )
+                )
+            elif spec.model_variant in {TIMEXER_TARGET_DIRECT_VARIANT, TIMEXER_TARGET_RESIDUAL_VARIANT}:
+                model, train_summary = _train_timexer(
+                    prepared,
+                    variant_name=spec.model_variant,
+                    seed=seed,
+                    device=device,
+                    batch_size=train_batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    d_model=64,
+                    n_heads=4,
+                    e_layers=2,
+                    dropout=0.1,
+                    patch_len=16,
+                )
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_timexer(
+                        model,
+                        prepared,
+                        windows,
+                        variant_name=spec.model_variant,
+                        device=train_summary["device"],
+                        batch_size=train_batch_size,
+                    )
+                    for split_name, eval_protocol, windows in window_specs
+                }
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id=(
+                            "timexer_target_only_residual_default"
+                            if spec.model_variant == TIMEXER_TARGET_RESIDUAL_VARIANT
+                            else "timexer_target_only_direct_default"
+                        ),
+                        search_config_id="timexer_target_only_default",
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
