@@ -1,0 +1,31 @@
+{
+  "blocked_rows": 0,
+  "chronos_batch_size": 32,
+  "completed_rows": 4,
+  "created_at_utc": "2026-04-24T09:26:06.001198+00:00",
+  "device": "cuda",
+  "family_id": "world_model_official_baselines_v2",
+  "learning_rate": 0.0001,
+  "max_epochs": 3,
+  "max_eval_origins": null,
+  "max_train_origins": null,
+  "ridge_alphas": [
+    0.0,
+    0.0001,
+    0.001,
+    0.01,
+    0.1,
+    1.0,
+    10.0
+  ],
+  "row_count": 4,
+  "supported_variants": [
+    "baseline_last_value_persistence_v2",
+    "baseline_ridge_residual_persistence_b0_v2",
+    "baseline_seasonal_persistence_v2",
+    "chronos2_official_zero_shot_b2_v2",
+    "itransformer_official_target_only_direct_b0_v2",
+    "itransformer_official_target_only_residual_b0_v2"
+  ],
+  "train_batch_size": 128
+}

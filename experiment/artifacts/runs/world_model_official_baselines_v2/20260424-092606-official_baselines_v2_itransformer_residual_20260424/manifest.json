@@ -1,0 +1,145 @@
+{
+  "args": {
+    "chronos_batch_size": 32,
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "device": "cuda",
+    "learning_rate": 0.0001,
+    "max_epochs": 3,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "seed": 3407,
+    "train_batch_size": 128,
+    "variant_names": [
+      "itransformer_official_target_only_residual_b0_v2"
+    ]
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_official_baselines_v2/20260424-formal-tuning-itransformer-residual.csv",
+      "sha256": "6694f979e41d060947ac07aea4ceee6a286b1f09f16eb3a328cb02396932be5e",
+      "size_bytes": 4271
+    },
+    "summary": {
+      "path": "experiment/artifacts/published/world_model_official_baselines_v2/20260424-formal-tuning-itransformer-residual.summary.json"
+    }
+  },
+  "created_at_utc": "2026-04-24T09:26:06.003829+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_official_baselines_v2.long_metrics.v1",
+    "display_name": "World-Model Official Baselines v2",
+    "family_id": "world_model_official_baselines_v2",
+    "implementation_root": "experiment/families/world_model_official_baselines_v2",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_official_baselines_v2/README.md",
+    "runner_entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "formal_tuning_status": {
+    "blocked_rows": 0,
+    "blocked_rows_are_not_performance_results": true,
+    "chronos_batch_size": 32,
+    "completed_rows": 4,
+    "created_at_utc": "2026-04-24T09:26:06.001198+00:00",
+    "device": "cuda",
+    "family_id": "world_model_official_baselines_v2",
+    "learning_rate": 0.0001,
+    "max_epochs": 3,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "row_count": 4,
+    "supported_variants": [
+      "baseline_last_value_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_seasonal_persistence_v2",
+      "chronos2_official_zero_shot_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2"
+    ],
+    "train_batch_size": 128
+  },
+  "git": {
+    "branch": "codex/official-baselines-v2",
+    "head": "7800a858a408435b0f45d671319195a259644681",
+    "is_dirty": true,
+    "status_short": [
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260424-formal-tuning-itransformer-residual.csv",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260424-formal-tuning-itransformer-residual.summary.json"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2_formal_tuning.py",
+    "kind": "formal_tuning_runner",
+    "run_label": "official_baselines_v2_itransformer_residual_20260424"
+  },
+  "no_test_feedback": true,
+  "notes": [
+    "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, missing official trainable adapters are recorded as blocked rows, not performance results."
+  ],
+  "quality_gates": {
+    "gate_a": {
+      "status": "previous_debug_snapshots_written"
+    },
+    "gate_b": {
+      "status": "computed_for_ridge_residual_controls_only"
+    },
+    "gate_c": {
+      "status": "computed_for_ridge_residual_controls_only"
+    },
+    "gate_d": {
+      "status": "validation_only_selection"
+    },
+    "gate_e": {
+      "status": "test_once_for_selected_completed_trials"
+    }
+  },
+  "result": {
+    "row_count": 4
+  },
+  "schema_version": 1,
+  "selected_by": "validation_only",
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "itransformer_official_target_only_residual_b0_v2"
+    ],
+    "result_splits": [
+      "val",
+      "test",
+      "formal_tuning_blocked"
+    ]
+  },
+  "test_evaluated_at": "2026-04-24T09:26:06.023842+00:00"
+}
