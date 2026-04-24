@@ -29,6 +29,7 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     FEATURE_PROTOCOL_ID,
     FORECAST_STEPS,
     HISTORY_STEPS,
+    CHRONOS2_VARIANT,
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
@@ -41,12 +42,12 @@ FORMAL_SUPPORTED_VARIANTS = {
     PERSISTENCE_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
+    CHRONOS2_VARIANT,
 }
 FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "chronos2_official": "chronos2_zero_shot_execution_not_integrated_in_v2_formal_runner",
     "dgcrn_official_core": "official_core_training_adapter_not_implemented",
     "timexer_official": "official_training_adapter_not_implemented",
     "itransformer_official": "official_training_adapter_not_implemented",
@@ -211,6 +212,149 @@ def _predict_ridge(prepared: Any, windows: Any, weights: np.ndarray) -> np.ndarr
     return (_repeat_anchor(anchor, prepared.forecast_steps) + residual).astype(np.float32)
 
 
+def _load_chronos2_pipeline(*, device: str):
+    from chronos import Chronos2Pipeline  # type: ignore
+
+    pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2", torch_dtype="float32")
+    model = getattr(pipeline, "model", None)
+    if model is not None and hasattr(model, "to"):
+        model.to(device)
+        if hasattr(model, "eval"):
+            model.eval()
+    return pipeline
+
+
+def _chronos_target_and_covariate_names(prepared: Any) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    state_base = _load_state_space_base()
+    local_value_names = prepared.local_input_feature_names[
+        state_base._LOCAL_VALUE_START + 1 : state_base._LOCAL_MASK_START
+    ]
+    global_value_names = prepared.context_history_feature_names[
+        state_base._CONTEXT_GLOBAL_VALUE_START : state_base._CONTEXT_GLOBAL_MASK_START
+    ]
+    calendar_names = prepared.context_history_feature_names[state_base._CONTEXT_CALENDAR_START :]
+    return tuple(local_value_names), tuple(global_value_names), tuple(calendar_names)
+
+
+def _chronos_input_for(prepared: Any, *, target_index: int, node_index: int) -> dict[str, Any]:
+    state_base = _load_state_space_base()
+    history = slice(target_index - prepared.history_steps, target_index)
+    future = slice(target_index, target_index + prepared.forecast_steps)
+    local_value_names, global_value_names, calendar_names = _chronos_target_and_covariate_names(prepared)
+    target = prepared.local_history_tensor[history, node_index, state_base._LOCAL_VALUE_START].astype(np.float32, copy=True)
+    target_mask = prepared.local_history_tensor[history, node_index, state_base._LOCAL_MASK_START]
+    target[target_mask >= 0.5] = np.nan
+
+    past_covariates: dict[str, np.ndarray] = {}
+    local_values = prepared.local_history_tensor[
+        history,
+        node_index,
+        state_base._LOCAL_VALUE_START + 1 : state_base._LOCAL_MASK_START,
+    ]
+    local_masks = prepared.local_history_tensor[
+        history,
+        node_index,
+        state_base._LOCAL_MASK_START + 1 : state_base._LOCAL_DELTA_START,
+    ]
+    for column_index, column_name in enumerate(local_value_names):
+        values = local_values[:, column_index].astype(np.float32, copy=True)
+        values[local_masks[:, column_index] >= 0.5] = np.nan
+        past_covariates[column_name] = values
+
+    global_values = prepared.context_history_tensor[
+        history,
+        state_base._CONTEXT_GLOBAL_VALUE_START : state_base._CONTEXT_GLOBAL_MASK_START,
+    ]
+    global_masks = prepared.context_history_tensor[
+        history,
+        state_base._CONTEXT_GLOBAL_MASK_START : state_base._CONTEXT_GLOBAL_DELTA_START,
+    ]
+    for column_index, column_name in enumerate(global_value_names):
+        values = global_values[:, column_index].astype(np.float32, copy=True)
+        values[global_masks[:, column_index] >= 0.5] = np.nan
+        past_covariates[column_name] = values
+
+    history_calendar = prepared.context_history_tensor[history, state_base._CONTEXT_CALENDAR_START :]
+    future_calendar = prepared.context_future_tensor[future]
+    future_covariates: dict[str, np.ndarray] = {}
+    for column_index, column_name in enumerate(calendar_names):
+        past_covariates[column_name] = history_calendar[:, column_index].astype(np.float32, copy=True)
+        future_covariates[column_name] = future_calendar[:, column_index].astype(np.float32, copy=True)
+    return {
+        "target": target,
+        "past_covariates": past_covariates,
+        "future_covariates": future_covariates,
+    }
+
+
+def _chronos_point_to_numpy(point_forecast: object, *, forecast_steps: int) -> np.ndarray:
+    if hasattr(point_forecast, "detach"):
+        point_forecast = point_forecast.detach()
+    if hasattr(point_forecast, "cpu"):
+        point_forecast = point_forecast.cpu()
+    values = np.asarray(point_forecast, dtype=np.float32)
+    if values.ndim == 2:
+        if values.shape[0] != 1:
+            raise ValueError(f"Expected a single target row from Chronos-2, found {values.shape!r}.")
+        values = values[0]
+    if values.shape != (forecast_steps,):
+        raise ValueError(f"Expected Chronos-2 forecast shape ({forecast_steps},), found {values.shape!r}.")
+    return values
+
+
+def _evaluate_chronos2(
+    pipeline: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    batch_size: int,
+) -> np.ndarray:
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    batch_inputs: list[dict[str, Any]] = []
+    batch_window_ids: list[int] = []
+    batch_node_ids: list[int] = []
+
+    def flush() -> None:
+        if not batch_inputs:
+            return
+        _quantiles, point_forecasts = pipeline.predict_quantiles(
+            batch_inputs,
+            prediction_length=prepared.forecast_steps,
+            batch_size=batch_size,
+            context_length=prepared.history_steps,
+            cross_learning=False,
+            limit_prediction_length=False,
+        )
+        if len(point_forecasts) != len(batch_inputs):
+            raise RuntimeError(
+                f"Chronos-2 returned {len(point_forecasts)} point forecasts for {len(batch_inputs)} inputs."
+            )
+        for row_index, point_forecast in enumerate(point_forecasts):
+            predictions[batch_window_ids[row_index], :, batch_node_ids[row_index]] = _chronos_point_to_numpy(
+                point_forecast,
+                forecast_steps=prepared.forecast_steps,
+            )
+        batch_inputs.clear()
+        batch_window_ids.clear()
+        batch_node_ids.clear()
+
+    for window_pos, target_index in enumerate(windows.target_indices):
+        for node_index in range(prepared.node_count):
+            batch_inputs.append(
+                _chronos_input_for(
+                    prepared,
+                    target_index=int(target_index),
+                    node_index=node_index,
+                )
+            )
+            batch_window_ids.append(window_pos)
+            batch_node_ids.append(node_index)
+            if len(batch_inputs) >= batch_size:
+                flush()
+    flush()
+    return predictions
+
+
 def _base_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int) -> dict[str, Any]:
     budget = spec.feature_budget
     return {
@@ -329,6 +473,8 @@ def run_formal_tuning(
     ridge_alphas: Sequence[float] = DEFAULT_RIDGE_ALPHAS,
     max_train_origins: int | None = None,
     max_eval_origins: int | None = None,
+    chronos_batch_size: int = 32,
+    device: str = "cuda",
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -459,6 +605,32 @@ def run_formal_tuning(
                             best_trial=index == best_index,
                         )
                     )
+            elif spec.model_variant == CHRONOS2_VARIANT:
+                pipeline = _load_chronos2_pipeline(device=device)
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_chronos2(
+                        pipeline,
+                        prepared,
+                        windows,
+                        batch_size=chronos_batch_size,
+                    )
+                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                }
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id="chronos2_zero_shot_median",
+                        search_config_id="chronos2_zero_shot_b2",
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=None,
+                        gate_c_passed=None,
+                        best_trial=True,
+                    )
+                )
     frame = pl.DataFrame(rows)
     resolved_output_path = Path(output_path)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -472,6 +644,8 @@ def run_formal_tuning(
         "blocked_rows": int((frame["trial_status"] == "blocked").sum()) if frame.height else 0,
         "supported_variants": sorted(FORMAL_SUPPORTED_VARIANTS),
         "ridge_alphas": [float(value) for value in ridge_alphas],
+        "chronos_batch_size": chronos_batch_size,
+        "device": device,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -487,6 +661,8 @@ def run_formal_tuning(
                 "variant_names": [spec.model_variant for spec in specs],
                 "seed": seed,
                 "ridge_alphas": [float(value) for value in ridge_alphas],
+                "chronos_batch_size": chronos_batch_size,
+                "device": device,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -540,6 +716,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ridge-alpha", action="append", type=float, dest="ridge_alphas")
     parser.add_argument("--max-train-origins", type=int, default=None)
     parser.add_argument("--max-eval-origins", type=int, default=None)
+    parser.add_argument("--chronos-batch-size", type=int, default=32)
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -555,6 +733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ridge_alphas=tuple(args.ridge_alphas) if args.ridge_alphas else DEFAULT_RIDGE_ALPHAS,
         max_train_origins=args.max_train_origins,
         max_eval_origins=args.max_eval_origins,
+        chronos_batch_size=args.chronos_batch_size,
+        device=args.device,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )
