@@ -287,8 +287,8 @@ def _gate_a_snapshot_for_spec(spec: OfficialVariantSpec) -> dict[str, Any]:
     )
 
 
-def _write_gate_a_snapshots(specs: Sequence[OfficialVariantSpec], *, run_stem: str) -> Path:
-    snapshot_dir = _SCRATCH_ROOT / "gates" / run_stem
+def _write_gate_a_snapshots(specs: Sequence[OfficialVariantSpec], snapshot_dir: str | Path) -> Path:
+    snapshot_dir = Path(snapshot_dir)
     for spec in specs:
         write_batch_debug_snapshot(
             _gate_a_snapshot_for_spec(spec),
@@ -428,7 +428,9 @@ def run_experiment(
     frame = _placeholder_result_rows(specs, dataset_ids, seed)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_csv(resolved_output_path)
-    gate_snapshot_dir = _write_gate_a_snapshots(specs, run_stem=run_stem)
+    gate_snapshot_dir = _SCRATCH_ROOT / "gates" / run_stem
+    if no_record_run:
+        _write_gate_a_snapshots(specs, gate_snapshot_dir)
     history_path = resolved_output_path.with_suffix(".training_history.csv")
     pl.DataFrame(
         {
@@ -453,10 +455,11 @@ def run_experiment(
             model_variants=tuple(spec.model_variant for spec in specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("debug",),
-            artifacts={"training_history": history_path, "gate_a_batch_debug_snapshots": gate_snapshot_dir},
+            artifacts={"training_history": history_path},
             run_label=run_label,
             run_stem=run_stem if output_path is None else None,
         )
+        gate_snapshot_dir = _write_gate_a_snapshots(specs, manifest_path.parent / "gate_a_batch_debug_snapshots")
         _enrich_v2_manifest(
             manifest_path,
             selection_metric=DEFAULT_SELECTION_METRICS[0],
