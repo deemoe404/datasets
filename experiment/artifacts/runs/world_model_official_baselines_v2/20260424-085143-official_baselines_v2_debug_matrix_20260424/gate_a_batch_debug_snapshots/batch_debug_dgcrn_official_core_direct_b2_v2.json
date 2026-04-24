@@ -1,0 +1,37 @@
+{
+  "checks": {
+    "forecast_horizon_is_36": true,
+    "future_target_leakage": false,
+    "input_history_is_144": true
+  },
+  "forecast_steps": 36,
+  "gate": "A_shape_horizon_leakage",
+  "history_steps": 144,
+  "inverse_transform": "per-unit metrics remain in pu; kW metrics multiply by rated power",
+  "known_future_shape": [
+    2,
+    36,
+    7
+  ],
+  "nan_count_after": 0,
+  "nan_count_before": 0,
+  "normalization": "per-unit target using rated power; covariates use task-bundle transforms",
+  "pairwise_shape": null,
+  "static_shape": [
+    6,
+    6
+  ],
+  "uses_future_target": false,
+  "variant_name": "dgcrn_official_core_direct_b2_v2",
+  "x_hist_shape": [
+    2,
+    144,
+    6,
+    8
+  ],
+  "y_future_shape": [
+    2,
+    36,
+    6
+  ]
+}

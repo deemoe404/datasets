@@ -1,0 +1,146 @@
+{
+  "args": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "seed": 3407,
+    "variant_names": [
+      "baseline_last_value_persistence_v2",
+      "baseline_seasonal_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_mlp_residual_persistence_b0_v2",
+      "baseline_gru_residual_persistence_b0_v2",
+      "baseline_tcn_residual_persistence_b0_v2",
+      "dgcrn_official_core_direct_b2_v2",
+      "dgcrn_official_core_residual_b2_v2",
+      "timexer_official_target_only_direct_b0_v2",
+      "timexer_official_target_only_residual_b0_v2",
+      "timexer_official_full_exog_residual_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2",
+      "itransformer_official_target_plus_exog_residual_b2_v2",
+      "tft_pf_per_turbine_direct_b2_v2",
+      "tft_pf_per_turbine_residual_b2_v2",
+      "mtgnn_official_core_target_only_b0_v2",
+      "mtgnn_official_core_calendar_residual_b1_v2",
+      "chronos2_official_zero_shot_b2_v2"
+    ]
+  },
+  "artifacts": {
+    "gate_a_batch_debug_snapshots": {
+      "path": "experiment/artifacts/runs/world_model_official_baselines_v2/20260424-085143-official_baselines_v2_debug_matrix_20260424/gate_a_batch_debug_snapshots"
+    },
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_official_baselines_v2/20260424-debug-matrix.csv",
+      "sha256": "7cdf5b5db047e80cec043e0cd395a8bb3c38ada7624e1d8b344e42c679fa6831",
+      "size_bytes": 9985
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_official_baselines_v2/20260424-debug-matrix.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-24T08:51:43.233608+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_official_baselines_v2.long_metrics.v1",
+    "display_name": "World-Model Official Baselines v2",
+    "family_id": "world_model_official_baselines_v2",
+    "implementation_root": "experiment/families/world_model_official_baselines_v2",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_official_baselines_v2/README.md",
+    "runner_entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "codex/official-baselines-v2",
+    "head": "0641b537f38ffb0dc016542f5ef7d00db50a9fcc",
+    "is_dirty": true,
+    "status_short": [
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "kind": "family_runner",
+    "run_label": "official_baselines_v2_debug_matrix_20260424"
+  },
+  "no_test_feedback": true,
+  "notes": [],
+  "quality_gates": {
+    "gate_a": {
+      "artifact": "experiment/artifacts/runs/world_model_official_baselines_v2/20260424-085143-official_baselines_v2_debug_matrix_20260424/gate_a_batch_debug_snapshots",
+      "name": "shape_horizon_leakage_snapshot",
+      "status": "written"
+    },
+    "gate_b": {
+      "name": "64_window_overfit",
+      "status": "pending_trainable_adapter_execution"
+    },
+    "gate_c": {
+      "name": "10_minute_persistence_continuity",
+      "status": "pending_trainable_adapter_execution"
+    },
+    "gate_d": {
+      "name": "validation_only_selection",
+      "status": "enforced_by_manifest"
+    },
+    "gate_e": {
+      "name": "test_once_frozen_config",
+      "status": "enforced_by_manifest"
+    }
+  },
+  "result": {
+    "no_test_feedback": true,
+    "row_count": 19,
+    "selected_by": "validation_only",
+    "selection_metric": "val_overall_rmse",
+    "test_evaluated_at": null
+  },
+  "schema_version": 1,
+  "selected_by": "validation_only",
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "baseline_last_value_persistence_v2",
+      "baseline_seasonal_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_mlp_residual_persistence_b0_v2",
+      "baseline_gru_residual_persistence_b0_v2",
+      "baseline_tcn_residual_persistence_b0_v2",
+      "dgcrn_official_core_direct_b2_v2",
+      "dgcrn_official_core_residual_b2_v2",
+      "timexer_official_target_only_direct_b0_v2",
+      "timexer_official_target_only_residual_b0_v2",
+      "timexer_official_full_exog_residual_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2",
+      "itransformer_official_target_plus_exog_residual_b2_v2",
+      "tft_pf_per_turbine_direct_b2_v2",
+      "tft_pf_per_turbine_residual_b2_v2",
+      "mtgnn_official_core_target_only_b0_v2",
+      "mtgnn_official_core_calendar_residual_b1_v2",
+      "chronos2_official_zero_shot_b2_v2"
+    ],
+    "no_test_feedback": true,
+    "result_splits": [
+      "debug"
+    ],
+    "selected_by": "validation_only",
+    "selection_metric": "val_overall_rmse",
+    "test_evaluated_at": null
+  },
+  "selection_metric": "val_overall_rmse",
+  "test_evaluated_at": null
+}
