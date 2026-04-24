@@ -1652,3 +1652,170 @@ def test_run_experiment_resume_skips_only_completed_selection_metric_jobs(tmp_pa
         module.SELECTION_METRIC_MAE,
         module.SELECTION_METRIC_RMSE,
     ]
+
+
+def test_run_experiment_reuses_chronos_zero_shot_for_second_selection_metric(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    variant_spec = _chronos_variant_spec(module)
+    prepared = _prepare_temp_dataset(
+        module,
+        tmp_path,
+        monkeypatch,
+        max_train_origins=2,
+        max_eval_origins=1,
+        variant_spec=variant_spec,
+    )
+    output_path = tmp_path / "published" / "chronos.csv"
+    work_root = tmp_path / ".work"
+    resume_paths = module._resume_paths_for_output(output_path=output_path, work_root=work_root)
+    effective_config = module._build_effective_config(
+        dataset_ids=(prepared.dataset_id,),
+        variant_specs=(variant_spec,),
+        selection_metrics=module.DEFAULT_SELECTION_METRICS,
+        device="cpu",
+        seed=7,
+        max_train_origins=None,
+        max_eval_origins=None,
+        batch_size=None,
+        eval_batch_size=4,
+        learning_rate=None,
+        max_epochs=None,
+        early_stopping_patience=None,
+        d_model=None,
+        lstm_hidden_dim=None,
+        attention_heads=None,
+        patch_len=None,
+        encoder_layers=None,
+        ff_hidden_dim=None,
+        residual_channels=None,
+        skip_channels=None,
+        end_channels=None,
+        gcn_depth=None,
+        mtgnn_layers=None,
+        subgraph_size=None,
+        node_embed_dim=None,
+        dilation_exponential=None,
+        propalpha=None,
+        hidden_dim=None,
+        embed_dim=None,
+        num_layers=None,
+        cheb_k=None,
+        teacher_forcing_ratio=None,
+        dropout=None,
+        grad_clip_norm=None,
+        weight_decay=None,
+        bounded_output_epsilon=None,
+        num_workers=None,
+        tensorboard_root=None,
+        disable_tensorboard=True,
+    )
+    profile = module.resolve_hyperparameter_profile(variant_spec.model_variant, dataset_id=prepared.dataset_id)
+    evaluation_results = [
+        (split_name, eval_protocol, windows, _make_eval_metrics(module, prepared, mae_pu=0.1, rmse_pu=0.2))
+        for split_name, eval_protocol, windows in module.iter_evaluation_specs(prepared)
+    ]
+    training_outcome = module.TrainingOutcome(
+        best_epoch=0,
+        epochs_ran=0,
+        best_val_rmse_pu=0.2,
+        best_val_mae_pu=0.1,
+        device="cpu",
+        amp_enabled=False,
+        model=None,
+    )
+    module._reset_resume_slot(resume_paths, effective_config=effective_config)
+    partial_rows = module.build_result_rows(
+        prepared,
+        variant_spec=variant_spec,
+        selection_metric=module.SELECTION_METRIC_RMSE,
+        training_outcome=training_outcome,
+        runtime_seconds=0.5,
+        seed=7,
+        profile=profile,
+        evaluation_results=evaluation_results,
+    )
+    module._write_partial_results(resume_paths, module._result_frame_from_rows(partial_rows))
+    module._append_training_history_row(
+        resume_paths.training_history_path,
+        {
+            **{column: None for column in module._TRAINING_HISTORY_COLUMNS},
+            "dataset_id": prepared.dataset_id,
+            "model_id": module.MODEL_ID,
+            "model_variant": variant_spec.model_variant,
+            "selection_metric": module.SELECTION_METRIC_RMSE,
+            "feature_protocol_id": variant_spec.feature_protocol_id,
+            "task_id": module.TASK_ID,
+            "window_protocol": module.WINDOW_PROTOCOL,
+            "baseline_type": variant_spec.baseline_type,
+            "epoch": 0,
+            "val_mae_pu": 0.1,
+            "val_rmse_pu": 0.2,
+            "best_val_mae_pu": 0.1,
+            "best_val_rmse_pu": 0.2,
+            "is_best_epoch": True,
+            "epochs_without_improvement": 0,
+            "train_batch_count": 0,
+            "train_window_count": len(prepared.train_windows),
+            "val_window_count": len(prepared.val_rolling_windows),
+            "device": "cpu",
+            "seed": 7,
+            "amp_enabled": False,
+        },
+    )
+    module._write_resume_state(
+        resume_paths,
+        status="running",
+        effective_config=effective_config,
+        active_job=module._job_identity(
+            dataset_id=prepared.dataset_id,
+            model_variant=variant_spec.model_variant,
+            selection_metric=module.SELECTION_METRIC_MAE,
+            feature_protocol_id=variant_spec.feature_protocol_id,
+        ),
+    )
+
+    calls: list[str] = []
+
+    def _dataset_loader(*_args, **_kwargs):
+        return prepared
+
+    def _job_runner(_prepared_dataset, **kwargs):
+        calls.append(kwargs["selection_metric"])
+        raise AssertionError("Chronos zero-shot should reuse completed selection-metric results")
+
+    results = module.run_experiment(
+        dataset_ids=(prepared.dataset_id,),
+        variant_names=(variant_spec.model_variant,),
+        selection_metrics=module.DEFAULT_SELECTION_METRICS,
+        output_path=output_path,
+        device="cpu",
+        seed=7,
+        eval_batch_size=4,
+        disable_tensorboard=True,
+        work_root=work_root,
+        dataset_loader=_dataset_loader,
+        job_runner=_job_runner,
+        resume=True,
+    )
+
+    assert calls == []
+    summary_rows = (
+        results.filter(
+            (pl.col("split_name") == "val")
+            & (pl.col("eval_protocol") == module.ROLLING_EVAL_PROTOCOL)
+            & (pl.col("metric_scope") == module.OVERALL_METRIC_SCOPE)
+        )
+        .sort("selection_metric")
+        .select(["selection_metric", "mae_pu", "rmse_pu"])
+    )
+    assert list(summary_rows.iter_rows()) == [
+        (module.SELECTION_METRIC_MAE, 0.1, 0.2),
+        (module.SELECTION_METRIC_RMSE, 0.1, 0.2),
+    ]
+    history = pl.read_csv(module.training_history_output_path(output_path)).sort("selection_metric")
+    assert history["selection_metric"].to_list() == [
+        module.SELECTION_METRIC_MAE,
+        module.SELECTION_METRIC_RMSE,
+    ]
+    state_payload = json.loads(resume_paths.state_path.read_text(encoding="utf-8"))
+    assert state_payload["status"] == "complete"

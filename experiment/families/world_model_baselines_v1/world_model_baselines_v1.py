@@ -6262,6 +6262,67 @@ def _completed_job_keys(frame: pl.DataFrame) -> set[tuple[str, str, str]]:
     }
 
 
+def _clone_selection_independent_result_rows(
+    rows: Sequence[dict[str, object]],
+    *,
+    dataset_id: str,
+    model_variant: str,
+    target_selection_metric: str,
+) -> list[dict[str, object]]:
+    for source_selection_metric in DEFAULT_SELECTION_METRICS:
+        if source_selection_metric == target_selection_metric:
+            continue
+        source_rows = [
+            row
+            for row in rows
+            if row["dataset_id"] == dataset_id
+            and row["model_variant"] == model_variant
+            and row["selection_metric"] == source_selection_metric
+        ]
+        if source_rows:
+            return [{**row, "selection_metric": target_selection_metric} for row in source_rows]
+    return []
+
+
+def _clone_selection_independent_training_history(
+    path: str | Path,
+    *,
+    dataset_id: str,
+    model_variant: str,
+    feature_protocol_id: str,
+    target_selection_metric: str,
+) -> None:
+    history = _read_training_history(path)
+    if history.is_empty():
+        return
+    target_identity = _job_identity(
+        dataset_id=dataset_id,
+        model_variant=model_variant,
+        selection_metric=target_selection_metric,
+        feature_protocol_id=feature_protocol_id,
+    )
+    if not history.filter(_training_history_job_expr(target_identity)).is_empty():
+        return
+    for source_selection_metric in DEFAULT_SELECTION_METRICS:
+        if source_selection_metric == target_selection_metric:
+            continue
+        source_identity = _job_identity(
+            dataset_id=dataset_id,
+            model_variant=model_variant,
+            selection_metric=source_selection_metric,
+            feature_protocol_id=feature_protocol_id,
+        )
+        source_history = history.filter(_training_history_job_expr(source_identity))
+        if source_history.is_empty():
+            continue
+        cloned_history = source_history.with_columns(pl.lit(target_selection_metric).alias("selection_metric"))
+        _write_training_history(
+            path,
+            pl.concat([history, cloned_history], how="diagonal_relaxed"),
+        )
+        return
+
+
 def _result_frame_from_rows(rows: Sequence[dict[str, object]]) -> pl.DataFrame:
     if not rows:
         return _empty_result_frame()
@@ -6565,6 +6626,43 @@ def run_experiment(
                     if current_job_key in completed_job_keys:
                         job_progress.update(1)
                         continue
+                    if variant_spec.model_variant == CHRONOS_VARIANT:
+                        reused_rows = _clone_selection_independent_result_rows(
+                            rows,
+                            dataset_id=dataset_id,
+                            model_variant=variant_spec.model_variant,
+                            target_selection_metric=selection_metric,
+                        )
+                        if reused_rows:
+                            rows.extend(reused_rows)
+                            partial_results = _result_frame_from_rows(rows)
+                            _write_partial_results(resume_paths, partial_results)
+                            _clone_selection_independent_training_history(
+                                resume_paths.training_history_path,
+                                dataset_id=dataset_id,
+                                model_variant=variant_spec.model_variant,
+                                feature_protocol_id=variant_spec.feature_protocol_id,
+                                target_selection_metric=selection_metric,
+                            )
+                            completed_job_keys.add(current_job_key)
+                            _delete_job_checkpoint(
+                                resume_paths,
+                                dataset_id=dataset_id,
+                                model_variant=variant_spec.model_variant,
+                                selection_metric=selection_metric,
+                            )
+                            _write_resume_state(
+                                resume_paths,
+                                status="running",
+                                effective_config=effective_config,
+                                active_job=None,
+                            )
+                            resume_active_job = None
+                            job_progress.set_postfix_str(
+                                f"{dataset_id}/{variant_spec.model_variant}/{selection_metric}: reused"
+                            )
+                            job_progress.update(1)
+                            continue
                     checkpoint_path = _job_checkpoint_path(
                         resume_paths,
                         dataset_id=dataset_id,
