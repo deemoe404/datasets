@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 import json
 import math
+from types import SimpleNamespace
 from pathlib import Path
 import sys
 import time
@@ -30,6 +31,8 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     FORECAST_STEPS,
     HISTORY_STEPS,
     CHRONOS2_VARIANT,
+    ITRANSFORMER_TARGET_DIRECT_VARIANT,
+    ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
@@ -43,6 +46,8 @@ FORMAL_SUPPORTED_VARIANTS = {
     SEASONAL_PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     CHRONOS2_VARIANT,
+    ITRANSFORMER_TARGET_DIRECT_VARIANT,
+    ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
 }
 FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
@@ -50,7 +55,7 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_tcn_residual": "residual_control_training_not_implemented",
     "dgcrn_official_core": "official_core_training_adapter_not_implemented",
     "timexer_official": "official_training_adapter_not_implemented",
-    "itransformer_official": "official_training_adapter_not_implemented",
+    "itransformer_official_target_plus_exog": "official_exog_adapter_not_implemented",
     "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
     "mtgnn_official_core": "official_core_training_adapter_not_implemented",
 }
@@ -355,6 +360,197 @@ def _evaluate_chronos2(
     return predictions
 
 
+def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layers: int, dropout: float):
+    source_root = REPO_ROOT / "experiment" / "official_baselines" / "itransformer" / "source"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from model.iTransformer import Model  # type: ignore
+
+    configs = SimpleNamespace(
+        seq_len=HISTORY_STEPS,
+        pred_len=FORECAST_STEPS,
+        output_attention=False,
+        use_norm=True,
+        d_model=d_model,
+        embed="timeF",
+        freq="h",
+        dropout=dropout,
+        class_strategy="projection",
+        factor=1,
+        n_heads=n_heads,
+        d_ff=d_model * 4,
+        e_layers=e_layers,
+        activation="gelu",
+    )
+    return Model(configs).to(device)
+
+
+def _iter_target_only_batches(
+    prepared: Any,
+    windows: Any,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+):
+    indices = np.arange(len(windows), dtype=np.int64)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+    for start in range(0, len(indices), batch_size):
+        batch_window_indices = indices[start : start + batch_size]
+        x = np.zeros((len(batch_window_indices), prepared.history_steps, prepared.node_count), dtype=np.float32)
+        y = np.zeros((len(batch_window_indices), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+        valid = np.zeros_like(y, dtype=np.float32)
+        anchor = np.zeros((len(batch_window_indices), prepared.node_count), dtype=np.float32)
+        for row_index, window_pos in enumerate(batch_window_indices):
+            target_index = int(windows.target_indices[int(window_pos)])
+            history = slice(target_index - prepared.history_steps, target_index)
+            future = slice(target_index, target_index + prepared.forecast_steps)
+            x[row_index] = prepared.local_history_tensor[history, :, 0]
+            target_unavailable = prepared.local_history_tensor[history, :, 17]
+            fallback = prepared.persistence_train_fallback_pu.astype(np.float32, copy=True)
+            last_values = fallback.copy()
+            for node_index in range(prepared.node_count):
+                valid_positions = np.flatnonzero(target_unavailable[:, node_index] < 0.5)
+                if valid_positions.size:
+                    last_values[node_index] = x[row_index, int(valid_positions[-1]), node_index]
+            anchor[row_index] = last_values
+            y[row_index] = prepared.target_pu_filled[future]
+            valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
+        yield x, y, valid, anchor
+
+
+def _masked_mse_torch(predictions: Any, targets: Any, valid: Any) -> Any:
+    denominator = valid.sum().clamp_min(1.0)
+    return (((predictions - targets) ** 2) * valid).sum() / denominator
+
+
+def _train_itransformer(
+    prepared: Any,
+    *,
+    variant_name: str,
+    seed: int,
+    device: str,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    d_model: int,
+    n_heads: int,
+    e_layers: int,
+    dropout: float,
+) -> tuple[Any, dict[str, Any]]:
+    import torch
+
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    model = _load_itransformer_model(
+        device=resolved_device,
+        d_model=d_model,
+        n_heads=n_heads,
+        e_layers=e_layers,
+        dropout=dropout,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    best_state = None
+    best_val_rmse = math.inf
+    best_val_mae = math.inf
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    residual_output = variant_name == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_batches = 0
+        for x_np, y_np, valid_np, anchor_np in _iter_target_only_batches(
+            prepared,
+            prepared.train_windows,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed + epoch,
+        ):
+            x = torch.as_tensor(x_np, device=resolved_device)
+            y = torch.as_tensor(y_np, device=resolved_device)
+            valid = torch.as_tensor(valid_np, device=resolved_device)
+            anchor = torch.as_tensor(anchor_np, device=resolved_device)
+            target = y - anchor[:, None, :] if residual_output else y
+            optimizer.zero_grad(set_to_none=True)
+            raw = model(x, None, None, None)
+            loss = _masked_mse_torch(raw, target, valid)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss_sum += float(loss.detach().cpu())
+            train_batches += 1
+        val_predictions = _evaluate_itransformer(
+            model,
+            prepared,
+            prepared.val_rolling_windows,
+            variant_name=variant_name,
+            device=resolved_device,
+            batch_size=batch_size,
+        )
+        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss_mean": train_loss_sum / max(train_batches, 1),
+                "val_rmse_pu": val_metrics["rmse_pu"],
+                "val_mae_pu": val_metrics["mae_pu"],
+            }
+        )
+        if val_metrics["rmse_pu"] < best_val_rmse:
+            best_val_rmse = float(val_metrics["rmse_pu"])
+            best_val_mae = float(val_metrics["mae_pu"])
+            best_epoch = epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {
+        "best_epoch": best_epoch,
+        "epochs_ran": max_epochs,
+        "best_val_rmse_pu": best_val_rmse,
+        "best_val_mae_pu": best_val_mae,
+        "history": history,
+        "device": resolved_device,
+    }
+
+
+def _evaluate_itransformer(
+    model: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+) -> np.ndarray:
+    import torch
+
+    residual_output = variant_name == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    model.eval()
+    offset = 0
+    with torch.no_grad():
+        for x_np, _y_np, _valid_np, anchor_np in _iter_target_only_batches(
+            prepared,
+            windows,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=0,
+        ):
+            x = torch.as_tensor(x_np, device=device)
+            raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            if residual_output:
+                raw = raw + anchor_np[:, None, :]
+            predictions[offset : offset + raw.shape[0]] = raw
+            offset += raw.shape[0]
+    return predictions
+
+
 def _base_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int) -> dict[str, Any]:
     budget = spec.feature_budget
     return {
@@ -475,6 +671,9 @@ def run_formal_tuning(
     max_eval_origins: int | None = None,
     chronos_batch_size: int = 32,
     device: str = "cuda",
+    train_batch_size: int = 128,
+    max_epochs: int = 3,
+    learning_rate: float = 1e-4,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -631,6 +830,50 @@ def run_formal_tuning(
                         best_trial=True,
                     )
                 )
+            elif spec.model_variant in {ITRANSFORMER_TARGET_DIRECT_VARIANT, ITRANSFORMER_TARGET_RESIDUAL_VARIANT}:
+                model, train_summary = _train_itransformer(
+                    prepared,
+                    variant_name=spec.model_variant,
+                    seed=seed,
+                    device=device,
+                    batch_size=train_batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    d_model=64,
+                    n_heads=4,
+                    e_layers=2,
+                    dropout=0.1,
+                )
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_itransformer(
+                        model,
+                        prepared,
+                        windows,
+                        variant_name=spec.model_variant,
+                        device=train_summary["device"],
+                        batch_size=train_batch_size,
+                    )
+                    for split_name, eval_protocol, windows in _windows_by_split(prepared)
+                }
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id=(
+                            "itransformer_target_only_residual_default"
+                            if spec.model_variant == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+                            else "itransformer_target_only_direct_default"
+                        ),
+                        search_config_id="itransformer_target_only_default",
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=None,
+                        gate_c_passed=None,
+                        best_trial=True,
+                    )
+                )
     frame = pl.DataFrame(rows)
     resolved_output_path = Path(output_path)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,6 +889,9 @@ def run_formal_tuning(
         "ridge_alphas": [float(value) for value in ridge_alphas],
         "chronos_batch_size": chronos_batch_size,
         "device": device,
+        "train_batch_size": train_batch_size,
+        "max_epochs": max_epochs,
+        "learning_rate": learning_rate,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -663,6 +909,9 @@ def run_formal_tuning(
                 "ridge_alphas": [float(value) for value in ridge_alphas],
                 "chronos_batch_size": chronos_batch_size,
                 "device": device,
+                "train_batch_size": train_batch_size,
+                "max_epochs": max_epochs,
+                "learning_rate": learning_rate,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -718,6 +967,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-eval-origins", type=int, default=None)
     parser.add_argument("--chronos-batch-size", type=int, default=32)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--train-batch-size", type=int, default=128)
+    parser.add_argument("--max-epochs", type=int, default=3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -735,6 +987,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_eval_origins=args.max_eval_origins,
         chronos_batch_size=args.chronos_batch_size,
         device=args.device,
+        train_batch_size=args.train_batch_size,
+        max_epochs=args.max_epochs,
+        learning_rate=args.learning_rate,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )
