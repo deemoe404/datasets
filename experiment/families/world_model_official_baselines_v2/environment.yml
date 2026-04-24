@@ -14,3 +14,4 @@ dependencies:
   - pip:
       - chronos-forecasting>=2.0
       - pytorch-forecasting
+      - reformer-pytorch
