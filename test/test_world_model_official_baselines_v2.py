@@ -211,9 +211,20 @@ def test_formal_tuning_cli_exposes_dgcrn_search_knobs() -> None:
             "0.0",
             "--dgcrn-gcn-depth",
             "3",
+            "--gate-b-overfit64-passed",
+            "--gate-b-overfit64-rmse-pu",
+            "0.028",
+            "--gate-b-overfit64-mae-pu",
+            "0.019",
+            "--gate-b-overfit64-source",
+            "scratch/overfit64.csv",
         ]
     )
 
     assert args.dgcrn_hidden_dim == 96
     assert args.dgcrn_dropout == 0.0
     assert args.dgcrn_gcn_depth == 3
+    assert args.gate_b_overfit64_passed is True
+    assert args.gate_b_overfit64_rmse_pu == 0.028
+    assert args.gate_b_overfit64_mae_pu == 0.019
+    assert args.gate_b_overfit64_source == "scratch/overfit64.csv"

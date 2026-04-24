@@ -1188,6 +1188,11 @@ def _metric_rows(
     residual_anchor_steps: int,
     best_trial: bool,
     window_specs: Sequence[tuple[str, str, Any]],
+    gate_b_scope: str | None = None,
+    gate_b_overfit64_passed: bool | None = None,
+    train_gate_after_fit_passed: bool | None = None,
+    train_gate_after_fit_rmse_pu: float | None = None,
+    train_gate_after_fit_mae_pu: float | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for split_name, eval_protocol, windows in window_specs:
@@ -1209,6 +1214,11 @@ def _metric_rows(
                 "is_best_validation_trial": best_trial,
                 "gate_a_passed": True,
                 "gate_b_passed": gate_b_passed,
+                "gate_b_scope": gate_b_scope,
+                "gate_b_overfit64_passed": gate_b_overfit64_passed,
+                "train_gate_after_fit_passed": train_gate_after_fit_passed,
+                "train_gate_after_fit_rmse_pu": train_gate_after_fit_rmse_pu,
+                "train_gate_after_fit_mae_pu": train_gate_after_fit_mae_pu,
                 "gate_c_passed": gate_c_passed,
                 "residual_anchor_steps": residual_anchor_steps,
                 "runtime_seconds": runtime_seconds,
@@ -1233,6 +1243,11 @@ def _blocked_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int, block
         "is_best_validation_trial": False,
         "gate_a_passed": True,
         "gate_b_passed": False if spec.trainable else None,
+        "gate_b_scope": "not_started" if spec.trainable else None,
+        "gate_b_overfit64_passed": False if spec.trainable else None,
+        "train_gate_after_fit_passed": None,
+        "train_gate_after_fit_rmse_pu": None,
+        "train_gate_after_fit_mae_pu": None,
         "gate_c_passed": False if spec.trainable else None,
         "residual_anchor_steps": 0,
         "runtime_seconds": 0.0,
@@ -1276,6 +1291,10 @@ def run_formal_tuning(
     dgcrn_hidden_dim: int = 64,
     dgcrn_dropout: float = 0.1,
     dgcrn_gcn_depth: int = 2,
+    gate_b_overfit64_passed: bool | None = None,
+    gate_b_overfit64_rmse_pu: float | None = None,
+    gate_b_overfit64_mae_pu: float | None = None,
+    gate_b_overfit64_source: str | None = None,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -1510,7 +1529,7 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
-                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                train_gate_after_fit_passed, gate_c_passed, train_gate_metrics, _gate_c_metrics = _gate_status_for_neural_model(
                     evaluator=_evaluate_dgcrn,
                     model=model,
                     prepared=prepared,
@@ -1523,6 +1542,14 @@ def run_formal_tuning(
                     persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
                     persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
                     persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
+                gate_b_for_row = (
+                    gate_b_overfit64_passed if gate_b_overfit64_passed is not None else train_gate_after_fit_passed
+                )
+                gate_b_scope = (
+                    "overfit64_preflight"
+                    if gate_b_overfit64_passed is not None
+                    else "train_gate_after_fit"
                 )
                 rows.extend(
                     _metric_rows(
@@ -1538,11 +1565,16 @@ def run_formal_tuning(
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=gate_b_passed,
+                        gate_b_passed=gate_b_for_row,
                         gate_c_passed=gate_c_passed,
                         residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=train_gate_after_fit_passed,
+                        train_gate_after_fit_rmse_pu=float(train_gate_metrics["rmse_pu"]),
+                        train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
                     )
                 )
             elif spec.model_variant in {TIMEXER_TARGET_DIRECT_VARIANT, TIMEXER_TARGET_RESIDUAL_VARIANT}:
@@ -1699,6 +1731,10 @@ def run_formal_tuning(
         "dgcrn_hidden_dim": dgcrn_hidden_dim,
         "dgcrn_dropout": dgcrn_dropout,
         "dgcrn_gcn_depth": dgcrn_gcn_depth,
+        "gate_b_overfit64_passed": gate_b_overfit64_passed,
+        "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
+        "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
+        "gate_b_overfit64_source": gate_b_overfit64_source,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -1728,6 +1764,10 @@ def run_formal_tuning(
                 "dgcrn_hidden_dim": dgcrn_hidden_dim,
                 "dgcrn_dropout": dgcrn_dropout,
                 "dgcrn_gcn_depth": dgcrn_gcn_depth,
+                "gate_b_overfit64_passed": gate_b_overfit64_passed,
+                "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
+                "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
+                "gate_b_overfit64_source": gate_b_overfit64_source,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -1804,6 +1844,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dgcrn-hidden-dim", type=int, default=64)
     parser.add_argument("--dgcrn-dropout", type=float, default=0.1)
     parser.add_argument("--dgcrn-gcn-depth", type=int, default=2)
+    parser.add_argument("--gate-b-overfit64-passed", action="store_true", default=None)
+    parser.add_argument("--gate-b-overfit64-rmse-pu", type=float, default=None)
+    parser.add_argument("--gate-b-overfit64-mae-pu", type=float, default=None)
+    parser.add_argument("--gate-b-overfit64-source", type=str, default=None)
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -1833,6 +1877,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         dgcrn_hidden_dim=args.dgcrn_hidden_dim,
         dgcrn_dropout=args.dgcrn_dropout,
         dgcrn_gcn_depth=args.dgcrn_gcn_depth,
+        gate_b_overfit64_passed=args.gate_b_overfit64_passed,
+        gate_b_overfit64_rmse_pu=args.gate_b_overfit64_rmse_pu,
+        gate_b_overfit64_mae_pu=args.gate_b_overfit64_mae_pu,
+        gate_b_overfit64_source=args.gate_b_overfit64_source,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )

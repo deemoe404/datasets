@@ -113,3 +113,10 @@ DGCRN official-core debug search should vary the declared CLI knobs
 `--dgcrn-hidden-dim`, `--dgcrn-dropout`, `--dgcrn-gcn-depth`,
 `--learning-rate`, and `--residual-anchor-steps`; these values are recorded in
 the summary, manifest, trial id, and formal search config id.
+
+For DGCRN formal search, `gate_b_passed` may be sourced from a declared
+64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit
+train-window diagnostic is recorded separately as
+`train_gate_after_fit_passed`, `train_gate_after_fit_rmse_pu`, and
+`train_gate_after_fit_mae_pu`. This keeps the paper gate contract distinct from
+post-search training-set diagnostics.
