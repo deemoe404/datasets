@@ -13,6 +13,8 @@ experiment/*.csv
 experiment/artifacts/published/**/*.log
 experiment/families/*/.conda/
 experiment/families/*/.work*/
+experiment/official_baselines/*/.conda/
+experiment/official_baselines/*/.work*/
 experiment/artifacts/scratch/**
 !experiment/artifacts/scratch/
 !experiment/artifacts/scratch/README.md

@@ -10,7 +10,7 @@ surface via `selection_metric`. This patch standardizes checkpoint selection,
 early stopping, and reporting only; it does not change model losses, feature
 budgets, or dataset-side inputs.
 
-The first implementation includes:
+The current repo-local controlled-comparison implementation includes:
 
 - `world_model_persistence_last_value_v1_farm_sync`: analytic last-value
   persistence over the 24-hour history window, with train-only target means as
@@ -39,6 +39,21 @@ The first implementation includes:
   graph baseline that learns an adaptive turbine graph from the same history
   and calendar tensors and predicts all turbines jointly without adding new
   dataset-side features.
+
+Display labels should stay explicit about implementation status:
+
+| `model_variant` | Display label |
+| --- | --- |
+| `world_model_persistence_last_value_v1_farm_sync` | `Baseline: Last-value persistence` |
+| `world_model_shared_weight_tft_no_graph_v1_farm_sync` | `Baseline: TFT-style repo-local` |
+| `world_model_shared_weight_timexer_no_graph_v1_farm_sync` | `Baseline: TimeXer-style repo-local` |
+| `world_model_dgcrn_v1_farm_sync` | `Baseline: DGCRN-style repo-local` |
+| `world_model_chronos_2_zero_shot_v1_farm_sync` | `Baseline: Chronos-2 zero-shot official` |
+| `world_model_itransformer_no_graph_v1_farm_sync` | `Baseline: iTransformer-style repo-local` |
+| `world_model_mtgnn_calendar_graph_v1_farm_sync` | `Baseline: MTGNN-style calendar-graph` |
+
+Official/official-core comparisons belong in sibling family
+`world_model_hardened_baselines_v1`.
 
 ## Run
 

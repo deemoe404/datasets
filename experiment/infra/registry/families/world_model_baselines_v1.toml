@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "world_model_baselines_v1"
 display_name = "World-Model Baselines v1"
 status = "prototype"
-summary = "Kelmarsh-only key baseline family for world_model_state_space_v1, including last-value persistence, shared-weight TFT, shared-weight TimeXer without graph inputs, a DGCRN-style dynamic-graph baseline, a Chronos-2 zero-shot baseline, a no-graph iTransformer baseline, and an MTGNN calendar-graph baseline."
+summary = "Kelmarsh-only repo-local controlled baseline family for world_model_state_space_v1, including last-value persistence, TFT-style, TimeXer-style, DGCRN-style, Chronos-2 official zero-shot, iTransformer-style, and MTGNN calendar-graph baselines."
 model_family = "world_model_baseline"
 training_mode = "trainable"
 implementation_root = "experiment/families/world_model_baselines_v1"
@@ -40,6 +40,7 @@ notes = [
   "The Chronos-2 variant adapts the same world_model_v1 tensor contract into zero-shot Chronos payloads without changing dataset-side semantics.",
   "The iTransformer variant consumes full farm windows without graph inputs and predicts all turbines jointly from the same world_model_v1 tensor contract.",
   "The MTGNN variant consumes the same local-history and calendar tensors while learning an adaptive graph over turbines without introducing new dataset-side features.",
+  "Display labels must keep repo-local/style status explicit; official/official-core baselines belong in world_model_hardened_baselines_v1.",
 ]
 
 [task_contract]

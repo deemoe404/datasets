@@ -93,6 +93,15 @@ DGCRN_VARIANT = "world_model_dgcrn_v1_farm_sync"
 CHRONOS_VARIANT = "world_model_chronos_2_zero_shot_v1_farm_sync"
 ITRANSFORMER_VARIANT = "world_model_itransformer_no_graph_v1_farm_sync"
 MTGNN_VARIANT = "world_model_mtgnn_calendar_graph_v1_farm_sync"
+MODEL_VARIANT_DISPLAY_NAMES = {
+    PERSISTENCE_VARIANT: "Baseline: Last-value persistence",
+    TFT_VARIANT: "Baseline: TFT-style repo-local",
+    TIMEXER_VARIANT: "Baseline: TimeXer-style repo-local",
+    DGCRN_VARIANT: "Baseline: DGCRN-style repo-local",
+    CHRONOS_VARIANT: "Baseline: Chronos-2 zero-shot official",
+    ITRANSFORMER_VARIANT: "Baseline: iTransformer-style repo-local",
+    MTGNN_VARIANT: "Baseline: MTGNN-style calendar-graph",
+}
 WINDOW_PROTOCOL = DEFAULT_WINDOW_PROTOCOL
 TASK_PROTOCOL: WindowProtocolSpec = resolve_window_protocol(WINDOW_PROTOCOL)
 TASK_ID = TASK_PROTOCOL.task_id

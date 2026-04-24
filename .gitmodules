@@ -1,0 +1,9 @@
+[submodule "experiment/official_baselines/dgcrn/source"]
+	path = experiment/official_baselines/dgcrn/source
+	url = https://github.com/tsinghua-fib-lab/Traffic-Benchmark.git
+[submodule "experiment/official_baselines/timexer/source"]
+	path = experiment/official_baselines/timexer/source
+	url = https://github.com/thuml/TimeXer.git
+[submodule "experiment/official_baselines/itransformer/source"]
+	path = experiment/official_baselines/itransformer/source
+	url = https://github.com/thuml/iTransformer.git

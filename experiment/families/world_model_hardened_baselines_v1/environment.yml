@@ -1,0 +1,16 @@
+name: world-model-hardened-baselines-v1
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - polars
+  - pyarrow
+  - duckdb
+  - pytest
+  - tensorboard
+  - tqdm
+  - pip:
+      - torch
+      - chronos-forecasting==2.2.2

@@ -217,6 +217,20 @@ def test_registry_declares_kelmarsh_only_and_seven_variants() -> None:
     assert 'world_model_mtgnn_calendar_graph_v1_farm_sync = "world_model_v1"' in text
 
 
+def test_repo_local_baseline_display_labels_are_explicit() -> None:
+    module = _load_module()
+
+    assert module.MODEL_VARIANT_DISPLAY_NAMES == {
+        module.PERSISTENCE_VARIANT: "Baseline: Last-value persistence",
+        module.TFT_VARIANT: "Baseline: TFT-style repo-local",
+        module.TIMEXER_VARIANT: "Baseline: TimeXer-style repo-local",
+        module.DGCRN_VARIANT: "Baseline: DGCRN-style repo-local",
+        module.CHRONOS_VARIANT: "Baseline: Chronos-2 zero-shot official",
+        module.ITRANSFORMER_VARIANT: "Baseline: iTransformer-style repo-local",
+        module.MTGNN_VARIANT: "Baseline: MTGNN-style calendar-graph",
+    }
+
+
 def test_non_kelmarsh_dataset_is_rejected() -> None:
     module = _load_module()
 
@@ -433,7 +447,8 @@ def test_timexer_dataset_splits_endogenous_exogenous_and_history_marks(tmp_path,
     assert layout.endogenous_history_names == ("target_pu",)
     assert layout.history_mark_names == _KNOWN_FUTURE_COLUMNS
     assert len(layout.exogenous_history_names) == 86
-    assert layout.exogenous_history_names[0] == "target_kw__mask"
+    assert layout.exogenous_history_names[0] == prepared.local_input_feature_names[1]
+    assert "target_kw__mask" in layout.exogenous_history_names
     assert "farm_pmu__gms_power_kw" in layout.exogenous_history_names
     assert sample[0].shape == (prepared.history_steps, 1)
     assert sample[1].shape == (prepared.history_steps, 86)

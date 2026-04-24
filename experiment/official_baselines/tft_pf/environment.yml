@@ -1,0 +1,13 @@
+name: official-baseline-tft-pf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - pip:
+      - torch
+      - lightning
+      - pytorch-forecasting
