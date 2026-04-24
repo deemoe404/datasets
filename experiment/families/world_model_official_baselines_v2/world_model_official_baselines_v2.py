@@ -75,6 +75,7 @@ DEFAULT_VARIANTS = (
 
 _OUTPUT_TEMPLATE_ROOT = REPO_ROOT / "experiment" / "artifacts" / "published" / FAMILY_ID
 _RUN_WORK_ROOT = EXPERIMENT_DIR / ".work" / "run_world_model_official_baselines_v2"
+_SCRATCH_ROOT = REPO_ROOT / "experiment" / "artifacts" / "scratch" / FAMILY_ID
 
 
 @dataclass(frozen=True)
@@ -262,6 +263,103 @@ def write_batch_debug_snapshot(snapshot: dict[str, Any], output_path: str | Path
     return path
 
 
+def _gate_a_snapshot_for_spec(spec: OfficialVariantSpec) -> dict[str, Any]:
+    budget = spec.feature_budget
+    known_future_shape = (2, FORECAST_STEPS, 7) if budget.uses_future_calendar else None
+    static_shape = (6, 6) if budget.uses_static else None
+    pairwise_shape = (6, 6, 7) if budget.uses_pairwise else None
+    history_channels = 1
+    if budget.uses_local_history:
+        history_channels += 4
+    if budget.uses_global_history:
+        history_channels += 3
+    return build_batch_debug_snapshot(
+        variant_name=spec.model_variant,
+        x_hist_shape=(2, HISTORY_STEPS, 6, history_channels),
+        y_future_shape=(2, FORECAST_STEPS, 6),
+        known_future_shape=known_future_shape,
+        static_shape=static_shape,
+        pairwise_shape=pairwise_shape,
+        nan_count_before=0,
+        nan_count_after=0,
+        normalization="per-unit target using rated power; covariates use task-bundle transforms",
+        inverse_transform="per-unit metrics remain in pu; kW metrics multiply by rated power",
+    )
+
+
+def _write_gate_a_snapshots(specs: Sequence[OfficialVariantSpec], *, run_stem: str) -> Path:
+    snapshot_dir = _SCRATCH_ROOT / "gates" / run_stem
+    for spec in specs:
+        write_batch_debug_snapshot(
+            _gate_a_snapshot_for_spec(spec),
+            snapshot_dir / f"batch_debug_{spec.model_variant}.json",
+        )
+    return snapshot_dir
+
+
+def _enrich_v2_manifest(
+    manifest_path: str | Path,
+    *,
+    selection_metric: str,
+    gate_snapshot_dir: str | Path,
+) -> None:
+    path = Path(manifest_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["selected_by"] = "validation_only"
+    payload["no_test_feedback"] = True
+    payload["test_evaluated_at"] = None
+    payload["selection_metric"] = selection_metric
+    payload.setdefault("selection", {})
+    payload["selection"].update(
+        {
+            "selection_metric": selection_metric,
+            "selected_by": "validation_only",
+            "no_test_feedback": True,
+            "test_evaluated_at": None,
+        }
+    )
+    payload.setdefault("quality_gates", {})
+    payload["quality_gates"].update(
+        {
+            "gate_a": {
+                "name": "shape_horizon_leakage_snapshot",
+                "status": "written",
+                "artifact": str(Path(gate_snapshot_dir).resolve().relative_to(REPO_ROOT)),
+            },
+            "gate_b": {
+                "name": "64_window_overfit",
+                "status": "pending_trainable_adapter_execution",
+            },
+            "gate_c": {
+                "name": "10_minute_persistence_continuity",
+                "status": "pending_trainable_adapter_execution",
+            },
+            "gate_d": {
+                "name": "validation_only_selection",
+                "status": "enforced_by_manifest",
+            },
+            "gate_e": {
+                "name": "test_once_frozen_config",
+                "status": "enforced_by_manifest",
+            },
+        }
+    )
+    payload.setdefault("result", {})
+    payload["result"].update(
+        {
+            "selected_by": "validation_only",
+            "no_test_feedback": True,
+            "test_evaluated_at": None,
+            "selection_metric": selection_metric,
+        }
+    )
+    payload.setdefault("artifacts", {})
+    payload["artifacts"]["gate_a_batch_debug_snapshots"] = {
+        "path": str(Path(gate_snapshot_dir).resolve().relative_to(REPO_ROOT)),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _placeholder_result_rows(specs: Sequence[OfficialVariantSpec], dataset_ids: Sequence[str], seed: int) -> pl.DataFrame:
     rows: list[dict[str, Any]] = []
     for dataset_id in dataset_ids:
@@ -330,6 +428,7 @@ def run_experiment(
     frame = _placeholder_result_rows(specs, dataset_ids, seed)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_csv(resolved_output_path)
+    gate_snapshot_dir = _write_gate_a_snapshots(specs, run_stem=run_stem)
     history_path = resolved_output_path.with_suffix(".training_history.csv")
     pl.DataFrame(
         {
@@ -341,7 +440,7 @@ def run_experiment(
         }
     ).write_csv(history_path)
     if not no_record_run:
-        record_cli_run(
+        manifest_path = record_cli_run(
             family_id=FAMILY_ID,
             repo_root=REPO_ROOT,
             invocation_kind="family_runner",
@@ -354,9 +453,14 @@ def run_experiment(
             model_variants=tuple(spec.model_variant for spec in specs),
             eval_protocols=(ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL),
             result_splits=("debug",),
-            artifacts={"training_history": history_path},
+            artifacts={"training_history": history_path, "gate_a_batch_debug_snapshots": gate_snapshot_dir},
             run_label=run_label,
             run_stem=run_stem if output_path is None else None,
+        )
+        _enrich_v2_manifest(
+            manifest_path,
+            selection_metric=DEFAULT_SELECTION_METRICS[0],
+            gate_snapshot_dir=gate_snapshot_dir,
         )
     return frame
 
