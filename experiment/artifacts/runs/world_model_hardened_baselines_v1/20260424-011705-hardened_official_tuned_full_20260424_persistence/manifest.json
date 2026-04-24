@@ -1,0 +1,157 @@
+{
+  "args": {
+    "attention_heads": null,
+    "batch_size": null,
+    "bounded_output_epsilon": null,
+    "cheb_k": null,
+    "d_model": null,
+    "datasets": null,
+    "device": "cuda",
+    "dilation_exponential": null,
+    "disable_tensorboard": true,
+    "dropout": null,
+    "embed_dim": null,
+    "encoder_layers": null,
+    "end_channels": null,
+    "epochs": null,
+    "eval_batch_size": 512,
+    "ff_hidden_dim": null,
+    "force_rerun": true,
+    "gcn_depth": null,
+    "grad_clip_norm": null,
+    "hidden_dim": null,
+    "learning_rate": null,
+    "lstm_hidden_dim": null,
+    "max_eval_origins": null,
+    "max_train_origins": null,
+    "mtgnn_layers": null,
+    "no_record_run": false,
+    "node_embed_dim": null,
+    "num_layers": null,
+    "num_workers": 0,
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.csv",
+    "patch_len": null,
+    "patience": null,
+    "propalpha": null,
+    "residual_channels": null,
+    "resolved_dataset_variant_hyperparameters": {
+      "kelmarsh": {
+        "world_model_last_value_persistence_hardened_v1_farm_sync": {
+          "adapter_kind": "analytic_anchor",
+          "attention_heads": null,
+          "backend_variant": "world_model_persistence_last_value_v1_farm_sync",
+          "baseline_type": "last_value_persistence_hardened",
+          "batch_size": 256,
+          "bounded_output_epsilon": null,
+          "cheb_k": null,
+          "d_model": null,
+          "dilation_exponential": null,
+          "dropout": null,
+          "early_stopping_patience": 10,
+          "embed_dim": null,
+          "encoder_layers": null,
+          "end_channels": null,
+          "feature_protocol_id": "world_model_v1",
+          "ff_hidden_dim": null,
+          "gcn_depth": null,
+          "grad_clip_norm": 1.0,
+          "hidden_dim": null,
+          "implementation_track": "hardened_official",
+          "learning_rate": 0.0001,
+          "lstm_hidden_dim": null,
+          "max_epochs": 30,
+          "mtgnn_layers": null,
+          "node_embed_dim": null,
+          "num_layers": null,
+          "patch_len": null,
+          "propalpha": null,
+          "residual_channels": null,
+          "search_config_id": "analytic_default",
+          "skip_channels": null,
+          "source_commit": "not-applicable",
+          "source_repo": "analytic://last-value-persistence",
+          "subgraph_size": null,
+          "teacher_forcing_ratio": null,
+          "weight_decay": 0.001
+        }
+      }
+    },
+    "resume": false,
+    "run_label": "hardened_official_tuned_full_20260424_persistence",
+    "seed": 3407,
+    "selection_metrics": [
+      "val_rmse_pu",
+      "val_mae_pu"
+    ],
+    "skip_channels": null,
+    "subgraph_size": null,
+    "teacher_forcing_ratio": null,
+    "tensorboard_log_dir": null,
+    "variants": [
+      "world_model_last_value_persistence_hardened_v1_farm_sync"
+    ],
+    "weight_decay": null
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.csv",
+      "sha256": "07874d5cc1d3ecbfecb9dc1e58934de2257ffd1fb4640e89f2b9c38886127e35",
+      "size_bytes": 190700
+    },
+    "training_history": {
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.training_history.csv"
+    }
+  },
+  "created_at_utc": "2026-04-24T01:17:05.135899+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_hardened_baselines_v1/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_hardened_baselines_v1.long_metrics.v1",
+    "display_name": "World-Model Hardened Baselines v1",
+    "family_id": "world_model_hardened_baselines_v1",
+    "implementation_root": "experiment/families/world_model_hardened_baselines_v1",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_hardened_baselines_v1/README.md",
+    "runner_entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "git": {
+    "branch": "main",
+    "head": "cf694bc35a56021a3b12e1dfb8fb6d86552f8ad5",
+    "is_dirty": true,
+    "status_short": [
+      "?? experiment/artifacts/published/world_model_hardened_baselines_v1/"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
+    "kind": "family_runner",
+    "run_label": "hardened_official_tuned_full_20260424_persistence"
+  },
+  "notes": [],
+  "result": {
+    "row_count": 296
+  },
+  "schema_version": 1,
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "world_model_last_value_persistence_hardened_v1_farm_sync"
+    ],
+    "result_splits": [
+      "val",
+      "test"
+    ]
+  }
+}
