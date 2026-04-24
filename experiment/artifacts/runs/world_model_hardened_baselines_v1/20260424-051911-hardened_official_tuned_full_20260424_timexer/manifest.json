@@ -29,7 +29,7 @@
     "node_embed_dim": null,
     "num_layers": null,
     "num_workers": 2,
-    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-timexer.csv",
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-timexer.csv",
     "patch_len": null,
     "patience": null,
     "propalpha": null,
@@ -77,7 +77,7 @@
       }
     },
     "resume": false,
-    "run_label": "hardened_official_tuned_full_20260424_timexer",
+    "run_label": "phase1_adapter_20260424_timexer",
     "seed": 3407,
     "selection_metrics": [
       "val_rmse_pu",
@@ -95,12 +95,12 @@
   "artifacts": {
     "primary_output": {
       "exists": true,
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-timexer.csv",
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-timexer.csv",
       "sha256": "808935c0a1f56982c64eb26bbfa21812c07d867942bbbdcc7103f263b92ebc92",
       "size_bytes": 200641
     },
     "training_history": {
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-timexer.training_history.csv"
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-timexer.training_history.csv"
     }
   },
   "created_at_utc": "2026-04-24T05:19:11.739384+00:00",
@@ -129,7 +129,7 @@
   "invocation": {
     "entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
     "kind": "family_runner",
-    "run_label": "hardened_official_tuned_full_20260424_timexer"
+    "run_label": "phase1_adapter_20260424_timexer"
   },
   "notes": [],
   "result": {

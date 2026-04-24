@@ -7,3 +7,6 @@
 [submodule "experiment/official_baselines/itransformer/source"]
 	path = experiment/official_baselines/itransformer/source
 	url = https://github.com/thuml/iTransformer.git
+[submodule "experiment/official_baselines/mtgnn/source"]
+	path = experiment/official_baselines/mtgnn/source
+	url = https://github.com/nnzhan/MTGNN.git

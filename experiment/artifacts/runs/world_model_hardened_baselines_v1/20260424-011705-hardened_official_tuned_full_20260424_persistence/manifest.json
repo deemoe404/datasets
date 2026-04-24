@@ -29,7 +29,7 @@
     "node_embed_dim": null,
     "num_layers": null,
     "num_workers": 0,
-    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.csv",
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-persistence.csv",
     "patch_len": null,
     "patience": null,
     "propalpha": null,
@@ -77,7 +77,7 @@
       }
     },
     "resume": false,
-    "run_label": "hardened_official_tuned_full_20260424_persistence",
+    "run_label": "phase1_adapter_20260424_persistence",
     "seed": 3407,
     "selection_metrics": [
       "val_rmse_pu",
@@ -95,12 +95,12 @@
   "artifacts": {
     "primary_output": {
       "exists": true,
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.csv",
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-persistence.csv",
       "sha256": "07874d5cc1d3ecbfecb9dc1e58934de2257ffd1fb4640e89f2b9c38886127e35",
       "size_bytes": 190700
     },
     "training_history": {
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-persistence.training_history.csv"
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-persistence.training_history.csv"
     }
   },
   "created_at_utc": "2026-04-24T01:17:05.135899+00:00",
@@ -128,7 +128,7 @@
   "invocation": {
     "entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
     "kind": "family_runner",
-    "run_label": "hardened_official_tuned_full_20260424_persistence"
+    "run_label": "phase1_adapter_20260424_persistence"
   },
   "notes": [],
   "result": {

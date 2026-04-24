@@ -25,6 +25,14 @@ Active variants:
 - `world_model_state_space_v1_no_farm_aux_farm_sync`: sets farm auxiliary loss weight to `0.0`.
 - `world_model_state_space_v1_no_met_aux_farm_sync`: sets met auxiliary loss weight to `0.0`.
 
+Main-paper candidate freeze as of `2026-04-24`: do not add new proposed
+architecture variants until the official baseline v2 hardening is complete.
+Treat canonical, residual persistence with `farm_loss_weight=0.0`, ramp v2
+residual `0.02`, and ramp v2 residual `0.05` as the main candidate set.
+Global/local, edge-gating, wake-unit, and related variants are diagnostics or
+appendix material unless a later explicit decision reopens proposed-model
+optimization.
+
 The default runner behavior remains canonical-only; ablations must be selected
 explicitly with repeated `--variant` flags.
 The search harness also remains canonical-only in this revision.

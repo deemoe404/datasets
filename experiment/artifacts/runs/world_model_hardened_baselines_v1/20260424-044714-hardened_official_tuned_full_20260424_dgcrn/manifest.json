@@ -29,7 +29,7 @@
     "node_embed_dim": null,
     "num_layers": null,
     "num_workers": 2,
-    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-dgcrn.csv",
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-dgcrn.csv",
     "patch_len": null,
     "patience": null,
     "propalpha": null,
@@ -77,7 +77,7 @@
       }
     },
     "resume": false,
-    "run_label": "hardened_official_tuned_full_20260424_dgcrn",
+    "run_label": "phase1_adapter_20260424_dgcrn",
     "seed": 3407,
     "selection_metrics": [
       "val_rmse_pu",
@@ -95,12 +95,12 @@
   "artifacts": {
     "primary_output": {
       "exists": true,
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-dgcrn.csv",
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-dgcrn.csv",
       "sha256": "eb3ff346d9e1a8c71e44c4501f3bdf02862e60561bba1894728657f6917a0c3b",
       "size_bytes": 204620
     },
     "training_history": {
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-dgcrn.training_history.csv"
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-dgcrn.training_history.csv"
     }
   },
   "created_at_utc": "2026-04-24T04:47:14.681189+00:00",
@@ -129,7 +129,7 @@
   "invocation": {
     "entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
     "kind": "family_runner",
-    "run_label": "hardened_official_tuned_full_20260424_dgcrn"
+    "run_label": "phase1_adapter_20260424_dgcrn"
   },
   "notes": [],
   "result": {

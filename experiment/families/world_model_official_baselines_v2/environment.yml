@@ -1,0 +1,15 @@
+name: world_model_official_baselines_v2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - polars
+  - pyyaml
+  - pytest
+  - pytorch
+  - pip
+  - pip:
+      - chronos-forecasting>=2.0
+      - pytorch-forecasting

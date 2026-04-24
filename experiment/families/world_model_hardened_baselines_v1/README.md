@@ -1,16 +1,22 @@
 # world_model_hardened_baselines_v1
 
-`world_model_hardened_baselines_v1` is a Kelmarsh-only sibling family for
-official or official-core baselines against `world_model_state_space_v1` on the
-active `next_6h_from_24h` task and existing `world_model_v1` bundle. It does
-not modify source data, task caches, or dataset-side protocol semantics.
+`world_model_hardened_baselines_v1` is retained as a phase-1 adapter sanity
+surface against `world_model_state_space_v1` on the active `next_6h_from_24h`
+task and existing `world_model_v1` bundle. It records official source
+provenance, but trainable execution still delegates to the repo-local backend
+variants from `world_model_baselines_v1`; these are not final official
+implementation baselines.
+
+Short form: phase-1 adapter sanity checks, repo-local backend execution, not final official implementation baselines.
 
 This family is separate from `world_model_baselines_v1`:
 
 - `world_model_baselines_v1`: repo-local controlled comparisons and
   task-adapted `*-style` variants.
-- `world_model_hardened_baselines_v1`: hardened official/official-core track
-  with explicit source provenance columns.
+- `world_model_hardened_baselines_v1`: phase-1 adapter sanity checks with
+  official provenance annotations and repo-local backend execution.
+- `world_model_official_baselines_v2`: final official / official-core baseline
+  track for paper-grade claims.
 
 The first tranche includes:
 
@@ -25,8 +31,8 @@ The first tranche includes:
 - `world_model_chronos_2_zero_shot_official_v1_farm_sync`: official
   `amazon/chronos-2` zero-shot package adapter.
 
-Result rows reuse the long metrics surface from `world_model_baselines_v1` and
-append:
+Result rows reuse the long metrics surface and repo-local backend dispatch from
+`world_model_baselines_v1`, then append:
 
 - `implementation_track`
 - `source_repo`
@@ -64,8 +70,8 @@ Smoke run:
 
 Default formal output:
 
-- `experiment/artifacts/published/world_model_hardened_baselines_v1/<run_timestamp>.csv`
-- `experiment/artifacts/published/world_model_hardened_baselines_v1/<run_timestamp>.training_history.csv`
+- `experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-*.csv`
+- `experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-*.training_history.csv`
 - `experiment/artifacts/runs/world_model_hardened_baselines_v1/<timestamp>/manifest.json`
 
 ## Source Wrappers

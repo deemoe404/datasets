@@ -16,3 +16,8 @@ Wrapper contract:
 The experiment family consumes the existing `world_model_v1` task bundle. These
 wrappers must not mutate raw data, cache bundle semantics, source keys, or
 feature protocols.
+
+Pinned wrappers currently include DGCRN, TimeXer, iTransformer, MTGNN,
+Chronos-2, and TFT-PF. Source-backed wrappers use submodules where the upstream
+implementation is a repository; package-backed wrappers record package/model IDs
+in their README and v2 run manifests.

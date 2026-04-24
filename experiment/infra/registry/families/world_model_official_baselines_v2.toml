@@ -1,0 +1,94 @@
+schema_version = 1
+family_id = "world_model_official_baselines_v2"
+display_name = "World-Model Official Baselines v2"
+status = "prototype"
+summary = "Kelmarsh-only paper-grade official/official-core baseline family with hard source guards, feature budgets, and validation-only selection manifests."
+model_family = "world_model_baseline"
+training_mode = "trainable"
+implementation_root = "experiment/families/world_model_official_baselines_v2"
+readme_path = "experiment/families/world_model_official_baselines_v2/README.md"
+runner_entrypoint = "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py"
+default_output_path = "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv"
+default_output_schema_version = "world_model_official_baselines_v2.long_metrics.v1"
+dataset_scope = ["kelmarsh"]
+supported_eval_protocols = ["rolling_origin_no_refit", "non_overlap"]
+supported_result_splits = ["debug", "val", "test"]
+supported_feature_protocols = ["world_model_v1"]
+implementation_label_kind = "model_variant"
+implementation_labels = [
+  "baseline_last_value_persistence_v2",
+  "baseline_seasonal_persistence_v2",
+  "baseline_ridge_residual_persistence_b0_v2",
+  "baseline_mlp_residual_persistence_b0_v2",
+  "baseline_gru_residual_persistence_b0_v2",
+  "baseline_tcn_residual_persistence_b0_v2",
+  "dgcrn_official_core_direct_b2_v2",
+  "dgcrn_official_core_residual_b2_v2",
+  "timexer_official_target_only_direct_b0_v2",
+  "timexer_official_target_only_residual_b0_v2",
+  "timexer_official_full_exog_residual_b2_v2",
+  "itransformer_official_target_only_direct_b0_v2",
+  "itransformer_official_target_only_residual_b0_v2",
+  "itransformer_official_target_plus_exog_residual_b2_v2",
+  "tft_pf_per_turbine_direct_b2_v2",
+  "tft_pf_per_turbine_residual_b2_v2",
+  "mtgnn_official_core_target_only_b0_v2",
+  "mtgnn_official_core_calendar_residual_b1_v2",
+  "chronos2_official_zero_shot_b2_v2",
+]
+model_variants = [
+  "baseline_last_value_persistence_v2",
+  "baseline_seasonal_persistence_v2",
+  "baseline_ridge_residual_persistence_b0_v2",
+  "baseline_mlp_residual_persistence_b0_v2",
+  "baseline_gru_residual_persistence_b0_v2",
+  "baseline_tcn_residual_persistence_b0_v2",
+  "dgcrn_official_core_direct_b2_v2",
+  "dgcrn_official_core_residual_b2_v2",
+  "timexer_official_target_only_direct_b0_v2",
+  "timexer_official_target_only_residual_b0_v2",
+  "timexer_official_full_exog_residual_b2_v2",
+  "itransformer_official_target_only_direct_b0_v2",
+  "itransformer_official_target_only_residual_b0_v2",
+  "itransformer_official_target_plus_exog_residual_b2_v2",
+  "tft_pf_per_turbine_direct_b2_v2",
+  "tft_pf_per_turbine_residual_b2_v2",
+  "mtgnn_official_core_target_only_b0_v2",
+  "mtgnn_official_core_calendar_residual_b1_v2",
+  "chronos2_official_zero_shot_b2_v2",
+]
+notes = [
+  "Supersedes world_model_hardened_baselines_v1 for final official/official-core claims.",
+  "Adapters must not import or dispatch through repo-local world_model_baselines_v1 model backends.",
+  "Each row records source_file, adapter_class, feature_budget_id, output_parameterization, seed, selected_by, and no_test_feedback.",
+  "Feature budgets B0/B1/B2/B3 make target-only, calendar, exogenous, and graph geometry access explicit.",
+]
+
+[task_contract]
+task_id = "next_6h_from_24h"
+history_duration = "24h"
+forecast_duration = "6h"
+window_protocol = "dense_sliding"
+split_protocol = "raw_chrono_70_10_20_strict_closed"
+granularity = "farm"
+
+[implementation_bindings]
+baseline_last_value_persistence_v2 = "world_model_v1"
+baseline_seasonal_persistence_v2 = "world_model_v1"
+baseline_ridge_residual_persistence_b0_v2 = "world_model_v1"
+baseline_mlp_residual_persistence_b0_v2 = "world_model_v1"
+baseline_gru_residual_persistence_b0_v2 = "world_model_v1"
+baseline_tcn_residual_persistence_b0_v2 = "world_model_v1"
+dgcrn_official_core_direct_b2_v2 = "world_model_v1"
+dgcrn_official_core_residual_b2_v2 = "world_model_v1"
+timexer_official_target_only_direct_b0_v2 = "world_model_v1"
+timexer_official_target_only_residual_b0_v2 = "world_model_v1"
+timexer_official_full_exog_residual_b2_v2 = "world_model_v1"
+itransformer_official_target_only_direct_b0_v2 = "world_model_v1"
+itransformer_official_target_only_residual_b0_v2 = "world_model_v1"
+itransformer_official_target_plus_exog_residual_b2_v2 = "world_model_v1"
+tft_pf_per_turbine_direct_b2_v2 = "world_model_v1"
+tft_pf_per_turbine_residual_b2_v2 = "world_model_v1"
+mtgnn_official_core_target_only_b0_v2 = "world_model_v1"
+mtgnn_official_core_calendar_residual_b1_v2 = "world_model_v1"
+chronos2_official_zero_shot_b2_v2 = "world_model_v1"

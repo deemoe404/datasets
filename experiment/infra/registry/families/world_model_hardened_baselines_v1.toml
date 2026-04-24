@@ -2,7 +2,7 @@ schema_version = 1
 family_id = "world_model_hardened_baselines_v1"
 display_name = "World-Model Hardened Baselines v1"
 status = "prototype"
-summary = "Kelmarsh-only hardened baseline family for official or official-core world_model_v1 comparisons, with external source provenance and separated wrapper environments."
+summary = "Kelmarsh-only phase-1 adapter sanity family that records official provenance while delegating execution to repo-local world_model_baselines_v1 backends."
 model_family = "world_model_baseline"
 training_mode = "trainable"
 implementation_root = "experiment/families/world_model_hardened_baselines_v1"
@@ -30,6 +30,8 @@ model_variants = [
   "world_model_chronos_2_zero_shot_official_v1_farm_sync",
 ]
 notes = [
+  "This family is retained as phase-1 adapter sanity evidence; final official/official-core claims belong in world_model_official_baselines_v2.",
+  "The trainable v1 variants still execute through repo-local world_model_baselines_v1 backend dispatch.",
   "This family is a sibling to world_model_baselines_v1; repo-local style baselines remain in that family for controlled comparisons.",
   "Result rows add implementation_track, source_repo, source_commit, adapter_kind, and search_config_id provenance columns.",
   "External source checkouts live under experiment/official_baselines/<baseline>/source as submodules, while each wrapper owns a sibling ignored .conda environment.",

@@ -33,6 +33,7 @@ def test_registry_snapshot_contains_active_families() -> None:
         "world_model_agcrn_v1",
         "world_model_baselines_v1",
         "world_model_hardened_baselines_v1",
+        "world_model_official_baselines_v2",
         "world_model_rollout_v1",
         "world_model_state_space_v1",
     }
@@ -47,6 +48,7 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
     world_model = snapshot.families["world_model_agcrn_v1"]
     world_model_baselines = snapshot.families["world_model_baselines_v1"]
     world_model_hardened_baselines = snapshot.families["world_model_hardened_baselines_v1"]
+    world_model_official_baselines = snapshot.families["world_model_official_baselines_v2"]
     world_model_rollout = snapshot.families["world_model_rollout_v1"]
     world_model_state_space = snapshot.families["world_model_state_space_v1"]
 
@@ -124,6 +126,16 @@ def test_registry_family_bindings_capture_current_active_contract() -> None:
         "world_model_itransformer_official_v1_farm_sync": "world_model_v1",
         "world_model_chronos_2_zero_shot_official_v1_farm_sync": "world_model_v1",
     }
+    assert world_model_official_baselines.status == "prototype"
+    assert world_model_official_baselines.task_contract.granularity == "farm"
+    assert world_model_official_baselines.dataset_scope == ("kelmarsh",)
+    assert (
+        world_model_official_baselines.default_output_path
+        == "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv"
+    )
+    assert world_model_official_baselines.supported_feature_protocols == ("world_model_v1",)
+    assert world_model_official_baselines.implementation_bindings["dgcrn_official_core_residual_b2_v2"] == "world_model_v1"
+    assert world_model_official_baselines.implementation_bindings["chronos2_official_zero_shot_b2_v2"] == "world_model_v1"
     assert world_model_rollout.status == "prototype"
     assert world_model_rollout.task_contract.granularity == "farm"
     assert world_model_rollout.dataset_scope == ("kelmarsh", "penmanshiel")
@@ -161,7 +173,7 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     snapshot = module.load_registry_snapshot()
     rows = module.build_dataset_family_feature_matrix(snapshot)
 
-    assert len(rows) == 27
+    assert len(rows) == 28
     assert rows[0].family_id == "agcrn_masked"
     assert rows[0].feature_protocol_id == "power_wd_yaw_pmean_hist_sincos_masked"
     assert rows[1].family_id == "agcrn_masked"
@@ -171,6 +183,7 @@ def test_registry_dataset_family_feature_matrix_matches_active_scope() -> None:
     assert sum(row.family_id == "world_model_agcrn_v1" for row in rows) == 2
     assert sum(row.family_id == "world_model_baselines_v1" for row in rows) == 1
     assert sum(row.family_id == "world_model_hardened_baselines_v1" for row in rows) == 1
+    assert sum(row.family_id == "world_model_official_baselines_v2" for row in rows) == 1
     assert sum(row.family_id == "world_model_rollout_v1" for row in rows) == 2
     assert sum(row.family_id == "world_model_state_space_v1" for row in rows) == 1
     assert {row.family_status for row in rows} == {"pilot", "prototype"}
@@ -188,6 +201,7 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "world_model_agcrn_v1" in rendered
     assert "world_model_baselines_v1" in rendered
     assert "world_model_hardened_baselines_v1" in rendered
+    assert "world_model_official_baselines_v2" in rendered
     assert "world_model_rollout_v1" in rendered
     assert "world_model_state_space_v1" in rendered
     assert "official_aligned_power_only_farm_sync" in rendered
@@ -220,6 +234,9 @@ def test_registry_markdown_renderer_mentions_active_family() -> None:
     assert "world_model_timexer_official_v1_farm_sync" in rendered
     assert "world_model_itransformer_official_v1_farm_sync" in rendered
     assert "world_model_chronos_2_zero_shot_official_v1_farm_sync" in rendered
+    assert "dgcrn_official_core_residual_b2_v2" in rendered
+    assert "timexer_official_full_exog_residual_b2_v2" in rendered
+    assert "chronos2_official_zero_shot_b2_v2" in rendered
     assert "world_model_rollout_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_farm_sync" in rendered
     assert "world_model_state_space_v1_residual_persistence_farm_sync" in rendered

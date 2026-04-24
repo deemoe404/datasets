@@ -29,7 +29,7 @@
     "node_embed_dim": null,
     "num_layers": null,
     "num_workers": 0,
-    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-chronos2.csv",
+    "output_path": "/home/sam/datasets/experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-chronos2.csv",
     "patch_len": null,
     "patience": null,
     "propalpha": null,
@@ -77,7 +77,7 @@
       }
     },
     "resume": true,
-    "run_label": "hardened_official_tuned_full_20260424_chronos2_resume_20260424",
+    "run_label": "phase1_adapter_20260424_chronos2_resume_20260424",
     "seed": 3407,
     "selection_metrics": [
       "val_rmse_pu",
@@ -95,12 +95,12 @@
   "artifacts": {
     "primary_output": {
       "exists": true,
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-chronos2.csv",
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-chronos2.csv",
       "sha256": "d599b80c1edc57282ca1f47255b373a9efe97b5f6da3e9de3cb9013683798e63",
       "size_bytes": 196594
     },
     "training_history": {
-      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-tuned-chronos2.training_history.csv"
+      "path": "experiment/artifacts/published/world_model_hardened_baselines_v1/20260424-phase1-adapter-chronos2.training_history.csv"
     }
   },
   "created_at_utc": "2026-04-24T07:37:06.222476+00:00",
@@ -129,7 +129,7 @@
   "invocation": {
     "entrypoint": "experiment/families/world_model_hardened_baselines_v1/run_world_model_hardened_baselines_v1.py",
     "kind": "family_runner",
-    "run_label": "hardened_official_tuned_full_20260424_chronos2_resume_20260424"
+    "run_label": "phase1_adapter_20260424_chronos2_resume_20260424"
   },
   "notes": [],
   "result": {

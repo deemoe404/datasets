@@ -43,6 +43,20 @@ def test_default_variants_are_initial_hardened_track() -> None:
     )
 
 
+def test_readme_declares_phase1_adapter_not_final_official_track() -> None:
+    readme = (
+        Path(__file__).resolve().parents[1]
+        / "experiment"
+        / "families"
+        / "world_model_hardened_baselines_v1"
+        / "README.md"
+    ).read_text()
+
+    assert "phase-1 adapter sanity" in readme
+    assert "repo-local backend" in readme
+    assert "not final official implementation baselines" in readme
+
+
 def test_hardened_variants_resolve_to_repo_baseline_backends() -> None:
     module = _load_module()
     specs = {spec.model_variant: spec for spec in module.resolve_variant_specs(None)}
