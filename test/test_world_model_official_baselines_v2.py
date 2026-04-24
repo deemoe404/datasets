@@ -196,3 +196,24 @@ def test_formal_tuning_support_is_fail_closed() -> None:
     status, blocker = formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"])
     assert status == "blocked"
     assert blocker == "official_core_training_adapter_not_implemented"
+
+
+def test_formal_tuning_cli_exposes_dgcrn_search_knobs() -> None:
+    formal = _load_formal_tuning_module()
+
+    args = formal.build_arg_parser().parse_args(
+        [
+            "--output-path",
+            "scratch.csv",
+            "--dgcrn-hidden-dim",
+            "96",
+            "--dgcrn-dropout",
+            "0.0",
+            "--dgcrn-gcn-depth",
+            "3",
+        ]
+    )
+
+    assert args.dgcrn_hidden_dim == 96
+    assert args.dgcrn_dropout == 0.0
+    assert args.dgcrn_gcn_depth == 3

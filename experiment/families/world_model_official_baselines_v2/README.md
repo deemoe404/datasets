@@ -89,6 +89,9 @@ the validation surface while debugging:
   --max-checkpoint-origins 1310 \
   --gate-origin-count 64 \
   --residual-anchor-steps 1 \
+  --dgcrn-hidden-dim 64 \
+  --dgcrn-dropout 0.1 \
+  --dgcrn-gcn-depth 2 \
   --output-path ../../artifacts/scratch/world_model_official_baselines_v2/dgcrn_debug.csv \
   --no-record-run
 ```
@@ -105,3 +108,8 @@ direct/residual, TimeXer official target-only direct/residual, and iTransformer
 official target-only direct/residual. TimeXer full-exog, iTransformer exog,
 TFT-PF, MTGNN, and neural residual controls must not be interpreted as tuned
 until their v2 adapters implement real training or zero-shot execution.
+
+DGCRN official-core debug search should vary the declared CLI knobs
+`--dgcrn-hidden-dim`, `--dgcrn-dropout`, `--dgcrn-gcn-depth`,
+`--learning-rate`, and `--residual-anchor-steps`; these values are recorded in
+the summary, manifest, trial id, and formal search config id.

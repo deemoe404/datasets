@@ -1273,6 +1273,9 @@ def run_formal_tuning(
     max_checkpoint_origins: int | None = None,
     gate_origin_count: int = 64,
     residual_anchor_steps: int = 0,
+    dgcrn_hidden_dim: int = 64,
+    dgcrn_dropout: float = 0.1,
+    dgcrn_gcn_depth: int = 2,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -1484,9 +1487,16 @@ def run_formal_tuning(
                     batch_size=train_batch_size,
                     learning_rate=learning_rate,
                     max_epochs=max_epochs,
-                    hidden_dim=64,
-                    dropout=0.1,
-                    gcn_depth=2,
+                    hidden_dim=dgcrn_hidden_dim,
+                    dropout=dgcrn_dropout,
+                    gcn_depth=dgcrn_gcn_depth,
+                )
+                dgcrn_search_config_id = (
+                    f"dgcrn_official_core_h{dgcrn_hidden_dim}"
+                    f"_dropout{dgcrn_dropout:g}"
+                    f"_gcn{dgcrn_gcn_depth}"
+                    f"_lr{learning_rate:g}"
+                    f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
                 )
                 predictions_by_split = {
                     (split_name, eval_protocol): _evaluate_dgcrn(
@@ -1520,11 +1530,11 @@ def run_formal_tuning(
                         prepared=prepared,
                         seed=seed,
                         trial_id=(
-                            "dgcrn_official_core_residual_default"
+                            f"dgcrn_official_core_residual_{dgcrn_search_config_id}"
                             if spec.model_variant == DGCRN_RESIDUAL_VARIANT
-                            else "dgcrn_official_core_direct_default"
+                            else f"dgcrn_official_core_direct_{dgcrn_search_config_id}"
                         ),
-                        search_config_id="dgcrn_official_core_default",
+                        search_config_id=dgcrn_search_config_id,
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
@@ -1686,6 +1696,9 @@ def run_formal_tuning(
         "max_checkpoint_origins": max_checkpoint_origins,
         "gate_origin_count": gate_origin_count,
         "residual_anchor_steps": residual_anchor_steps,
+        "dgcrn_hidden_dim": dgcrn_hidden_dim,
+        "dgcrn_dropout": dgcrn_dropout,
+        "dgcrn_gcn_depth": dgcrn_gcn_depth,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -1712,6 +1725,9 @@ def run_formal_tuning(
                 "max_checkpoint_origins": max_checkpoint_origins,
                 "gate_origin_count": gate_origin_count,
                 "residual_anchor_steps": residual_anchor_steps,
+                "dgcrn_hidden_dim": dgcrn_hidden_dim,
+                "dgcrn_dropout": dgcrn_dropout,
+                "dgcrn_gcn_depth": dgcrn_gcn_depth,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -1785,6 +1801,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-checkpoint-origins", type=int, default=None)
     parser.add_argument("--gate-origin-count", type=int, default=64)
     parser.add_argument("--residual-anchor-steps", type=int, default=0)
+    parser.add_argument("--dgcrn-hidden-dim", type=int, default=64)
+    parser.add_argument("--dgcrn-dropout", type=float, default=0.1)
+    parser.add_argument("--dgcrn-gcn-depth", type=int, default=2)
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -1811,6 +1830,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_checkpoint_origins=args.max_checkpoint_origins,
         gate_origin_count=args.gate_origin_count,
         residual_anchor_steps=args.residual_anchor_steps,
+        dgcrn_hidden_dim=args.dgcrn_hidden_dim,
+        dgcrn_dropout=args.dgcrn_dropout,
+        dgcrn_gcn_depth=args.dgcrn_gcn_depth,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )
