@@ -618,11 +618,36 @@ def _masked_mse_torch(predictions: Any, targets: Any, valid: Any) -> Any:
     return (((predictions - targets) ** 2) * valid).sum() / denominator
 
 
+def _anchored_loss_valid(valid: Any, *, residual_output: bool, residual_anchor_steps: int) -> Any:
+    if not residual_output or residual_anchor_steps <= 0:
+        return valid
+    anchored = valid.clone()
+    anchored[:, :residual_anchor_steps, :] = 0.0
+    return anchored
+
+
+def _apply_residual_anchor_torch(raw: Any, *, residual_output: bool, residual_anchor_steps: int) -> Any:
+    if not residual_output or residual_anchor_steps <= 0:
+        return raw
+    anchored = raw.clone()
+    anchored[:, :residual_anchor_steps, :] = 0.0
+    return anchored
+
+
+def _apply_residual_anchor_numpy(raw: np.ndarray, *, residual_output: bool, residual_anchor_steps: int) -> np.ndarray:
+    if not residual_output or residual_anchor_steps <= 0:
+        return raw
+    anchored = raw.copy()
+    anchored[:, :residual_anchor_steps, :] = 0.0
+    return anchored
+
+
 def _train_itransformer(
     prepared: Any,
     *,
     variant_name: str,
     validation_windows: Any,
+    residual_anchor_steps: int,
     seed: int,
     device: str,
     batch_size: int,
@@ -671,7 +696,20 @@ def _train_itransformer(
             target = y - anchor[:, None, :] if residual_output else y
             optimizer.zero_grad(set_to_none=True)
             raw = model(x, None, None, None)
-            loss = _masked_mse_torch(raw, target, valid)
+            raw = _apply_residual_anchor_torch(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+            loss = _masked_mse_torch(
+                raw,
+                target,
+                _anchored_loss_valid(
+                    valid,
+                    residual_output=residual_output,
+                    residual_anchor_steps=residual_anchor_steps,
+                ),
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -684,6 +722,7 @@ def _train_itransformer(
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
         )
         val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
@@ -717,6 +756,7 @@ def _train_dgcrn(
     *,
     variant_name: str,
     validation_windows: Any,
+    residual_anchor_steps: int,
     seed: int,
     device: str,
     batch_size: int,
@@ -768,7 +808,20 @@ def _train_dgcrn(
             target = y - anchor[:, None, :] if residual_output else y
             optimizer.zero_grad(set_to_none=True)
             raw = model(x, ycl=ycl, batches_seen=batches_seen, task_level=prepared.forecast_steps).squeeze(-1)
-            loss = _masked_mse_torch(raw, target, valid)
+            raw = _apply_residual_anchor_torch(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+            loss = _masked_mse_torch(
+                raw,
+                target,
+                _anchored_loss_valid(
+                    valid,
+                    residual_output=residual_output,
+                    residual_anchor_steps=residual_anchor_steps,
+                ),
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -782,6 +835,7 @@ def _train_dgcrn(
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
         )
         val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
@@ -815,6 +869,7 @@ def _train_timexer(
     *,
     variant_name: str,
     validation_windows: Any,
+    residual_anchor_steps: int,
     seed: int,
     device: str,
     batch_size: int,
@@ -865,7 +920,20 @@ def _train_timexer(
             target = y - anchor[:, None, :] if residual_output else y
             optimizer.zero_grad(set_to_none=True)
             raw = model(x, None, None, None)
-            loss = _masked_mse_torch(raw, target, valid)
+            raw = _apply_residual_anchor_torch(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+            loss = _masked_mse_torch(
+                raw,
+                target,
+                _anchored_loss_valid(
+                    valid,
+                    residual_output=residual_output,
+                    residual_anchor_steps=residual_anchor_steps,
+                ),
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -878,6 +946,7 @@ def _train_timexer(
             variant_name=variant_name,
             device=resolved_device,
             batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
         )
         val_targets, val_valid = _target_and_valid(prepared, validation_windows)
         val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
@@ -914,6 +983,7 @@ def _evaluate_itransformer(
     variant_name: str,
     device: str,
     batch_size: int,
+    residual_anchor_steps: int,
 ) -> np.ndarray:
     import torch
 
@@ -931,6 +1001,11 @@ def _evaluate_itransformer(
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            raw = _apply_residual_anchor_numpy(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
             if residual_output:
                 raw = raw + anchor_np[:, None, :]
             predictions[offset : offset + raw.shape[0]] = raw
@@ -946,6 +1021,7 @@ def _evaluate_dgcrn(
     variant_name: str,
     device: str,
     batch_size: int,
+    residual_anchor_steps: int,
 ) -> np.ndarray:
     import torch
 
@@ -965,6 +1041,11 @@ def _evaluate_dgcrn(
             ycl = torch.as_tensor(ycl_np, device=device)
             raw = model(x, ycl=ycl, batches_seen=None, task_level=prepared.forecast_steps).squeeze(-1)
             raw_np = raw.detach().cpu().numpy().astype(np.float32, copy=False)
+            raw_np = _apply_residual_anchor_numpy(
+                raw_np,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
             if residual_output:
                 raw_np = raw_np + anchor_np[:, None, :]
             predictions[offset : offset + raw_np.shape[0]] = raw_np
@@ -980,6 +1061,7 @@ def _evaluate_timexer(
     variant_name: str,
     device: str,
     batch_size: int,
+    residual_anchor_steps: int,
 ) -> np.ndarray:
     import torch
 
@@ -997,6 +1079,11 @@ def _evaluate_timexer(
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            raw = _apply_residual_anchor_numpy(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
             if residual_output:
                 raw = raw + anchor_np[:, None, :]
             predictions[offset : offset + raw.shape[0]] = raw
@@ -1012,6 +1099,7 @@ def _gate_status_for_neural_model(
     variant_name: str,
     device: str,
     batch_size: int,
+    residual_anchor_steps: int,
     train_gate_windows: Any,
     gate_c_windows: Any,
     persistence_train_rmse: float,
@@ -1025,6 +1113,7 @@ def _gate_status_for_neural_model(
         variant_name=variant_name,
         device=device,
         batch_size=batch_size,
+        residual_anchor_steps=residual_anchor_steps,
     )
     train_targets, train_valid = _target_and_valid(prepared, train_gate_windows)
     train_metrics = _metrics(train_predictions, train_targets, train_valid, rated_power_kw=prepared.rated_power_kw)
@@ -1040,6 +1129,7 @@ def _gate_status_for_neural_model(
         variant_name=variant_name,
         device=device,
         batch_size=batch_size,
+        residual_anchor_steps=residual_anchor_steps,
     )
     gate_c_targets, gate_c_valid = _target_and_valid(prepared, gate_c_windows)
     gate_c_metrics = _metrics(gate_c_predictions, gate_c_targets, gate_c_valid, rated_power_kw=prepared.rated_power_kw)
@@ -1095,6 +1185,7 @@ def _metric_rows(
     runtime_seconds: float,
     gate_b_passed: bool | None,
     gate_c_passed: bool | None,
+    residual_anchor_steps: int,
     best_trial: bool,
     window_specs: Sequence[tuple[str, str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1119,6 +1210,7 @@ def _metric_rows(
                 "gate_a_passed": True,
                 "gate_b_passed": gate_b_passed,
                 "gate_c_passed": gate_c_passed,
+                "residual_anchor_steps": residual_anchor_steps,
                 "runtime_seconds": runtime_seconds,
                 **metrics,
             }
@@ -1142,6 +1234,7 @@ def _blocked_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int, block
         "gate_a_passed": True,
         "gate_b_passed": False if spec.trainable else None,
         "gate_c_passed": False if spec.trainable else None,
+        "residual_anchor_steps": 0,
         "runtime_seconds": 0.0,
         "window_count": None,
         "prediction_count": None,
@@ -1179,6 +1272,7 @@ def run_formal_tuning(
     checkpoint_eval_protocol: str = ROLLING_EVAL_PROTOCOL,
     max_checkpoint_origins: int | None = None,
     gate_origin_count: int = 64,
+    residual_anchor_steps: int = 0,
     run_label: str | None = None,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
@@ -1257,6 +1351,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=None,
                         gate_c_passed=True,
+                        residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1278,6 +1373,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=None,
                         gate_c_passed=None,
+                        residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1344,6 +1440,7 @@ def run_formal_tuning(
                             runtime_seconds=time.perf_counter() - started,
                             gate_b_passed=gate_b_passed,
                             gate_c_passed=gate_c_passed,
+                            residual_anchor_steps=0,
                             best_trial=index == best_index,
                             window_specs=window_specs,
                         )
@@ -1371,6 +1468,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=None,
                         gate_c_passed=None,
+                        residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1380,6 +1478,7 @@ def run_formal_tuning(
                     prepared,
                     variant_name=spec.model_variant,
                     validation_windows=checkpoint_windows,
+                    residual_anchor_steps=residual_anchor_steps,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1397,6 +1496,7 @@ def run_formal_tuning(
                         variant_name=spec.model_variant,
                         device=train_summary["device"],
                         batch_size=train_batch_size,
+                        residual_anchor_steps=residual_anchor_steps,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -1407,6 +1507,7 @@ def run_formal_tuning(
                     variant_name=spec.model_variant,
                     device=train_summary["device"],
                     batch_size=train_batch_size,
+                    residual_anchor_steps=residual_anchor_steps,
                     train_gate_windows=train_gate_windows,
                     gate_c_windows=gate_c_windows,
                     persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
@@ -1429,6 +1530,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=gate_b_passed,
                         gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1438,6 +1540,7 @@ def run_formal_tuning(
                     prepared,
                     variant_name=spec.model_variant,
                     validation_windows=checkpoint_windows,
+                    residual_anchor_steps=residual_anchor_steps,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1457,6 +1560,7 @@ def run_formal_tuning(
                         variant_name=spec.model_variant,
                         device=train_summary["device"],
                         batch_size=train_batch_size,
+                        residual_anchor_steps=residual_anchor_steps,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -1467,6 +1571,7 @@ def run_formal_tuning(
                     variant_name=spec.model_variant,
                     device=train_summary["device"],
                     batch_size=train_batch_size,
+                    residual_anchor_steps=residual_anchor_steps,
                     train_gate_windows=train_gate_windows,
                     gate_c_windows=gate_c_windows,
                     persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
@@ -1489,6 +1594,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=gate_b_passed,
                         gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1498,6 +1604,7 @@ def run_formal_tuning(
                     prepared,
                     variant_name=spec.model_variant,
                     validation_windows=checkpoint_windows,
+                    residual_anchor_steps=residual_anchor_steps,
                     seed=seed,
                     device=device,
                     batch_size=train_batch_size,
@@ -1516,6 +1623,7 @@ def run_formal_tuning(
                         variant_name=spec.model_variant,
                         device=train_summary["device"],
                         batch_size=train_batch_size,
+                        residual_anchor_steps=residual_anchor_steps,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -1526,6 +1634,7 @@ def run_formal_tuning(
                     variant_name=spec.model_variant,
                     device=train_summary["device"],
                     batch_size=train_batch_size,
+                    residual_anchor_steps=residual_anchor_steps,
                     train_gate_windows=train_gate_windows,
                     gate_c_windows=gate_c_windows,
                     persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
@@ -1548,6 +1657,7 @@ def run_formal_tuning(
                         runtime_seconds=time.perf_counter() - started,
                         gate_b_passed=gate_b_passed,
                         gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
                     )
@@ -1575,6 +1685,7 @@ def run_formal_tuning(
         "checkpoint_eval_protocol": checkpoint_eval_protocol,
         "max_checkpoint_origins": max_checkpoint_origins,
         "gate_origin_count": gate_origin_count,
+        "residual_anchor_steps": residual_anchor_steps,
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
     }
@@ -1600,6 +1711,7 @@ def run_formal_tuning(
                 "checkpoint_eval_protocol": checkpoint_eval_protocol,
                 "max_checkpoint_origins": max_checkpoint_origins,
                 "gate_origin_count": gate_origin_count,
+                "residual_anchor_steps": residual_anchor_steps,
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
             },
@@ -1672,6 +1784,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-checkpoint-origins", type=int, default=None)
     parser.add_argument("--gate-origin-count", type=int, default=64)
+    parser.add_argument("--residual-anchor-steps", type=int, default=0)
     parser.add_argument("--run-label", type=str, default=None)
     parser.add_argument("--no-record-run", action="store_true")
     return parser
@@ -1697,6 +1810,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_eval_protocol=args.checkpoint_eval_protocol,
         max_checkpoint_origins=args.max_checkpoint_origins,
         gate_origin_count=args.gate_origin_count,
+        residual_anchor_steps=args.residual_anchor_steps,
         run_label=args.run_label,
         no_record_run=args.no_record_run,
     )

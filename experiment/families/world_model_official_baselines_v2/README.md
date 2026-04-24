@@ -88,9 +88,16 @@ the validation surface while debugging:
   --checkpoint-eval-protocol non_overlap \
   --max-checkpoint-origins 1310 \
   --gate-origin-count 64 \
+  --residual-anchor-steps 1 \
   --output-path ../../artifacts/scratch/world_model_official_baselines_v2/dgcrn_debug.csv \
   --no-record-run
 ```
+
+`--residual-anchor-steps 1` is a declared output parameterization for residual
+neural adapters: the first 10-minute residual is fixed to zero, so the point
+forecast at lead 1 is exactly the last-value persistence anchor. The anchored
+lead is excluded from training loss because the model is not allowed to change
+it.
 
 Current executable formal rows include analytic persistence, the closed-form
 Ridge residual control, Chronos-2 zero-shot, DGCRN official-core
