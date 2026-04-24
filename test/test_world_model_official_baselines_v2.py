@@ -24,6 +24,26 @@ def _load_module():
     return module
 
 
+def _load_formal_tuning_module():
+    module_path = (
+        Path(__file__).resolve().parents[1]
+        / "experiment"
+        / "families"
+        / "world_model_official_baselines_v2"
+        / "formal_tuning.py"
+    )
+    family_dir = module_path.parent
+    if str(family_dir) not in sys.path:
+        sys.path.insert(0, str(family_dir))
+    spec = spec_from_file_location("world_model_official_baselines_v2_formal_tuning", module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_default_variants_cover_debug_matrix_without_repo_local_backends() -> None:
     module = _load_module()
 
@@ -157,3 +177,15 @@ def test_statistics_helpers_report_bootstrap_probability_and_error_quantiles() -
     assert result["prob_delta_gt_zero"] == 1.0
     assert result["ci95_low"] > 0
     assert quantiles == {"ae_p50": 0.25, "ae_p90": 0.37, "ae_p95": 0.385}
+
+
+def test_formal_tuning_support_is_fail_closed() -> None:
+    module = _load_module()
+    formal = _load_formal_tuning_module()
+    specs = {spec.model_variant: spec for spec in module.resolve_variant_specs(None)}
+
+    assert formal.formal_support_status(specs["baseline_last_value_persistence_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["baseline_ridge_residual_persistence_b0_v2"]) == ("supported", None)
+    status, blocker = formal.formal_support_status(specs["dgcrn_official_core_residual_b2_v2"])
+    assert status == "blocked"
+    assert blocker == "official_core_training_adapter_not_implemented"

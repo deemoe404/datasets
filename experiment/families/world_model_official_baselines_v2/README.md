@@ -67,3 +67,19 @@ cd experiment/families/world_model_official_baselines_v2
   --output-path ../../artifacts/scratch/world_model_official_baselines_v2/debug_matrix.csv \
   --no-record-run
 ```
+
+Formal tuning is fail-closed while the official trainable adapters are being
+ported. The launcher runs only executable baselines and records all missing
+official trainable adapters as blocked rows, not performance results:
+
+```shell
+./.conda/bin/python run_world_model_official_baselines_v2_formal_tuning.py \
+  --output-path ../../artifacts/published/world_model_official_baselines_v2/20260424-formal-tuning-start.csv \
+  --run-label official_baselines_v2_formal_tuning_start_20260424
+```
+
+As of this scaffold, executable formal rows are limited to analytic
+persistence and the closed-form Ridge residual control. DGCRN, TimeXer,
+iTransformer, TFT-PF, MTGNN, Chronos-2, and neural residual controls must not
+be interpreted as tuned until their v2 official adapters implement real
+training or zero-shot execution.
