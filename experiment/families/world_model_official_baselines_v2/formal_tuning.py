@@ -31,6 +31,8 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     FORECAST_STEPS,
     HISTORY_STEPS,
     CHRONOS2_VARIANT,
+    DGCRN_DIRECT_VARIANT,
+    DGCRN_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
     PERSISTENCE_VARIANT,
@@ -48,6 +50,8 @@ FORMAL_SUPPORTED_VARIANTS = {
     SEASONAL_PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     CHRONOS2_VARIANT,
+    DGCRN_DIRECT_VARIANT,
+    DGCRN_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
@@ -57,7 +61,6 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "dgcrn_official_core": "official_core_training_adapter_not_implemented",
     "timexer_official_full_exog": "official_full_exog_adapter_not_implemented",
     "itransformer_official_target_plus_exog": "official_exog_adapter_not_implemented",
     "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
@@ -404,6 +407,35 @@ def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layer
     return Model(configs).to(device)
 
 
+def _load_dgcrn_model(*, prepared: Any, device: str, in_dim: int, hidden_dim: int, dropout: float, gcn_depth: int):
+    import torch
+
+    source_root = REPO_ROOT / "experiment" / "official_baselines" / "dgcrn" / "source" / "methods" / "DGCRN"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    from net import DGCRN  # type: ignore
+
+    adjacency = torch.eye(prepared.node_count, dtype=torch.float32, device=device)
+    model = DGCRN(
+        gcn_depth=gcn_depth,
+        num_nodes=prepared.node_count,
+        device=device,
+        predefined_A=[adjacency, adjacency.transpose(0, 1)],
+        dropout=dropout,
+        subgraph_size=min(6, prepared.node_count),
+        node_dim=16,
+        middle_dim=8,
+        seq_length=HISTORY_STEPS,
+        in_dim=in_dim,
+        out_dim=FORECAST_STEPS,
+        layers=1,
+        rnn_size=hidden_dim,
+        hyperGNN_dim=16,
+    ).to(device)
+    model.use_curriculum_learning = False
+    return model
+
+
 def _load_timexer_model(*, device: str, d_model: int, n_heads: int, e_layers: int, dropout: float, patch_len: int):
     source_root = REPO_ROOT / "experiment" / "official_baselines" / "timexer" / "source"
     if str(source_root) not in sys.path:
@@ -429,6 +461,29 @@ def _load_timexer_model(*, device: str, d_model: int, n_heads: int, e_layers: in
         activation="gelu",
     )
     return Model(configs).to(device)
+
+
+def _last_available_series(values: np.ndarray, unavailable: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    last_values = fallback.astype(np.float32, copy=True)
+    for node_index in range(values.shape[1]):
+        valid_positions = np.flatnonzero(unavailable[:, node_index] < 0.5)
+        if valid_positions.size:
+            last_values[node_index] = values[int(valid_positions[-1]), node_index]
+    return last_values
+
+
+def _static_summary(prepared: Any) -> np.ndarray:
+    static = np.asarray(prepared.static_tensor, dtype=np.float32)
+    if static.ndim != 2 or static.shape[0] != prepared.node_count or static.shape[1] == 0:
+        return np.zeros((prepared.node_count,), dtype=np.float32)
+    column = static[:, 0].astype(np.float32, copy=True)
+    finite = np.isfinite(column)
+    if not finite.any():
+        return np.zeros((prepared.node_count,), dtype=np.float32)
+    mean = float(column[finite].mean())
+    std = float(column[finite].std()) or 1.0
+    column = np.where(finite, column, mean)
+    return ((column - mean) / std).astype(np.float32)
 
 
 def _iter_target_only_batches(
@@ -465,6 +520,70 @@ def _iter_target_only_batches(
             y[row_index] = prepared.target_pu_filled[future]
             valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
         yield x, y, valid, anchor
+
+
+def _iter_dgcrn_batches(
+    prepared: Any,
+    windows: Any,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+):
+    state_base = _load_state_space_base()
+    calendar_count = prepared.context_future_tensor.shape[1]
+    in_dim = 1 + calendar_count + 3
+    indices = np.arange(len(windows), dtype=np.int64)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+    static_summary = _static_summary(prepared)
+    local_fallback = np.zeros((prepared.node_count,), dtype=np.float32)
+    for start in range(0, len(indices), batch_size):
+        batch_window_indices = indices[start : start + batch_size]
+        x = np.zeros((len(batch_window_indices), in_dim, prepared.node_count, prepared.history_steps), dtype=np.float32)
+        ycl = np.zeros((len(batch_window_indices), in_dim, prepared.node_count, prepared.forecast_steps), dtype=np.float32)
+        y = np.zeros((len(batch_window_indices), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+        valid = np.zeros_like(y, dtype=np.float32)
+        anchor = np.zeros((len(batch_window_indices), prepared.node_count), dtype=np.float32)
+        for row_index, window_pos in enumerate(batch_window_indices):
+            target_index = int(windows.target_indices[int(window_pos)])
+            history = slice(target_index - prepared.history_steps, target_index)
+            future = slice(target_index, target_index + prepared.forecast_steps)
+            target_history = prepared.local_history_tensor[history, :, 0]
+            target_unavailable = prepared.local_history_tensor[history, :, 17]
+            last_target = _last_available_series(
+                target_history,
+                target_unavailable,
+                prepared.persistence_train_fallback_pu.astype(np.float32, copy=False),
+            )
+            anchor[row_index] = last_target
+            x[row_index, 0] = target_history.T
+
+            history_calendar = prepared.context_history_tensor[history, state_base._CONTEXT_CALENDAR_START :]
+            future_calendar = prepared.context_future_tensor[future]
+            for calendar_index in range(calendar_count):
+                x[row_index, 1 + calendar_index] = history_calendar[:, calendar_index][None, :]
+                ycl[row_index, 1 + calendar_index] = future_calendar[:, calendar_index][None, :]
+
+            local_values = prepared.local_history_tensor[history, :, 1]
+            local_unavailable = prepared.local_history_tensor[history, :, 18]
+            local_last = _last_available_series(local_values, local_unavailable, local_fallback)
+            x[row_index, 1 + calendar_count] = local_values.T
+            ycl[row_index, 1 + calendar_count] = local_last[:, None]
+
+            global_values = prepared.context_history_tensor[history, state_base._CONTEXT_GLOBAL_VALUE_START]
+            global_unavailable = prepared.context_history_tensor[history, state_base._CONTEXT_GLOBAL_MASK_START]
+            global_last_scalar = float(global_values[np.flatnonzero(global_unavailable < 0.5)[-1]]) if np.any(global_unavailable < 0.5) else 0.0
+            x[row_index, 2 + calendar_count] = global_values[None, :]
+            ycl[row_index, 2 + calendar_count] = np.full((prepared.node_count, prepared.forecast_steps), global_last_scalar, dtype=np.float32)
+
+            x[row_index, 3 + calendar_count] = static_summary[:, None]
+            ycl[row_index, 3 + calendar_count] = static_summary[:, None]
+
+            y[row_index] = prepared.target_pu_filled[future]
+            valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
+        yield x, ycl, y, valid, anchor
 
 
 def _masked_mse_torch(predictions: Any, targets: Any, valid: Any) -> Any:
@@ -531,6 +650,103 @@ def _train_itransformer(
             train_loss_sum += float(loss.detach().cpu())
             train_batches += 1
         val_predictions = _evaluate_itransformer(
+            model,
+            prepared,
+            prepared.val_rolling_windows,
+            variant_name=variant_name,
+            device=resolved_device,
+            batch_size=batch_size,
+        )
+        val_targets, val_valid = _target_and_valid(prepared, prepared.val_rolling_windows)
+        val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss_mean": train_loss_sum / max(train_batches, 1),
+                "val_rmse_pu": val_metrics["rmse_pu"],
+                "val_mae_pu": val_metrics["mae_pu"],
+            }
+        )
+        if val_metrics["rmse_pu"] < best_val_rmse:
+            best_val_rmse = float(val_metrics["rmse_pu"])
+            best_val_mae = float(val_metrics["mae_pu"])
+            best_epoch = epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {
+        "best_epoch": best_epoch,
+        "epochs_ran": max_epochs,
+        "best_val_rmse_pu": best_val_rmse,
+        "best_val_mae_pu": best_val_mae,
+        "history": history,
+        "device": resolved_device,
+    }
+
+
+def _train_dgcrn(
+    prepared: Any,
+    *,
+    variant_name: str,
+    seed: int,
+    device: str,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    hidden_dim: int,
+    dropout: float,
+    gcn_depth: int,
+) -> tuple[Any, dict[str, Any]]:
+    import torch
+
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    in_dim = 1 + prepared.context_future_tensor.shape[1] + 3
+    model = _load_dgcrn_model(
+        prepared=prepared,
+        device=resolved_device,
+        in_dim=in_dim,
+        hidden_dim=hidden_dim,
+        dropout=dropout,
+        gcn_depth=gcn_depth,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    best_state = None
+    best_val_rmse = math.inf
+    best_val_mae = math.inf
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    residual_output = variant_name == DGCRN_RESIDUAL_VARIANT
+    batches_seen = 0
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_batches = 0
+        for x_np, ycl_np, y_np, valid_np, anchor_np in _iter_dgcrn_batches(
+            prepared,
+            prepared.train_windows,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed + epoch,
+        ):
+            x = torch.as_tensor(x_np, device=resolved_device)
+            ycl = torch.as_tensor(ycl_np, device=resolved_device)
+            y = torch.as_tensor(y_np, device=resolved_device)
+            valid = torch.as_tensor(valid_np, device=resolved_device)
+            anchor = torch.as_tensor(anchor_np, device=resolved_device)
+            target = y - anchor[:, None, :] if residual_output else y
+            optimizer.zero_grad(set_to_none=True)
+            raw = model(x, ycl=ycl, batches_seen=batches_seen, task_level=prepared.forecast_steps).squeeze(-1)
+            loss = _masked_mse_torch(raw, target, valid)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            batches_seen += 1
+            train_loss_sum += float(loss.detach().cpu())
+            train_batches += 1
+        val_predictions = _evaluate_dgcrn(
             model,
             prepared,
             prepared.val_rolling_windows,
@@ -689,6 +905,40 @@ def _evaluate_itransformer(
                 raw = raw + anchor_np[:, None, :]
             predictions[offset : offset + raw.shape[0]] = raw
             offset += raw.shape[0]
+    return predictions
+
+
+def _evaluate_dgcrn(
+    model: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+) -> np.ndarray:
+    import torch
+
+    residual_output = variant_name == DGCRN_RESIDUAL_VARIANT
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    model.eval()
+    offset = 0
+    with torch.no_grad():
+        for x_np, ycl_np, _y_np, _valid_np, anchor_np in _iter_dgcrn_batches(
+            prepared,
+            windows,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=0,
+        ):
+            x = torch.as_tensor(x_np, device=device)
+            ycl = torch.as_tensor(ycl_np, device=device)
+            raw = model(x, ycl=ycl, batches_seen=None, task_level=prepared.forecast_steps).squeeze(-1)
+            raw_np = raw.detach().cpu().numpy().astype(np.float32, copy=False)
+            if residual_output:
+                raw_np = raw_np + anchor_np[:, None, :]
+            predictions[offset : offset + raw_np.shape[0]] = raw_np
+            offset += raw_np.shape[0]
     return predictions
 
 
@@ -1004,6 +1254,50 @@ def run_formal_tuning(
                         seed=seed,
                         trial_id="chronos2_zero_shot_median",
                         search_config_id="chronos2_zero_shot_b2",
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=None,
+                        gate_c_passed=None,
+                        best_trial=True,
+                        window_specs=window_specs,
+                    )
+                )
+            elif spec.model_variant in {DGCRN_DIRECT_VARIANT, DGCRN_RESIDUAL_VARIANT}:
+                model, train_summary = _train_dgcrn(
+                    prepared,
+                    variant_name=spec.model_variant,
+                    seed=seed,
+                    device=device,
+                    batch_size=train_batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    hidden_dim=64,
+                    dropout=0.1,
+                    gcn_depth=2,
+                )
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_dgcrn(
+                        model,
+                        prepared,
+                        windows,
+                        variant_name=spec.model_variant,
+                        device=train_summary["device"],
+                        batch_size=train_batch_size,
+                    )
+                    for split_name, eval_protocol, windows in window_specs
+                }
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id=(
+                            "dgcrn_official_core_residual_default"
+                            if spec.model_variant == DGCRN_RESIDUAL_VARIANT
+                            else "dgcrn_official_core_direct_default"
+                        ),
+                        search_config_id="dgcrn_official_core_default",
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,

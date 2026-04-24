@@ -78,8 +78,9 @@ official trainable adapters as blocked rows, not performance results:
   --run-label official_baselines_v2_formal_tuning_start_20260424
 ```
 
-As of this scaffold, executable formal rows are limited to analytic
-persistence and the closed-form Ridge residual control. DGCRN, TimeXer,
-iTransformer, TFT-PF, MTGNN, Chronos-2, and neural residual controls must not
-be interpreted as tuned until their v2 official adapters implement real
-training or zero-shot execution.
+Current executable formal rows include analytic persistence, the closed-form
+Ridge residual control, Chronos-2 zero-shot, DGCRN official-core
+direct/residual, TimeXer official target-only direct/residual, and iTransformer
+official target-only direct/residual. TimeXer full-exog, iTransformer exog,
+TFT-PF, MTGNN, and neural residual controls must not be interpreted as tuned
+until their v2 adapters implement real training or zero-shot execution.

@@ -187,10 +187,12 @@ def test_formal_tuning_support_is_fail_closed() -> None:
     assert formal.formal_support_status(specs["baseline_last_value_persistence_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["baseline_ridge_residual_persistence_b0_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["chronos2_official_zero_shot_b2_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["dgcrn_official_core_direct_b2_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["dgcrn_official_core_residual_b2_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["timexer_official_target_only_direct_b0_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["timexer_official_target_only_residual_b0_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["itransformer_official_target_only_direct_b0_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["itransformer_official_target_only_residual_b0_v2"]) == ("supported", None)
-    status, blocker = formal.formal_support_status(specs["dgcrn_official_core_residual_b2_v2"])
+    status, blocker = formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"])
     assert status == "blocked"
     assert blocker == "official_core_training_adapter_not_implemented"
