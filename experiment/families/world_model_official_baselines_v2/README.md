@@ -135,6 +135,16 @@ TFT forward pass over a PyTorch dataloader rather than repeated
 `TemporalFusionTransformer.predict()` calls, which keeps the model
 implementation official while avoiding repeated Lightning predictor teardown.
 
+Current blocker: TFT-PF full rolling test-once is blocked as of 2026-04-25.
+The full rolling test expands 94,458 forecast origins into per-turbine
+PyTorch Forecasting frames and repeatedly destabilized the Ubuntu CUDA host:
+the one-shot path exhausted memory and I/O, chunked predictor calls hit native
+NumPy/PyTorch Forecasting crashes, and the manual full rolling attempt made
+the host unreachable. The existing TFT-PF smoke, overfit64, validation, and
+bounded-test diagnostics are retained as adapter evidence, but TFT-PF must not
+be used as a paper-grade full rolling test row until a redesigned streaming
+evaluator passes the bounded-to-full recovery ladder.
+
 For DGCRN formal search, `gate_b_passed` may be sourced from a declared
 64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit
 train-window diagnostic is recorded separately as
