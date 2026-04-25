@@ -127,6 +127,11 @@ TFT-PF debug search should vary the declared CLI knobs `--tft-hidden-size`,
 `--residual-anchor-steps`; these values are recorded in the summary, manifest,
 trial id, and formal search config id.
 
+TFT-PF full rolling evaluation is chunked by forecast origins via
+`--tft-eval-window-chunk-size` (default `1024`). This preserves the same test
+window set and metrics while avoiding one-shot construction of the full
+per-turbine PyTorch Forecasting prediction frame.
+
 For DGCRN formal search, `gate_b_passed` may be sourced from a declared
 64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit
 train-window diagnostic is recorded separately as

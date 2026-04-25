@@ -73,6 +73,7 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
 }
 DEFAULT_RIDGE_ALPHAS = (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 RIDGE_LAGS = (1, 2, 3, 6, 12, 18, 36, 72, 144)
+DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE = 1024
 
 
 def formal_support_status(spec: OfficialVariantSpec) -> tuple[str, str | None]:
@@ -136,6 +137,15 @@ def _limit_windows(windows: Any, max_origins: int | None) -> Any:
         target_indices=windows.target_indices[keep],
         output_start_us=windows.output_start_us[keep],
         output_end_us=windows.output_end_us[keep],
+    )
+
+
+def _slice_windows(windows: Any, start: int, stop: int) -> Any:
+    return replace(
+        windows,
+        target_indices=windows.target_indices[start:stop],
+        output_start_us=windows.output_start_us[start:stop],
+        output_end_us=windows.output_end_us[start:stop],
     )
 
 
@@ -972,6 +982,47 @@ def _evaluate_tft(
     device: str,
     batch_size: int,
     residual_anchor_steps: int,
+    eval_window_chunk_size: int | None = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
+) -> np.ndarray:
+    chunk_size = int(eval_window_chunk_size or 0)
+    if chunk_size > 0 and len(windows) > chunk_size:
+        predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+        for start in range(0, len(windows), chunk_size):
+            stop = min(start + chunk_size, len(windows))
+            chunk_windows = _slice_windows(windows, start, stop)
+            predictions[start:stop] = _evaluate_tft_single_chunk(
+                model,
+                training_dataset,
+                prepared,
+                chunk_windows,
+                variant_name=variant_name,
+                device=device,
+                batch_size=batch_size,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+        return predictions
+    return _evaluate_tft_single_chunk(
+        model,
+        training_dataset,
+        prepared,
+        windows,
+        variant_name=variant_name,
+        device=device,
+        batch_size=batch_size,
+        residual_anchor_steps=residual_anchor_steps,
+    )
+
+
+def _evaluate_tft_single_chunk(
+    model: Any,
+    training_dataset: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    residual_anchor_steps: int,
 ) -> np.ndarray:
     residual_output = variant_name == TFT_RESIDUAL_VARIANT
     frame, sample_map = _tft_frame(
@@ -1722,6 +1773,7 @@ def run_formal_tuning(
     tft_attention_head_size: int = 4,
     tft_hidden_continuous_size: int = 16,
     tft_dropout: float = 0.1,
+    tft_eval_window_chunk_size: int = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
     timexer_d_model: int = 64,
     timexer_n_heads: int = 4,
     timexer_e_layers: int = 2,
@@ -2137,6 +2189,7 @@ def run_formal_tuning(
                         device=train_summary["device"],
                         batch_size=train_batch_size,
                         residual_anchor_steps=residual_anchor_steps,
+                        eval_window_chunk_size=tft_eval_window_chunk_size,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -2225,6 +2278,7 @@ def run_formal_tuning(
                         training_dataset,
                         prepared,
                         windows,
+                        eval_window_chunk_size=tft_eval_window_chunk_size,
                         **kwargs,
                     ),
                     model=model,
@@ -2305,6 +2359,7 @@ def run_formal_tuning(
         "tft_attention_head_size": tft_attention_head_size,
         "tft_hidden_continuous_size": tft_hidden_continuous_size,
         "tft_dropout": tft_dropout,
+        "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
         "timexer_d_model": timexer_d_model,
         "timexer_n_heads": timexer_n_heads,
         "timexer_e_layers": timexer_e_layers,
@@ -2352,6 +2407,7 @@ def run_formal_tuning(
                 "tft_attention_head_size": tft_attention_head_size,
                 "tft_hidden_continuous_size": tft_hidden_continuous_size,
                 "tft_dropout": tft_dropout,
+                "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
                 "timexer_d_model": timexer_d_model,
                 "timexer_n_heads": timexer_n_heads,
                 "timexer_e_layers": timexer_e_layers,
@@ -2446,6 +2502,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tft-attention-head-size", type=int, default=4)
     parser.add_argument("--tft-hidden-continuous-size", type=int, default=16)
     parser.add_argument("--tft-dropout", type=float, default=0.1)
+    parser.add_argument("--tft-eval-window-chunk-size", type=int, default=DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE)
     parser.add_argument("--timexer-d-model", type=int, default=64)
     parser.add_argument("--timexer-n-heads", type=int, default=4)
     parser.add_argument("--timexer-e-layers", type=int, default=2)
@@ -2493,6 +2550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tft_attention_head_size=args.tft_attention_head_size,
         tft_hidden_continuous_size=args.tft_hidden_continuous_size,
         tft_dropout=args.tft_dropout,
+        tft_eval_window_chunk_size=args.tft_eval_window_chunk_size,
         timexer_d_model=args.timexer_d_model,
         timexer_n_heads=args.timexer_n_heads,
         timexer_e_layers=args.timexer_e_layers,
