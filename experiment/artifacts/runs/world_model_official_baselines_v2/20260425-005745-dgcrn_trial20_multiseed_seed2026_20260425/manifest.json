@@ -1,0 +1,184 @@
+{
+  "args": {
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 3,
+    "dgcrn_hidden_dim": 96,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "gate_b_overfit64_mae_pu": 0.017527911760187802,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.028786084707360226,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_residual_formal_search_20260424/gate_overfit64_h64_lr3e4.csv",
+    "gate_origin_count": 64,
+    "learning_rate": 0.0005,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 12,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "seed": 2026,
+    "split_names": [
+      "test"
+    ],
+    "train_batch_size": 128,
+    "variant_names": [
+      "dgcrn_official_core_residual_b2_v2"
+    ]
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_20260425/seed2026.csv",
+      "sha256": "9a5775b61e87db6e95761d3359f5c8d4d662f262b2cb6ba6a7455ef95770a3b1",
+      "size_bytes": 2935
+    },
+    "summary": {
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_20260425/seed2026.summary.json"
+    }
+  },
+  "created_at_utc": "2026-04-25T00:57:45.943219+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_official_baselines_v2.long_metrics.v1",
+    "display_name": "World-Model Official Baselines v2",
+    "family_id": "world_model_official_baselines_v2",
+    "implementation_root": "experiment/families/world_model_official_baselines_v2",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_official_baselines_v2/README.md",
+    "runner_entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "formal_tuning_status": {
+    "blocked_rows": 0,
+    "blocked_rows_are_not_performance_results": true,
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "completed_rows": 2,
+    "created_at_utc": "2026-04-25T00:57:45.940575+00:00",
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 3,
+    "dgcrn_hidden_dim": 96,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "family_id": "world_model_official_baselines_v2",
+    "gate_b_overfit64_mae_pu": 0.017527911760187802,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.028786084707360226,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_residual_formal_search_20260424/gate_overfit64_h64_lr3e4.csv",
+    "gate_origin_count": 64,
+    "learning_rate": 0.0005,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 12,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "row_count": 2,
+    "split_names": [
+      "test"
+    ],
+    "supported_variants": [
+      "baseline_last_value_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_seasonal_persistence_v2",
+      "chronos2_official_zero_shot_b2_v2",
+      "dgcrn_official_core_direct_b2_v2",
+      "dgcrn_official_core_residual_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2",
+      "timexer_official_target_only_direct_b0_v2",
+      "timexer_official_target_only_residual_b0_v2"
+    ],
+    "train_batch_size": 128
+  },
+  "git": {
+    "branch": "codex/official-baselines-v2",
+    "head": "fe6a8b4552cd6fe330d697b0ecee7c08cfcb7664",
+    "is_dirty": true,
+    "status_short": [
+      "? experiment/official_baselines/dgcrn/source",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-004652-dgcrn_trial20_multiseed_seed3407_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-004652-dgcrn_trial20_multiseed_seed42_20260425/"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2_formal_tuning.py",
+    "kind": "formal_tuning_runner",
+    "run_label": "dgcrn_trial20_multiseed_seed2026_20260425"
+  },
+  "no_test_feedback": true,
+  "notes": [
+    "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, missing official trainable adapters are recorded as blocked rows, not performance results."
+  ],
+  "quality_gates": {
+    "gate_a": {
+      "status": "previous_debug_snapshots_written"
+    },
+    "gate_b": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_c": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_d": {
+      "status": "validation_only_selection"
+    },
+    "gate_e": {
+      "status": "test_once_for_selected_completed_trials"
+    }
+  },
+  "result": {
+    "row_count": 2
+  },
+  "schema_version": 1,
+  "selected_by": "validation_only",
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "dgcrn_official_core_residual_b2_v2"
+    ],
+    "result_splits": [
+      "test"
+    ]
+  },
+  "test_evaluated_at": "2026-04-25T00:57:45.961527+00:00"
+}
