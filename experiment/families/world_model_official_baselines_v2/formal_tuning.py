@@ -1291,6 +1291,11 @@ def run_formal_tuning(
     dgcrn_hidden_dim: int = 64,
     dgcrn_dropout: float = 0.1,
     dgcrn_gcn_depth: int = 2,
+    timexer_d_model: int = 64,
+    timexer_n_heads: int = 4,
+    timexer_e_layers: int = 2,
+    timexer_dropout: float = 0.1,
+    timexer_patch_len: int = 16,
     gate_b_overfit64_passed: bool | None = None,
     gate_b_overfit64_rmse_pu: float | None = None,
     gate_b_overfit64_mae_pu: float | None = None,
@@ -1588,11 +1593,11 @@ def run_formal_tuning(
                     batch_size=train_batch_size,
                     learning_rate=learning_rate,
                     max_epochs=max_epochs,
-                    d_model=64,
-                    n_heads=4,
-                    e_layers=2,
-                    dropout=0.1,
-                    patch_len=16,
+                    d_model=timexer_d_model,
+                    n_heads=timexer_n_heads,
+                    e_layers=timexer_e_layers,
+                    dropout=timexer_dropout,
+                    patch_len=timexer_patch_len,
                 )
                 predictions_by_split = {
                     (split_name, eval_protocol): _evaluate_timexer(
@@ -1606,7 +1611,7 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
-                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                gate_b_passed, gate_c_passed, train_gate_metrics, _gate_c_metrics = _gate_status_for_neural_model(
                     evaluator=_evaluate_timexer,
                     model=model,
                     prepared=prepared,
@@ -1639,6 +1644,10 @@ def run_formal_tuning(
                         residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
+                        gate_b_scope="train_gate_after_fit",
+                        train_gate_after_fit_passed=gate_b_passed,
+                        train_gate_after_fit_rmse_pu=float(train_gate_metrics["rmse_pu"]),
+                        train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
                     )
                 )
             elif spec.model_variant in {ITRANSFORMER_TARGET_DIRECT_VARIANT, ITRANSFORMER_TARGET_RESIDUAL_VARIANT}:
@@ -1731,6 +1740,11 @@ def run_formal_tuning(
         "dgcrn_hidden_dim": dgcrn_hidden_dim,
         "dgcrn_dropout": dgcrn_dropout,
         "dgcrn_gcn_depth": dgcrn_gcn_depth,
+        "timexer_d_model": timexer_d_model,
+        "timexer_n_heads": timexer_n_heads,
+        "timexer_e_layers": timexer_e_layers,
+        "timexer_dropout": timexer_dropout,
+        "timexer_patch_len": timexer_patch_len,
         "gate_b_overfit64_passed": gate_b_overfit64_passed,
         "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
         "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
@@ -1764,6 +1778,11 @@ def run_formal_tuning(
                 "dgcrn_hidden_dim": dgcrn_hidden_dim,
                 "dgcrn_dropout": dgcrn_dropout,
                 "dgcrn_gcn_depth": dgcrn_gcn_depth,
+                "timexer_d_model": timexer_d_model,
+                "timexer_n_heads": timexer_n_heads,
+                "timexer_e_layers": timexer_e_layers,
+                "timexer_dropout": timexer_dropout,
+                "timexer_patch_len": timexer_patch_len,
                 "gate_b_overfit64_passed": gate_b_overfit64_passed,
                 "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
                 "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
@@ -1844,6 +1863,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dgcrn-hidden-dim", type=int, default=64)
     parser.add_argument("--dgcrn-dropout", type=float, default=0.1)
     parser.add_argument("--dgcrn-gcn-depth", type=int, default=2)
+    parser.add_argument("--timexer-d-model", type=int, default=64)
+    parser.add_argument("--timexer-n-heads", type=int, default=4)
+    parser.add_argument("--timexer-e-layers", type=int, default=2)
+    parser.add_argument("--timexer-dropout", type=float, default=0.1)
+    parser.add_argument("--timexer-patch-len", type=int, default=16)
     parser.add_argument("--gate-b-overfit64-passed", action="store_true", default=None)
     parser.add_argument("--gate-b-overfit64-rmse-pu", type=float, default=None)
     parser.add_argument("--gate-b-overfit64-mae-pu", type=float, default=None)
@@ -1877,6 +1901,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         dgcrn_hidden_dim=args.dgcrn_hidden_dim,
         dgcrn_dropout=args.dgcrn_dropout,
         dgcrn_gcn_depth=args.dgcrn_gcn_depth,
+        timexer_d_model=args.timexer_d_model,
+        timexer_n_heads=args.timexer_n_heads,
+        timexer_e_layers=args.timexer_e_layers,
+        timexer_dropout=args.timexer_dropout,
+        timexer_patch_len=args.timexer_patch_len,
         gate_b_overfit64_passed=args.gate_b_overfit64_passed,
         gate_b_overfit64_rmse_pu=args.gate_b_overfit64_rmse_pu,
         gate_b_overfit64_mae_pu=args.gate_b_overfit64_mae_pu,
