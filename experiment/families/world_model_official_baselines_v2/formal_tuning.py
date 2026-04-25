@@ -39,6 +39,8 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
+    TFT_DIRECT_VARIANT,
+    TFT_RESIDUAL_VARIANT,
     TIMEXER_FULL_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
     TIMEXER_TARGET_RESIDUAL_VARIANT,
@@ -60,12 +62,13 @@ FORMAL_SUPPORTED_VARIANTS = {
     TIMEXER_FULL_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
     TIMEXER_TARGET_RESIDUAL_VARIANT,
+    TFT_DIRECT_VARIANT,
+    TFT_RESIDUAL_VARIANT,
 }
 FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
     "mtgnn_official_core": "official_core_training_adapter_not_implemented",
 }
 DEFAULT_RIDGE_ALPHAS = (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
@@ -501,6 +504,15 @@ def _load_timexer_model(
     return Model(configs).to(device)
 
 
+def _load_tft_components():
+    from lightning.pytorch import Trainer  # type: ignore
+    from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer  # type: ignore
+    from pytorch_forecasting.data import NaNLabelEncoder  # type: ignore
+    from pytorch_forecasting.metrics import RMSE  # type: ignore
+
+    return Trainer, TimeSeriesDataSet, TemporalFusionTransformer, NaNLabelEncoder, RMSE
+
+
 def _last_available_series(values: np.ndarray, unavailable: np.ndarray, fallback: np.ndarray) -> np.ndarray:
     last_values = fallback.astype(np.float32, copy=True)
     for node_index in range(values.shape[1]):
@@ -730,6 +742,284 @@ def _iter_dgcrn_batches(
             y[row_index] = prepared.target_pu_filled[future]
             valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
         yield x, ycl, y, valid, anchor
+
+
+_TFT_LOCAL_VALUE_INDICES = _TIMEXER_FULL_LOCAL_VALUE_INDICES
+_TFT_CONTEXT_HISTORY_INDICES = _TIMEXER_FULL_CONTEXT_HISTORY_INDICES
+
+
+def _tft_feature_names(prepared: Any) -> tuple[list[str], list[str], list[str]]:
+    local_names = [f"local_{index}" for index in _TFT_LOCAL_VALUE_INDICES]
+    context_names = [f"context_{index}" for index in _TFT_CONTEXT_HISTORY_INDICES]
+    calendar_names = [f"calendar_{index}" for index in range(int(prepared.context_future_tensor.shape[1]))]
+    return local_names, context_names, calendar_names
+
+
+def _tft_frame(
+    prepared: Any,
+    windows: Any,
+    *,
+    residual_output: bool,
+    residual_anchor_steps: int,
+) -> tuple[Any, dict[str, tuple[int, int]]]:
+    import pandas as pd
+
+    state_base = _load_state_space_base()
+    static_z = _standardized_static_tensor(prepared)
+    local_names, context_names, calendar_names = _tft_feature_names(prepared)
+    static_names = [f"static_{index}" for index in range(static_z.shape[1])]
+    rows: list[dict[str, Any]] = []
+    sample_map: dict[str, tuple[int, int]] = {}
+    for window_pos, target_index_value in enumerate(windows.target_indices):
+        target_index = int(target_index_value)
+        history = slice(target_index - prepared.history_steps, target_index)
+        future = slice(target_index, target_index + prepared.forecast_steps)
+        target_history_all = prepared.local_history_tensor[history, :, 0]
+        target_unavailable = prepared.local_history_tensor[history, :, state_base._LOCAL_MASK_START]
+        anchors = _last_available_series(
+            target_history_all,
+            target_unavailable,
+            prepared.persistence_train_fallback_pu.astype(np.float32, copy=False),
+        )
+        history_calendar = prepared.context_history_tensor[history, state_base._CONTEXT_CALENDAR_START :]
+        future_calendar = prepared.context_future_tensor[future]
+        context_history = prepared.context_history_tensor[history]
+        for node_index in range(prepared.node_count):
+            sample_id = f"w{window_pos}_n{node_index}"
+            sample_map[sample_id] = (window_pos, node_index)
+            anchor = float(anchors[node_index])
+            target_values = np.concatenate(
+                (
+                    prepared.target_pu_filled[history, node_index],
+                    prepared.target_pu_filled[future, node_index],
+                )
+            ).astype(np.float32, copy=True)
+            if residual_output:
+                target_values = target_values - anchor
+                if residual_anchor_steps > 0:
+                    start = prepared.history_steps
+                    stop = min(prepared.history_steps + residual_anchor_steps, target_values.shape[0])
+                    target_values[start:stop] = 0.0
+
+            local_columns: dict[str, np.ndarray] = {}
+            for local_name, value_index in zip(local_names, _TFT_LOCAL_VALUE_INDICES, strict=True):
+                values = prepared.local_history_tensor[history, node_index, value_index].astype(np.float32, copy=True)
+                mask_index = state_base._LOCAL_MASK_START + value_index
+                masks = prepared.local_history_tensor[history, node_index, mask_index]
+                values[masks >= 0.5] = 0.0
+                local_columns[local_name] = np.concatenate(
+                    (values, np.zeros((prepared.forecast_steps,), dtype=np.float32))
+                )
+
+            context_columns: dict[str, np.ndarray] = {}
+            for context_name, context_index in zip(context_names, _TFT_CONTEXT_HISTORY_INDICES, strict=True):
+                values = context_history[:, context_index].astype(np.float32, copy=True)
+                context_columns[context_name] = np.concatenate(
+                    (values, np.zeros((prepared.forecast_steps,), dtype=np.float32))
+                )
+
+            calendar_values = np.concatenate((history_calendar, future_calendar), axis=0).astype(np.float32, copy=False)
+            for step_index in range(prepared.history_steps + prepared.forecast_steps):
+                row: dict[str, Any] = {
+                    "sample_id": sample_id,
+                    "turbine_id": f"t{node_index}",
+                    "time_idx": step_index,
+                    "relative_time": float((step_index - prepared.history_steps + 1) / prepared.forecast_steps),
+                    "is_decoder": float(step_index >= prepared.history_steps),
+                    "target": float(target_values[step_index]),
+                    "anchor": anchor,
+                }
+                for local_name in local_names:
+                    row[local_name] = float(local_columns[local_name][step_index])
+                for context_name in context_names:
+                    row[context_name] = float(context_columns[context_name][step_index])
+                for calendar_index, calendar_name in enumerate(calendar_names):
+                    row[calendar_name] = float(calendar_values[step_index, calendar_index])
+                for static_index, static_name in enumerate(static_names):
+                    row[static_name] = float(static_z[node_index, static_index])
+                rows.append(row)
+    return pd.DataFrame.from_records(rows), sample_map
+
+
+def _tft_dataset(
+    frame: Any,
+    *,
+    categorical_encoders: dict[str, Any] | None = None,
+    training: Any | None = None,
+    predict: bool = False,
+):
+    _Trainer, TimeSeriesDataSet, _TemporalFusionTransformer, NaNLabelEncoder, _RMSE = _load_tft_components()
+    local_names = [column for column in frame.columns if column.startswith("local_")]
+    context_names = [column for column in frame.columns if column.startswith("context_")]
+    calendar_names = [column for column in frame.columns if column.startswith("calendar_")]
+    static_names = [column for column in frame.columns if column.startswith("static_")]
+    if training is not None:
+        return TimeSeriesDataSet.from_dataset(training, frame, predict=predict, stop_randomization=True)
+    encoders = categorical_encoders or {
+        "sample_id": NaNLabelEncoder(add_nan=True),
+        "turbine_id": NaNLabelEncoder(add_nan=True),
+    }
+    return TimeSeriesDataSet(
+        frame,
+        time_idx="time_idx",
+        target="target",
+        group_ids=["sample_id"],
+        min_encoder_length=HISTORY_STEPS,
+        max_encoder_length=HISTORY_STEPS,
+        min_prediction_length=FORECAST_STEPS,
+        max_prediction_length=FORECAST_STEPS,
+        static_categoricals=["turbine_id"],
+        static_reals=["anchor", *static_names],
+        time_varying_known_reals=["relative_time", "is_decoder", *calendar_names],
+        time_varying_unknown_reals=["target", *local_names, *context_names],
+        target_normalizer=None,
+        categorical_encoders=encoders,
+        add_relative_time_idx=False,
+        add_target_scales=False,
+        add_encoder_length=False,
+        randomize_length=False,
+    )
+
+
+def _train_tft(
+    prepared: Any,
+    *,
+    variant_name: str,
+    validation_windows: Any,
+    residual_anchor_steps: int,
+    seed: int,
+    device: str,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    hidden_size: int,
+    lstm_layers: int,
+    attention_head_size: int,
+    hidden_continuous_size: int,
+    dropout: float,
+) -> tuple[Any, Any, dict[str, Any]]:
+    import torch
+
+    Trainer, _TimeSeriesDataSet, TemporalFusionTransformer, NaNLabelEncoder, RMSE = _load_tft_components()
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    residual_output = variant_name == TFT_RESIDUAL_VARIANT
+    train_frame, _train_sample_map = _tft_frame(
+        prepared,
+        prepared.train_windows,
+        residual_output=residual_output,
+        residual_anchor_steps=residual_anchor_steps,
+    )
+    validation_frame, _validation_sample_map = _tft_frame(
+        prepared,
+        validation_windows,
+        residual_output=residual_output,
+        residual_anchor_steps=residual_anchor_steps,
+    )
+    sample_encoder = NaNLabelEncoder(add_nan=True)
+    sample_encoder.fit(np.concatenate((train_frame["sample_id"].to_numpy(), validation_frame["sample_id"].to_numpy())))
+    turbine_encoder = NaNLabelEncoder(add_nan=True)
+    turbine_encoder.fit(np.concatenate((train_frame["turbine_id"].to_numpy(), validation_frame["turbine_id"].to_numpy())))
+    training = _tft_dataset(
+        train_frame,
+        categorical_encoders={"sample_id": sample_encoder, "turbine_id": turbine_encoder},
+    )
+    validation = _tft_dataset(validation_frame, training=training, predict=True)
+    train_loader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
+    validation_loader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+    model = TemporalFusionTransformer.from_dataset(
+        training,
+        learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        lstm_layers=lstm_layers,
+        attention_head_size=attention_head_size,
+        hidden_continuous_size=hidden_continuous_size,
+        dropout=dropout,
+        loss=RMSE(),
+        log_interval=-1,
+        reduce_on_plateau_patience=3,
+    )
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        accelerator="gpu" if resolved_device == "cuda" else "cpu",
+        devices=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+        gradient_clip_val=0.1,
+        num_sanity_val_steps=0,
+    )
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=validation_loader)
+    model.eval()
+    return model, training, {
+        "epochs_ran": max_epochs,
+        "device": resolved_device,
+        "train_sample_count": int(train_frame["sample_id"].nunique()),
+        "validation_sample_count": int(validation_frame["sample_id"].nunique()),
+    }
+
+
+def _evaluate_tft(
+    model: Any,
+    training_dataset: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    residual_anchor_steps: int,
+) -> np.ndarray:
+    residual_output = variant_name == TFT_RESIDUAL_VARIANT
+    frame, sample_map = _tft_frame(
+        prepared,
+        windows,
+        residual_output=residual_output,
+        residual_anchor_steps=residual_anchor_steps,
+    )
+    dataset = _tft_dataset(frame, training=training_dataset, predict=True)
+    prediction = model.predict(
+        dataset,
+        mode="prediction",
+        return_index=True,
+        batch_size=batch_size,
+        num_workers=0,
+        trainer_kwargs={
+            "accelerator": "gpu" if device == "cuda" else "cpu",
+            "devices": 1,
+            "logger": False,
+            "enable_checkpointing": False,
+            "enable_progress_bar": False,
+            "enable_model_summary": False,
+        },
+    )
+    output = prediction.output
+    if hasattr(output, "detach"):
+        output = output.detach().cpu().numpy()
+    output = np.asarray(output, dtype=np.float32)
+    if output.ndim == 3 and output.shape[-1] == 1:
+        output = output[..., 0]
+    if output.shape[1] != prepared.forecast_steps:
+        raise RuntimeError(f"Expected TFT prediction horizon {prepared.forecast_steps}, found {output.shape!r}.")
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    index_frame = prediction.index
+    if index_frame is None or "sample_id" not in index_frame:
+        ordered_sample_ids = list(dict.fromkeys(frame["sample_id"].tolist()))
+    else:
+        ordered_sample_ids = [str(value) for value in index_frame["sample_id"].tolist()]
+    anchors = dict(frame.groupby("sample_id", sort=False)["anchor"].first())
+    for row_index, sample_id in enumerate(ordered_sample_ids):
+        window_pos, node_index = sample_map[sample_id]
+        values = output[row_index].astype(np.float32, copy=True)
+        if residual_output:
+            if residual_anchor_steps > 0:
+                values[:residual_anchor_steps] = 0.0
+            values = values + float(anchors[sample_id])
+        predictions[window_pos, :, node_index] = values
+    return predictions
 
 
 def _masked_mse_torch(predictions: Any, targets: Any, valid: Any) -> Any:
@@ -1427,6 +1717,11 @@ def run_formal_tuning(
     itransformer_n_heads: int = 4,
     itransformer_e_layers: int = 2,
     itransformer_dropout: float = 0.1,
+    tft_hidden_size: int = 32,
+    tft_lstm_layers: int = 1,
+    tft_attention_head_size: int = 4,
+    tft_hidden_continuous_size: int = 16,
+    tft_dropout: float = 0.1,
     timexer_d_model: int = 64,
     timexer_n_heads: int = 4,
     timexer_e_layers: int = 2,
@@ -1889,6 +2184,91 @@ def run_formal_tuning(
                         train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
                     )
                 )
+            elif spec.model_variant in {TFT_DIRECT_VARIANT, TFT_RESIDUAL_VARIANT}:
+                tft_search_config_id = (
+                    f"tft_pf_h{tft_hidden_size}_lstm{tft_lstm_layers}_heads{tft_attention_head_size}"
+                    f"_hc{tft_hidden_continuous_size}_dropout{tft_dropout}_lr{learning_rate}"
+                    f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
+                )
+                model, training_dataset, train_summary = _train_tft(
+                    prepared,
+                    variant_name=spec.model_variant,
+                    validation_windows=checkpoint_windows,
+                    residual_anchor_steps=residual_anchor_steps,
+                    seed=seed,
+                    device=device,
+                    batch_size=train_batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    hidden_size=tft_hidden_size,
+                    lstm_layers=tft_lstm_layers,
+                    attention_head_size=tft_attention_head_size,
+                    hidden_continuous_size=tft_hidden_continuous_size,
+                    dropout=tft_dropout,
+                )
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_tft(
+                        model,
+                        training_dataset,
+                        prepared,
+                        windows,
+                        variant_name=spec.model_variant,
+                        device=train_summary["device"],
+                        batch_size=train_batch_size,
+                        residual_anchor_steps=residual_anchor_steps,
+                    )
+                    for split_name, eval_protocol, windows in window_specs
+                }
+                gate_b_passed, gate_c_passed, gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                    evaluator=lambda model, prepared, windows, **kwargs: _evaluate_tft(
+                        model,
+                        training_dataset,
+                        prepared,
+                        windows,
+                        **kwargs,
+                    ),
+                    model=model,
+                    prepared=prepared,
+                    variant_name=spec.model_variant,
+                    device=train_summary["device"],
+                    batch_size=train_batch_size,
+                    residual_anchor_steps=residual_anchor_steps,
+                    train_gate_windows=train_gate_windows,
+                    gate_c_windows=gate_c_windows,
+                    persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
+                    persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
+                    persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
+                gate_b_for_row = (
+                    gate_b_overfit64_passed if gate_b_overfit64_passed is not None else gate_b_passed
+                )
+                gate_b_scope = (
+                    "overfit64_preflight"
+                    if gate_b_overfit64_passed is not None
+                    else "train_gate_after_fit"
+                )
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id=f"{spec.model_variant}_{tft_search_config_id}",
+                        search_config_id=tft_search_config_id,
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=gate_b_for_row,
+                        gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
+                        best_trial=True,
+                        window_specs=window_specs,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=gate_b_passed,
+                        train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
+                        train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                    )
+                )
     frame = pl.DataFrame(rows)
     resolved_output_path = Path(output_path)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1920,6 +2300,11 @@ def run_formal_tuning(
         "itransformer_n_heads": itransformer_n_heads,
         "itransformer_e_layers": itransformer_e_layers,
         "itransformer_dropout": itransformer_dropout,
+        "tft_hidden_size": tft_hidden_size,
+        "tft_lstm_layers": tft_lstm_layers,
+        "tft_attention_head_size": tft_attention_head_size,
+        "tft_hidden_continuous_size": tft_hidden_continuous_size,
+        "tft_dropout": tft_dropout,
         "timexer_d_model": timexer_d_model,
         "timexer_n_heads": timexer_n_heads,
         "timexer_e_layers": timexer_e_layers,
@@ -1962,6 +2347,11 @@ def run_formal_tuning(
                 "itransformer_n_heads": itransformer_n_heads,
                 "itransformer_e_layers": itransformer_e_layers,
                 "itransformer_dropout": itransformer_dropout,
+                "tft_hidden_size": tft_hidden_size,
+                "tft_lstm_layers": tft_lstm_layers,
+                "tft_attention_head_size": tft_attention_head_size,
+                "tft_hidden_continuous_size": tft_hidden_continuous_size,
+                "tft_dropout": tft_dropout,
                 "timexer_d_model": timexer_d_model,
                 "timexer_n_heads": timexer_n_heads,
                 "timexer_e_layers": timexer_e_layers,
@@ -2051,6 +2441,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--itransformer-n-heads", type=int, default=4)
     parser.add_argument("--itransformer-e-layers", type=int, default=2)
     parser.add_argument("--itransformer-dropout", type=float, default=0.1)
+    parser.add_argument("--tft-hidden-size", type=int, default=32)
+    parser.add_argument("--tft-lstm-layers", type=int, default=1)
+    parser.add_argument("--tft-attention-head-size", type=int, default=4)
+    parser.add_argument("--tft-hidden-continuous-size", type=int, default=16)
+    parser.add_argument("--tft-dropout", type=float, default=0.1)
     parser.add_argument("--timexer-d-model", type=int, default=64)
     parser.add_argument("--timexer-n-heads", type=int, default=4)
     parser.add_argument("--timexer-e-layers", type=int, default=2)
@@ -2093,6 +2488,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         itransformer_n_heads=args.itransformer_n_heads,
         itransformer_e_layers=args.itransformer_e_layers,
         itransformer_dropout=args.itransformer_dropout,
+        tft_hidden_size=args.tft_hidden_size,
+        tft_lstm_layers=args.tft_lstm_layers,
+        tft_attention_head_size=args.tft_attention_head_size,
+        tft_hidden_continuous_size=args.tft_hidden_continuous_size,
+        tft_dropout=args.tft_dropout,
         timexer_d_model=args.timexer_d_model,
         timexer_n_heads=args.timexer_n_heads,
         timexer_e_layers=args.timexer_e_layers,

@@ -198,6 +198,8 @@ def test_formal_tuning_support_is_fail_closed() -> None:
         "supported",
         None,
     )
+    assert formal.formal_support_status(specs["tft_pf_per_turbine_direct_b2_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["tft_pf_per_turbine_residual_b2_v2"]) == ("supported", None)
     status, blocker = formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"])
     assert status == "blocked"
     assert blocker == "official_core_training_adapter_not_implemented"
@@ -224,6 +226,16 @@ def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
             "3",
             "--itransformer-dropout",
             "0.2",
+            "--tft-hidden-size",
+            "64",
+            "--tft-lstm-layers",
+            "2",
+            "--tft-attention-head-size",
+            "4",
+            "--tft-hidden-continuous-size",
+            "16",
+            "--tft-dropout",
+            "0.3",
             "--gate-b-overfit64-passed",
             "--gate-b-overfit64-rmse-pu",
             "0.028",
@@ -241,6 +253,11 @@ def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
     assert args.itransformer_n_heads == 8
     assert args.itransformer_e_layers == 3
     assert args.itransformer_dropout == 0.2
+    assert args.tft_hidden_size == 64
+    assert args.tft_lstm_layers == 2
+    assert args.tft_attention_head_size == 4
+    assert args.tft_hidden_continuous_size == 16
+    assert args.tft_dropout == 0.3
     assert args.gate_b_overfit64_passed is True
     assert args.gate_b_overfit64_rmse_pu == 0.028
     assert args.gate_b_overfit64_mae_pu == 0.019
