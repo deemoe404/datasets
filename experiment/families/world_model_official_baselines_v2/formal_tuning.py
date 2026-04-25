@@ -38,6 +38,7 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
+    TIMEXER_FULL_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
     TIMEXER_TARGET_RESIDUAL_VARIANT,
     TASK_ID,
@@ -54,6 +55,7 @@ FORMAL_SUPPORTED_VARIANTS = {
     DGCRN_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+    TIMEXER_FULL_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
     TIMEXER_TARGET_RESIDUAL_VARIANT,
 }
@@ -61,7 +63,6 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "timexer_official_full_exog": "official_full_exog_adapter_not_implemented",
     "itransformer_official_target_plus_exog": "official_exog_adapter_not_implemented",
     "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
     "mtgnn_official_core": "official_core_training_adapter_not_implemented",
@@ -463,7 +464,16 @@ def _load_dgcrn_model(*, prepared: Any, device: str, in_dim: int, hidden_dim: in
     return model
 
 
-def _load_timexer_model(*, device: str, d_model: int, n_heads: int, e_layers: int, dropout: float, patch_len: int):
+def _load_timexer_model(
+    *,
+    device: str,
+    d_model: int,
+    n_heads: int,
+    e_layers: int,
+    dropout: float,
+    patch_len: int,
+    enc_in: int,
+):
     source_root = REPO_ROOT / "experiment" / "official_baselines" / "timexer" / "source"
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
@@ -476,7 +486,7 @@ def _load_timexer_model(*, device: str, d_model: int, n_heads: int, e_layers: in
         pred_len=FORECAST_STEPS,
         use_norm=True,
         patch_len=patch_len,
-        enc_in=6,
+        enc_in=enc_in,
         d_model=d_model,
         embed="timeF",
         freq="h",
@@ -544,6 +554,114 @@ def _iter_target_only_batches(
                 if valid_positions.size:
                     last_values[node_index] = x[row_index, int(valid_positions[-1]), node_index]
             anchor[row_index] = last_values
+            y[row_index] = prepared.target_pu_filled[future]
+            valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
+        yield x, y, valid, anchor
+
+
+_TIMEXER_FULL_LOCAL_VALUE_INDICES = (1, 2, 3, 4, 5, 6)
+_TIMEXER_FULL_CONTEXT_HISTORY_INDICES = tuple(range(0, 9)) + tuple(range(27, 40))
+
+
+def _standardized_static_tensor(prepared: Any) -> np.ndarray:
+    static = np.asarray(prepared.static_tensor, dtype=np.float32)
+    if static.ndim != 2 or static.shape[0] != prepared.node_count or static.shape[1] == 0:
+        return np.zeros((prepared.node_count, 0), dtype=np.float32)
+    finite = np.isfinite(static)
+    means = np.nanmean(np.where(finite, static, np.nan), axis=0)
+    means = np.where(np.isfinite(means), means, 0.0).astype(np.float32)
+    filled = np.where(finite, static, means[None, :]).astype(np.float32)
+    std = filled.std(axis=0).astype(np.float32)
+    std = np.where(std > 1e-6, std, 1.0).astype(np.float32)
+    return ((filled - means[None, :]) / std[None, :]).astype(np.float32)
+
+
+def _timexer_full_exog_channel_count(prepared: Any) -> int:
+    calendar_count = int(prepared.context_future_tensor.shape[1])
+    static_count = int(np.asarray(prepared.static_tensor).shape[1]) if np.asarray(prepared.static_tensor).ndim == 2 else 0
+    return (
+        prepared.node_count
+        + len(_TIMEXER_FULL_LOCAL_VALUE_INDICES) * prepared.node_count
+        + len(_TIMEXER_FULL_CONTEXT_HISTORY_INDICES)
+        + calendar_count
+        + static_count * prepared.node_count
+    )
+
+
+def _iter_timexer_batches(
+    prepared: Any,
+    windows: Any,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    full_exog: bool,
+):
+    if not full_exog:
+        yield from _iter_target_only_batches(
+            prepared,
+            windows,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            seed=seed,
+        )
+        return
+
+    state_base = _load_state_space_base()
+    indices = np.arange(len(windows), dtype=np.int64)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+    channel_count = _timexer_full_exog_channel_count(prepared)
+    static_z = _standardized_static_tensor(prepared)
+    for start in range(0, len(indices), batch_size):
+        batch_window_indices = indices[start : start + batch_size]
+        x = np.zeros((len(batch_window_indices), prepared.history_steps, channel_count), dtype=np.float32)
+        y = np.zeros((len(batch_window_indices), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+        valid = np.zeros_like(y, dtype=np.float32)
+        anchor = np.zeros((len(batch_window_indices), prepared.node_count), dtype=np.float32)
+        for row_index, window_pos in enumerate(batch_window_indices):
+            target_index = int(windows.target_indices[int(window_pos)])
+            history = slice(target_index - prepared.history_steps, target_index)
+            future = slice(target_index, target_index + prepared.forecast_steps)
+            target_history = prepared.local_history_tensor[history, :, 0]
+            target_unavailable = prepared.local_history_tensor[history, :, state_base._LOCAL_MASK_START]
+            last_values = _last_available_series(
+                target_history,
+                target_unavailable,
+                prepared.persistence_train_fallback_pu.astype(np.float32, copy=False),
+            )
+            anchor[row_index] = last_values
+
+            cursor = 0
+            x[row_index, :, cursor : cursor + prepared.node_count] = target_history
+            cursor += prepared.node_count
+
+            for value_index in _TIMEXER_FULL_LOCAL_VALUE_INDICES:
+                values = prepared.local_history_tensor[history, :, value_index].astype(np.float32, copy=True)
+                mask_index = state_base._LOCAL_MASK_START + value_index
+                masks = prepared.local_history_tensor[history, :, mask_index]
+                values[masks >= 0.5] = 0.0
+                x[row_index, :, cursor : cursor + prepared.node_count] = values
+                cursor += prepared.node_count
+
+            context_history = prepared.context_history_tensor[history]
+            for context_index in _TIMEXER_FULL_CONTEXT_HISTORY_INDICES:
+                x[row_index, :, cursor] = context_history[:, context_index]
+                cursor += 1
+
+            future_calendar_summary = prepared.context_future_tensor[future].mean(axis=0).astype(np.float32, copy=False)
+            for value in future_calendar_summary:
+                x[row_index, :, cursor] = float(value)
+                cursor += 1
+
+            for static_column in range(static_z.shape[1]):
+                values = static_z[:, static_column]
+                x[row_index, :, cursor : cursor + prepared.node_count] = values[None, :]
+                cursor += prepared.node_count
+
+            if cursor != channel_count:
+                raise RuntimeError(f"TimeXer full-exog channel cursor mismatch: {cursor} != {channel_count}.")
             y[row_index] = prepared.target_pu_filled[future]
             valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
         yield x, y, valid, anchor
@@ -887,6 +1005,7 @@ def _train_timexer(
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    full_exog = variant_name == TIMEXER_FULL_RESIDUAL_VARIANT
     model = _load_timexer_model(
         device=resolved_device,
         d_model=d_model,
@@ -894,6 +1013,7 @@ def _train_timexer(
         e_layers=e_layers,
         dropout=dropout,
         patch_len=patch_len,
+        enc_in=_timexer_full_exog_channel_count(prepared) if full_exog else prepared.node_count,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     best_state = None
@@ -901,17 +1021,18 @@ def _train_timexer(
     best_val_mae = math.inf
     best_epoch = -1
     history: list[dict[str, Any]] = []
-    residual_output = variant_name == TIMEXER_TARGET_RESIDUAL_VARIANT
+    residual_output = variant_name in {TIMEXER_TARGET_RESIDUAL_VARIANT, TIMEXER_FULL_RESIDUAL_VARIANT}
     for epoch in range(max_epochs):
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
-        for x_np, y_np, valid_np, anchor_np in _iter_target_only_batches(
+        for x_np, y_np, valid_np, anchor_np in _iter_timexer_batches(
             prepared,
             prepared.train_windows,
             batch_size=batch_size,
             shuffle=True,
             seed=seed + epoch,
+            full_exog=full_exog,
         ):
             x = torch.as_tensor(x_np, device=resolved_device)
             y = torch.as_tensor(y_np, device=resolved_device)
@@ -919,7 +1040,7 @@ def _train_timexer(
             anchor = torch.as_tensor(anchor_np, device=resolved_device)
             target = y - anchor[:, None, :] if residual_output else y
             optimizer.zero_grad(set_to_none=True)
-            raw = model(x, None, None, None)
+            raw = model(x, None, None, None)[..., : prepared.node_count]
             raw = _apply_residual_anchor_torch(
                 raw,
                 residual_output=residual_output,
@@ -1065,20 +1186,22 @@ def _evaluate_timexer(
 ) -> np.ndarray:
     import torch
 
-    residual_output = variant_name == TIMEXER_TARGET_RESIDUAL_VARIANT
+    residual_output = variant_name in {TIMEXER_TARGET_RESIDUAL_VARIANT, TIMEXER_FULL_RESIDUAL_VARIANT}
+    full_exog = variant_name == TIMEXER_FULL_RESIDUAL_VARIANT
     predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
     model.eval()
     offset = 0
     with torch.no_grad():
-        for x_np, _y_np, _valid_np, anchor_np in _iter_target_only_batches(
+        for x_np, _y_np, _valid_np, anchor_np in _iter_timexer_batches(
             prepared,
             windows,
             batch_size=batch_size,
             shuffle=False,
             seed=0,
+            full_exog=full_exog,
         ):
             x = torch.as_tensor(x_np, device=device)
-            raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            raw = model(x, None, None, None)[..., : prepared.node_count].detach().cpu().numpy().astype(np.float32, copy=False)
             raw = _apply_residual_anchor_numpy(
                 raw,
                 residual_output=residual_output,
@@ -1582,9 +1705,14 @@ def run_formal_tuning(
                         train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
                     )
                 )
-            elif spec.model_variant in {TIMEXER_TARGET_DIRECT_VARIANT, TIMEXER_TARGET_RESIDUAL_VARIANT}:
+            elif spec.model_variant in {
+                TIMEXER_TARGET_DIRECT_VARIANT,
+                TIMEXER_TARGET_RESIDUAL_VARIANT,
+                TIMEXER_FULL_RESIDUAL_VARIANT,
+            }:
+                timexer_feature_mode = "full_exog" if spec.model_variant == TIMEXER_FULL_RESIDUAL_VARIANT else "target_only"
                 timexer_search_config_id = (
-                    f"timexer_target_only_d{timexer_d_model}_h{timexer_n_heads}_e{timexer_e_layers}"
+                    f"timexer_{timexer_feature_mode}_d{timexer_d_model}_h{timexer_n_heads}_e{timexer_e_layers}"
                     f"_dropout{timexer_dropout:g}_patch{timexer_patch_len}_lr{learning_rate:g}"
                     f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
                 )
@@ -1644,8 +1772,8 @@ def run_formal_tuning(
                         prepared=prepared,
                         seed=seed,
                         trial_id=(
-                            f"timexer_target_only_residual_{timexer_search_config_id}"
-                            if spec.model_variant == TIMEXER_TARGET_RESIDUAL_VARIANT
+                            f"timexer_{timexer_feature_mode}_residual_{timexer_search_config_id}"
+                            if spec.output_parameterization == "residual"
                             else f"timexer_target_only_direct_{timexer_search_config_id}"
                         ),
                         search_config_id=timexer_search_config_id,
