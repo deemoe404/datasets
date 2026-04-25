@@ -1,0 +1,205 @@
+{
+  "args": {
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 2,
+    "dgcrn_hidden_dim": 64,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "gate_b_overfit64_mae_pu": 0.0084228085997153,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.0254615825684246,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/itransformer_next_baseline_20260425/itransformer_target_residual_overfit64.csv",
+    "gate_origin_count": 64,
+    "itransformer_d_model": 64,
+    "itransformer_dropout": 0.1,
+    "itransformer_e_layers": 2,
+    "itransformer_n_heads": 4,
+    "learning_rate": 0.0003,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 6,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "seed": 3407,
+    "split_names": [
+      "val"
+    ],
+    "timexer_d_model": 64,
+    "timexer_dropout": 0.1,
+    "timexer_e_layers": 2,
+    "timexer_n_heads": 4,
+    "timexer_patch_len": 16,
+    "train_batch_size": 128,
+    "variant_names": [
+      "itransformer_official_target_only_residual_b0_v2"
+    ]
+  },
+  "artifacts": {
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/itransformer_next_baseline_20260425/itransformer_trial16_validation_selected.csv",
+      "sha256": "0b0f6015f74bb48fbb72bdce43a3b493357e67f510a6f31be6d68acbb27af7db",
+      "size_bytes": 2980
+    },
+    "summary": {
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/itransformer_next_baseline_20260425/itransformer_trial16_validation_selected.summary.json"
+    }
+  },
+  "created_at_utc": "2026-04-25T02:30:16.183417+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_official_baselines_v2.long_metrics.v1",
+    "display_name": "World-Model Official Baselines v2",
+    "family_id": "world_model_official_baselines_v2",
+    "implementation_root": "experiment/families/world_model_official_baselines_v2",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_official_baselines_v2/README.md",
+    "runner_entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "formal_tuning_status": {
+    "blocked_rows": 0,
+    "blocked_rows_are_not_performance_results": true,
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "completed_rows": 2,
+    "created_at_utc": "2026-04-25T02:30:16.180684+00:00",
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 2,
+    "dgcrn_hidden_dim": 64,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "family_id": "world_model_official_baselines_v2",
+    "gate_b_overfit64_mae_pu": 0.0084228085997153,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.0254615825684246,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/itransformer_next_baseline_20260425/itransformer_target_residual_overfit64.csv",
+    "gate_origin_count": 64,
+    "itransformer_d_model": 64,
+    "itransformer_dropout": 0.1,
+    "itransformer_e_layers": 2,
+    "itransformer_n_heads": 4,
+    "learning_rate": 0.0003,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 6,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "row_count": 2,
+    "split_names": [
+      "val"
+    ],
+    "supported_variants": [
+      "baseline_last_value_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_seasonal_persistence_v2",
+      "chronos2_official_zero_shot_b2_v2",
+      "dgcrn_official_core_direct_b2_v2",
+      "dgcrn_official_core_residual_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2",
+      "itransformer_official_target_plus_exog_residual_b2_v2",
+      "timexer_official_full_exog_residual_b2_v2",
+      "timexer_official_target_only_direct_b0_v2",
+      "timexer_official_target_only_residual_b0_v2"
+    ],
+    "timexer_d_model": 64,
+    "timexer_dropout": 0.1,
+    "timexer_e_layers": 2,
+    "timexer_n_heads": 4,
+    "timexer_patch_len": 16,
+    "train_batch_size": 128
+  },
+  "git": {
+    "branch": "codex/official-baselines-v2",
+    "head": "a48e48c614067e87b0f67589ec27545a08e09711",
+    "is_dirty": true,
+    "status_short": [
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-022229-itransformer_exog_residual_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-022326-itransformer_target_direct_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-022337-itransformer_target_residual_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-022349-itransformer_exog_residual_overfit64_20260425/"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2_formal_tuning.py",
+    "kind": "formal_tuning_runner",
+    "run_label": "itransformer_trial16_validation_selected_20260425"
+  },
+  "no_test_feedback": true,
+  "notes": [
+    "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, missing official trainable adapters are recorded as blocked rows, not performance results."
+  ],
+  "quality_gates": {
+    "gate_a": {
+      "status": "previous_debug_snapshots_written"
+    },
+    "gate_b": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_c": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_d": {
+      "status": "validation_only_selection"
+    },
+    "gate_e": {
+      "status": "test_once_for_selected_completed_trials"
+    }
+  },
+  "result": {
+    "row_count": 2
+  },
+  "schema_version": 1,
+  "selected_by": "validation_only",
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "itransformer_official_target_only_residual_b0_v2"
+    ],
+    "result_splits": [
+      "val"
+    ]
+  },
+  "test_evaluated_at": "2026-04-25T02:30:16.204493+00:00"
+}
