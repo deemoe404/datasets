@@ -130,7 +130,10 @@ trial id, and formal search config id.
 TFT-PF full rolling evaluation is chunked by forecast origins via
 `--tft-eval-window-chunk-size` (default `1024`). This preserves the same test
 window set and metrics while avoiding one-shot construction of the full
-per-turbine PyTorch Forecasting prediction frame.
+per-turbine PyTorch Forecasting prediction frame. Evaluation uses the official
+TFT forward pass over a PyTorch dataloader rather than repeated
+`TemporalFusionTransformer.predict()` calls, which keeps the model
+implementation official while avoiding repeated Lightning predictor teardown.
 
 For DGCRN formal search, `gate_b_passed` may be sourced from a declared
 64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit

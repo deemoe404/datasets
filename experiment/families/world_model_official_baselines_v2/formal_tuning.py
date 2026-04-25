@@ -1032,35 +1032,22 @@ def _evaluate_tft_single_chunk(
         residual_anchor_steps=residual_anchor_steps,
     )
     dataset = _tft_dataset(frame, training=training_dataset, predict=True)
-    prediction = model.predict(
+    output = _predict_tft_dataset(
+        model,
         dataset,
-        mode="prediction",
-        return_index=True,
         batch_size=batch_size,
-        num_workers=0,
-        trainer_kwargs={
-            "accelerator": "gpu" if device == "cuda" else "cpu",
-            "devices": 1,
-            "logger": False,
-            "enable_checkpointing": False,
-            "enable_progress_bar": False,
-            "enable_model_summary": False,
-        },
+        device=device,
     )
-    output = prediction.output
-    if hasattr(output, "detach"):
-        output = output.detach().cpu().numpy()
-    output = np.asarray(output, dtype=np.float32)
     if output.ndim == 3 and output.shape[-1] == 1:
         output = output[..., 0]
     if output.shape[1] != prepared.forecast_steps:
         raise RuntimeError(f"Expected TFT prediction horizon {prepared.forecast_steps}, found {output.shape!r}.")
     predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
-    index_frame = prediction.index
-    if index_frame is None or "sample_id" not in index_frame:
-        ordered_sample_ids = list(dict.fromkeys(frame["sample_id"].tolist()))
-    else:
-        ordered_sample_ids = [str(value) for value in index_frame["sample_id"].tolist()]
+    ordered_sample_ids = list(dict.fromkeys(frame["sample_id"].tolist()))
+    if output.shape[0] != len(ordered_sample_ids):
+        raise RuntimeError(
+            f"Expected {len(ordered_sample_ids)} TFT prediction rows, found {output.shape[0]}."
+        )
     anchors = dict(frame.groupby("sample_id", sort=False)["anchor"].first())
     for row_index, sample_id in enumerate(ordered_sample_ids):
         window_pos, node_index = sample_map[sample_id]
@@ -1071,6 +1058,56 @@ def _evaluate_tft_single_chunk(
             values = values + float(anchors[sample_id])
         predictions[window_pos, :, node_index] = values
     return predictions
+
+
+def _move_tft_batch_to_device(value: Any, device: Any) -> Any:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _move_tft_batch_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_move_tft_batch_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_tft_batch_to_device(item, device) for item in value]
+    return value
+
+
+def _tft_prediction_from_forward(output: Any) -> Any:
+    if isinstance(output, dict) and "prediction" in output:
+        return output["prediction"]
+    if hasattr(output, "prediction"):
+        return output.prediction
+    try:
+        return output["prediction"]
+    except Exception as exc:  # pragma: no cover - defensive adapter guard.
+        raise RuntimeError("TFT forward output did not expose a prediction tensor.") from exc
+
+
+def _predict_tft_dataset(
+    model: Any,
+    dataset: Any,
+    *,
+    batch_size: int,
+    device: str,
+) -> np.ndarray:
+    import torch
+
+    resolved_device = torch.device("cuda" if device == "cuda" and torch.cuda.is_available() else "cpu")
+    model.to(resolved_device)
+    model.eval()
+    loader = dataset.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+    outputs: list[np.ndarray] = []
+    with torch.inference_mode():
+        for batch in loader:
+            x, _y = batch
+            x = _move_tft_batch_to_device(x, resolved_device)
+            prediction = _tft_prediction_from_forward(model(x))
+            outputs.append(prediction.detach().cpu().numpy().astype(np.float32, copy=False))
+    if not outputs:
+        return np.zeros((0, FORECAST_STEPS), dtype=np.float32)
+    return np.concatenate(outputs, axis=0)
 
 
 def _masked_mse_torch(predictions: Any, targets: Any, valid: Any) -> Any:
