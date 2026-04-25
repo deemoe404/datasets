@@ -1611,7 +1611,7 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
-                gate_b_passed, gate_c_passed, train_gate_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                train_gate_after_fit_passed, gate_c_passed, train_gate_metrics, _gate_c_metrics = _gate_status_for_neural_model(
                     evaluator=_evaluate_timexer,
                     model=model,
                     prepared=prepared,
@@ -1624,6 +1624,14 @@ def run_formal_tuning(
                     persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
                     persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
                     persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
+                gate_b_for_row = (
+                    gate_b_overfit64_passed if gate_b_overfit64_passed is not None else train_gate_after_fit_passed
+                )
+                gate_b_scope = (
+                    "overfit64_preflight"
+                    if gate_b_overfit64_passed is not None
+                    else "train_gate_after_fit"
                 )
                 rows.extend(
                     _metric_rows(
@@ -1639,13 +1647,14 @@ def run_formal_tuning(
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=gate_b_passed,
+                        gate_b_passed=gate_b_for_row,
                         gate_c_passed=gate_c_passed,
                         residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
-                        gate_b_scope="train_gate_after_fit",
-                        train_gate_after_fit_passed=gate_b_passed,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=train_gate_after_fit_passed,
                         train_gate_after_fit_rmse_pu=float(train_gate_metrics["rmse_pu"]),
                         train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
                     )
