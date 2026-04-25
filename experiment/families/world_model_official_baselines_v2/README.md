@@ -106,9 +106,9 @@ Current executable formal rows include analytic persistence, the closed-form
 Ridge residual control, Chronos-2 zero-shot, DGCRN official-core
 direct/residual, TimeXer official target-only direct/residual/full-exog
 residual, and iTransformer official target-only direct/residual plus
-target-plus-exog residual, and TFT-PF per-turbine direct/residual. MTGNN and
-neural residual controls must not be interpreted as tuned until their v2
-adapters implement real training or zero-shot execution.
+target-plus-exog residual, TFT-PF per-turbine direct/residual, and MTGNN
+official-core target-only/calendar-residual. Neural residual controls must not
+be interpreted as tuned until their v2 adapters implement real training.
 
 DGCRN official-core debug search should vary the declared CLI knobs
 `--dgcrn-hidden-dim`, `--dgcrn-dropout`, `--dgcrn-gcn-depth`,
@@ -126,6 +126,16 @@ TFT-PF debug search should vary the declared CLI knobs `--tft-hidden-size`,
 `--tft-hidden-continuous-size`, `--tft-dropout`, `--learning-rate`, and
 `--residual-anchor-steps`; these values are recorded in the summary, manifest,
 trial id, and formal search config id.
+
+MTGNN official-core debug search should vary the declared CLI knobs
+`--mtgnn-gcn-depth`, `--mtgnn-subgraph-size`, `--mtgnn-node-dim`,
+`--mtgnn-residual-channels`, `--mtgnn-skip-channels`,
+`--mtgnn-end-channels`, `--mtgnn-layers`, `--mtgnn-dropout`,
+`--learning-rate`, and `--residual-anchor-steps`; these values are recorded in
+the summary, manifest, trial id, and formal search config id. The B0
+target-only variant uses official `gtnet` directly. The B1 residual variant
+keeps official `gtnet` as the temporal graph core and adds only a small
+task-adapter future-calendar bias head before residual re-anchoring.
 
 TFT-PF full rolling evaluation is chunked by forecast origins via
 `--tft-eval-window-chunk-size` (default `1024`). This preserves the same test

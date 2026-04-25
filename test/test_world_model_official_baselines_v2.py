@@ -200,9 +200,8 @@ def test_formal_tuning_support_is_fail_closed() -> None:
     )
     assert formal.formal_support_status(specs["tft_pf_per_turbine_direct_b2_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["tft_pf_per_turbine_residual_b2_v2"]) == ("supported", None)
-    status, blocker = formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"])
-    assert status == "blocked"
-    assert blocker == "official_core_training_adapter_not_implemented"
+    assert formal.formal_support_status(specs["mtgnn_official_core_target_only_b0_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"]) == ("supported", None)
 
 
 def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
@@ -236,6 +235,22 @@ def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
             "16",
             "--tft-dropout",
             "0.3",
+            "--mtgnn-gcn-depth",
+            "3",
+            "--mtgnn-subgraph-size",
+            "4",
+            "--mtgnn-node-dim",
+            "32",
+            "--mtgnn-residual-channels",
+            "16",
+            "--mtgnn-skip-channels",
+            "32",
+            "--mtgnn-end-channels",
+            "64",
+            "--mtgnn-layers",
+            "2",
+            "--mtgnn-dropout",
+            "0.2",
             "--gate-b-overfit64-passed",
             "--gate-b-overfit64-rmse-pu",
             "0.028",
@@ -258,6 +273,14 @@ def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
     assert args.tft_attention_head_size == 4
     assert args.tft_hidden_continuous_size == 16
     assert args.tft_dropout == 0.3
+    assert args.mtgnn_gcn_depth == 3
+    assert args.mtgnn_subgraph_size == 4
+    assert args.mtgnn_node_dim == 32
+    assert args.mtgnn_residual_channels == 16
+    assert args.mtgnn_skip_channels == 32
+    assert args.mtgnn_end_channels == 64
+    assert args.mtgnn_layers == 2
+    assert args.mtgnn_dropout == 0.2
     assert args.gate_b_overfit64_passed is True
     assert args.gate_b_overfit64_rmse_pu == 0.028
     assert args.gate_b_overfit64_mae_pu == 0.019

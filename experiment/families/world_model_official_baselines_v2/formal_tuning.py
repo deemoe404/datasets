@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 import json
@@ -36,6 +37,8 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+    MTGNN_CALENDAR_RESIDUAL_VARIANT,
+    MTGNN_TARGET_VARIANT,
     PERSISTENCE_VARIANT,
     RIDGE_RESIDUAL_VARIANT,
     SEASONAL_PERSISTENCE_VARIANT,
@@ -64,12 +67,13 @@ FORMAL_SUPPORTED_VARIANTS = {
     TIMEXER_TARGET_RESIDUAL_VARIANT,
     TFT_DIRECT_VARIANT,
     TFT_RESIDUAL_VARIANT,
+    MTGNN_CALENDAR_RESIDUAL_VARIANT,
+    MTGNN_TARGET_VARIANT,
 }
 FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "mtgnn_official_core": "official_core_training_adapter_not_implemented",
 }
 DEFAULT_RIDGE_ALPHAS = (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 RIDGE_LAGS = (1, 2, 3, 6, 12, 18, 36, 72, 144)
@@ -523,6 +527,91 @@ def _load_tft_components():
     return Trainer, TimeSeriesDataSet, TemporalFusionTransformer, NaNLabelEncoder, RMSE
 
 
+def _mtgnn_net_module():
+    source_root = REPO_ROOT / "experiment" / "official_baselines" / "mtgnn" / "source"
+    if str(source_root) not in sys.path:
+        sys.path.insert(0, str(source_root))
+    module_name = "_world_model_official_mtgnn_net"
+    module_path = source_root / "net.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load MTGNN official source from {module_path}.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _wrap_mtgnn_core(core: Any, *, calendar_channels: int, use_calendar: bool, device: str):
+    import torch
+
+    class MTGNNOfficialCoreModule(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.core = core
+            self.calendar_head = torch.nn.Linear(calendar_channels, core.num_nodes) if use_calendar else None
+
+        def forward(self, x: Any, future_calendar: Any | None = None) -> Any:
+            raw = self.core(x)
+            if raw.ndim != 4:
+                raise RuntimeError(f"Expected MTGNN core output [B, H, N, T], found {tuple(raw.shape)}.")
+            raw = raw[..., -1]
+            if self.calendar_head is not None:
+                if future_calendar is None:
+                    raise RuntimeError("MTGNN calendar residual variant requires future calendar features.")
+                raw = raw + self.calendar_head(future_calendar)
+            return raw
+
+    return MTGNNOfficialCoreModule().to(device)
+
+
+def _load_mtgnn_model(
+    *,
+    prepared: Any,
+    device: str,
+    gcn_depth: int,
+    subgraph_size: int,
+    node_dim: int,
+    residual_channels: int,
+    skip_channels: int,
+    end_channels: int,
+    layers: int,
+    dropout: float,
+    use_calendar: bool,
+):
+    import torch
+
+    module = _mtgnn_net_module()
+    model_class = module.gtnet
+    core = model_class(
+        gcn_true=True,
+        buildA_true=True,
+        gcn_depth=gcn_depth,
+        num_nodes=prepared.node_count,
+        device=torch.device(device),
+        predefined_A=None,
+        static_feat=None,
+        dropout=dropout,
+        subgraph_size=min(int(subgraph_size), prepared.node_count),
+        node_dim=node_dim,
+        dilation_exponential=1,
+        conv_channels=residual_channels,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        seq_length=prepared.history_steps,
+        in_dim=1,
+        out_dim=prepared.forecast_steps,
+        layers=layers,
+    )
+    return _wrap_mtgnn_core(
+        core,
+        calendar_channels=int(prepared.context_future_tensor.shape[1]),
+        use_calendar=use_calendar,
+        device=device,
+    )
+
+
 def _last_available_series(values: np.ndarray, unavailable: np.ndarray, fallback: np.ndarray) -> np.ndarray:
     last_values = fallback.astype(np.float32, copy=True)
     for node_index in range(values.shape[1]):
@@ -580,6 +669,44 @@ def _iter_target_only_batches(
             y[row_index] = prepared.target_pu_filled[future]
             valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
         yield x, y, valid, anchor
+
+
+def _iter_mtgnn_batches(
+    prepared: Any,
+    windows: Any,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+):
+    indices = np.arange(len(windows), dtype=np.int64)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+    calendar_channels = int(prepared.context_future_tensor.shape[1])
+    fallback = prepared.persistence_train_fallback_pu.astype(np.float32, copy=False)
+    for start in range(0, len(indices), batch_size):
+        batch_window_indices = indices[start : start + batch_size]
+        x = np.zeros((len(batch_window_indices), 1, prepared.node_count, prepared.history_steps), dtype=np.float32)
+        future_calendar = np.zeros(
+            (len(batch_window_indices), prepared.forecast_steps, calendar_channels),
+            dtype=np.float32,
+        )
+        y = np.zeros((len(batch_window_indices), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+        valid = np.zeros_like(y, dtype=np.float32)
+        anchor = np.zeros((len(batch_window_indices), prepared.node_count), dtype=np.float32)
+        for row_index, window_pos in enumerate(batch_window_indices):
+            target_index = int(windows.target_indices[int(window_pos)])
+            history = slice(target_index - prepared.history_steps, target_index)
+            future = slice(target_index, target_index + prepared.forecast_steps)
+            target_history = prepared.target_pu_filled[history].astype(np.float32, copy=False)
+            target_unavailable = 1.0 - prepared.target_valid_mask[history].astype(np.float32, copy=False)
+            x[row_index, 0] = target_history.T
+            anchor[row_index] = _last_available_series(target_history, target_unavailable, fallback)
+            future_calendar[row_index] = prepared.context_future_tensor[future].astype(np.float32, copy=False)
+            y[row_index] = prepared.target_pu_filled[future]
+            valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
+        yield x, future_calendar, y, valid, anchor
 
 
 _TIMEXER_FULL_LOCAL_VALUE_INDICES = (1, 2, 3, 4, 5, 6)
@@ -1479,6 +1606,127 @@ def _train_timexer(
     }
 
 
+def _train_mtgnn(
+    prepared: Any,
+    *,
+    variant_name: str,
+    validation_windows: Any,
+    residual_anchor_steps: int,
+    seed: int,
+    device: str,
+    batch_size: int,
+    learning_rate: float,
+    max_epochs: int,
+    gcn_depth: int,
+    subgraph_size: int,
+    node_dim: int,
+    residual_channels: int,
+    skip_channels: int,
+    end_channels: int,
+    layers: int,
+    dropout: float,
+) -> tuple[Any, dict[str, Any]]:
+    import torch
+
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    residual_output = variant_name == MTGNN_CALENDAR_RESIDUAL_VARIANT
+    use_calendar = variant_name == MTGNN_CALENDAR_RESIDUAL_VARIANT
+    model = _load_mtgnn_model(
+        prepared=prepared,
+        device=resolved_device,
+        gcn_depth=gcn_depth,
+        subgraph_size=subgraph_size,
+        node_dim=node_dim,
+        residual_channels=residual_channels,
+        skip_channels=skip_channels,
+        end_channels=end_channels,
+        layers=layers,
+        dropout=dropout,
+        use_calendar=use_calendar,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    best_state = None
+    best_val_rmse = math.inf
+    best_val_mae = math.inf
+    best_epoch = -1
+    history: list[dict[str, Any]] = []
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss_sum = 0.0
+        train_batches = 0
+        for x_np, calendar_np, y_np, valid_np, anchor_np in _iter_mtgnn_batches(
+            prepared,
+            prepared.train_windows,
+            batch_size=batch_size,
+            shuffle=True,
+            seed=seed + epoch,
+        ):
+            x = torch.as_tensor(x_np, device=resolved_device)
+            future_calendar = torch.as_tensor(calendar_np, device=resolved_device)
+            y = torch.as_tensor(y_np, device=resolved_device)
+            valid = torch.as_tensor(valid_np, device=resolved_device)
+            anchor = torch.as_tensor(anchor_np, device=resolved_device)
+            target = y - anchor[:, None, :] if residual_output else y
+            optimizer.zero_grad(set_to_none=True)
+            raw = model(x, future_calendar if use_calendar else None)
+            raw = _apply_residual_anchor_torch(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+            loss = _masked_mse_torch(
+                raw,
+                target,
+                _anchored_loss_valid(
+                    valid,
+                    residual_output=residual_output,
+                    residual_anchor_steps=residual_anchor_steps,
+                ),
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss_sum += float(loss.detach().cpu())
+            train_batches += 1
+        val_predictions = _evaluate_mtgnn(
+            model,
+            prepared,
+            validation_windows,
+            variant_name=variant_name,
+            device=resolved_device,
+            batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
+        )
+        val_targets, val_valid = _target_and_valid(prepared, validation_windows)
+        val_metrics = _metrics(val_predictions, val_targets, val_valid, rated_power_kw=prepared.rated_power_kw)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss_mean": train_loss_sum / max(train_batches, 1),
+                "val_rmse_pu": val_metrics["rmse_pu"],
+                "val_mae_pu": val_metrics["mae_pu"],
+            }
+        )
+        if val_metrics["rmse_pu"] < best_val_rmse:
+            best_val_rmse = float(val_metrics["rmse_pu"])
+            best_val_mae = float(val_metrics["mae_pu"])
+            best_epoch = epoch
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {
+        "best_epoch": best_epoch,
+        "epochs_ran": max_epochs,
+        "best_val_rmse_pu": best_val_rmse,
+        "best_val_mae_pu": best_val_mae,
+        "history": history,
+        "device": resolved_device,
+    }
+
+
 def _evaluate_itransformer(
     model: Any,
     prepared: Any,
@@ -1589,6 +1837,46 @@ def _evaluate_timexer(
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None)[..., : prepared.node_count].detach().cpu().numpy().astype(np.float32, copy=False)
+            raw = _apply_residual_anchor_numpy(
+                raw,
+                residual_output=residual_output,
+                residual_anchor_steps=residual_anchor_steps,
+            )
+            if residual_output:
+                raw = raw + anchor_np[:, None, :]
+            predictions[offset : offset + raw.shape[0]] = raw
+            offset += raw.shape[0]
+    return predictions
+
+
+def _evaluate_mtgnn(
+    model: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    residual_anchor_steps: int,
+) -> np.ndarray:
+    import torch
+
+    residual_output = variant_name == MTGNN_CALENDAR_RESIDUAL_VARIANT
+    use_calendar = variant_name == MTGNN_CALENDAR_RESIDUAL_VARIANT
+    predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    model.eval()
+    offset = 0
+    with torch.no_grad():
+        for x_np, calendar_np, _y_np, _valid_np, anchor_np in _iter_mtgnn_batches(
+            prepared,
+            windows,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=0,
+        ):
+            x = torch.as_tensor(x_np, device=device)
+            future_calendar = torch.as_tensor(calendar_np, device=device)
+            raw = model(x, future_calendar if use_calendar else None).detach().cpu().numpy().astype(np.float32, copy=False)
             raw = _apply_residual_anchor_numpy(
                 raw,
                 residual_output=residual_output,
@@ -1811,6 +2099,14 @@ def run_formal_tuning(
     tft_hidden_continuous_size: int = 16,
     tft_dropout: float = 0.1,
     tft_eval_window_chunk_size: int = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
+    mtgnn_gcn_depth: int = 2,
+    mtgnn_subgraph_size: int = 6,
+    mtgnn_node_dim: int = 40,
+    mtgnn_residual_channels: int = 32,
+    mtgnn_skip_channels: int = 64,
+    mtgnn_end_channels: int = 128,
+    mtgnn_layers: int = 3,
+    mtgnn_dropout: float = 0.3,
     timexer_d_model: int = 64,
     timexer_n_heads: int = 4,
     timexer_e_layers: int = 2,
@@ -2274,6 +2570,91 @@ def run_formal_tuning(
                         train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
                     )
                 )
+            elif spec.model_variant in {MTGNN_TARGET_VARIANT, MTGNN_CALENDAR_RESIDUAL_VARIANT}:
+                mtgnn_feature_mode = (
+                    "calendar" if spec.model_variant == MTGNN_CALENDAR_RESIDUAL_VARIANT else "target_only"
+                )
+                mtgnn_search_config_id = (
+                    f"mtgnn_{mtgnn_feature_mode}_gcn{mtgnn_gcn_depth}_sub{mtgnn_subgraph_size}"
+                    f"_node{mtgnn_node_dim}_res{mtgnn_residual_channels}_skip{mtgnn_skip_channels}"
+                    f"_end{mtgnn_end_channels}_layers{mtgnn_layers}_dropout{mtgnn_dropout:g}_lr{learning_rate:g}"
+                    f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
+                )
+                model, train_summary = _train_mtgnn(
+                    prepared,
+                    variant_name=spec.model_variant,
+                    validation_windows=checkpoint_windows,
+                    residual_anchor_steps=residual_anchor_steps,
+                    seed=seed,
+                    device=device,
+                    batch_size=train_batch_size,
+                    learning_rate=learning_rate,
+                    max_epochs=max_epochs,
+                    gcn_depth=mtgnn_gcn_depth,
+                    subgraph_size=mtgnn_subgraph_size,
+                    node_dim=mtgnn_node_dim,
+                    residual_channels=mtgnn_residual_channels,
+                    skip_channels=mtgnn_skip_channels,
+                    end_channels=mtgnn_end_channels,
+                    layers=mtgnn_layers,
+                    dropout=mtgnn_dropout,
+                )
+                predictions_by_split = {
+                    (split_name, eval_protocol): _evaluate_mtgnn(
+                        model,
+                        prepared,
+                        windows,
+                        variant_name=spec.model_variant,
+                        device=train_summary["device"],
+                        batch_size=train_batch_size,
+                        residual_anchor_steps=residual_anchor_steps,
+                    )
+                    for split_name, eval_protocol, windows in window_specs
+                }
+                gate_b_passed, gate_c_passed, gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                    evaluator=_evaluate_mtgnn,
+                    model=model,
+                    prepared=prepared,
+                    variant_name=spec.model_variant,
+                    device=train_summary["device"],
+                    batch_size=train_batch_size,
+                    residual_anchor_steps=residual_anchor_steps,
+                    train_gate_windows=train_gate_windows,
+                    gate_c_windows=gate_c_windows,
+                    persistence_train_rmse=float(persistence_train_gate_metrics["rmse_pu"]),
+                    persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
+                    persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
+                )
+                gate_b_for_row = (
+                    gate_b_overfit64_passed if gate_b_overfit64_passed is not None else gate_b_passed
+                )
+                gate_b_scope = (
+                    "overfit64_preflight"
+                    if gate_b_overfit64_passed is not None
+                    else "train_gate_after_fit"
+                )
+                rows.extend(
+                    _metric_rows(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        trial_id=f"{spec.model_variant}_{mtgnn_search_config_id}",
+                        search_config_id=mtgnn_search_config_id,
+                        alpha=None,
+                        predictions_by_split=predictions_by_split,
+                        runtime_seconds=time.perf_counter() - started,
+                        gate_b_passed=gate_b_for_row,
+                        gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
+                        best_trial=True,
+                        window_specs=window_specs,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=gate_b_passed,
+                        train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
+                        train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                    )
+                )
             elif spec.model_variant in {TFT_DIRECT_VARIANT, TFT_RESIDUAL_VARIANT}:
                 tft_search_config_id = (
                     f"tft_pf_h{tft_hidden_size}_lstm{tft_lstm_layers}_heads{tft_attention_head_size}"
@@ -2397,6 +2778,14 @@ def run_formal_tuning(
         "tft_hidden_continuous_size": tft_hidden_continuous_size,
         "tft_dropout": tft_dropout,
         "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
+        "mtgnn_gcn_depth": mtgnn_gcn_depth,
+        "mtgnn_subgraph_size": mtgnn_subgraph_size,
+        "mtgnn_node_dim": mtgnn_node_dim,
+        "mtgnn_residual_channels": mtgnn_residual_channels,
+        "mtgnn_skip_channels": mtgnn_skip_channels,
+        "mtgnn_end_channels": mtgnn_end_channels,
+        "mtgnn_layers": mtgnn_layers,
+        "mtgnn_dropout": mtgnn_dropout,
         "timexer_d_model": timexer_d_model,
         "timexer_n_heads": timexer_n_heads,
         "timexer_e_layers": timexer_e_layers,
@@ -2445,6 +2834,14 @@ def run_formal_tuning(
                 "tft_hidden_continuous_size": tft_hidden_continuous_size,
                 "tft_dropout": tft_dropout,
                 "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
+                "mtgnn_gcn_depth": mtgnn_gcn_depth,
+                "mtgnn_subgraph_size": mtgnn_subgraph_size,
+                "mtgnn_node_dim": mtgnn_node_dim,
+                "mtgnn_residual_channels": mtgnn_residual_channels,
+                "mtgnn_skip_channels": mtgnn_skip_channels,
+                "mtgnn_end_channels": mtgnn_end_channels,
+                "mtgnn_layers": mtgnn_layers,
+                "mtgnn_dropout": mtgnn_dropout,
                 "timexer_d_model": timexer_d_model,
                 "timexer_n_heads": timexer_n_heads,
                 "timexer_e_layers": timexer_e_layers,
@@ -2540,6 +2937,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tft-hidden-continuous-size", type=int, default=16)
     parser.add_argument("--tft-dropout", type=float, default=0.1)
     parser.add_argument("--tft-eval-window-chunk-size", type=int, default=DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE)
+    parser.add_argument("--mtgnn-gcn-depth", type=int, default=2)
+    parser.add_argument("--mtgnn-subgraph-size", type=int, default=6)
+    parser.add_argument("--mtgnn-node-dim", type=int, default=40)
+    parser.add_argument("--mtgnn-residual-channels", type=int, default=32)
+    parser.add_argument("--mtgnn-skip-channels", type=int, default=64)
+    parser.add_argument("--mtgnn-end-channels", type=int, default=128)
+    parser.add_argument("--mtgnn-layers", type=int, default=3)
+    parser.add_argument("--mtgnn-dropout", type=float, default=0.3)
     parser.add_argument("--timexer-d-model", type=int, default=64)
     parser.add_argument("--timexer-n-heads", type=int, default=4)
     parser.add_argument("--timexer-e-layers", type=int, default=2)
@@ -2588,6 +2993,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         tft_hidden_continuous_size=args.tft_hidden_continuous_size,
         tft_dropout=args.tft_dropout,
         tft_eval_window_chunk_size=args.tft_eval_window_chunk_size,
+        mtgnn_gcn_depth=args.mtgnn_gcn_depth,
+        mtgnn_subgraph_size=args.mtgnn_subgraph_size,
+        mtgnn_node_dim=args.mtgnn_node_dim,
+        mtgnn_residual_channels=args.mtgnn_residual_channels,
+        mtgnn_skip_channels=args.mtgnn_skip_channels,
+        mtgnn_end_channels=args.mtgnn_end_channels,
+        mtgnn_layers=args.mtgnn_layers,
+        mtgnn_dropout=args.mtgnn_dropout,
         timexer_d_model=args.timexer_d_model,
         timexer_n_heads=args.timexer_n_heads,
         timexer_e_layers=args.timexer_e_layers,
