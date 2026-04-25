@@ -33,6 +33,7 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     CHRONOS2_VARIANT,
     DGCRN_DIRECT_VARIANT,
     DGCRN_RESIDUAL_VARIANT,
+    ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
     PERSISTENCE_VARIANT,
@@ -53,6 +54,7 @@ FORMAL_SUPPORTED_VARIANTS = {
     CHRONOS2_VARIANT,
     DGCRN_DIRECT_VARIANT,
     DGCRN_RESIDUAL_VARIANT,
+    ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
     ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
     TIMEXER_FULL_RESIDUAL_VARIANT,
@@ -63,7 +65,6 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
     "baseline_mlp_residual": "residual_control_training_not_implemented",
     "baseline_gru_residual": "residual_control_training_not_implemented",
     "baseline_tcn_residual": "residual_control_training_not_implemented",
-    "itransformer_official_target_plus_exog": "official_exog_adapter_not_implemented",
     "tft_pf": "pytorch_forecasting_training_adapter_not_implemented",
     "mtgnn_official_core": "official_core_training_adapter_not_implemented",
 }
@@ -795,17 +796,19 @@ def _train_itransformer(
     best_val_mae = math.inf
     best_epoch = -1
     history: list[dict[str, Any]] = []
-    residual_output = variant_name == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+    residual_output = variant_name in {ITRANSFORMER_TARGET_RESIDUAL_VARIANT, ITRANSFORMER_EXOG_RESIDUAL_VARIANT}
+    full_exog = variant_name == ITRANSFORMER_EXOG_RESIDUAL_VARIANT
     for epoch in range(max_epochs):
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
-        for x_np, y_np, valid_np, anchor_np in _iter_target_only_batches(
+        for x_np, y_np, valid_np, anchor_np in _iter_timexer_batches(
             prepared,
             prepared.train_windows,
             batch_size=batch_size,
             shuffle=True,
             seed=seed + epoch,
+            full_exog=full_exog,
         ):
             x = torch.as_tensor(x_np, device=resolved_device)
             y = torch.as_tensor(y_np, device=resolved_device)
@@ -814,6 +817,8 @@ def _train_itransformer(
             target = y - anchor[:, None, :] if residual_output else y
             optimizer.zero_grad(set_to_none=True)
             raw = model(x, None, None, None)
+            if full_exog:
+                raw = raw[..., : prepared.node_count]
             raw = _apply_residual_anchor_torch(
                 raw,
                 residual_output=residual_output,
@@ -1108,20 +1113,24 @@ def _evaluate_itransformer(
 ) -> np.ndarray:
     import torch
 
-    residual_output = variant_name == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
+    residual_output = variant_name in {ITRANSFORMER_TARGET_RESIDUAL_VARIANT, ITRANSFORMER_EXOG_RESIDUAL_VARIANT}
+    full_exog = variant_name == ITRANSFORMER_EXOG_RESIDUAL_VARIANT
     predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
     model.eval()
     offset = 0
     with torch.no_grad():
-        for x_np, _y_np, _valid_np, anchor_np in _iter_target_only_batches(
+        for x_np, _y_np, _valid_np, anchor_np in _iter_timexer_batches(
             prepared,
             windows,
             batch_size=batch_size,
             shuffle=False,
             seed=0,
+            full_exog=full_exog,
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
+            if full_exog:
+                raw = raw[..., : prepared.node_count]
             raw = _apply_residual_anchor_numpy(
                 raw,
                 residual_output=residual_output,
@@ -1414,6 +1423,10 @@ def run_formal_tuning(
     dgcrn_hidden_dim: int = 64,
     dgcrn_dropout: float = 0.1,
     dgcrn_gcn_depth: int = 2,
+    itransformer_d_model: int = 64,
+    itransformer_n_heads: int = 4,
+    itransformer_e_layers: int = 2,
+    itransformer_dropout: float = 0.1,
     timexer_d_model: int = 64,
     timexer_n_heads: int = 4,
     timexer_e_layers: int = 2,
@@ -1792,7 +1805,19 @@ def run_formal_tuning(
                         train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
                     )
                 )
-            elif spec.model_variant in {ITRANSFORMER_TARGET_DIRECT_VARIANT, ITRANSFORMER_TARGET_RESIDUAL_VARIANT}:
+            elif spec.model_variant in {
+                ITRANSFORMER_TARGET_DIRECT_VARIANT,
+                ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+                ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
+            }:
+                itransformer_feature_mode = (
+                    "target_plus_exog" if spec.model_variant == ITRANSFORMER_EXOG_RESIDUAL_VARIANT else "target_only"
+                )
+                itransformer_search_config_id = (
+                    f"itransformer_{itransformer_feature_mode}_d{itransformer_d_model}_h{itransformer_n_heads}"
+                    f"_e{itransformer_e_layers}_dropout{itransformer_dropout}_lr{learning_rate}"
+                    f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
+                )
                 model, train_summary = _train_itransformer(
                     prepared,
                     variant_name=spec.model_variant,
@@ -1803,10 +1828,10 @@ def run_formal_tuning(
                     batch_size=train_batch_size,
                     learning_rate=learning_rate,
                     max_epochs=max_epochs,
-                    d_model=64,
-                    n_heads=4,
-                    e_layers=2,
-                    dropout=0.1,
+                    d_model=itransformer_d_model,
+                    n_heads=itransformer_n_heads,
+                    e_layers=itransformer_e_layers,
+                    dropout=itransformer_dropout,
                 )
                 predictions_by_split = {
                     (split_name, eval_protocol): _evaluate_itransformer(
@@ -1820,7 +1845,7 @@ def run_formal_tuning(
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
-                gate_b_passed, gate_c_passed, _gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
+                gate_b_passed, gate_c_passed, gate_b_metrics, _gate_c_metrics = _gate_status_for_neural_model(
                     evaluator=_evaluate_itransformer,
                     model=model,
                     prepared=prepared,
@@ -1834,25 +1859,34 @@ def run_formal_tuning(
                     persistence_gate_c_lead1_rmse=float(persistence_gate_c_metrics["lead1_rmse_pu"]),
                     persistence_gate_c_lead1_mae=float(persistence_gate_c_metrics["lead1_mae_pu"]),
                 )
+                gate_b_for_row = (
+                    gate_b_overfit64_passed if gate_b_overfit64_passed is not None else gate_b_passed
+                )
+                gate_b_scope = (
+                    "overfit64_preflight"
+                    if gate_b_overfit64_passed is not None
+                    else "train_gate_after_fit"
+                )
                 rows.extend(
                     _metric_rows(
                         spec,
                         prepared=prepared,
                         seed=seed,
-                        trial_id=(
-                            "itransformer_target_only_residual_default"
-                            if spec.model_variant == ITRANSFORMER_TARGET_RESIDUAL_VARIANT
-                            else "itransformer_target_only_direct_default"
-                        ),
-                        search_config_id="itransformer_target_only_default",
+                        trial_id=f"itransformer_{itransformer_feature_mode}_{spec.output_parameterization}_{itransformer_search_config_id}",
+                        search_config_id=itransformer_search_config_id,
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=gate_b_passed,
+                        gate_b_passed=gate_b_for_row,
                         gate_c_passed=gate_c_passed,
                         residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
                         best_trial=True,
                         window_specs=window_specs,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=gate_b_passed,
+                        train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
+                        train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
                     )
                 )
     frame = pl.DataFrame(rows)
@@ -1882,6 +1916,10 @@ def run_formal_tuning(
         "dgcrn_hidden_dim": dgcrn_hidden_dim,
         "dgcrn_dropout": dgcrn_dropout,
         "dgcrn_gcn_depth": dgcrn_gcn_depth,
+        "itransformer_d_model": itransformer_d_model,
+        "itransformer_n_heads": itransformer_n_heads,
+        "itransformer_e_layers": itransformer_e_layers,
+        "itransformer_dropout": itransformer_dropout,
         "timexer_d_model": timexer_d_model,
         "timexer_n_heads": timexer_n_heads,
         "timexer_e_layers": timexer_e_layers,
@@ -1920,6 +1958,10 @@ def run_formal_tuning(
                 "dgcrn_hidden_dim": dgcrn_hidden_dim,
                 "dgcrn_dropout": dgcrn_dropout,
                 "dgcrn_gcn_depth": dgcrn_gcn_depth,
+                "itransformer_d_model": itransformer_d_model,
+                "itransformer_n_heads": itransformer_n_heads,
+                "itransformer_e_layers": itransformer_e_layers,
+                "itransformer_dropout": itransformer_dropout,
                 "timexer_d_model": timexer_d_model,
                 "timexer_n_heads": timexer_n_heads,
                 "timexer_e_layers": timexer_e_layers,
@@ -2005,6 +2047,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dgcrn-hidden-dim", type=int, default=64)
     parser.add_argument("--dgcrn-dropout", type=float, default=0.1)
     parser.add_argument("--dgcrn-gcn-depth", type=int, default=2)
+    parser.add_argument("--itransformer-d-model", type=int, default=64)
+    parser.add_argument("--itransformer-n-heads", type=int, default=4)
+    parser.add_argument("--itransformer-e-layers", type=int, default=2)
+    parser.add_argument("--itransformer-dropout", type=float, default=0.1)
     parser.add_argument("--timexer-d-model", type=int, default=64)
     parser.add_argument("--timexer-n-heads", type=int, default=4)
     parser.add_argument("--timexer-e-layers", type=int, default=2)
@@ -2043,6 +2089,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         dgcrn_hidden_dim=args.dgcrn_hidden_dim,
         dgcrn_dropout=args.dgcrn_dropout,
         dgcrn_gcn_depth=args.dgcrn_gcn_depth,
+        itransformer_d_model=args.itransformer_d_model,
+        itransformer_n_heads=args.itransformer_n_heads,
+        itransformer_e_layers=args.itransformer_e_layers,
+        itransformer_dropout=args.itransformer_dropout,
         timexer_d_model=args.timexer_d_model,
         timexer_n_heads=args.timexer_n_heads,
         timexer_e_layers=args.timexer_e_layers,

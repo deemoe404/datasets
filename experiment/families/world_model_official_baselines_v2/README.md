@@ -104,15 +104,22 @@ it.
 
 Current executable formal rows include analytic persistence, the closed-form
 Ridge residual control, Chronos-2 zero-shot, DGCRN official-core
-direct/residual, TimeXer official target-only direct/residual, and iTransformer
-official target-only direct/residual. TimeXer full-exog, iTransformer exog,
-TFT-PF, MTGNN, and neural residual controls must not be interpreted as tuned
-until their v2 adapters implement real training or zero-shot execution.
+direct/residual, TimeXer official target-only direct/residual/full-exog
+residual, and iTransformer official target-only direct/residual plus
+target-plus-exog residual. TFT-PF, MTGNN, and neural residual controls must not
+be interpreted as tuned until their v2 adapters implement real training or
+zero-shot execution.
 
 DGCRN official-core debug search should vary the declared CLI knobs
 `--dgcrn-hidden-dim`, `--dgcrn-dropout`, `--dgcrn-gcn-depth`,
 `--learning-rate`, and `--residual-anchor-steps`; these values are recorded in
 the summary, manifest, trial id, and formal search config id.
+
+iTransformer official debug search should vary the declared CLI knobs
+`--itransformer-d-model`, `--itransformer-n-heads`,
+`--itransformer-e-layers`, `--itransformer-dropout`, `--learning-rate`, and
+`--residual-anchor-steps`; these values are recorded in the summary, manifest,
+trial id, and formal search config id.
 
 For DGCRN formal search, `gate_b_passed` may be sourced from a declared
 64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit

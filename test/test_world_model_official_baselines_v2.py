@@ -194,12 +194,16 @@ def test_formal_tuning_support_is_fail_closed() -> None:
     assert formal.formal_support_status(specs["timexer_official_full_exog_residual_b2_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["itransformer_official_target_only_direct_b0_v2"]) == ("supported", None)
     assert formal.formal_support_status(specs["itransformer_official_target_only_residual_b0_v2"]) == ("supported", None)
+    assert formal.formal_support_status(specs["itransformer_official_target_plus_exog_residual_b2_v2"]) == (
+        "supported",
+        None,
+    )
     status, blocker = formal.formal_support_status(specs["mtgnn_official_core_calendar_residual_b1_v2"])
     assert status == "blocked"
     assert blocker == "official_core_training_adapter_not_implemented"
 
 
-def test_formal_tuning_cli_exposes_dgcrn_search_knobs() -> None:
+def test_formal_tuning_cli_exposes_neural_search_knobs() -> None:
     formal = _load_formal_tuning_module()
 
     args = formal.build_arg_parser().parse_args(
@@ -212,6 +216,14 @@ def test_formal_tuning_cli_exposes_dgcrn_search_knobs() -> None:
             "0.0",
             "--dgcrn-gcn-depth",
             "3",
+            "--itransformer-d-model",
+            "128",
+            "--itransformer-n-heads",
+            "8",
+            "--itransformer-e-layers",
+            "3",
+            "--itransformer-dropout",
+            "0.2",
             "--gate-b-overfit64-passed",
             "--gate-b-overfit64-rmse-pu",
             "0.028",
@@ -225,6 +237,10 @@ def test_formal_tuning_cli_exposes_dgcrn_search_knobs() -> None:
     assert args.dgcrn_hidden_dim == 96
     assert args.dgcrn_dropout == 0.0
     assert args.dgcrn_gcn_depth == 3
+    assert args.itransformer_d_model == 128
+    assert args.itransformer_n_heads == 8
+    assert args.itransformer_e_layers == 3
+    assert args.itransformer_dropout == 0.2
     assert args.gate_b_overfit64_passed is True
     assert args.gate_b_overfit64_rmse_pu == 0.028
     assert args.gate_b_overfit64_mae_pu == 0.019
