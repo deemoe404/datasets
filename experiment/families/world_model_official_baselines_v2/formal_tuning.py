@@ -1583,6 +1583,11 @@ def run_formal_tuning(
                     )
                 )
             elif spec.model_variant in {TIMEXER_TARGET_DIRECT_VARIANT, TIMEXER_TARGET_RESIDUAL_VARIANT}:
+                timexer_search_config_id = (
+                    f"timexer_target_only_d{timexer_d_model}_h{timexer_n_heads}_e{timexer_e_layers}"
+                    f"_dropout{timexer_dropout:g}_patch{timexer_patch_len}_lr{learning_rate:g}"
+                    f"_anchor{residual_anchor_steps if spec.output_parameterization == 'residual' else 0}"
+                )
                 model, train_summary = _train_timexer(
                     prepared,
                     variant_name=spec.model_variant,
@@ -1639,11 +1644,11 @@ def run_formal_tuning(
                         prepared=prepared,
                         seed=seed,
                         trial_id=(
-                            "timexer_target_only_residual_default"
+                            f"timexer_target_only_residual_{timexer_search_config_id}"
                             if spec.model_variant == TIMEXER_TARGET_RESIDUAL_VARIANT
-                            else "timexer_target_only_direct_default"
+                            else f"timexer_target_only_direct_{timexer_search_config_id}"
                         ),
-                        search_config_id="timexer_target_only_default",
+                        search_config_id=timexer_search_config_id,
                         alpha=None,
                         predictions_by_split=predictions_by_split,
                         runtime_seconds=time.perf_counter() - started,
