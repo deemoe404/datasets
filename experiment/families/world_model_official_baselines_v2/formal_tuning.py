@@ -33,6 +33,7 @@ from world_model_official_baselines_v2 import (  # noqa: E402
     HISTORY_STEPS,
     CHRONOS2_VARIANT,
     DGCRN_DIRECT_VARIANT,
+    DGCRN_GEOMETRY_RESIDUAL_VARIANT,
     DGCRN_RESIDUAL_VARIANT,
     ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
@@ -58,6 +59,7 @@ FORMAL_SUPPORTED_VARIANTS = {
     RIDGE_RESIDUAL_VARIANT,
     CHRONOS2_VARIANT,
     DGCRN_DIRECT_VARIANT,
+    DGCRN_GEOMETRY_RESIDUAL_VARIANT,
     DGCRN_RESIDUAL_VARIANT,
     ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
     ITRANSFORMER_TARGET_DIRECT_VARIANT,
@@ -78,6 +80,27 @@ FORMAL_BLOCKER_BY_VARIANT_PREFIX = {
 DEFAULT_RIDGE_ALPHAS = (0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 RIDGE_LAGS = (1, 2, 3, 6, 12, 18, 36, 72, 144)
 DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE = 1024
+DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT = 5_000_000
+_PUBLIC_METRIC_KEYS = {
+    "window_count",
+    "prediction_count",
+    "mae_pu",
+    "rmse_pu",
+    "mae_kw",
+    "rmse_kw",
+    "lead1_mae_pu",
+    "lead1_rmse_pu",
+    "short_rmse_pu",
+    "mid_rmse_pu",
+    "long_rmse_pu",
+    "ae_p50",
+    "ae_p90",
+    "ae_p95",
+    "metrics_backend",
+    "ae_quantile_status",
+    "ae_quantile_exact_count",
+    "ae_quantile_exact_limit",
+}
 
 
 def formal_support_status(spec: OfficialVariantSpec) -> tuple[str, str | None]:
@@ -221,6 +244,7 @@ def _metrics(predictions: np.ndarray, targets: np.ndarray, valid: np.ndarray, *,
         rmse_pu = float(math.sqrt(np.square(errors_pu).sum() / prediction_count))
         mae_kw = mae_pu * float(rated_power_kw)
         rmse_kw = rmse_pu * float(rated_power_kw)
+    lead_window_count = (valid_f.sum(axis=2) > 0).sum(axis=0).astype(np.int64, copy=False)
     lead_valid = valid_f.sum(axis=(0, 2))
     lead_abs = np.abs(errors_pu).sum(axis=(0, 2))
     lead_sq = np.square(errors_pu).sum(axis=(0, 2))
@@ -244,7 +268,235 @@ def _metrics(predictions: np.ndarray, targets: np.ndarray, valid: np.ndarray, *,
         "ae_p50": float(np.quantile(abs_errors, 0.50)) if abs_errors.size else math.nan,
         "ae_p90": float(np.quantile(abs_errors, 0.90)) if abs_errors.size else math.nan,
         "ae_p95": float(np.quantile(abs_errors, 0.95)) if abs_errors.size else math.nan,
+        "_lead_window_count": lead_window_count,
+        "_lead_prediction_count": lead_valid.astype(np.int64, copy=False),
+        "_lead_mae_pu": lead_mae,
+        "_lead_rmse_pu": lead_rmse,
     }
+
+
+def _per_origin_abs_error_pu(predictions: np.ndarray, targets: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if predictions.shape != targets.shape or predictions.shape != valid.shape:
+        raise ValueError(
+            f"Origin error shape mismatch: predictions={predictions.shape!r}, "
+            f"targets={targets.shape!r}, valid={valid.shape!r}."
+        )
+    if predictions.ndim != 3:
+        raise ValueError(f"Origin error export expects [window, lead, node] arrays, found {predictions.shape!r}.")
+    valid_f = valid.astype(np.float64, copy=False)
+    abs_errors = np.abs(predictions.astype(np.float64, copy=False) - targets.astype(np.float64, copy=False)) * valid_f
+    valid_counts = valid_f.sum(axis=(1, 2)).astype(np.int64, copy=False)
+    origin_abs_error = np.divide(
+        abs_errors.sum(axis=(1, 2)),
+        valid_counts,
+        out=np.full((predictions.shape[0],), np.nan, dtype=np.float64),
+        where=valid_counts > 0,
+    )
+    return origin_abs_error, valid_counts
+
+
+def _origin_error_rows(
+    spec: OfficialVariantSpec,
+    *,
+    prepared: Any,
+    seed: int,
+    split_name: str,
+    eval_protocol: str,
+    windows: Any,
+    predictions: np.ndarray,
+    trial_id: str,
+    search_config_id: str,
+    residual_anchor_steps: int,
+    best_trial: bool,
+) -> list[dict[str, Any]]:
+    targets, valid = _target_and_valid(prepared, windows)
+    baseline_predictions = _repeat_anchor(_last_value_anchor(prepared, windows), prepared.forecast_steps)
+    proposed_abs_error, valid_counts = _per_origin_abs_error_pu(predictions, targets, valid)
+    baseline_abs_error, _baseline_valid_counts = _per_origin_abs_error_pu(baseline_predictions, targets, valid)
+    if np.any(valid_counts <= 0):
+        missing = np.flatnonzero(valid_counts <= 0).tolist()
+        raise ValueError(f"Origin error export missing coverage for origin indices {missing}.")
+    if not np.array_equal(valid_counts, _baseline_valid_counts):
+        raise ValueError("Origin error export baseline/proposed coverage mismatch.")
+    window_count = int(len(windows))
+    rows: list[dict[str, Any]] = []
+    for origin_index in range(window_count):
+        baseline_value = float(baseline_abs_error[origin_index])
+        proposed_value = float(proposed_abs_error[origin_index])
+        rows.append(
+            {
+                "dataset_id": prepared.dataset_id,
+                "model_id": "WORLD_MODEL_OFFICIAL_BASELINE",
+                "model_variant": spec.model_variant,
+                "task_id": TASK_ID,
+                "history_steps": HISTORY_STEPS,
+                "forecast_steps": FORECAST_STEPS,
+                "seed": seed,
+                "split_name": split_name,
+                "eval_protocol": eval_protocol,
+                "metric_scope": "forecast_origin",
+                "origin_index": origin_index,
+                "target_index": int(windows.target_indices[origin_index]),
+                "output_start_us": int(windows.output_start_us[origin_index]),
+                "output_end_us": int(windows.output_end_us[origin_index]),
+                "window_count": window_count,
+                "origin_prediction_count": int(valid_counts[origin_index]),
+                "node_count": int(prepared.node_count),
+                "trial_id": trial_id,
+                "formal_search_config_id": search_config_id,
+                "is_best_validation_trial": best_trial,
+                "feature_budget_id": spec.feature_budget_id,
+                "output_parameterization": spec.output_parameterization,
+                "residual_input_mode": spec.residual_input_mode,
+                "official_internal_norm": spec.official_internal_norm,
+                "selection_metric": spec.selection_metric,
+                "selected_by": "validation_only",
+                "no_test_feedback": True,
+                "residual_anchor_steps": residual_anchor_steps,
+                "baseline_model_variant": PERSISTENCE_VARIANT,
+                "baseline_abs_error_pu": baseline_value,
+                "proposed_abs_error_pu": proposed_value,
+                "control_abs_error_pu": baseline_value,
+                "candidate_abs_error_pu": proposed_value,
+            }
+        )
+    return rows
+
+
+class _StreamingMetricAccumulator:
+    def __init__(
+        self,
+        *,
+        forecast_steps: int,
+        rated_power_kw: float,
+        exact_abs_error_limit: int | None = DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT,
+    ) -> None:
+        self.forecast_steps = int(forecast_steps)
+        self.rated_power_kw = float(rated_power_kw)
+        self.exact_abs_error_limit = None if exact_abs_error_limit is None else int(exact_abs_error_limit)
+        self.window_count = 0
+        self.prediction_count = 0
+        self.abs_error_sum = 0.0
+        self.sq_error_sum = 0.0
+        self.lead_window_count = np.zeros((self.forecast_steps,), dtype=np.int64)
+        self.lead_valid = np.zeros((self.forecast_steps,), dtype=np.float64)
+        self.lead_abs = np.zeros((self.forecast_steps,), dtype=np.float64)
+        self.lead_sq = np.zeros((self.forecast_steps,), dtype=np.float64)
+        self._abs_error_chunks: list[np.ndarray] = []
+        self._abs_error_count = 0
+        self._quantile_status = "exact"
+
+    def update(self, predictions: np.ndarray, targets: np.ndarray, valid: np.ndarray) -> None:
+        if predictions.shape != targets.shape or predictions.shape != valid.shape:
+            raise ValueError(
+                f"Streaming metrics shape mismatch: predictions={predictions.shape!r}, "
+                f"targets={targets.shape!r}, valid={valid.shape!r}."
+            )
+        if predictions.ndim != 3:
+            raise ValueError(f"Streaming metrics expect [window, lead, node] arrays, found {predictions.shape!r}.")
+        if predictions.shape[1] != self.forecast_steps:
+            raise ValueError(
+                f"Streaming metrics expected {self.forecast_steps} lead steps, found {predictions.shape[1]}."
+            )
+        valid_f = valid.astype(np.float64, copy=False)
+        errors_pu = (predictions.astype(np.float64, copy=False) - targets.astype(np.float64, copy=False)) * valid_f
+        abs_errors_masked = np.abs(errors_pu)
+        sq_errors_masked = np.square(errors_pu)
+        self.window_count += int(predictions.shape[0])
+        chunk_prediction_count = int(valid_f.sum())
+        self.prediction_count += chunk_prediction_count
+        self.abs_error_sum += float(abs_errors_masked.sum())
+        self.sq_error_sum += float(sq_errors_masked.sum())
+        self.lead_window_count += (valid_f.sum(axis=2) > 0).sum(axis=0).astype(np.int64, copy=False)
+        self.lead_valid += valid_f.sum(axis=(0, 2))
+        self.lead_abs += abs_errors_masked.sum(axis=(0, 2))
+        self.lead_sq += sq_errors_masked.sum(axis=(0, 2))
+        if chunk_prediction_count <= 0 or self._quantile_status != "exact":
+            return
+        abs_errors = abs_errors_masked[valid_f > 0]
+        next_count = self._abs_error_count + int(abs_errors.size)
+        if self.exact_abs_error_limit is not None and next_count > self.exact_abs_error_limit:
+            self._abs_error_chunks.clear()
+            self._abs_error_count = 0
+            self._quantile_status = "exact_limit_exceeded"
+            return
+        self._abs_error_chunks.append(abs_errors.astype(np.float64, copy=False))
+        self._abs_error_count = next_count
+
+    def finalize(self) -> dict[str, Any]:
+        if self.prediction_count <= 0:
+            mae_pu = rmse_pu = mae_kw = rmse_kw = math.nan
+        else:
+            mae_pu = self.abs_error_sum / self.prediction_count
+            rmse_pu = math.sqrt(self.sq_error_sum / self.prediction_count)
+            mae_kw = mae_pu * self.rated_power_kw
+            rmse_kw = rmse_pu * self.rated_power_kw
+        lead_mae = np.divide(
+            self.lead_abs,
+            self.lead_valid,
+            out=np.full_like(self.lead_abs, np.nan, dtype=np.float64),
+            where=self.lead_valid > 0,
+        )
+        lead_rmse = np.sqrt(
+            np.divide(
+                self.lead_sq,
+                self.lead_valid,
+                out=np.full_like(self.lead_sq, np.nan, dtype=np.float64),
+                where=self.lead_valid > 0,
+            )
+        )
+        if self._quantile_status == "exact":
+            abs_errors = (
+                np.concatenate(self._abs_error_chunks)
+                if self._abs_error_chunks
+                else np.zeros((0,), dtype=np.float64)
+            )
+            ae_p50 = float(np.quantile(abs_errors, 0.50)) if abs_errors.size else math.nan
+            ae_p90 = float(np.quantile(abs_errors, 0.90)) if abs_errors.size else math.nan
+            ae_p95 = float(np.quantile(abs_errors, 0.95)) if abs_errors.size else math.nan
+        else:
+            ae_p50 = ae_p90 = ae_p95 = math.nan
+        return {
+            "window_count": self.window_count,
+            "prediction_count": self.prediction_count,
+            "mae_pu": float(mae_pu),
+            "rmse_pu": float(rmse_pu),
+            "mae_kw": float(mae_kw),
+            "rmse_kw": float(rmse_kw),
+            "lead1_mae_pu": float(lead_mae[0]) if lead_mae.size else math.nan,
+            "lead1_rmse_pu": float(lead_rmse[0]) if lead_rmse.size else math.nan,
+            "short_rmse_pu": _lead_bucket_rmse(self.lead_sq, self.lead_valid, 1, 6),
+            "mid_rmse_pu": _lead_bucket_rmse(self.lead_sq, self.lead_valid, 7, 18),
+            "long_rmse_pu": _lead_bucket_rmse(self.lead_sq, self.lead_valid, 19, 36),
+            "ae_p50": ae_p50,
+            "ae_p90": ae_p90,
+            "ae_p95": ae_p95,
+            "metrics_backend": "streaming",
+            "ae_quantile_status": self._quantile_status,
+            "ae_quantile_exact_count": self._abs_error_count if self._quantile_status == "exact" else None,
+            "ae_quantile_exact_limit": self.exact_abs_error_limit,
+            "_lead_window_count": self.lead_window_count.astype(np.int64, copy=True),
+            "_lead_prediction_count": self.lead_valid.astype(np.int64, copy=False),
+            "_lead_mae_pu": lead_mae,
+            "_lead_rmse_pu": lead_rmse,
+        }
+
+
+def _metrics_from_prediction_chunks(
+    chunks: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    *,
+    forecast_steps: int,
+    rated_power_kw: float,
+    exact_abs_error_limit: int | None = DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT,
+) -> dict[str, Any]:
+    accumulator = _StreamingMetricAccumulator(
+        forecast_steps=forecast_steps,
+        rated_power_kw=rated_power_kw,
+        exact_abs_error_limit=exact_abs_error_limit,
+    )
+    for predictions, targets, valid in chunks:
+        accumulator.update(predictions, targets, valid)
+    return accumulator.finalize()
 
 
 def _lead_bucket_rmse(lead_sq: np.ndarray, lead_valid: np.ndarray, start_step: int, end_step: int) -> float:
@@ -254,6 +506,46 @@ def _lead_bucket_rmse(lead_sq: np.ndarray, lead_valid: np.ndarray, start_step: i
     if denominator <= 0:
         return math.nan
     return float(math.sqrt(float(lead_sq[start_index:end_index].sum()) / denominator))
+
+
+def _public_metric_values(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in metrics.items() if key in _PUBLIC_METRIC_KEYS}
+
+
+def _horizon_metrics(metrics: dict[str, Any], *, rated_power_kw: float, resolution_minutes: int = 10) -> list[dict[str, Any]]:
+    required_keys = ("_lead_window_count", "_lead_prediction_count", "_lead_mae_pu", "_lead_rmse_pu")
+    if not all(key in metrics for key in required_keys):
+        raise ValueError("Horizon row export requires per-lead metric arrays.")
+    lead_window_count = np.asarray(metrics["_lead_window_count"], dtype=np.int64)
+    lead_prediction_count = np.asarray(metrics["_lead_prediction_count"], dtype=np.int64)
+    lead_mae_pu = np.asarray(metrics["_lead_mae_pu"], dtype=np.float64)
+    lead_rmse_pu = np.asarray(metrics["_lead_rmse_pu"], dtype=np.float64)
+    if not (lead_window_count.shape == lead_prediction_count.shape == lead_mae_pu.shape == lead_rmse_pu.shape):
+        raise ValueError("Horizon row export found mismatched per-lead metric array shapes.")
+    rows: list[dict[str, Any]] = []
+    for lead_index in range(lead_rmse_pu.size):
+        rows.append(
+            {
+                "metric_scope": "horizon",
+                "lead_step": lead_index + 1,
+                "lead_minutes": (lead_index + 1) * int(resolution_minutes),
+                "window_count": int(lead_window_count[lead_index]),
+                "prediction_count": int(lead_prediction_count[lead_index]),
+                "mae_pu": float(lead_mae_pu[lead_index]),
+                "rmse_pu": float(lead_rmse_pu[lead_index]),
+                "mae_kw": float(lead_mae_pu[lead_index]) * float(rated_power_kw),
+                "rmse_kw": float(lead_rmse_pu[lead_index]) * float(rated_power_kw),
+                "lead1_mae_pu": None,
+                "lead1_rmse_pu": None,
+                "short_rmse_pu": None,
+                "mid_rmse_pu": None,
+                "long_rmse_pu": None,
+                "ae_p50": None,
+                "ae_p90": None,
+                "ae_p95": None,
+            }
+        )
+    return rows
 
 
 def _ridge_features(prepared: Any, windows: Any) -> np.ndarray:
@@ -428,7 +720,15 @@ def _evaluate_chronos2(
     return predictions
 
 
-def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layers: int, dropout: float):
+def _load_itransformer_model(
+    *,
+    device: str,
+    d_model: int,
+    n_heads: int,
+    e_layers: int,
+    dropout: float,
+    use_norm: bool = True,
+):
     source_root = REPO_ROOT / "experiment" / "official_baselines" / "itransformer" / "source"
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
@@ -438,7 +738,7 @@ def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layer
         seq_len=HISTORY_STEPS,
         pred_len=FORECAST_STEPS,
         output_attention=False,
-        use_norm=True,
+        use_norm=use_norm,
         d_model=d_model,
         embed="timeF",
         freq="h",
@@ -453,7 +753,48 @@ def _load_itransformer_model(*, device: str, d_model: int, n_heads: int, e_layer
     return Model(configs).to(device)
 
 
-def _load_dgcrn_model(*, prepared: Any, device: str, in_dim: int, hidden_dim: int, dropout: float, gcn_depth: int):
+def _dgcrn_geometry_adjacency(prepared: Any, *, device: str):
+    import torch
+
+    pairwise_raw = getattr(prepared, "pairwise_tensor", None)
+    if pairwise_raw is None:
+        raise ValueError("DGCRN geometry adjacency requires prepared.pairwise_tensor.")
+    pairwise = np.asarray(pairwise_raw, dtype=np.float32)
+    if pairwise.ndim != 3 or pairwise.shape[0] != prepared.node_count or pairwise.shape[1] != prepared.node_count:
+        raise ValueError(
+            "DGCRN geometry adjacency requires pairwise_tensor shaped "
+            f"[node, node, feature], found {pairwise.shape!r}."
+        )
+    feature_names = tuple(getattr(prepared, "pairwise_feature_names", ()))
+    if feature_names:
+        try:
+            distance_index = feature_names.index("distance_in_rotor_diameters")
+        except ValueError as exc:
+            raise ValueError("DGCRN geometry adjacency requires distance_in_rotor_diameters pairwise feature.") from exc
+    elif pairwise.shape[2] == 1:
+        distance_index = 0
+    else:
+        raise ValueError("DGCRN geometry adjacency cannot infer distance feature without pairwise_feature_names.")
+    distances = np.asarray(pairwise[:, :, distance_index], dtype=np.float32)
+    distances = np.nan_to_num(distances, nan=np.inf, posinf=np.inf, neginf=0.0)
+    distances = np.maximum(distances, 0.0)
+    adjacency = np.exp(-distances / 4.0).astype(np.float32, copy=False)
+    np.fill_diagonal(adjacency, 1.0)
+    if not np.isfinite(adjacency).all():
+        raise ValueError("DGCRN geometry adjacency contains non-finite edge weights after distance transform.")
+    return torch.as_tensor(adjacency, dtype=torch.float32, device=device)
+
+
+def _load_dgcrn_model(
+    *,
+    prepared: Any,
+    device: str,
+    in_dim: int,
+    hidden_dim: int,
+    dropout: float,
+    gcn_depth: int,
+    use_geometry_adjacency: bool = False,
+):
     import torch
 
     source_root = REPO_ROOT / "experiment" / "official_baselines" / "dgcrn" / "source" / "methods" / "DGCRN"
@@ -461,7 +802,11 @@ def _load_dgcrn_model(*, prepared: Any, device: str, in_dim: int, hidden_dim: in
         sys.path.insert(0, str(source_root))
     from net import DGCRN  # type: ignore
 
-    adjacency = torch.eye(prepared.node_count, dtype=torch.float32, device=device)
+    adjacency = (
+        _dgcrn_geometry_adjacency(prepared, device=device)
+        if use_geometry_adjacency
+        else torch.eye(prepared.node_count, dtype=torch.float32, device=device)
+    )
     model = DGCRN(
         gcn_depth=gcn_depth,
         num_nodes=prepared.node_count,
@@ -491,6 +836,7 @@ def _load_timexer_model(
     dropout: float,
     patch_len: int,
     enc_in: int,
+    use_norm: bool = True,
 ):
     source_root = REPO_ROOT / "experiment" / "official_baselines" / "timexer" / "source"
     if str(source_root) not in sys.path:
@@ -502,7 +848,7 @@ def _load_timexer_model(
         features="M",
         seq_len=HISTORY_STEPS,
         pred_len=FORECAST_STEPS,
-        use_norm=True,
+        use_norm=use_norm,
         patch_len=patch_len,
         enc_in=enc_in,
         d_model=d_model,
@@ -642,6 +988,7 @@ def _iter_target_only_batches(
     batch_size: int,
     shuffle: bool,
     seed: int,
+    residual_output: bool = False,
 ):
     indices = np.arange(len(windows), dtype=np.int64)
     if shuffle:
@@ -666,6 +1013,8 @@ def _iter_target_only_batches(
                 if valid_positions.size:
                     last_values[node_index] = x[row_index, int(valid_positions[-1]), node_index]
             anchor[row_index] = last_values
+            if residual_output:
+                x[row_index] = x[row_index] - last_values[None, :]
             y[row_index] = prepared.target_pu_filled[future]
             valid[row_index] = prepared.target_valid_mask[future].astype(np.float32, copy=False)
         yield x, y, valid, anchor
@@ -746,6 +1095,7 @@ def _iter_timexer_batches(
     shuffle: bool,
     seed: int,
     full_exog: bool,
+    residual_output: bool = False,
 ):
     if not full_exog:
         yield from _iter_target_only_batches(
@@ -754,6 +1104,7 @@ def _iter_timexer_batches(
             batch_size=batch_size,
             shuffle=shuffle,
             seed=seed,
+            residual_output=residual_output,
         )
         return
 
@@ -784,7 +1135,12 @@ def _iter_timexer_batches(
             anchor[row_index] = last_values
 
             cursor = 0
-            x[row_index, :, cursor : cursor + prepared.node_count] = target_history
+            target_input = (
+                target_history - last_values[None, :]
+                if residual_output
+                else target_history
+            )
+            x[row_index, :, cursor : cursor + prepared.node_count] = target_input
             cursor += prepared.node_count
 
             for value_index in _TIMEXER_FULL_LOCAL_VALUE_INDICES:
@@ -1111,24 +1467,76 @@ def _evaluate_tft(
     residual_anchor_steps: int,
     eval_window_chunk_size: int | None = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
 ) -> np.ndarray:
+    chunk_predictions = [
+        predictions
+        for _chunk_windows, predictions in _iter_evaluate_tft_chunks(
+            model,
+            training_dataset,
+            prepared,
+            windows,
+            variant_name=variant_name,
+            device=device,
+            batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
+            eval_window_chunk_size=eval_window_chunk_size,
+        )
+    ]
+    if not chunk_predictions:
+        return np.zeros((0, prepared.forecast_steps, prepared.node_count), dtype=np.float32)
+    return np.concatenate(chunk_predictions, axis=0)
+
+
+def _iter_evaluate_tft_chunks(
+    model: Any,
+    training_dataset: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    residual_anchor_steps: int,
+    eval_window_chunk_size: int | None = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
+):
+    if len(windows) <= 0:
+        return
     chunk_size = int(eval_window_chunk_size or 0)
-    if chunk_size > 0 and len(windows) > chunk_size:
-        predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
-        for start in range(0, len(windows), chunk_size):
-            stop = min(start + chunk_size, len(windows))
-            chunk_windows = _slice_windows(windows, start, stop)
-            predictions[start:stop] = _evaluate_tft_single_chunk(
-                model,
-                training_dataset,
-                prepared,
-                chunk_windows,
-                variant_name=variant_name,
-                device=device,
-                batch_size=batch_size,
-                residual_anchor_steps=residual_anchor_steps,
-            )
-        return predictions
-    return _evaluate_tft_single_chunk(
+    if chunk_size <= 0:
+        chunk_size = len(windows)
+    for start in range(0, len(windows), chunk_size):
+        stop = min(start + chunk_size, len(windows))
+        chunk_windows = _slice_windows(windows, start, stop)
+        yield chunk_windows, _evaluate_tft_single_chunk(
+            model,
+            training_dataset,
+            prepared,
+            chunk_windows,
+            variant_name=variant_name,
+            device=device,
+            batch_size=batch_size,
+            residual_anchor_steps=residual_anchor_steps,
+        )
+
+
+def _evaluate_tft_streaming_metrics(
+    model: Any,
+    training_dataset: Any,
+    prepared: Any,
+    windows: Any,
+    *,
+    variant_name: str,
+    device: str,
+    batch_size: int,
+    residual_anchor_steps: int,
+    eval_window_chunk_size: int | None = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
+    exact_abs_error_limit: int | None = DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT,
+) -> dict[str, Any]:
+    accumulator = _StreamingMetricAccumulator(
+        forecast_steps=prepared.forecast_steps,
+        rated_power_kw=prepared.rated_power_kw,
+        exact_abs_error_limit=exact_abs_error_limit,
+    )
+    for chunk_windows, predictions in _iter_evaluate_tft_chunks(
         model,
         training_dataset,
         prepared,
@@ -1137,7 +1545,11 @@ def _evaluate_tft(
         device=device,
         batch_size=batch_size,
         residual_anchor_steps=residual_anchor_steps,
-    )
+        eval_window_chunk_size=eval_window_chunk_size,
+    ):
+        targets, valid = _target_and_valid(prepared, chunk_windows)
+        accumulator.update(predictions, targets, valid)
+    return accumulator.finalize()
 
 
 def _evaluate_tft_single_chunk(
@@ -1288,12 +1700,15 @@ def _train_itransformer(
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    residual_output = variant_name in {ITRANSFORMER_TARGET_RESIDUAL_VARIANT, ITRANSFORMER_EXOG_RESIDUAL_VARIANT}
+    full_exog = variant_name == ITRANSFORMER_EXOG_RESIDUAL_VARIANT
     model = _load_itransformer_model(
         device=resolved_device,
         d_model=d_model,
         n_heads=n_heads,
         e_layers=e_layers,
         dropout=dropout,
+        use_norm=not residual_output,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     best_state = None
@@ -1301,8 +1716,6 @@ def _train_itransformer(
     best_val_mae = math.inf
     best_epoch = -1
     history: list[dict[str, Any]] = []
-    residual_output = variant_name in {ITRANSFORMER_TARGET_RESIDUAL_VARIANT, ITRANSFORMER_EXOG_RESIDUAL_VARIANT}
-    full_exog = variant_name == ITRANSFORMER_EXOG_RESIDUAL_VARIANT
     for epoch in range(max_epochs):
         model.train()
         train_loss_sum = 0.0
@@ -1314,6 +1727,7 @@ def _train_itransformer(
             shuffle=True,
             seed=seed + epoch,
             full_exog=full_exog,
+            residual_output=residual_output,
         ):
             x = torch.as_tensor(x_np, device=resolved_device)
             y = torch.as_tensor(y_np, device=resolved_device)
@@ -1376,6 +1790,8 @@ def _train_itransformer(
         "best_val_mae_pu": best_val_mae,
         "history": history,
         "device": resolved_device,
+        "residual_input_mode": "anchor_centered" if residual_output else "absolute",
+        "official_internal_norm": not residual_output,
     }
 
 
@@ -1393,6 +1809,8 @@ def _train_dgcrn(
     hidden_dim: int,
     dropout: float,
     gcn_depth: int,
+    checkpoint_output_path: str | Path | None = None,
+    checkpoint_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import torch
 
@@ -1401,6 +1819,7 @@ def _train_dgcrn(
         torch.cuda.manual_seed_all(seed)
     resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
     in_dim = 1 + prepared.context_future_tensor.shape[1] + 3
+    use_geometry_adjacency = variant_name == DGCRN_GEOMETRY_RESIDUAL_VARIANT
     model = _load_dgcrn_model(
         prepared=prepared,
         device=resolved_device,
@@ -1408,6 +1827,7 @@ def _train_dgcrn(
         hidden_dim=hidden_dim,
         dropout=dropout,
         gcn_depth=gcn_depth,
+        use_geometry_adjacency=use_geometry_adjacency,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     best_state = None
@@ -1415,8 +1835,9 @@ def _train_dgcrn(
     best_val_mae = math.inf
     best_epoch = -1
     history: list[dict[str, Any]] = []
-    residual_output = variant_name == DGCRN_RESIDUAL_VARIANT
+    residual_output = variant_name in {DGCRN_RESIDUAL_VARIANT, DGCRN_GEOMETRY_RESIDUAL_VARIANT}
     batches_seen = 0
+    resolved_checkpoint_output_path = Path(checkpoint_output_path) if checkpoint_output_path is not None else None
     for epoch in range(max_epochs):
         model.train()
         train_loss_sum = 0.0
@@ -1480,6 +1901,35 @@ def _train_dgcrn(
             best_val_mae = float(val_metrics["mae_pu"])
             best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            if resolved_checkpoint_output_path is not None:
+                resolved_checkpoint_output_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "schema_version": 1,
+                        "created_at": datetime.now(tz=UTC).isoformat(),
+                        "model_variant": variant_name,
+                        "seed": int(seed),
+                        "model_state_dict": best_state,
+                        "best_epoch": int(best_epoch),
+                        "best_val_rmse_pu": float(best_val_rmse),
+                        "best_val_mae_pu": float(best_val_mae),
+                        "history": list(history),
+                        "config": {
+                            "variant_name": variant_name,
+                            "residual_anchor_steps": int(residual_anchor_steps),
+                            "seed": int(seed),
+                            "batch_size": int(batch_size),
+                            "learning_rate": float(learning_rate),
+                            "max_epochs": int(max_epochs),
+                            "hidden_dim": int(hidden_dim),
+                            "dropout": float(dropout),
+                            "gcn_depth": int(gcn_depth),
+                            "use_geometry_adjacency": bool(use_geometry_adjacency),
+                        },
+                        "metadata": dict(checkpoint_metadata or {}),
+                    },
+                    resolved_checkpoint_output_path,
+                )
     if best_state is not None:
         model.load_state_dict(best_state)
     return model, {
@@ -1489,6 +1939,8 @@ def _train_dgcrn(
         "best_val_mae_pu": best_val_mae,
         "history": history,
         "device": resolved_device,
+        "dgcrn_adjacency": "geometry_b3" if use_geometry_adjacency else "identity_b2",
+        "checkpoint_output_path": str(resolved_checkpoint_output_path) if resolved_checkpoint_output_path else None,
     }
 
 
@@ -1515,6 +1967,7 @@ def _train_timexer(
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     resolved_device = device if device != "cuda" or torch.cuda.is_available() else "cpu"
+    residual_output = variant_name in {TIMEXER_TARGET_RESIDUAL_VARIANT, TIMEXER_FULL_RESIDUAL_VARIANT}
     full_exog = variant_name == TIMEXER_FULL_RESIDUAL_VARIANT
     model = _load_timexer_model(
         device=resolved_device,
@@ -1524,6 +1977,7 @@ def _train_timexer(
         dropout=dropout,
         patch_len=patch_len,
         enc_in=_timexer_full_exog_channel_count(prepared) if full_exog else prepared.node_count,
+        use_norm=not residual_output,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     best_state = None
@@ -1531,7 +1985,6 @@ def _train_timexer(
     best_val_mae = math.inf
     best_epoch = -1
     history: list[dict[str, Any]] = []
-    residual_output = variant_name in {TIMEXER_TARGET_RESIDUAL_VARIANT, TIMEXER_FULL_RESIDUAL_VARIANT}
     for epoch in range(max_epochs):
         model.train()
         train_loss_sum = 0.0
@@ -1543,6 +1996,7 @@ def _train_timexer(
             shuffle=True,
             seed=seed + epoch,
             full_exog=full_exog,
+            residual_output=residual_output,
         ):
             x = torch.as_tensor(x_np, device=resolved_device)
             y = torch.as_tensor(y_np, device=resolved_device)
@@ -1603,6 +2057,8 @@ def _train_timexer(
         "best_val_mae_pu": best_val_mae,
         "history": history,
         "device": resolved_device,
+        "residual_input_mode": "anchor_centered" if residual_output else "absolute",
+        "official_internal_norm": not residual_output,
     }
 
 
@@ -1752,6 +2208,7 @@ def _evaluate_itransformer(
             shuffle=False,
             seed=0,
             full_exog=full_exog,
+            residual_output=residual_output,
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1781,7 +2238,7 @@ def _evaluate_dgcrn(
 ) -> np.ndarray:
     import torch
 
-    residual_output = variant_name == DGCRN_RESIDUAL_VARIANT
+    residual_output = variant_name in {DGCRN_RESIDUAL_VARIANT, DGCRN_GEOMETRY_RESIDUAL_VARIANT}
     predictions = np.zeros((len(windows), prepared.forecast_steps, prepared.node_count), dtype=np.float32)
     model.eval()
     offset = 0
@@ -1834,6 +2291,7 @@ def _evaluate_timexer(
             shuffle=False,
             seed=0,
             full_exog=full_exog,
+            residual_output=residual_output,
         ):
             x = torch.as_tensor(x_np, device=device)
             raw = model(x, None, None, None)[..., : prepared.node_count].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -1958,6 +2416,8 @@ def _base_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int) -> dict[
         "selection_metric": spec.selection_metric,
         "feature_budget_id": spec.feature_budget_id,
         "output_parameterization": spec.output_parameterization,
+        "residual_input_mode": spec.residual_input_mode,
+        "official_internal_norm": spec.official_internal_norm,
         "uses_target_history": budget.uses_target_history,
         "uses_local_history": budget.uses_local_history,
         "uses_global_history": budget.uses_global_history,
@@ -1968,6 +2428,58 @@ def _base_row(spec: OfficialVariantSpec, *, dataset_id: str, seed: int) -> dict[
         "selected_by": "validation_only",
         "no_test_feedback": True,
         "test_evaluated_at": None,
+    }
+
+
+def _completed_metric_row(
+    spec: OfficialVariantSpec,
+    *,
+    prepared: Any,
+    seed: int,
+    split_name: str,
+    eval_protocol: str,
+    trial_id: str,
+    search_config_id: str,
+    alpha: float | None,
+    runtime_seconds: float,
+    gate_b_passed: bool | None,
+    gate_c_passed: bool | None,
+    residual_anchor_steps: int,
+    best_trial: bool,
+    metrics: dict[str, Any],
+    gate_b_scope: str | None = None,
+    gate_b_overfit64_passed: bool | None = None,
+    train_gate_after_fit_passed: bool | None = None,
+    train_gate_after_fit_rmse_pu: float | None = None,
+    train_gate_after_fit_mae_pu: float | None = None,
+    metric_scope: str = "overall",
+    lead_step: int | None = None,
+    lead_minutes: int | None = None,
+) -> dict[str, Any]:
+    return {
+        **_base_row(spec, dataset_id=prepared.dataset_id, seed=seed),
+        "split_name": split_name,
+        "eval_protocol": eval_protocol,
+        "metric_scope": metric_scope,
+        "lead_step": lead_step,
+        "lead_minutes": lead_minutes,
+        "trial_id": trial_id,
+        "trial_status": "completed",
+        "trial_blocker": None,
+        "alpha": alpha,
+        "formal_search_config_id": search_config_id,
+        "is_best_validation_trial": best_trial,
+        "gate_a_passed": True,
+        "gate_b_passed": gate_b_passed,
+        "gate_b_scope": gate_b_scope,
+        "gate_b_overfit64_passed": gate_b_overfit64_passed,
+        "train_gate_after_fit_passed": train_gate_after_fit_passed,
+        "train_gate_after_fit_rmse_pu": train_gate_after_fit_rmse_pu,
+        "train_gate_after_fit_mae_pu": train_gate_after_fit_mae_pu,
+        "gate_c_passed": gate_c_passed,
+        "residual_anchor_steps": residual_anchor_steps,
+        "runtime_seconds": runtime_seconds,
+        **_public_metric_values(metrics),
     }
 
 
@@ -1991,38 +2503,85 @@ def _metric_rows(
     train_gate_after_fit_passed: bool | None = None,
     train_gate_after_fit_rmse_pu: float | None = None,
     train_gate_after_fit_mae_pu: float | None = None,
+    origin_error_rows: list[dict[str, Any]] | None = None,
+    include_horizon_rows: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for split_name, eval_protocol, windows in window_specs:
         predictions = predictions_by_split[(split_name, eval_protocol)]
         targets, valid = _target_and_valid(prepared, windows)
         metrics = _metrics(predictions, targets, valid, rated_power_kw=prepared.rated_power_kw)
+        if origin_error_rows is not None:
+            origin_error_rows.extend(
+                _origin_error_rows(
+                    spec,
+                    prepared=prepared,
+                    seed=seed,
+                    split_name=split_name,
+                    eval_protocol=eval_protocol,
+                    windows=windows,
+                    predictions=predictions,
+                    trial_id=trial_id,
+                    search_config_id=search_config_id,
+                    residual_anchor_steps=residual_anchor_steps,
+                    best_trial=best_trial,
+                )
+            )
         rows.append(
-            {
-                **_base_row(spec, dataset_id=prepared.dataset_id, seed=seed),
-                "split_name": split_name,
-                "eval_protocol": eval_protocol,
-                "metric_scope": "overall",
-                "lead_step": None,
-                "trial_id": trial_id,
-                "trial_status": "completed",
-                "trial_blocker": None,
-                "alpha": alpha,
-                "formal_search_config_id": search_config_id,
-                "is_best_validation_trial": best_trial,
-                "gate_a_passed": True,
-                "gate_b_passed": gate_b_passed,
-                "gate_b_scope": gate_b_scope,
-                "gate_b_overfit64_passed": gate_b_overfit64_passed,
-                "train_gate_after_fit_passed": train_gate_after_fit_passed,
-                "train_gate_after_fit_rmse_pu": train_gate_after_fit_rmse_pu,
-                "train_gate_after_fit_mae_pu": train_gate_after_fit_mae_pu,
-                "gate_c_passed": gate_c_passed,
-                "residual_anchor_steps": residual_anchor_steps,
-                "runtime_seconds": runtime_seconds,
-                **metrics,
-            }
+            _completed_metric_row(
+                spec,
+                prepared=prepared,
+                seed=seed,
+                split_name=split_name,
+                eval_protocol=eval_protocol,
+                trial_id=trial_id,
+                search_config_id=search_config_id,
+                alpha=alpha,
+                runtime_seconds=runtime_seconds,
+                gate_b_passed=gate_b_passed,
+                gate_c_passed=gate_c_passed,
+                residual_anchor_steps=residual_anchor_steps,
+                best_trial=best_trial,
+                metrics=metrics,
+                gate_b_scope=gate_b_scope,
+                gate_b_overfit64_passed=gate_b_overfit64_passed,
+                train_gate_after_fit_passed=train_gate_after_fit_passed,
+                train_gate_after_fit_rmse_pu=train_gate_after_fit_rmse_pu,
+                train_gate_after_fit_mae_pu=train_gate_after_fit_mae_pu,
+            )
         )
+        if include_horizon_rows:
+            for horizon_metrics in _horizon_metrics(
+                metrics,
+                rated_power_kw=prepared.rated_power_kw,
+                resolution_minutes=getattr(prepared, "resolution_minutes", 10),
+            ):
+                rows.append(
+                    _completed_metric_row(
+                        spec,
+                        prepared=prepared,
+                        seed=seed,
+                        split_name=split_name,
+                        eval_protocol=eval_protocol,
+                        trial_id=trial_id,
+                        search_config_id=search_config_id,
+                        alpha=alpha,
+                        runtime_seconds=runtime_seconds,
+                        gate_b_passed=gate_b_passed,
+                        gate_c_passed=gate_c_passed,
+                        residual_anchor_steps=residual_anchor_steps,
+                        best_trial=best_trial,
+                        metrics=horizon_metrics,
+                        gate_b_scope=gate_b_scope,
+                        gate_b_overfit64_passed=gate_b_overfit64_passed,
+                        train_gate_after_fit_passed=train_gate_after_fit_passed,
+                        train_gate_after_fit_rmse_pu=train_gate_after_fit_rmse_pu,
+                        train_gate_after_fit_mae_pu=train_gate_after_fit_mae_pu,
+                        metric_scope="horizon",
+                        lead_step=int(horizon_metrics["lead_step"]),
+                        lead_minutes=int(horizon_metrics["lead_minutes"]),
+                    )
+                )
     return rows
 
 
@@ -2099,6 +2658,7 @@ def run_formal_tuning(
     tft_hidden_continuous_size: int = 16,
     tft_dropout: float = 0.1,
     tft_eval_window_chunk_size: int = DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE,
+    tft_streaming_exact_ae_limit: int | None = DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT,
     mtgnn_gcn_depth: int = 2,
     mtgnn_subgraph_size: int = 6,
     mtgnn_node_dim: int = 40,
@@ -2117,10 +2677,13 @@ def run_formal_tuning(
     gate_b_overfit64_mae_pu: float | None = None,
     gate_b_overfit64_source: str | None = None,
     run_label: str | None = None,
+    origin_error_output_path: str | Path | None = None,
+    include_horizon_rows: bool = False,
     no_record_run: bool = False,
 ) -> pl.DataFrame:
     specs = resolve_variant_specs(variant_names or DEFAULT_VARIANTS)
     rows: list[dict[str, Any]] = []
+    origin_error_rows: list[dict[str, Any]] | None = [] if origin_error_output_path is not None else None
     for dataset_id in dataset_ids:
         prepared = _prepare_dataset(dataset_id, max_train_origins=max_train_origins, max_eval_origins=max_eval_origins)
         window_specs = _selected_window_specs(prepared, split_names=split_names, eval_protocols=eval_protocols)
@@ -2197,6 +2760,8 @@ def run_formal_tuning(
                         residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant == SEASONAL_PERSISTENCE_VARIANT:
@@ -2219,6 +2784,8 @@ def run_formal_tuning(
                         residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant == RIDGE_RESIDUAL_VARIANT:
@@ -2286,6 +2853,8 @@ def run_formal_tuning(
                             residual_anchor_steps=0,
                             best_trial=index == best_index,
                             window_specs=window_specs,
+                            origin_error_rows=origin_error_rows,
+                            include_horizon_rows=include_horizon_rows,
                         )
                     )
             elif spec.model_variant == CHRONOS2_VARIANT:
@@ -2314,9 +2883,11 @@ def run_formal_tuning(
                         residual_anchor_steps=0,
                         best_trial=True,
                         window_specs=window_specs,
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
-            elif spec.model_variant in {DGCRN_DIRECT_VARIANT, DGCRN_RESIDUAL_VARIANT}:
+            elif spec.model_variant in {DGCRN_DIRECT_VARIANT, DGCRN_RESIDUAL_VARIANT, DGCRN_GEOMETRY_RESIDUAL_VARIANT}:
                 model, train_summary = _train_dgcrn(
                     prepared,
                     variant_name=spec.model_variant,
@@ -2331,8 +2902,9 @@ def run_formal_tuning(
                     dropout=dgcrn_dropout,
                     gcn_depth=dgcrn_gcn_depth,
                 )
+                dgcrn_feature_mode = "b3_geometry" if spec.model_variant == DGCRN_GEOMETRY_RESIDUAL_VARIANT else "b2_identity"
                 dgcrn_search_config_id = (
-                    f"dgcrn_official_core_h{dgcrn_hidden_dim}"
+                    f"dgcrn_official_core_{dgcrn_feature_mode}_h{dgcrn_hidden_dim}"
                     f"_dropout{dgcrn_dropout:g}"
                     f"_gcn{dgcrn_gcn_depth}"
                     f"_lr{learning_rate:g}"
@@ -2379,7 +2951,7 @@ def run_formal_tuning(
                         seed=seed,
                         trial_id=(
                             f"dgcrn_official_core_residual_{dgcrn_search_config_id}"
-                            if spec.model_variant == DGCRN_RESIDUAL_VARIANT
+                            if spec.output_parameterization == "residual"
                             else f"dgcrn_official_core_direct_{dgcrn_search_config_id}"
                         ),
                         search_config_id=dgcrn_search_config_id,
@@ -2396,6 +2968,8 @@ def run_formal_tuning(
                         train_gate_after_fit_passed=train_gate_after_fit_passed,
                         train_gate_after_fit_rmse_pu=float(train_gate_metrics["rmse_pu"]),
                         train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant in {
@@ -2483,6 +3057,8 @@ def run_formal_tuning(
                         train_gate_after_fit_passed=train_gate_after_fit_passed,
                         train_gate_after_fit_rmse_pu=float(train_gate_metrics["rmse_pu"]),
                         train_gate_after_fit_mae_pu=float(train_gate_metrics["mae_pu"]),
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant in {
@@ -2522,7 +3098,6 @@ def run_formal_tuning(
                         device=train_summary["device"],
                         batch_size=train_batch_size,
                         residual_anchor_steps=residual_anchor_steps,
-                        eval_window_chunk_size=tft_eval_window_chunk_size,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -2568,6 +3143,8 @@ def run_formal_tuning(
                         train_gate_after_fit_passed=gate_b_passed,
                         train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
                         train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant in {MTGNN_TARGET_VARIANT, MTGNN_CALENDAR_RESIDUAL_VARIANT}:
@@ -2653,6 +3230,8 @@ def run_formal_tuning(
                         train_gate_after_fit_passed=gate_b_passed,
                         train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
                         train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                        origin_error_rows=origin_error_rows,
+                        include_horizon_rows=include_horizon_rows,
                     )
                 )
             elif spec.model_variant in {TFT_DIRECT_VARIANT, TFT_RESIDUAL_VARIANT}:
@@ -2677,8 +3256,8 @@ def run_formal_tuning(
                     hidden_continuous_size=tft_hidden_continuous_size,
                     dropout=tft_dropout,
                 )
-                predictions_by_split = {
-                    (split_name, eval_protocol): _evaluate_tft(
+                metrics_by_split = {
+                    (split_name, eval_protocol): _evaluate_tft_streaming_metrics(
                         model,
                         training_dataset,
                         prepared,
@@ -2687,6 +3266,8 @@ def run_formal_tuning(
                         device=train_summary["device"],
                         batch_size=train_batch_size,
                         residual_anchor_steps=residual_anchor_steps,
+                        eval_window_chunk_size=tft_eval_window_chunk_size,
+                        exact_abs_error_limit=tft_streaming_exact_ae_limit,
                     )
                     for split_name, eval_protocol, windows in window_specs
                 }
@@ -2719,32 +3300,73 @@ def run_formal_tuning(
                     if gate_b_overfit64_passed is not None
                     else "train_gate_after_fit"
                 )
-                rows.extend(
-                    _metric_rows(
-                        spec,
-                        prepared=prepared,
-                        seed=seed,
-                        trial_id=f"{spec.model_variant}_{tft_search_config_id}",
-                        search_config_id=tft_search_config_id,
-                        alpha=None,
-                        predictions_by_split=predictions_by_split,
-                        runtime_seconds=time.perf_counter() - started,
-                        gate_b_passed=gate_b_for_row,
-                        gate_c_passed=gate_c_passed,
-                        residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
-                        best_trial=True,
-                        window_specs=window_specs,
-                        gate_b_scope=gate_b_scope,
-                        gate_b_overfit64_passed=gate_b_overfit64_passed,
-                        train_gate_after_fit_passed=gate_b_passed,
-                        train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
-                        train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                for split_name, eval_protocol, _windows in window_specs:
+                    metrics = metrics_by_split[(split_name, eval_protocol)]
+                    rows.append(
+                        _completed_metric_row(
+                            spec,
+                            prepared=prepared,
+                            seed=seed,
+                            split_name=split_name,
+                            eval_protocol=eval_protocol,
+                            trial_id=f"{spec.model_variant}_{tft_search_config_id}",
+                            search_config_id=tft_search_config_id,
+                            alpha=None,
+                            runtime_seconds=time.perf_counter() - started,
+                            gate_b_passed=gate_b_for_row,
+                            gate_c_passed=gate_c_passed,
+                            residual_anchor_steps=residual_anchor_steps if spec.output_parameterization == "residual" else 0,
+                            best_trial=True,
+                            metrics=metrics,
+                            gate_b_scope=gate_b_scope,
+                            gate_b_overfit64_passed=gate_b_overfit64_passed,
+                            train_gate_after_fit_passed=gate_b_passed,
+                            train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
+                            train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                        )
                     )
-                )
-    frame = pl.DataFrame(rows)
+                    if include_horizon_rows:
+                        for horizon_metrics in _horizon_metrics(
+                            metrics,
+                            rated_power_kw=prepared.rated_power_kw,
+                            resolution_minutes=getattr(prepared, "resolution_minutes", 10),
+                        ):
+                            rows.append(
+                                _completed_metric_row(
+                                    spec,
+                                    prepared=prepared,
+                                    seed=seed,
+                                    split_name=split_name,
+                                    eval_protocol=eval_protocol,
+                                    trial_id=f"{spec.model_variant}_{tft_search_config_id}",
+                                    search_config_id=tft_search_config_id,
+                                    alpha=None,
+                                    runtime_seconds=time.perf_counter() - started,
+                                    gate_b_passed=gate_b_for_row,
+                                    gate_c_passed=gate_c_passed,
+                                    residual_anchor_steps=residual_anchor_steps
+                                    if spec.output_parameterization == "residual"
+                                    else 0,
+                                    best_trial=True,
+                                    metrics=horizon_metrics,
+                                    gate_b_scope=gate_b_scope,
+                                    gate_b_overfit64_passed=gate_b_overfit64_passed,
+                                    train_gate_after_fit_passed=gate_b_passed,
+                                    train_gate_after_fit_rmse_pu=float(gate_b_metrics["rmse_pu"]),
+                                    train_gate_after_fit_mae_pu=float(gate_b_metrics["mae_pu"]),
+                                    metric_scope="horizon",
+                                    lead_step=int(horizon_metrics["lead_step"]),
+                                    lead_minutes=int(horizon_metrics["lead_minutes"]),
+                                )
+                            )
+    frame = pl.DataFrame(rows, infer_schema_length=None)
     resolved_output_path = Path(output_path)
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_csv(resolved_output_path)
+    resolved_origin_error_output_path = Path(origin_error_output_path) if origin_error_output_path is not None else None
+    if resolved_origin_error_output_path is not None:
+        resolved_origin_error_output_path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(origin_error_rows or [], infer_schema_length=None).write_csv(resolved_origin_error_output_path)
     summary_path = resolved_output_path.with_suffix(".summary.json")
     summary = {
         "created_at_utc": datetime.now(tz=UTC).isoformat(),
@@ -2778,6 +3400,7 @@ def run_formal_tuning(
         "tft_hidden_continuous_size": tft_hidden_continuous_size,
         "tft_dropout": tft_dropout,
         "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
+        "tft_streaming_exact_ae_limit": tft_streaming_exact_ae_limit,
         "mtgnn_gcn_depth": mtgnn_gcn_depth,
         "mtgnn_subgraph_size": mtgnn_subgraph_size,
         "mtgnn_node_dim": mtgnn_node_dim,
@@ -2795,8 +3418,13 @@ def run_formal_tuning(
         "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
         "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
         "gate_b_overfit64_source": gate_b_overfit64_source,
+        "origin_error_output_path": str(resolved_origin_error_output_path) if resolved_origin_error_output_path else None,
+        "origin_error_row_count": len(origin_error_rows or []),
+        "include_horizon_rows": bool(include_horizon_rows),
         "max_train_origins": max_train_origins,
         "max_eval_origins": max_eval_origins,
+        "residual_input_mode_policy": "TimeXer/iTransformer residual variants use anchor_centered target-history channels; other variants use absolute inputs.",
+        "official_internal_norm_policy": "TimeXer/iTransformer residual variants set use_norm=False; direct variants keep use_norm=True.",
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not no_record_run:
@@ -2834,6 +3462,7 @@ def run_formal_tuning(
                 "tft_hidden_continuous_size": tft_hidden_continuous_size,
                 "tft_dropout": tft_dropout,
                 "tft_eval_window_chunk_size": tft_eval_window_chunk_size,
+                "tft_streaming_exact_ae_limit": tft_streaming_exact_ae_limit,
                 "mtgnn_gcn_depth": mtgnn_gcn_depth,
                 "mtgnn_subgraph_size": mtgnn_subgraph_size,
                 "mtgnn_node_dim": mtgnn_node_dim,
@@ -2851,8 +3480,14 @@ def run_formal_tuning(
                 "gate_b_overfit64_rmse_pu": gate_b_overfit64_rmse_pu,
                 "gate_b_overfit64_mae_pu": gate_b_overfit64_mae_pu,
                 "gate_b_overfit64_source": gate_b_overfit64_source,
+                "origin_error_output_path": (
+                    str(resolved_origin_error_output_path) if resolved_origin_error_output_path else None
+                ),
+                "include_horizon_rows": bool(include_horizon_rows),
                 "max_train_origins": max_train_origins,
                 "max_eval_origins": max_eval_origins,
+                "residual_input_mode_policy": summary["residual_input_mode_policy"],
+                "official_internal_norm_policy": summary["official_internal_norm_policy"],
             },
             output_path=resolved_output_path,
             result_row_count=frame.height,
@@ -2861,7 +3496,10 @@ def run_formal_tuning(
             model_variants=tuple(spec.model_variant for spec in specs),
             eval_protocols=tuple(eval_protocols or (ROLLING_EVAL_PROTOCOL, NON_OVERLAP_EVAL_PROTOCOL)),
             result_splits=tuple(split_names or ("val", "test", "formal_tuning_blocked")),
-            artifacts={"summary": summary_path},
+            artifacts={
+                **({"origin_errors": resolved_origin_error_output_path} if resolved_origin_error_output_path else {}),
+                "summary": summary_path,
+            },
             notes=(
                 "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, "
                 "missing official trainable adapters are recorded as blocked rows, not performance results.",
@@ -2937,6 +3575,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tft-hidden-continuous-size", type=int, default=16)
     parser.add_argument("--tft-dropout", type=float, default=0.1)
     parser.add_argument("--tft-eval-window-chunk-size", type=int, default=DEFAULT_TFT_EVAL_WINDOW_CHUNK_SIZE)
+    parser.add_argument("--tft-streaming-exact-ae-limit", type=int, default=DEFAULT_TFT_STREAMING_EXACT_AE_LIMIT)
     parser.add_argument("--mtgnn-gcn-depth", type=int, default=2)
     parser.add_argument("--mtgnn-subgraph-size", type=int, default=6)
     parser.add_argument("--mtgnn-node-dim", type=int, default=40)
@@ -2955,6 +3594,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gate-b-overfit64-mae-pu", type=float, default=None)
     parser.add_argument("--gate-b-overfit64-source", type=str, default=None)
     parser.add_argument("--run-label", type=str, default=None)
+    parser.add_argument("--origin-error-output-path", type=Path, default=None)
+    parser.add_argument("--include-horizon-rows", action="store_true")
     parser.add_argument("--no-record-run", action="store_true")
     return parser
 
@@ -2993,6 +3634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tft_hidden_continuous_size=args.tft_hidden_continuous_size,
         tft_dropout=args.tft_dropout,
         tft_eval_window_chunk_size=args.tft_eval_window_chunk_size,
+        tft_streaming_exact_ae_limit=args.tft_streaming_exact_ae_limit,
         mtgnn_gcn_depth=args.mtgnn_gcn_depth,
         mtgnn_subgraph_size=args.mtgnn_subgraph_size,
         mtgnn_node_dim=args.mtgnn_node_dim,
@@ -3011,6 +3653,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         gate_b_overfit64_mae_pu=args.gate_b_overfit64_mae_pu,
         gate_b_overfit64_source=args.gate_b_overfit64_source,
         run_label=args.run_label,
+        origin_error_output_path=args.origin_error_output_path,
+        include_horizon_rows=args.include_horizon_rows,
         no_record_run=args.no_record_run,
     )
     return 0

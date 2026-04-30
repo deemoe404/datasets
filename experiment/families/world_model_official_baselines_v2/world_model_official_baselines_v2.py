@@ -39,6 +39,7 @@ GRU_RESIDUAL_VARIANT = "baseline_gru_residual_persistence_b0_v2"
 TCN_RESIDUAL_VARIANT = "baseline_tcn_residual_persistence_b0_v2"
 DGCRN_DIRECT_VARIANT = "dgcrn_official_core_direct_b2_v2"
 DGCRN_RESIDUAL_VARIANT = "dgcrn_official_core_residual_b2_v2"
+DGCRN_GEOMETRY_RESIDUAL_VARIANT = "dgcrn_official_core_residual_b3_geometry_v2"
 TIMEXER_TARGET_DIRECT_VARIANT = "timexer_official_target_only_direct_b0_v2"
 TIMEXER_TARGET_RESIDUAL_VARIANT = "timexer_official_target_only_residual_b0_v2"
 TIMEXER_FULL_RESIDUAL_VARIANT = "timexer_official_full_exog_residual_b2_v2"
@@ -60,6 +61,7 @@ DEFAULT_VARIANTS = (
     TCN_RESIDUAL_VARIANT,
     DGCRN_DIRECT_VARIANT,
     DGCRN_RESIDUAL_VARIANT,
+    DGCRN_GEOMETRY_RESIDUAL_VARIANT,
     TIMEXER_TARGET_DIRECT_VARIANT,
     TIMEXER_TARGET_RESIDUAL_VARIANT,
     TIMEXER_FULL_RESIDUAL_VARIANT,
@@ -122,6 +124,34 @@ class OfficialVariantSpec:
     def uses_future_target(self) -> bool:
         return self.feature_budget.uses_future_target
 
+    @property
+    def residual_input_mode(self) -> str:
+        centered_variants = {
+            TIMEXER_TARGET_RESIDUAL_VARIANT,
+            TIMEXER_FULL_RESIDUAL_VARIANT,
+            ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+            ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
+        }
+        return "anchor_centered" if self.model_variant in centered_variants else "absolute"
+
+    @property
+    def official_internal_norm(self) -> bool | None:
+        centered_variants = {
+            TIMEXER_TARGET_RESIDUAL_VARIANT,
+            TIMEXER_FULL_RESIDUAL_VARIANT,
+            ITRANSFORMER_TARGET_RESIDUAL_VARIANT,
+            ITRANSFORMER_EXOG_RESIDUAL_VARIANT,
+        }
+        direct_variants = {
+            TIMEXER_TARGET_DIRECT_VARIANT,
+            ITRANSFORMER_TARGET_DIRECT_VARIANT,
+        }
+        if self.model_variant in centered_variants:
+            return False
+        if self.model_variant in direct_variants:
+            return True
+        return None
+
 
 def _source(path: str) -> str:
     return str((REPO_ROOT / path).resolve())
@@ -136,6 +166,7 @@ VARIANT_SPECS = (
     OfficialVariantSpec(TCN_RESIDUAL_VARIANT, "adapters.residual_controls", "TCNResidualAdapter", "TCNResidualControl", "repo://official-baselines-v2-controls", "not-applicable", _source("experiment/families/world_model_official_baselines_v2/adapters/residual_controls.py"), "adapters/residual_controls.py", "debug_matrix", "val_overall_rmse", "B0", "residual", True),
     OfficialVariantSpec(DGCRN_DIRECT_VARIANT, "adapters.dgcrn_official_core", "DGCRNOfficialCoreAdapter", "DGCRN", "https://github.com/tsinghua-fib-lab/Traffic-Benchmark.git", "b9f8e40b4df9b58f5ad88432dc070cbbbcdc0228", _source("experiment/official_baselines/dgcrn/source/methods/DGCRN/net.py"), "experiment/official_baselines/dgcrn/source/methods/DGCRN/train.py", "debug_matrix", "val_overall_rmse", "B2", "direct", True),
     OfficialVariantSpec(DGCRN_RESIDUAL_VARIANT, "adapters.dgcrn_official_core", "DGCRNOfficialCoreAdapter", "DGCRN", "https://github.com/tsinghua-fib-lab/Traffic-Benchmark.git", "b9f8e40b4df9b58f5ad88432dc070cbbbcdc0228", _source("experiment/official_baselines/dgcrn/source/methods/DGCRN/net.py"), "experiment/official_baselines/dgcrn/source/methods/DGCRN/train.py", "debug_matrix", "val_overall_rmse", "B2", "residual", True),
+    OfficialVariantSpec(DGCRN_GEOMETRY_RESIDUAL_VARIANT, "adapters.dgcrn_official_core", "DGCRNOfficialCoreAdapter", "DGCRN", "https://github.com/tsinghua-fib-lab/Traffic-Benchmark.git", "b9f8e40b4df9b58f5ad88432dc070cbbbcdc0228", _source("experiment/official_baselines/dgcrn/source/methods/DGCRN/net.py"), "experiment/official_baselines/dgcrn/source/methods/DGCRN/train.py", "debug_matrix", "val_overall_rmse", "B3", "residual", True),
     OfficialVariantSpec(TIMEXER_TARGET_DIRECT_VARIANT, "adapters.timexer_official", "TimeXerOfficialAdapter", "Model", "https://github.com/thuml/TimeXer.git", "76011909357972bd55a27adba2e1be994d81b327", _source("experiment/official_baselines/timexer/source/models/TimeXer.py"), "experiment/official_baselines/timexer/source/run.py", "debug_matrix", "val_overall_rmse", "B0", "direct", True),
     OfficialVariantSpec(TIMEXER_TARGET_RESIDUAL_VARIANT, "adapters.timexer_official", "TimeXerOfficialAdapter", "Model", "https://github.com/thuml/TimeXer.git", "76011909357972bd55a27adba2e1be994d81b327", _source("experiment/official_baselines/timexer/source/models/TimeXer.py"), "experiment/official_baselines/timexer/source/run.py", "debug_matrix", "val_overall_rmse", "B0", "residual", True),
     OfficialVariantSpec(TIMEXER_FULL_RESIDUAL_VARIANT, "adapters.timexer_official", "TimeXerOfficialAdapter", "Model", "https://github.com/thuml/TimeXer.git", "76011909357972bd55a27adba2e1be994d81b327", _source("experiment/official_baselines/timexer/source/models/TimeXer.py"), "experiment/official_baselines/timexer/source/run.py", "debug_matrix", "val_overall_rmse", "B2", "residual", True),
@@ -391,6 +422,8 @@ def _placeholder_result_rows(specs: Sequence[OfficialVariantSpec], dataset_ids: 
                     "seed": seed,
                     "feature_budget_id": spec.feature_budget_id,
                     "output_parameterization": spec.output_parameterization,
+                    "residual_input_mode": spec.residual_input_mode,
+                    "official_internal_norm": spec.official_internal_norm,
                     "uses_target_history": budget.uses_target_history,
                     "uses_local_history": budget.uses_local_history,
                     "uses_global_history": budget.uses_global_history,

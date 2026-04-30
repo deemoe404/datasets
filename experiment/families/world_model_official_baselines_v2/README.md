@@ -22,6 +22,7 @@ baseline backend classes.
 - `baseline_tcn_residual_persistence_b0_v2`
 - `dgcrn_official_core_direct_b2_v2`
 - `dgcrn_official_core_residual_b2_v2`
+- `dgcrn_official_core_residual_b3_geometry_v2`
 - `timexer_official_target_only_direct_b0_v2`
 - `timexer_official_target_only_residual_b0_v2`
 - `timexer_official_full_exog_residual_b2_v2`
@@ -114,12 +115,28 @@ DGCRN official-core debug search should vary the declared CLI knobs
 `--dgcrn-hidden-dim`, `--dgcrn-dropout`, `--dgcrn-gcn-depth`,
 `--learning-rate`, and `--residual-anchor-steps`; these values are recorded in
 the summary, manifest, trial id, and formal search config id.
+The B3 geometry residual variant uses the task pairwise feature
+`distance_in_rotor_diameters`: off-diagonal edge weights are
+`exp(-distance_in_rotor_diameters / 4)`, diagonal self-loops are `1.0`, and the
+official DGCRN core receives `[A, A.T]`.
 
 iTransformer official debug search should vary the declared CLI knobs
 `--itransformer-d-model`, `--itransformer-n-heads`,
 `--itransformer-e-layers`, `--itransformer-dropout`, `--learning-rate`, and
 `--residual-anchor-steps`; these values are recorded in the summary, manifest,
-trial id, and formal search config id.
+trial id, and formal search config id. As of 2026-04-25, the validation-frozen
+residual variants center target-history input channels by the last-value anchor
+and disable the official internal normalization (`use_norm=False`). Direct
+variants keep absolute target-history inputs and `use_norm=True`. Result rows
+record this as `residual_input_mode` and `official_internal_norm`. The prior
+validation-frozen target-plus-exog residual trial24 config
+(`itransformer_target_plus_exog_d64_h4_e2_dropout0.1_lr0.0003_anchor1`) has
+five-seed test mean/std and paired persistence bootstrap artifacts at
+`experiment/artifacts/published/world_model_official_baselines_v2/20260425-itransformer-trial24-multiseed-origin-errors-*`.
+The bootstrap direction is `baseline_abs_error_pu - proposed_abs_error_pu`;
+rolling and non-overlap deltas are both negative with
+`prob_delta_gt_zero=0.0`, so this official iTransformer residual baseline is
+weak relative to last-value persistence.
 
 TFT-PF debug search should vary the declared CLI knobs `--tft-hidden-size`,
 `--tft-lstm-layers`, `--tft-attention-head-size`,
@@ -137,6 +154,23 @@ target-only variant uses official `gtnet` directly. The B1 residual variant
 keeps official `gtnet` as the temporal graph core and adds only a small
 task-adapter future-calendar bias head before residual re-anchoring.
 
+Chronos-2 zero-shot full rolling validation and full rolling test-once are
+closed through the recoverable shard evaluator at
+`experiment/families/world_model_official_baselines_v2/diagnostics/chronos2_rolling_shards.py`.
+The frozen zero-shot B2 rolling test aggregate is
+`experiment/artifacts/scratch/world_model_official_baselines_v2/chronos2_test_rolling_shards_20260425/chronos2_kelmarsh_test_rolling_origin_no_refit_aggregate.{json,csv}`.
+The shard evaluator stores flat exact absolute-error arrays rather than
+per-origin CSVs, so
+`experiment/families/world_model_official_baselines_v2/diagnostics/enrich_chronos_origin_errors.py`
+reconstructs per-origin proposed AE from those arrays using the prepared
+valid-count mask, verifies shard/window metadata, and writes the published
+paired persistence comparison and bootstrap/status artifacts at
+`experiment/artifacts/published/world_model_official_baselines_v2/20260425-chronos2-rolling-test-origin-errors-*`.
+The bootstrap direction is `baseline_abs_error_pu - proposed_abs_error_pu`;
+the rolling paired/block deltas are positive, so the zero-shot Chronos-2 row
+is slightly favorable to Chronos versus last-value persistence on origin-level
+AE. Chronos-2 remains zero-shot only, not a trainable multiseed baseline.
+
 TFT-PF full rolling evaluation is chunked by forecast origins via
 `--tft-eval-window-chunk-size` (default `1024`). This preserves the same test
 window set and metrics while avoiding one-shot construction of the full
@@ -145,15 +179,25 @@ TFT forward pass over a PyTorch dataloader rather than repeated
 `TemporalFusionTransformer.predict()` calls, which keeps the model
 implementation official while avoiding repeated Lightning predictor teardown.
 
-Current blocker: TFT-PF full rolling test-once is blocked as of 2026-04-25.
-The full rolling test expands 94,458 forecast origins into per-turbine
-PyTorch Forecasting frames and repeatedly destabilized the Ubuntu CUDA host:
-the one-shot path exhausted memory and I/O, chunked predictor calls hit native
-NumPy/PyTorch Forecasting crashes, and the manual full rolling attempt made
-the host unreachable. The existing TFT-PF smoke, overfit64, validation, and
-bounded-test diagnostics are retained as adapter evidence, but TFT-PF must not
-be used as a paper-grade full rolling test row until a redesigned streaming
-evaluator passes the bounded-to-full recovery ladder.
+Current status as of 2026-04-25: TFT-PF full rolling validation and full
+rolling test-once are closed only through the recoverable shard evaluator,
+not through a monolithic run. The full rolling test expands 94,458 forecast
+origins into per-turbine PyTorch Forecasting frames; the one-shot path
+exhausted memory and I/O, and larger chunked predictor calls hit native
+NumPy/PyTorch Forecasting crashes. The shard evaluator isolates the lifecycle
+in one subprocess per segment, retries native failures, splits persistent
+failures, checks continuous coverage, and aggregates only complete shard
+artifacts. The frozen residual B2 config now has full rolling test-once
+evidence at
+`experiment/artifacts/scratch/world_model_official_baselines_v2/tft_pf_test_rolling_shards_full_20260425/tft_pf_residual_kelmarsh_test_rolling_origin_no_refit_aggregate.{json,csv}`;
+published origin-level persistence comparison and bootstrap/status artifacts
+were generated at
+`experiment/artifacts/published/world_model_official_baselines_v2/20260425-tft-pf-trial02-rolling-test-origin-errors-*`.
+The bootstrap direction is `baseline_abs_error_pu - proposed_abs_error_pu`;
+the rolling paired/block deltas are both negative, so this single-seed result
+is unfavorable to TFT-PF versus last-value persistence. The result remains
+runtime-fragile and should not be used as a final paper-table row until
+multiseed mean/std artifacts are generated.
 
 For DGCRN formal search, `gate_b_passed` may be sourced from a declared
 64-window overfit preflight via `--gate-b-overfit64-passed`; the full-fit
@@ -161,3 +205,27 @@ train-window diagnostic is recorded separately as
 `train_gate_after_fit_passed`, `train_gate_after_fit_rmse_pu`, and
 `train_gate_after_fit_mae_pu`. This keeps the paper gate contract distinct from
 post-search training-set diagnostics.
+
+## Paper-Grade Long Run Driver
+
+The 2026-04-25 paper-grade queue is generated by:
+
+```shell
+./.conda/bin/python experiment/families/world_model_official_baselines_v2/diagnostics/long_run_driver.py \
+  plan \
+  --run-root experiment/artifacts/scratch/world_model_official_baselines_v2/long_run_20260425_paper_grade
+```
+
+Execute or resume the queue one item at a time with:
+
+```shell
+./.conda/bin/python experiment/families/world_model_official_baselines_v2/diagnostics/long_run_driver.py \
+  run \
+  --run-root experiment/artifacts/scratch/world_model_official_baselines_v2/long_run_20260425_paper_grade
+```
+
+The driver writes command logs and exit records under the run root, skips items
+whose expected artifacts already exist, and keeps selection validation-only.
+After phase-2 search finishes, run the generated `select` item, then run the
+materialized `phase3_full_validation_queue.json`. After selecting from the full
+validation outputs, materialize and run `phase4_test_multiseed_queue.json`.

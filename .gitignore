@@ -11,6 +11,10 @@ plan/*.pdf
 plan/*.synctex.gz
 experiment/*.csv
 experiment/artifacts/published/**/*.log
+experiment/artifacts/published/**/*origin-comparison.csv
+experiment/artifacts/published/**/*origin-errors-comparison.csv
+!experiment/artifacts/published/**/*origin-comparison.csv.gz
+!experiment/artifacts/published/**/*origin-errors-comparison.csv.gz
 experiment/families/*/.conda/
 experiment/families/*/.work*/
 experiment/official_baselines/*/.conda/
