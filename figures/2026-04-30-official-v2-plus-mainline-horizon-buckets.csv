@@ -1,0 +1,42 @@
+label,eval_protocol,status,lead1_rmse,short_rmse,mid_rmse,long_rmse,source
+Official v2: Last value,rolling_origin_no_refit,main,0.0754568734871374,0.1143348907221784,0.1671291879478433,0.2157192645872846,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Last value,non_overlap,main,0.0759869372274263,0.1134650115168926,0.1642960968568577,0.213394977607854,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Seasonal,rolling_origin_no_refit,main,0.3217236396718774,0.3225730105749738,0.3257455496035673,0.3304028690176965,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Seasonal,non_overlap,main,0.3191347700437106,0.3198069030705895,0.3252692576270476,0.328434222159486,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Ridge residual B0,rolling_origin_no_refit,main,0.0718958986963795,0.1066163188779766,0.1540655904230628,0.1948186260999621,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Ridge residual B0,non_overlap,main,0.0725811108875223,0.1061701475184747,0.1528573447097375,0.1931390210594868,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Chronos-2 B2,non_overlap,main,0.0755484638316209,0.1110397697587723,0.1627459056187634,0.2098154937051698,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: Chronos-2 B2,rolling_origin_no_refit,main,0.0749788429589833,0.1116547292807472,0.1645184128956161,0.2130496434517501,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv
+Official v2: iTransformer residual B0,rolling_origin_no_refit,main,0.0754568734871374,0.10711864773742252,0.15454806732298515,0.19593642600837521,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: iTransformer residual B0,non_overlap,main,0.0759869372274263,0.10666630612918641,0.15375660761387222,0.19405345304816798,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: MTGNN residual B1,rolling_origin_no_refit,main,0.0754568734871374,0.11341021386667101,0.16473018368402326,0.21107568891216816,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: MTGNN residual B1,non_overlap,main,0.0759869372274263,0.11265737594262164,0.162470443298669,0.20889730458446393,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: TimeXer residual B0,rolling_origin_no_refit,main,0.0754568734871374,0.10705512165496486,0.1539962755952549,0.19459298012610673,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: TimeXer residual B0,non_overlap,main,0.0759869372274263,0.10672979177066341,0.1533042515574706,0.19324361152244662,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv
+Official v2: DGCRN rescue B2,rolling_origin_no_refit,appendix_diagnostic,0.07545687348713755,0.11004263600778001,0.1563472632591641,0.19559254160163353,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-dgcrn-rescue-statistics-summary.csv
+Official v2: DGCRN rescue B2,non_overlap,appendix_diagnostic,0.07598693722742637,0.10970120759287072,0.15540401098111165,0.1934585027858041,experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-dgcrn-rescue-statistics-summary.csv
+Official v2: TFT-PF B2,rolling_origin_no_refit,appendix_diagnostic,0.07545197786488145,0.14912754455858915,0.20344472013195553,0.24944783560267952,experiment/artifacts/scratch/world_model_official_baselines_v2/tft_pf_test_rolling_shards_full_20260425/tft_pf_residual_kelmarsh_test_rolling_origin_no_refit_aggregate.json
+State-space: Official canonical,rolling_origin_no_refit,main,0.07840029405525271,0.10904168173841122,0.15602900375329998,0.1977642891561316,derived_from_leadwise_rows
+State-space: Official canonical,non_overlap,main,0.07758719508530151,0.10834903916601364,0.1550640291225117,0.19720464823226663,derived_from_leadwise_rows
+State-space: Residual scratch (farm=0.05),rolling_origin_no_refit,diagnostic,0.07399099885703433,0.10636552898049711,0.15331288288160944,0.19334348521598688,derived_from_leadwise_rows
+State-space: Residual scratch (farm=0.05),non_overlap,diagnostic,0.07439688544922093,0.10592521617365847,0.15178023112077174,0.19170134712750433,derived_from_leadwise_rows
+State-space: Residual scratch (farm=0.0),rolling_origin_no_refit,diagnostic,0.07342613634118422,0.10579236337624133,0.15294169655807383,0.19284146448987236,derived_from_leadwise_rows
+State-space: Residual scratch (farm=0.0),non_overlap,diagnostic,0.07382002940127058,0.10556412661570275,0.15157049426299787,0.1913079646366217,derived_from_leadwise_rows
+State-space: Global-local residual,rolling_origin_no_refit,diagnostic,0.07393203207675884,0.10625491464480609,0.15319352373762662,0.19445223381109555,derived_from_leadwise_rows
+State-space: Global-local residual,non_overlap,diagnostic,0.07463181121355165,0.10599096409114467,0.1514283887897218,0.1927618944826553,derived_from_leadwise_rows
+State-space: Global-local increment,rolling_origin_no_refit,diagnostic,0.07303059186157652,0.10658782063100375,0.15852850119024706,0.2062877545391929,derived_from_leadwise_rows
+State-space: Global-local increment,non_overlap,diagnostic,0.07357080715117666,0.10662709980792927,0.15753189039279195,0.20424116410635434,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.00),rolling_origin_no_refit,diagnostic,0.0732072893028869,0.10572625187564767,0.15315892420413835,0.19368060240485993,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.00),non_overlap,diagnostic,0.07370595011374294,0.10546419840630132,0.15136962987295546,0.1916563257139855,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.02),rolling_origin_no_refit,diagnostic,0.0737822983530019,0.10550177356159955,0.15248861941500355,0.19269098714072463,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.02),non_overlap,diagnostic,0.0742914922111251,0.10523702740499462,0.1507310193632999,0.19048165106306308,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.05),rolling_origin_no_refit,diagnostic,0.07379557845471374,0.1059828612231646,0.1529798143991666,0.19220912544932198,derived_from_leadwise_rows
+State-space: Ramp v2 residual (0.05),non_overlap,diagnostic,0.0740961854980133,0.10573481824605528,0.1513130452638445,0.189929552348788,derived_from_leadwise_rows
+State-space: Edge residual control,rolling_origin_no_refit,diagnostic,0.0732072893028869,0.10572625187564767,0.15315892420413835,0.19368060240485993,derived_from_leadwise_rows
+State-space: Edge residual control,non_overlap,diagnostic,0.07370595011374294,0.10546419840630132,0.15136962987295546,0.1916563257139855,derived_from_leadwise_rows
+State-space: Edge gated sum,rolling_origin_no_refit,diagnostic,0.07357850094650929,0.10584404320317732,0.1537062813753561,0.19459634515912413,derived_from_leadwise_rows
+State-space: Edge gated sum,non_overlap,diagnostic,0.07411343345239138,0.10605613820714654,0.15270703836879254,0.19305422702313782,derived_from_leadwise_rows
+State-space: Edge rotor wake,rolling_origin_no_refit,diagnostic,0.07354767377187726,0.1056244048468844,0.1527910584210019,0.19555869272956472,derived_from_leadwise_rows
+State-space: Edge rotor wake,non_overlap,diagnostic,0.07400516947642528,0.1052043015540051,0.15148118625924015,0.19476731896594562,derived_from_leadwise_rows
+State-space: Edge gated + rotor wake,rolling_origin_no_refit,diagnostic,0.07297702216713624,0.1055559954856084,0.1526190402440785,0.19372741578943378,derived_from_leadwise_rows
+State-space: Edge gated + rotor wake,non_overlap,diagnostic,0.07340777279422708,0.10504299980472358,0.15119669927740503,0.19213842652062987,derived_from_leadwise_rows
