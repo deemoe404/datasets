@@ -1,0 +1,29 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": -0.02871103668129832,
+    "ci95_low": -0.04911962655417819,
+    "delta_mean": -0.03895421775902152,
+    "prob_delta_gt_zero": 0.0
+  },
+  "block_bootstrap_blocked_reason": null,
+  "block_length": 6,
+  "blocked_reason": null,
+  "bootstrap_repeats": 5000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/multiseed_origin_errors_non_overlap.csv",
+  "created_at": "2026-04-25T07:25:06.670215+00:00",
+  "origin_count": 145,
+  "paired_bootstrap": {
+    "ci95_high": -0.029883614372743637,
+    "ci95_low": -0.047410481228697364,
+    "delta_mean": -0.038638052814968696,
+    "prob_delta_gt_zero": 0.0
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "row_count": 145,
+  "seed_rows_csv": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/multiseed_seed_rows_non_overlap.csv",
+  "statistics_summary_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-origin-errors-nonoverlap-statistics-summary.csv",
+  "summary_csv": null
+}

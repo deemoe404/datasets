@@ -1,0 +1,31 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": 0.00039827436120845193,
+    "ci95_low": -0.0013693397971916224,
+    "delta_mean": -0.00047494155336664454,
+    "prob_delta_gt_zero": 0.1526
+  },
+  "block_bootstrap_blocked_reason": null,
+  "block_length": 24,
+  "blocked_reason": null,
+  "bootstrap_repeats": 5000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-dgcrn-rescue-non_overlap-origin-comparison.csv",
+  "completed_seed_count": 5,
+  "created_at": "2026-04-29T18:23:40.983905+00:00",
+  "expected_seed_count": 5,
+  "main_table_status": "appendix_diagnostic",
+  "origin_count": 13120,
+  "paired_bootstrap": {
+    "ci95_high": 0.00019354594099101714,
+    "ci95_low": -0.0011371963650069214,
+    "delta_mean": -0.00047164796756880183,
+    "prob_delta_gt_zero": 0.0838
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "protocol": "non_overlap",
+  "row_count": 13120,
+  "seed_rows_csv": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-dgcrn-rescue-seed-rows.csv"
+}

@@ -1,0 +1,27 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": 0.0001707972429806507,
+    "ci95_low": -0.0002387597019101955,
+    "delta_mean": -3.524775221649402e-05,
+    "prob_delta_gt_zero": 0.3695
+  },
+  "block_length": 24,
+  "blocked_reason": null,
+  "bootstrap_repeats": 2000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-mtgnn-rolling_origin_no_refit-origin-comparison.csv",
+  "created_at": "2026-04-27T05:04:20.718484+00:00",
+  "eval_protocol": "rolling_origin_no_refit",
+  "family": "mtgnn",
+  "origin_count": 94458,
+  "paired_bootstrap": {
+    "ci95_high": 1.057984322402575e-05,
+    "ci95_low": -9.260485340542107e-05,
+    "delta_mean": -4.010335674230586e-05,
+    "prob_delta_gt_zero": 0.0645
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "seed_count": 5
+}

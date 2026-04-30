@@ -1,0 +1,33 @@
+{
+  "blocked_reason": "missing_per_origin_paired_errors",
+  "bootstrap_status": "blocked",
+  "comparison_csv": null,
+  "created_at": "2026-04-25T05:30:22.088933+00:00",
+  "detail": "Paired and block bootstrap require per-origin paired error rows for the compared baseline/proposed models. Aggregate seed-level metrics are not sufficient and must not be resampled as origin-level evidence.",
+  "required_column_pairs": [
+    [
+      "baseline_abs_error_pu",
+      "proposed_abs_error_pu"
+    ],
+    [
+      "baseline_ae_pu",
+      "proposed_ae_pu"
+    ],
+    [
+      "baseline_error_pu",
+      "proposed_error_pu"
+    ],
+    [
+      "baseline_error",
+      "proposed_error"
+    ],
+    [
+      "control_abs_error_pu",
+      "candidate_abs_error_pu"
+    ]
+  ],
+  "seed_row_count": 10,
+  "seed_rows_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-seed-rows.csv",
+  "statistics_summary_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-statistics-summary.csv",
+  "summary_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-summary.csv"
+}

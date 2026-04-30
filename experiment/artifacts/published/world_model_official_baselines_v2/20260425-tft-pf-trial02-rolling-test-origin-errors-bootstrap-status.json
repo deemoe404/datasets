@@ -1,0 +1,26 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": -0.03208013419530972,
+    "ci95_low": -0.03497588280079496,
+    "delta_mean": -0.03351085379901536,
+    "prob_delta_gt_zero": 0.0
+  },
+  "block_bootstrap_blocked_reason": null,
+  "block_length": 24,
+  "blocked_reason": null,
+  "bootstrap_repeats": 5000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-tft-pf-trial02-rolling-test-origin-errors-comparison.csv",
+  "created_at": "2026-04-25T14:43:33.311219+00:00",
+  "origin_count": 94458,
+  "paired_bootstrap": {
+    "ci95_high": -0.03313863406704068,
+    "ci95_low": -0.03390052439847622,
+    "delta_mean": -0.03352133488448922,
+    "prob_delta_gt_zero": 0.0
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "row_count": 94458
+}

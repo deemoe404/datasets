@@ -1,0 +1,27 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": 0.0033309088655634474,
+    "ci95_low": -0.00015986269101508772,
+    "delta_mean": 0.001615369053123222,
+    "prob_delta_gt_zero": 0.961
+  },
+  "block_length": 24,
+  "blocked_reason": null,
+  "bootstrap_repeats": 2000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-itransformer-non_overlap-origin-comparison.csv",
+  "created_at": "2026-04-27T05:04:09.122589+00:00",
+  "eval_protocol": "non_overlap",
+  "family": "itransformer",
+  "origin_count": 2624,
+  "paired_bootstrap": {
+    "ci95_high": 0.0030395591745056064,
+    "ci95_low": 7.9936140289633e-05,
+    "delta_mean": 0.0015737535902969218,
+    "prob_delta_gt_zero": 0.9795
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "seed_count": 5
+}

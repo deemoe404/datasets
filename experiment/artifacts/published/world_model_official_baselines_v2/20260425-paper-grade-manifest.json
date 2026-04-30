@@ -1,0 +1,19 @@
+{
+  "artifacts": {
+    "bootstrap_status_summary": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-bootstrap-status-summary.csv",
+    "controls_and_chronos_test_rows": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-controls-and-chronos-test-rows.csv",
+    "coverage_validation": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-coverage-validation.csv",
+    "final_table": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-final-table.csv",
+    "trainable_seed_rows": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-seed-rows.csv",
+    "trainable_statistics_summary": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-trainable-statistics-summary.csv"
+  },
+  "created_at": "2026-04-27T05:04:30.301503+00:00",
+  "dgcrn_status": "excluded_main_table_native_exit_-11_before_test_artifacts",
+  "prefix": "20260425-paper-grade",
+  "run_root": "/home/sam/datasets/experiment/artifacts/scratch/world_model_official_baselines_v2/long_run_20260425_paper_grade",
+  "trainable_completed_families": [
+    "itransformer",
+    "timexer",
+    "mtgnn"
+  ]
+}

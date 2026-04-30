@@ -1,0 +1,272 @@
+{
+  "args": {
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 3,
+    "dgcrn_hidden_dim": 96,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "gate_b_overfit64_mae_pu": 0.017527911760187802,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.028786084707360226,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_residual_formal_search_20260424/gate_overfit64_h64_lr3e4.csv",
+    "gate_origin_count": 64,
+    "itransformer_d_model": 64,
+    "itransformer_dropout": 0.1,
+    "itransformer_e_layers": 2,
+    "itransformer_n_heads": 4,
+    "learning_rate": 0.0005,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 12,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "mtgnn_dropout": 0.3,
+    "mtgnn_end_channels": 128,
+    "mtgnn_gcn_depth": 2,
+    "mtgnn_layers": 3,
+    "mtgnn_node_dim": 40,
+    "mtgnn_residual_channels": 32,
+    "mtgnn_skip_channels": 64,
+    "mtgnn_subgraph_size": 6,
+    "origin_error_output_path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/seed926.origin_errors.csv",
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "seed": 926,
+    "split_names": [
+      "test"
+    ],
+    "tft_attention_head_size": 4,
+    "tft_dropout": 0.1,
+    "tft_eval_window_chunk_size": 1024,
+    "tft_hidden_continuous_size": 16,
+    "tft_hidden_size": 32,
+    "tft_lstm_layers": 1,
+    "tft_streaming_exact_ae_limit": 5000000,
+    "timexer_d_model": 64,
+    "timexer_dropout": 0.1,
+    "timexer_e_layers": 2,
+    "timexer_n_heads": 4,
+    "timexer_patch_len": 16,
+    "train_batch_size": 128,
+    "variant_names": [
+      "dgcrn_official_core_residual_b2_v2"
+    ]
+  },
+  "artifacts": {
+    "origin_errors": {
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/seed926.origin_errors.csv"
+    },
+    "primary_output": {
+      "exists": true,
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/seed926.csv",
+      "sha256": "5a33cc221d1cde3c9d38377809675248597ad9863127826834a4cce302f9895e",
+      "size_bytes": 2932
+    },
+    "summary": {
+      "path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/seed926.summary.json"
+    }
+  },
+  "created_at_utc": "2026-04-25T07:23:50.214735+00:00",
+  "family": {
+    "default_output_path": "experiment/artifacts/published/world_model_official_baselines_v2/{run_timestamp}.csv",
+    "default_output_schema_version": "world_model_official_baselines_v2.long_metrics.v1",
+    "display_name": "World-Model Official Baselines v2",
+    "family_id": "world_model_official_baselines_v2",
+    "implementation_root": "experiment/families/world_model_official_baselines_v2",
+    "model_family": "world_model_baseline",
+    "orchestrator_entrypoint": null,
+    "readme_path": "experiment/families/world_model_official_baselines_v2/README.md",
+    "runner_entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2.py",
+    "status": "prototype",
+    "training_mode": "trainable"
+  },
+  "formal_tuning_status": {
+    "blocked_rows": 0,
+    "blocked_rows_are_not_performance_results": true,
+    "checkpoint_eval_protocol": "rolling_origin_no_refit",
+    "chronos_batch_size": 32,
+    "completed_rows": 2,
+    "created_at_utc": "2026-04-25T07:23:50.211930+00:00",
+    "device": "cuda",
+    "dgcrn_dropout": 0.1,
+    "dgcrn_gcn_depth": 3,
+    "dgcrn_hidden_dim": 96,
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "family_id": "world_model_official_baselines_v2",
+    "gate_b_overfit64_mae_pu": 0.017527911760187802,
+    "gate_b_overfit64_passed": true,
+    "gate_b_overfit64_rmse_pu": 0.028786084707360226,
+    "gate_b_overfit64_source": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_residual_formal_search_20260424/gate_overfit64_h64_lr3e4.csv",
+    "gate_origin_count": 64,
+    "itransformer_d_model": 64,
+    "itransformer_dropout": 0.1,
+    "itransformer_e_layers": 2,
+    "itransformer_n_heads": 4,
+    "learning_rate": 0.0005,
+    "max_checkpoint_origins": 512,
+    "max_epochs": 12,
+    "max_eval_origins": 1024,
+    "max_train_origins": 4096,
+    "mtgnn_dropout": 0.3,
+    "mtgnn_end_channels": 128,
+    "mtgnn_gcn_depth": 2,
+    "mtgnn_layers": 3,
+    "mtgnn_node_dim": 40,
+    "mtgnn_residual_channels": 32,
+    "mtgnn_skip_channels": 64,
+    "mtgnn_subgraph_size": 6,
+    "origin_error_output_path": "experiment/artifacts/scratch/world_model_official_baselines_v2/dgcrn_trial20_multiseed_origin_errors_20260425/seed926.origin_errors.csv",
+    "origin_error_row_count": 1053,
+    "residual_anchor_steps": 1,
+    "ridge_alphas": [
+      0.0,
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "row_count": 2,
+    "split_names": [
+      "test"
+    ],
+    "supported_variants": [
+      "baseline_last_value_persistence_v2",
+      "baseline_ridge_residual_persistence_b0_v2",
+      "baseline_seasonal_persistence_v2",
+      "chronos2_official_zero_shot_b2_v2",
+      "dgcrn_official_core_direct_b2_v2",
+      "dgcrn_official_core_residual_b2_v2",
+      "itransformer_official_target_only_direct_b0_v2",
+      "itransformer_official_target_only_residual_b0_v2",
+      "itransformer_official_target_plus_exog_residual_b2_v2",
+      "mtgnn_official_core_calendar_residual_b1_v2",
+      "mtgnn_official_core_target_only_b0_v2",
+      "tft_pf_per_turbine_direct_b2_v2",
+      "tft_pf_per_turbine_residual_b2_v2",
+      "timexer_official_full_exog_residual_b2_v2",
+      "timexer_official_target_only_direct_b0_v2",
+      "timexer_official_target_only_residual_b0_v2"
+    ],
+    "tft_attention_head_size": 4,
+    "tft_dropout": 0.1,
+    "tft_eval_window_chunk_size": 1024,
+    "tft_hidden_continuous_size": 16,
+    "tft_hidden_size": 32,
+    "tft_lstm_layers": 1,
+    "tft_streaming_exact_ae_limit": 5000000,
+    "timexer_d_model": 64,
+    "timexer_dropout": 0.1,
+    "timexer_e_layers": 2,
+    "timexer_n_heads": 4,
+    "timexer_patch_len": 16,
+    "train_batch_size": 128
+  },
+  "git": {
+    "branch": "codex/official-baselines-v2",
+    "head": "15d179fff3eef5e06e353fb0d03c082d47b4e771",
+    "is_dirty": true,
+    "status_short": [
+      "M experiment/families/world_model_official_baselines_v2/diagnostics/statistics.py",
+      " M experiment/families/world_model_official_baselines_v2/formal_tuning.py",
+      " M experiment/families/world_model_state_space_v1/work_log.txt",
+      " ? experiment/official_baselines/dgcrn/source",
+      " ? experiment/official_baselines/mtgnn/source",
+      " ? experiment/official_baselines/timexer/source",
+      " M test/test_world_model_official_baselines_v2.py",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-bootstrap-status.csv",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-bootstrap-status.json",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-statistics-summary.csv",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-dgcrn-trial20-multiseed-summary-validation.json",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-timexer-trial09-test-once.csv",
+      "?? experiment/artifacts/published/world_model_official_baselines_v2/20260425-timexer-trial09-test-once.summary.json",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-024246-tft_direct_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-024314-tft_residual_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-024427-tft_residual_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-024542-tft_direct_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-025652-tft_trial02_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-025905-tft_trial02_validation_selected_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-033242-tft_trial02_test_chunked_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-040523-tft_trial02_test_manual_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-044337-chronos2_val_nonoverlap_smoke_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-044609-chronos2_val_rolling128_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-045615-mtgnn_calendar_residual_overfit64_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-045742-mtgnn_calendar_residual_overfit64_retry_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-054756-timexer_trial09_test_once_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-065350-dgcrn_trial20_multiseed_origin_errors_seed3407_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-070120-dgcrn_trial20_multiseed_origin_errors_seed42_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-070849-dgcrn_trial20_multiseed_origin_errors_seed2026_20260425/",
+      "?? experiment/artifacts/runs/world_model_official_baselines_v2/20260425-071618-dgcrn_trial20_multiseed_origin_errors_seed17_20260425/",
+      "?? experiment/families/world_model_official_baselines_v2/diagnostics/generate_statistics_artifacts.py"
+    ]
+  },
+  "invocation": {
+    "entrypoint": "experiment/families/world_model_official_baselines_v2/run_world_model_official_baselines_v2_formal_tuning.py",
+    "kind": "formal_tuning_runner",
+    "run_label": "dgcrn_trial20_multiseed_origin_errors_seed926_20260425"
+  },
+  "no_test_feedback": true,
+  "notes": [
+    "This formal tuning runner is fail-closed: executable analytic/Ridge controls run, missing official trainable adapters are recorded as blocked rows, not performance results."
+  ],
+  "quality_gates": {
+    "gate_a": {
+      "status": "previous_debug_snapshots_written"
+    },
+    "gate_b": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_c": {
+      "status": "computed_for_ridge_and_supported_neural_trainable_paths"
+    },
+    "gate_d": {
+      "status": "validation_only_selection"
+    },
+    "gate_e": {
+      "status": "test_once_for_selected_completed_trials"
+    }
+  },
+  "result": {
+    "row_count": 2
+  },
+  "schema_version": 1,
+  "selected_by": "validation_only",
+  "selection": {
+    "dataset_ids": [
+      "kelmarsh"
+    ],
+    "eval_protocols": [
+      "rolling_origin_no_refit",
+      "non_overlap"
+    ],
+    "feature_protocol_ids": [
+      "world_model_v1"
+    ],
+    "model_variants": [
+      "dgcrn_official_core_residual_b2_v2"
+    ],
+    "result_splits": [
+      "test"
+    ]
+  },
+  "test_evaluated_at": "2026-04-25T07:23:50.234258+00:00"
+}

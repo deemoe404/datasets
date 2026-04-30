@@ -1,0 +1,27 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": 0.0032257533120159184,
+    "ci95_low": -0.0003351641408752608,
+    "delta_mean": 0.001462387120998048,
+    "prob_delta_gt_zero": 0.9385
+  },
+  "block_length": 24,
+  "blocked_reason": null,
+  "bootstrap_repeats": 2000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "/home/sam/datasets/experiment/artifacts/published/world_model_official_baselines_v2/20260425-paper-grade-timexer-non_overlap-origin-comparison.csv",
+  "created_at": "2026-04-27T05:04:19.574855+00:00",
+  "eval_protocol": "non_overlap",
+  "family": "timexer",
+  "origin_count": 2624,
+  "paired_bootstrap": {
+    "ci95_high": 0.0029083048580634523,
+    "ci95_low": -2.930263895310346e-07,
+    "delta_mean": 0.0014496234571651767,
+    "prob_delta_gt_zero": 0.975
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "seed_count": 5
+}

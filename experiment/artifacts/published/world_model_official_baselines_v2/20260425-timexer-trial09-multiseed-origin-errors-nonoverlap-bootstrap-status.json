@@ -1,0 +1,29 @@
+{
+  "baseline_error_column": "baseline_abs_error_pu",
+  "block_bootstrap": {
+    "ci95_high": -0.035802710301414464,
+    "ci95_low": -0.07760719143253059,
+    "delta_mean": -0.05575819668918556,
+    "prob_delta_gt_zero": 0.0
+  },
+  "block_bootstrap_blocked_reason": null,
+  "block_length": 6,
+  "blocked_reason": null,
+  "bootstrap_repeats": 5000,
+  "bootstrap_seed": 3407,
+  "bootstrap_status": "completed",
+  "comparison_csv": "experiment/artifacts/scratch/world_model_official_baselines_v2/timexer_trial09_multiseed_origin_errors_20260425/multiseed_origin_errors_non_overlap.csv",
+  "created_at": "2026-04-25T07:29:01.666468+00:00",
+  "origin_count": 145,
+  "paired_bootstrap": {
+    "ci95_high": -0.040029488003198575,
+    "ci95_low": -0.07305619302544934,
+    "delta_mean": -0.05625218418762418,
+    "prob_delta_gt_zero": 0.0
+  },
+  "proposed_error_column": "proposed_abs_error_pu",
+  "row_count": 145,
+  "seed_rows_csv": "experiment/artifacts/scratch/world_model_official_baselines_v2/timexer_trial09_multiseed_origin_errors_20260425/multiseed_seed_rows_non_overlap.csv",
+  "statistics_summary_csv": "experiment/artifacts/published/world_model_official_baselines_v2/20260425-timexer-trial09-multiseed-origin-errors-nonoverlap-statistics-summary.csv",
+  "summary_csv": null
+}
